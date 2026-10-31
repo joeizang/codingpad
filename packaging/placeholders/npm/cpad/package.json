@@ -1,5 +1,5 @@
 {
-  "name": "cpad",
+  "name": "@codingpad/cpad",
   "version": "0.0.1",
   "description": "Placeholder for cpad, the CodingPad command-line runner. Not functional yet.",
   "license": "(MIT OR Apache-2.0)",
@@ -7,5 +7,7 @@
   "homepage": "https://github.com/joeizang/codingpad",
   "repository": { "type": "git", "url": "git+https://github.com/joeizang/codingpad.git" },
   "bin": { "cpad": "bin/cpad.js" },
-  "files": ["bin", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
+  "files": ["bin", "README.md", "LICENSE-MIT", "LICENSE-APACHE"],
+  "publishConfig": { "access": "public" }
+
 }

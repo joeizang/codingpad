@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>CodingPad</RootNamespace>
+    <PackageId>codingpad</PackageId>
+    <Version>0.0.1</Version>
+    <Authors>Joseph Izang</Authors>
+    <Description>Placeholder for the CodingPad runtime library (dump, cache, secret, db). Not functional yet.</Description>
+    <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/joeizang/codingpad</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/joeizang/codingpad</RepositoryUrl>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>codingpad;scratchpad</PackageTags>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,10 @@
+# build outputs
+bin/
+obj/
+target/
+dist/
+node_modules/
+*.nupkg
+
+# npm bin folders are source, not build output
+!packaging/placeholders/npm/cpad/bin/

@@ -1,0 +1,12 @@
+{
+  "name": "codingpad",
+  "version": "0.0.1",
+  "description": "Placeholder for the CodingPad runtime library (dump, cache, secret, db). Not functional yet.",
+  "license": "(MIT OR Apache-2.0)",
+  "author": "Joseph Izang",
+  "homepage": "https://github.com/joeizang/codingpad",
+  "repository": { "type": "git", "url": "git+https://github.com/joeizang/codingpad.git" },
+  "type": "module",
+  "main": "index.js",
+  "files": ["index.js", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
+}

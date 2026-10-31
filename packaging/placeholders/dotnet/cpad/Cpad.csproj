@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RollForward>Major</RollForward>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>cpad</ToolCommandName>
+    <PackageId>cpad</PackageId>
+    <Version>0.0.1</Version>
+    <Authors>Joseph Izang</Authors>
+    <Description>Placeholder for cpad, the CodingPad command-line runner. Not functional yet.</Description>
+    <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/joeizang/codingpad</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/joeizang/codingpad</RepositoryUrl>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>codingpad;scratchpad;cli</PackageTags>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+</Project>

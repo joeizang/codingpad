@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cpad"
+version = "0.0.1"
+description = "Placeholder for cpad, the CodingPad command-line runner. Not functional yet."
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+authors = [{ name = "Joseph Izang" }]
+requires-python = ">=3.10"
+classifiers = ["Development Status :: 1 - Planning"]
+
+[project.scripts]
+cpad = "cpad:main"
+
+[project.urls]
+Homepage = "https://github.com/joeizang/codingpad"

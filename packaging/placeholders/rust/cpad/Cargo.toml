@@ -1,0 +1,13 @@
+[package]
+name = "cpad"
+version = "0.0.1"
+edition = "2024"
+description = "Placeholder for cpad, the CodingPad command-line runner. Not functional yet."
+license = "MIT OR Apache-2.0"
+authors = ["Joseph Izang"]
+homepage = "https://github.com/joeizang/codingpad"
+repository = "https://github.com/joeizang/codingpad"
+readme = "README.md"
+keywords = ["codingpad", "scratchpad", "cli"]
+
+[workspace]

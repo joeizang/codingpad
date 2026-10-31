@@ -16,7 +16,7 @@
 | D10 | Scripts are **plain native files** with a one-line `codingpad:` comment header. See [ADR 0004](adr/0004-scripts-are-plain-native-files.md) | 2026-10-30 |
 | D11 | Execution: **one warm process per open script, a clean slate on every run**, an explicit `cache()` helper and a **Reset** button. Rust starts fresh each run, and its `cache()` persists to disk | 2026-10-30 |
 | D12 | Toolchains: **use the user's installed toolchains first; if one is missing, offer a one-click private install** into CodingPad's data folder. Nothing is bundled in the installer | 2026-10-30 |
-| D13 | **Windows, macOS and Linux are equal first-class platforms** from day one: CI builds and tests all three, and manual testing covers all three | 2026-10-30 |
+| D13 | **Windows, macOS and Linux are equal first-class platforms** from day one: the code must build and pass tests on all three, checked locally (see D39), and manual testing covers all three | 2026-10-30 (revised 2026-10-31) |
 | D14 | Learner content in the MVP: **built-in samples** (~10 runnable scripts per language) plus a **bundled SQLite sample database**. Full tutorials come later | 2026-10-30 |
 | D15 | AI: **not in the MVP**. In a later phase, **bring-your-own-key, multi-provider including local models**. The MVP leaves clean extension points for it | 2026-10-30 |
 | D16 | **Scratchpad layout only** (one script, one results panel). No notebook/cells view planned | 2026-10-30 |
@@ -25,7 +25,7 @@
 | D19 | Rust runs as a **hidden cargo project per script with a shared build cache (`target/`)**, plus background pre-compiling of popular crates. evcxr was rejected because its behaviour differs from real Rust | 2026-10-30 |
 | D20 | TypeScript and Python scripts **run even with type errors**; errors show as squiggles plus a warning count. C# and Rust block, because they cannot compile | 2026-10-31 |
 | D21 | Script storage: a default **library** folder (`Documents/CodingPad`, configurable) plus user-added **pinned folders**. Any single file can also be opened | 2026-10-31 |
-| D22 | **The last expression is dumped automatically** in Python, C# and TypeScript. In Rust only when the script ends with a plain expression; otherwise explicit `dump()` | 2026-10-31 |
+| D22 | **The last expression is dumped automatically** in Python, C# (only where valid C#, see D49) and TypeScript. In Rust only when the script ends with a plain expression; otherwise explicit `dump()` | 2026-10-31 |
 | D23 | Connection passwords and other secrets live in the **OS password vault** (Keychain / Credential Manager / Secret Service). A `secret("name")` helper is in all four languages in the MVP. Without a vault, prompt once per session | 2026-10-31 |
 | D24 | Code editor component: **Monaco** | 2026-10-31 |
 | D25 | UI framework: **React + TypeScript**, with virtualised rendering for large dumps and tables | 2026-10-31 |
@@ -43,7 +43,29 @@
 | D37 | Runtime libraries are named **`codingpad`** on PyPI, NuGet, crates.io and npm (C# namespace `CodingPad`). Reserve `codingpad` and `cpad` on all four now with placeholder releases. Packages are ready in `packaging/placeholders/` (**owner: Joseph, publishes with their registry accounts**) | 2026-10-31 |
 | D38 | Performance targets for 1.0 (tracked by automated checks): app usable <1s; warm rerun Python/TS <200ms, C# <500ms, Rust after a small edit <3s; first kernel start <3s (Rust longer on first compile); 100k-row dump never freezes, first rows <1s; completions <300ms; idle memory <300MB | 2026-10-31 |
 
+| D39 | **Builds and tests run locally, with no CI for now.** One command builds and tests everything on whichever machine runs it. Release installers are built locally, each on its own platform. If CI is added later (GitHub Actions is free for public repos), it only runs that same command | 2026-10-31 |
+| D40 | **M1 starts with a thin end-to-end skeleton:** type Python, press Run, see output, with each part only as deep as that needs. The other parts are deepened one at a time afterwards | 2026-10-31 |
+| D41 | The skeleton's output covers **printed text plus a basic dump tree** (objects, lists, plain values, auto-dumped last expression). Lazy nodes, tables, images and live updates come later in M1 | 2026-10-31 |
+| D42 | Platform testing without CI: **macOS and Linux are tested continuously** on the owner's own machines. **Windows is checked in a local virtual machine before each milestone closes** (the same one command must pass) |  2026-10-31 |
+| D43 | The one build-and-test command is run by **`just`** (a `justfile` at the repo root with recipes such as `check`, `run`, `release`) | 2026-10-31 |
+| D44 | The skeleton **assumes `uv` is already installed** and shows a clear message if not. One-click toolchain install is built later in M1 | 2026-10-31 |
+| D45 | Inside CodingPad, the kernel puts its **own built-in copy of the runtime library** on the script's import path (no download, no declared dependency). Outside CodingPad, the script declares `codingpad` as a normal dependency from the package registry, and `dump()` falls back to terminal pretty-printing. Same pattern for every language | 2026-10-31 |
+| D46 | **M1 includes Python code intelligence**: basedpyright through the Rust core's language-server multiplexer, so M2 only plugs in Roslyn LSP | 2026-10-31 |
+| D47 | M1 build order after the skeleton: **(1) full dump** (lazy nodes, paged tables, images, HTML, live, tracebacks) → **(2) run control** (Stop, Reset, `cache()`) → **(3) library and files** (sidebar, pinned folders, script header) → **(4) Python packages** (PEP 723 via `uv`) → **(5) code intelligence** (basedpyright, language-server multiplexer) → **(6) one-click `uv` install**. Protocol-heavy work comes first so it is stable before M2 | 2026-10-31 |
+| D48 | **M1 is done only when the Python speed targets from D38 pass**, measured locally by `just bench` on macOS and Linux. The Windows VM check confirms things work, not timings | 2026-10-31 |
+| D49 | **C# auto-dump stays valid C#:** the final statement is dumped only if it is a call that returns a value (e.g. `people.Where(...).ToList();`). Otherwise use `.Dump()`. A bare final value is not allowed, so scripts compile cleanly in the editor and under `dotnet run` | 2026-10-31 |
+| D50 | **M2 includes the one-click .NET 10 SDK install** (official install script into CodingPad's data folder), reusing M1's installer framework | 2026-10-31 |
+| D51 | M2 supports the C# directives **`#:package`, `#:property` (common compiler options) and `#:sdk Microsoft.NET.Sdk.Web`**. `#:project` shows a clear "not supported in CodingPad yet; runs with `dotnet run`" message and is deferred to after 1.0 | 2026-10-31 |
+| D52 | C# code intelligence uses a **shadow project** per script (hidden `.csproj` with the script's packages, properties and the built-in `CodingPad` library), generated from the same parsed directives the kernel compiles with. M2 builds the shared shadow-project manager reused by Rust and TypeScript | 2026-10-31 |
+| D53 | C# `cache()` **reuses a cached value only when it is safe**: if the value contains types defined in the script and the script has been recompiled, the cached code is rerun and a small "cache refreshed: script types changed" note is shown. Values built only from standard or NuGet types are reused as normal | 2026-10-31 |
+| D54 | C# dumps of deferred collections (`IEnumerable`) **load only the first page** and fetch more as the user scrolls, using the protocol's paging. The kernel keeps the half-read sequence alive until the next run or Reset. Endless sequences never hang | 2026-10-31 |
+| D55 | **M2 is done only when the C# speed targets from D38 pass** (`just bench` on macOS and Linux; Windows VM checks function only). NuGet package download time on a first run is excluded; reruns are timed with packages cached | 2026-10-31 |
+| D56 | M2 build order: **(0) C# skeleton** (run, console output, basic `.Dump()`, compile errors) → **(1) full dump** → **(2) run control** → **(3) packages and directives** → **(4) code intelligence** → **(5) one-click .NET SDK install** | 2026-10-31 |
+| D57 | **Stop asks nicely, then restarts the kernel**, in every language. Stop first sends a cancel signal (in C#, a ready-made cancellation token scripts can pass to `await` calls). If the script hasn't stopped within ~2s, the kernel process is killed and restarted, and the user is told the cache was cleared | 2026-10-31 |
+| D58 | C# scripts run on the **newest installed .NET, 10 or later**; the one-click install uses the current long-term-support release. The **C# compiler is built into CodingPad** and updated with each release; a too-new C# feature gives a "needs a newer CodingPad" message | 2026-10-31 |
+| D59 | C# helpers are **short global names needing no `using` line**: `x.Dump()`, `Cache("key", () => ...)`, `Secret("name")`, and the `Cancel` token. Inside CodingPad they are always available; under `dotnet run`, the `CodingPad` NuGet package adds the global usings itself, so the same script compiles in both | 2026-10-31 |
+| D60 | C# package restore **respects the standard `NuGet.config` files** (user-wide and in the script's folder or above), like `dotnet run`. Feeds with username/password or token auth work in M2; credential-provider plugins come later | 2026-10-31 |
 
 ## Open
 
-None. Every branch of the design interview is settled (2026-10-31).
+None. Every branch of the design interview is settled, including the M1/M2 planning session (D39–D60, 2026-10-31).

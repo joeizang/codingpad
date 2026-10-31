@@ -30,10 +30,12 @@ Decision numbers (D#) refer to [04-open-questions.md](04-open-questions.md). Ter
 - **Distribution:** GitHub Releases, unsigned at first, with an update notice instead of an auto-updater (D29, D30).
 
 ## Milestones (D33, D34)
+Builds and tests run locally with `just`, no CI (D39, D42, D43).
+
 | Milestone | Scope | Release |
 |---|---|---|
-| M1 | Foundations: app shell, library sidebar, Monaco, protocol, Python kernel, dump, `cache()`, Reset, toolchain install | |
-| M2 | C# kernel (in-memory Roslyn, NuGet) | |
+| M1 | Foundations: skeleton first (D40), then full dump, run control, library, Python packages, basedpyright, `uv` install (D47). Done when Python speed targets pass (D48) | |
+| M2 | C# kernel: skeleton, full dump, run control, `#:package`/`#:property`/`#:sdk Web`, Roslyn LSP via shadow project, .NET SDK install (D49–D60). Done when C# speed targets pass (D55) | |
 | M3 | Databases: connections, schema panel, SQL scripts, database client, data contexts (Python + C#), secrets, export | |
 | M4 | Polish: samples + sample DB, `cpad run`, update notice, "Report on GitHub", first-launch docs | **0.1 preview** |
 | M5 | Rust kernel, shared build cache | 0.2 |

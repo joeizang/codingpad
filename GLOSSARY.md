@@ -46,6 +46,10 @@ _Avoid_: Hidden project, workspace
 Rich, explorable output of a value, shown as expandable trees and tables in the results panel.
 _Avoid_: Output, print, display
 
+**Auto-dump**:
+The automatic dump of a script's final value at the end of a run, without an explicit `dump()` call.
+_Avoid_: Implicit output, result
+
 **Lazy node**:
 A part of a dump whose contents are fetched only when the user expands it.
 _Avoid_: Link, handle

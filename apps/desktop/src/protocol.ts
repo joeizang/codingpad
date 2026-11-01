@@ -1,13 +1,70 @@
+export type TraceFrame = {
+  file: string;
+  line: number;
+  column: number;
+  function: string;
+  text: string;
+  script: boolean;
+};
+
 export type DumpNode =
-  | { kind: "null" }
-  | { kind: "primitive"; v: number | boolean }
-  | { kind: "string"; v: string; type?: string }
-  | { kind: "list"; type: string; items: DumpNode[]; truncated: boolean }
+  | { id?: string; kind: "null" }
+  | { id?: string; kind: "primitive"; v: number | boolean }
   | {
+      id?: string;
+      kind: "string";
+      v: string;
+      type?: string;
+      truncated?: boolean;
+      total?: number;
+    }
+  | {
+      id?: string;
+      kind: "list";
+      type: string;
+      items: DumpNode[];
+      total?: number;
+      next?: string | null;
+      handle?: string;
+      truncated: boolean;
+    }
+  | {
+      id?: string;
       kind: "object";
       type: string;
       fields: { name: string; value: DumpNode }[];
+      total?: number;
+      next?: string | null;
+      handle?: string;
       truncated: boolean;
+    }
+  | {
+      id?: string;
+      kind: "lazy";
+      type?: string;
+      preview: string;
+      handle: string;
+    }
+  | {
+      id?: string;
+      kind: "table";
+      type: string;
+      columns: { name: string; type?: string }[];
+      rows: DumpNode[][];
+      total: number;
+      next: string | null;
+      handle?: string;
+    }
+  | { id?: string; kind: "image"; mime: string; src: string; name?: string }
+  | { id?: string; kind: "html"; html: string }
+  | { id?: string; kind: "live"; node: DumpNode }
+  | {
+      id?: string;
+      kind: "error";
+      type: string;
+      message: string;
+      traceback: TraceFrame[];
+      causes?: { type: string; message: string }[];
     };
 
 export type KernelEvent =
@@ -16,6 +73,10 @@ export type KernelEvent =
       params: { runId: number; stream: "stdout" | "stderr"; text: string };
     }
   | { method: "dump"; params: { runId: number; node: DumpNode } }
+  | {
+      method: "dump_update";
+      params: { runId: number; nodeId: string; node: DumpNode };
+    }
   | { method: "run_finished"; params: { runId: number; ok: boolean } };
 
 export type Output = { id: number } & (
@@ -46,7 +107,8 @@ export function appendOutputBatch(
     }
   };
   for (const event of events) {
-    if (event.method === "run_finished") continue;
+    if (event.method === "run_finished" || event.method === "dump_update")
+      continue;
     if (event.method === "dump") {
       flush();
       incoming.push({ id: nextId++, kind: "dump", node: event.params.node });
@@ -74,4 +136,16 @@ export function appendOutputBatch(
 
 export function appendOutput(output: Output[], event: KernelEvent): Output[] {
   return appendOutputBatch(output, [event]);
+}
+
+export function collectDumpUpdates(
+  events: KernelEvent[],
+): Record<string, DumpNode> {
+  const updates: Record<string, DumpNode> = {};
+  for (const event of events) {
+    if (event.method === "dump_update") {
+      updates[event.params.nodeId] = event.params.node;
+    }
+  }
+  return updates;
 }

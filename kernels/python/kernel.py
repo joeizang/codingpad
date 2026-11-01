@@ -1,4 +1,4 @@
-"""CodingPad protocol v0: newline-delimited JSON-RPC 2.0 on stdio."""
+"""CodingPad protocol v1: newline-delimited JSON-RPC 2.0 on stdio."""
 
 import ast
 import builtins
@@ -24,6 +24,8 @@ _protocol_out = os.fdopen(
     os.dup(sys.stdout.fileno()), "w", encoding="utf-8", buffering=1
 )
 _protocol_in = os.fdopen(os.dup(sys.stdin.fileno()), "r", encoding="utf-8")
+_KERNEL_FILE = os.path.realpath(__file__)
+_MAX_MESSAGE = 10000
 
 
 def redirect_fd(source, target):
@@ -334,6 +336,70 @@ class NoInput(io.TextIOBase):
         raise RuntimeError("Interactive input is not supported in CodingPad yet")
 
 
+def safe_message(error):
+    try:
+        return str(error)[:_MAX_MESSAGE]
+    except Exception:
+        return "<exception str() failed>"
+
+
+def error_causes(error):
+    """Describe the explicit cause or implicit context chain, newest first."""
+    causes = []
+    seen = {id(error)}
+    current = error.__cause__
+    if current is None and not getattr(error, "__suppress_context__", False):
+        current = error.__context__
+    while current is not None and id(current) not in seen and len(causes) < 5:
+        seen.add(id(current))
+        causes.append(
+            {"type": type(current).__name__, "message": safe_message(current)}
+        )
+        next_error = current.__cause__
+        if next_error is None and not getattr(current, "__suppress_context__", False):
+            next_error = current.__context__
+        current = next_error
+    return causes
+
+
+def error_node(error, filename):
+    """Turn a script exception into a dump node with clickable script frames."""
+    if isinstance(error, SyntaxError):
+        frames = [
+            {
+                "file": error.filename or filename,
+                "line": error.lineno or 0,
+                "column": error.offset or 0,
+                "function": "<module>",
+                "text": (error.text or "").strip(),
+                "script": (error.filename or filename) == filename,
+            }
+        ]
+    else:
+        frames = []
+        for frame in traceback.extract_tb(error.__traceback__)[-30:]:
+            if os.path.realpath(frame.filename) == _KERNEL_FILE:
+                continue
+            frames.append(
+                {
+                    "file": frame.filename,
+                    "line": frame.lineno or 0,
+                    "column": 0,
+                    "function": frame.name,
+                    "text": (frame.line or "").strip(),
+                    "script": frame.filename == filename,
+                }
+            )
+    return {
+        "id": codingpad._node_id(),
+        "kind": "error",
+        "type": type(error).__name__,
+        "message": safe_message(error),
+        "traceback": frames,
+        "causes": error_causes(error),
+    }
+
+
 @contextlib.contextmanager
 def script_timers():
     # Interval timers otherwise keep invoking user handlers during cleanup and
@@ -400,7 +466,14 @@ def run(request):
                 drain()
                 notify("dump", {"runId": run_id, "node": node})
 
-            codingpad._sink = emit_dump
+            def emit_update(node_id, node):
+                drain()
+                notify(
+                    "dump_update",
+                    {"runId": run_id, "nodeId": node_id, "node": node},
+                )
+
+            codingpad._begin(emit_dump, emit_update, run_id)
             try:
                 tree = ast.parse(source, filename=filename)
                 if tree.body and isinstance(tree.body[-1], ast.Expr):
@@ -420,17 +493,55 @@ def run(request):
                     ast.fix_missing_locations(tree)
                 exec(compile(tree, filename, "exec"), scope)
                 ok = True
-            except BaseException:
+            except BaseException as error:
                 # Finish preceding output before reporting the script failure.
                 # SystemExit/KeyboardInterrupt must not kill the kernel either.
-                drain()
-                traceback.print_exc()
+                emit_dump(error_node(error, filename))
     finally:
-        codingpad._sink = None
+        codingpad._end()
         sys.stdin = previous_input
         sys.modules["__main__"] = previous_main
     notify("run_finished", {"runId": run_id, "ok": ok})
     send({"id": run_id, "result": {"ok": ok}})
+
+
+def expand(request):
+    params = request["params"]
+    handle = params.get("handle")
+    if not isinstance(handle, str):
+        raise ValueError("expand requires params.handle as a string")
+    cursor = params.get("cursor")
+    if cursor is not None and not isinstance(cursor, str):
+        raise ValueError("params.cursor must be a string or null")
+    limit = params.get("limit")
+    if limit is not None and not isinstance(limit, int):
+        raise ValueError("params.limit must be an integer or null")
+    try:
+        node = codingpad._expand(handle, cursor, limit)
+    except KeyError:
+        send(
+            {
+                "id": request["id"],
+                "error": {
+                    "code": -32001,
+                    "message": "That preview is no longer available. Run the script again.",
+                },
+            }
+        )
+        return
+    except BaseException as error:
+        # User dunders can raise (or exit) while previewing; keep the kernel serving.
+        send(
+            {
+                "id": request["id"],
+                "error": {
+                    "code": -32603,
+                    "message": f"Could not expand this value: {type(error).__name__}",
+                },
+            }
+        )
+        return
+    send({"id": request["id"], "result": {"node": node}})
 
 
 def main():
@@ -444,7 +555,8 @@ def main():
                 or not isinstance(request.get("id"), int)
             ):
                 raise ValueError("Expected a JSON-RPC request with an integer id")
-            if request.get("method") != "run":
+            method = request.get("method")
+            if method not in {"run", "expand"}:
                 send(
                     {
                         "id": request["id"],
@@ -453,24 +565,29 @@ def main():
                 )
                 continue
             params = request.get("params")
-            if not isinstance(params, dict) or not isinstance(
-                params.get("source"), str
-            ):
-                raise ValueError("run requires params.source as a string")
-            try:
-                run(request)
-            except BaseException as error:
-                # Execution/cleanup failures are request errors, not malformed
-                # input and not a reason to terminate the warm kernel.
-                send(
-                    {
-                        "id": request["id"],
-                        "error": {
-                            "code": -32603,
-                            "message": f"Kernel run failed: {type(error).__name__}",
-                        },
-                    }
-                )
+            if method == "run":
+                if not isinstance(params, dict) or not isinstance(
+                    params.get("source"), str
+                ):
+                    raise ValueError("run requires params.source as a string")
+                try:
+                    run(request)
+                except BaseException as error:
+                    # Execution/cleanup failures are request errors, not malformed
+                    # input and not a reason to terminate the warm kernel.
+                    send(
+                        {
+                            "id": request["id"],
+                            "error": {
+                                "code": -32603,
+                                "message": f"Kernel run failed: {type(error).__name__}",
+                            },
+                        }
+                    )
+            else:
+                if not isinstance(params, dict):
+                    raise ValueError("expand requires params")
+                expand(request)
         except (ValueError, TypeError) as error:
             send(
                 {

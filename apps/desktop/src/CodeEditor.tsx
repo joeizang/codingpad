@@ -7,16 +7,24 @@ import EditorWorker from "monaco-editor/editor/editor.worker.js?worker";
 self.MonacoEnvironment = { getWorker: () => new EditorWorker() };
 loader.config({ monaco });
 
+export type EditorHandle = {
+  revealLineInCenter: (line: number) => void;
+  setPosition: (position: { lineNumber: number; column: number }) => void;
+  focus: () => void;
+};
+
 export default function CodeEditor({
   id,
   source,
   onChange,
   onRun,
+  onMount,
 }: {
   id: string;
   source: string;
   onChange: (source: string) => void;
   onRun: () => void;
+  onMount?: (editor: EditorHandle) => void;
 }) {
   return (
     <Editor
@@ -25,9 +33,10 @@ export default function CodeEditor({
       theme="vs-dark"
       value={source}
       onChange={(value) => onChange(value ?? "")}
-      onMount={(editor) =>
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, onRun)
-      }
+      onMount={(editor) => {
+        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, onRun);
+        onMount?.(editor);
+      }}
       options={{
         fontSize: 14,
         fontFamily: "'SFMono-Regular', Consolas, monospace",

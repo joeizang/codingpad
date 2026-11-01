@@ -1,4 +1,4 @@
-# Kernel protocol v0 (M1 skeleton)
+# Kernel protocol v1 (M1 full dump)
 
 JSON-RPC 2.0 over UTF-8 stdio, one JSON object per line. The Rust supervisor starts
 one warm Python process per open script, writes requests to stdin and reads stdout.
@@ -33,7 +33,7 @@ fence cannot release a newer flush.
 
 Python-level writes are serialized. On a switch between stdout and stderr, the
 previous stream is drained before writing to the next one, preserving their
-relative write order. Both streams are also drained before a script traceback is
+relative write order. Both streams are also drained before a structured error is
 reported. Ordering gates are acquired without waiting. Reentrant writes (including
 signal handlers and finalizers) and writes on kernel I/O workers use a reentrant
 [`SimpleQueue`](https://docs.python.org/3/library/queue.html#queue.SimpleQueue.put)
@@ -61,21 +61,22 @@ surrogates before JSON encoding so Rust can decode them. Notifications include:
 ```json
 {"jsonrpc":"2.0","method":"stream","params":{"runId":1,"stream":"stdout","text":"hello"}}
 {"jsonrpc":"2.0","method":"stream","params":{"runId":1,"stream":"stdout","text":"\n"}}
-{"jsonrpc":"2.0","method":"dump","params":{"runId":1,"node":{"kind":"list","type":"list","items":[{"kind":"primitive","v":1},{"kind":"primitive","v":2}],"truncated":false}}}
-{"jsonrpc":"2.0","method":"dump","params":{"runId":1,"node":{"kind":"primitive","v":42}}}
+{"jsonrpc":"2.0","method":"dump","params":{"runId":1,"node":{"id":"n1","kind":"list","type":"list","items":[{"id":"n2","kind":"primitive","v":1},{"id":"n3","kind":"primitive","v":2}],"total":2,"next":null,"truncated":false}}}
+{"jsonrpc":"2.0","method":"dump_update","params":{"runId":1,"nodeId":"n4","node":{"id":"n5","kind":"primitive","v":2}}}
+{"jsonrpc":"2.0","method":"dump","params":{"runId":1,"node":{"id":"n6","kind":"primitive","v":42}}}
 {"jsonrpc":"2.0","method":"run_finished","params":{"runId":1,"ok":true}}
 {"jsonrpc":"2.0","id":1,"result":{"ok":true}}
 ```
 
-Python exceptions, including `SystemExit` and `KeyboardInterrupt`, stream a plain
-traceback to `stderr`, followed by `run_finished` and a response with `ok: false`.
-A script failure does not discard the warm process. Unhandled execution or cleanup
-exceptions are contained at the request boundary and return error `-32603` with
-the exception type. The Rust supervisor displays the failure and completes the
-run with `ok: false`, retaining the same Python process for the next request.
-Interval timers are stopped before restoring idle streams so a script's timer
-handlers cannot continue firing during later requests. Other imported/module
-state remains warm.
+Python exceptions, including `SystemExit` and `KeyboardInterrupt`, produce a
+structured `error` dump node (see below), followed by `run_finished` and a response
+with `ok: false`. A script failure does not discard the warm process. Unhandled
+execution or cleanup exceptions are contained at the request boundary and return
+error `-32603` with the exception type. The Rust supervisor displays the failure
+and completes the run with `ok: false`, retaining the same Python process for the
+next request. Interval timers are stopped before restoring idle streams so a
+script's timer handlers cannot continue firing during later requests. Other
+imported/module state remains warm.
 
 A process crash or malformed protocol discards the kernel; the next run creates a
 fresh one. Unknown methods return error `-32601`; invalid requests return `-32600`.
@@ -89,23 +90,99 @@ per animation frame and flushed at run completion. Stable output IDs are retaine
 when the 500-block limit evicts old output. Per-run generation checks discard late
 notifications from an earlier invocation.
 
-## Basic dump nodes
+## Expanding values
 
-- `null`: Python `None`
-- `primitive`: JSON-safe boolean or number
-- `string`: text in `v` (also used for non-finite floats, oversized integers and
+Lazy nodes and pages use handles created by the kernel. Expand when the user
+clicks or scrolls:
+
+```json
+{"jsonrpc":"2.0","id":9,"method":"expand","params":{"handle":"h2","cursor":"100","limit":100}}
+{"jsonrpc":"2.0","id":9,"result":{"node":{"id":"n90","kind":"table","type":"list","columns":[{"name":"name"}],"rows":[[{"id":"n91","kind":"string","v":"row 100"}]],"total":100000,"next":"200","handle":"h2"}}}
+```
+
+- `handle` is required. `cursor` is an opaque string; for the current Python kernel
+  it is a decimal row/child offset. `limit` is capped at 1,000 and defaults to 100.
+- The result is a node of the same kind as the container, containing the requested
+  page. Merge `items`, `fields` or `rows` and continue with its `next` cursor.
+- A lazy node expands at depth zero, so a deep object shows another six useful
+  levels with another lazy node at the end.
+- Handles stay valid until the next run begins (Reset in #3 also replaces them).
+  An unknown or expired handle returns error `-32001` with a message telling the
+  user to run the script again. The desktop shows that message in place of the
+  preview. A handle is cached per value within a run, so paging and repeated
+  cells reuse one registry entry.
+- If user code raises while a preview is built (for example a broken `__repr__`),
+  the kernel answers `-32603` ("Could not expand this value: RuntimeError") and
+  keeps serving. `BaseException` is contained too, so a preview cannot `sys.exit`
+  the kernel.
+- Expansion requests are answered when no run is active; the frontend only offers
+  expansion for output from the most recent run.
+
+## Dump nodes
+
+Every node has an `id` string. IDs are prefixed with the run number (`3:n12`) so
+values kept between runs cannot collide; the examples below abbreviate the
+prefix. The desktop uses IDs to apply live updates without rebuilding the rest of
+the tree.
+
+- `null`: Python `None`.
+- `primitive`: JSON-safe boolean or number.
+- `string`: text in `v` (also used for non-finite floats, oversized integers,
   depth/cycle markers, and bounded `repr()` fallbacks for values without an
-  instance dictionary)
-- `list`: list/tuple/set/frozenset with `type`, `items`, `truncated`
+  instance dictionary).
+- `list`: list/tuple/set/frozenset with `type`, `items`, `total`, `next` and
+  `truncated`. A page holds at most 100 children; `next` (and `handle`) is present
+  when more remain.
 - `object`: dictionary or instance attributes with `type`, `fields` containing
-  `{name, value}`, and `truncated`
+  `{name, value}`, `total`, `next` and `truncated`. Objects with more than 100
+  fields are paged the same way as lists.
+- `table`: a sequence of records. `columns` is the union of the first 100 rows'
+  keys (at most 32), `rows` contains up to 100 rows of cell nodes, `total` is the
+  sequence length, and `next`/`handle` page through the rest. A record is a
+  `dict` or an object with `vars()`. Cells are scalars, or `lazy` nodes when a
+  value needs its own tree (for example a list column).
+- `lazy`: `type`, `preview` and `handle`. Emitted when a value is deeper than six
+  levels or the node budget runs out; expanding starts a fresh six-level view.
+- `live`: wraps the current node of a `live()` value. `dump_update` notifications
+  target the wrapped node's ID (not the wrapper), so the live badge and styling
+  stay in place while the inner value changes.
+- `image`: `mime`, `name` when it came from a file, and a `src` data URI. The
+  desktop renders it with a bounded height.
+- `html`: markup in `html`. The desktop renders it in an iframe with an empty
+  `sandbox` attribute, so scripts and same-origin access are blocked.
+- `error`: `type`, `message`, `traceback` and `causes`. `traceback` is a list of
+  `{file, line, column, function, text, script}` frames. `script` frames point
+  into the current script; clicking one moves the editor to that line. Imported
+  library frames are shown but are not clickable. `causes` lists up to five
+  `{type, message}` entries from `raise ... from ...` or an implicit context.
 
-Strings are limited to 10,000 characters, containers to 100 children and depth to
-six, with a total budget of 1,000 nodes per dump. Repeated references are allowed;
-only cycles in the current path are marked. Integers exceeding Python's decimal
-conversion limit show a bit-count summary instead of failing the run.
-Properties and arbitrary iterators are not evaluated. Outside the app, `dump()`
-falls back to terminal pretty-printing.
+Strings are limited to 10,000 characters (1,000 in table cells), container pages
+to 100 children, tables to 100 rows and 32 columns, HTML to 200,000 characters,
+images to 4 MiB, nesting to six levels, and each dump or page to 1,000 nodes and
+about 4 MiB of JSON text and image data (ASCII counts 1, other BMP characters 6
+and astral characters 12, matching `ensure_ascii`). Images, HTML and strings that
+do not fit become lazy nodes, so expanding starts with a fresh budget. Strings
+cut at the 10,000-character (or 1,000 in a table cell) limit carry
+`truncated: true` and `total`, and the desktop shows the marker. Repeated references
+are allowed; only cycles in the current path are marked. Properties and arbitrary
+iterators are not evaluated. Outside the app, `dump()` falls back to terminal
+pretty-printing, and `html()` prints its markup.
 
-This protocol is intentionally small and will evolve in #2 for lazy nodes, tables,
-images, HTML, live dumps and clickable tracebacks. Cancellation follows in #3.
+The runtime library provides four helpers:
+
+```python
+from codingpad import dump, html, image, live
+
+dump({"name": "Ada"})
+dump(html("<b>trusted markup</b>"))
+dump(image("plot.png"))          # or bytes/bytearray
+status = live("starting")
+dump(status)                     # the results panel shows "starting"
+status.value = "done"            # updates that same block
+```
+
+A 100,000-row table sends only its first page, so the first rows appear well under
+a second; scrolling fetches pages by offset. Browsers cap element height in the
+tens of millions of pixels, so tables beyond roughly 500,000 rows cannot be
+scrolled to the end in one webview; split or filter larger data. Cancellation
+arrives in #3.

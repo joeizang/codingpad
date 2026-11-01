@@ -24,6 +24,11 @@ pub struct RunResult {
     pub ok: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExpandResult {
+    pub node: Value,
+}
+
 struct Slot {
     kernel: Mutex<Option<Kernel>>,
     closed: watch::Sender<bool>,
@@ -135,6 +140,42 @@ impl Supervisor {
         }
     }
 
+    pub async fn expand(
+        &self,
+        script_id: &str,
+        handle: &str,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<ExpandResult, String> {
+        let slot = {
+            let kernels = self.kernels.lock().await;
+            kernels.get(script_id).cloned()
+        };
+        let unavailable =
+            || "That preview is no longer available. Run the script again.".to_owned();
+        let slot = slot.ok_or_else(unavailable)?;
+        let mut guard = slot.kernel.lock().await;
+        let outcome = {
+            let kernel = guard.as_mut().ok_or_else(unavailable)?;
+            kernel
+                .request(
+                    "expand",
+                    json!({"handle": handle, "cursor": cursor, "limit": limit}),
+                )
+                .await
+        };
+        match outcome {
+            Ok(node) => serde_json::from_value(node).map_err(|e| e.to_string()),
+            Err(CallError::Kernel(message)) => Err(message),
+            Err(CallError::Transport(message)) => {
+                // The kernel died or answered with garbage. Drop it so the next
+                // run starts a fresh process instead of failing once.
+                *guard = None;
+                Err(message)
+            }
+        }
+    }
+
     pub async fn shutdown(&self) {
         let slots: Vec<_> = self
             .kernels
@@ -204,6 +245,47 @@ impl Kernel {
         })
     }
 
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value, CallError> {
+        self.next_id += 1;
+        let id = self.next_id;
+        let mut request = serde_json::to_vec(
+            &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
+        )
+        .map_err(|e| CallError::Transport(e.to_string()))?;
+        request.push(b'\n');
+        self.input
+            .write_all(&request)
+            .await
+            .map_err(|e| CallError::Transport(format!("Could not send request to Python: {e}")))?;
+        self.input
+            .flush()
+            .await
+            .map_err(|e| CallError::Transport(e.to_string()))?;
+        let message = self.next_message().await?;
+        if message.get("id").is_some() {
+            return response_result(&message, id);
+        }
+        Err(CallError::Transport(
+            "Unexpected kernel notification while waiting for a preview".into(),
+        ))
+    }
+
+    async fn next_message(&mut self) -> Result<Value, CallError> {
+        let line = self
+            .output
+            .next_line()
+            .await
+            .map_err(|e| CallError::Transport(format!("Could not read Python output: {e}")))?
+            .ok_or_else(|| {
+                CallError::Transport(
+                    "Python kernel exited before finishing. Run again to start a fresh kernel."
+                        .to_owned(),
+                )
+            })?;
+        serde_json::from_str(&line)
+            .map_err(|e| CallError::Transport(format!("Invalid kernel message: {e}")))
+    }
+
     async fn run(
         &mut self,
         source: &str,
@@ -222,41 +304,28 @@ impl Kernel {
             .map_err(|e| format!("Could not send script to Python: {e}"))?;
         self.input.flush().await.map_err(|e| e.to_string())?;
         loop {
-            let line = self
-                .output
-                .next_line()
-                .await
-                .map_err(|e| format!("Could not read Python output: {e}"))?
-                .ok_or_else(|| {
-                    "Python kernel exited before finishing. Run again to start a fresh kernel."
-                        .to_owned()
-                })?;
-            let message: Value =
-                serde_json::from_str(&line).map_err(|e| format!("Invalid kernel message: {e}"))?;
+            let message = self.next_message().await.map_err(CallError::message)?;
             if message["jsonrpc"] != "2.0" {
                 return Err("Invalid kernel protocol version".into());
             }
             if message.get("id").is_some() {
-                if message["id"] != id {
-                    return Err("Unexpected kernel response id".into());
+                if message["error"]["code"] == -32603 {
+                    let text = message["error"]["message"]
+                        .as_str()
+                        .unwrap_or("Kernel run failed");
+                    emit(KernelEvent {
+                        method: "stream".into(),
+                        params: json!({"runId": id, "stream": "stderr", "text": format!("{text}\n")}),
+                    });
+                    emit(KernelEvent {
+                        method: "run_finished".into(),
+                        params: json!({"runId": id, "ok": false}),
+                    });
+                    return Ok(RunResult { ok: false });
                 }
-                if let Some(error) = message.get("error") {
-                    if error["code"] == -32603 {
-                        let text = error["message"].as_str().unwrap_or("Kernel run failed");
-                        emit(KernelEvent {
-                            method: "stream".into(),
-                            params: json!({"runId": id, "stream": "stderr", "text": format!("{text}\n")}),
-                        });
-                        emit(KernelEvent {
-                            method: "run_finished".into(),
-                            params: json!({"runId": id, "ok": false}),
-                        });
-                        return Ok(RunResult { ok: false });
-                    }
-                    return Err(format!("Kernel request failed: {error}"));
-                }
-                return serde_json::from_value(message["result"].clone())
-                    .map_err(|e| e.to_string());
+                return response_result(&message, id)
+                    .map_err(CallError::message)
+                    .and_then(|value| serde_json::from_value(value).map_err(|e| e.to_string()));
             }
             if message["params"]["runId"] != id {
                 return Err("Unexpected kernel notification run id".into());
@@ -267,6 +336,40 @@ impl Kernel {
             );
         }
     }
+}
+
+enum CallError {
+    /// A JSON-RPC error reported by a live kernel; keep the process.
+    Kernel(String),
+    /// I/O, EOF or malformed protocol; the process cannot be trusted.
+    Transport(String),
+}
+
+impl CallError {
+    fn message(self) -> String {
+        match self {
+            Self::Kernel(message) | Self::Transport(message) => message,
+        }
+    }
+}
+
+fn response_result(message: &Value, id: u64) -> Result<Value, CallError> {
+    if message["jsonrpc"] != "2.0" {
+        return Err(CallError::Transport(
+            "Invalid kernel protocol version".into(),
+        ));
+    }
+    if message["id"] != id {
+        return Err(CallError::Transport("Unexpected kernel response id".into()));
+    }
+    if let Some(error) = message.get("error") {
+        let text = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("The kernel could not complete the request");
+        return Err(CallError::Kernel(text.to_owned()));
+    }
+    Ok(message["result"].clone())
 }
 
 impl Drop for Kernel {

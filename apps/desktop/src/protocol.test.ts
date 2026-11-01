@@ -1,5 +1,10 @@
 import { expect, test } from "vitest";
-import { appendOutput, appendOutputBatch, type KernelEvent } from "./protocol";
+import {
+  appendOutput,
+  appendOutputBatch,
+  collectDumpUpdates,
+  type KernelEvent,
+} from "./protocol";
 
 test("streams coalesce without losing interleaved dumps or stderr", () => {
   const events: KernelEvent[] = [
@@ -48,4 +53,41 @@ test("dropping old blocks and merging streams preserve retained output ids", () 
   };
   const first = appendOutput(after, stream);
   expect(appendOutput(first, stream).at(-1)!.id).toBe(first.at(-1)!.id);
+});
+
+test("live updates are not emitted as output blocks", () => {
+  const output = appendOutput([], {
+    method: "stream",
+    params: { runId: 1, stream: "stdout", text: "hello" },
+  });
+  const unchanged = appendOutput(output, {
+    method: "dump_update",
+    params: {
+      runId: 1,
+      nodeId: "n1",
+      node: { kind: "primitive", v: 2 },
+    },
+  });
+  expect(unchanged).toBe(output);
+});
+
+test("only the latest update per node is kept for a frame", () => {
+  const events: KernelEvent[] = [
+    {
+      method: "dump_update",
+      params: { runId: 1, nodeId: "a", node: { kind: "primitive", v: 1 } },
+    },
+    {
+      method: "dump_update",
+      params: { runId: 1, nodeId: "b", node: { kind: "primitive", v: 2 } },
+    },
+    {
+      method: "dump_update",
+      params: { runId: 1, nodeId: "a", node: { kind: "primitive", v: 3 } },
+    },
+  ];
+  expect(collectDumpUpdates(events)).toEqual({
+    a: { kind: "primitive", v: 3 },
+    b: { kind: "primitive", v: 2 },
+  });
 });

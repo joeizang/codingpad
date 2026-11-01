@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import CodeEditor, { type EditorHandle } from "./CodeEditor";
 import { DumpTree } from "./DumpTree";
+import type { DiagnosticsSummary } from "./lsp";
 import {
   appendOutputBatch,
   collectDumpUpdates,
@@ -23,6 +24,7 @@ dump({"name": "Ada", "languages": ["Python", "C#", "Rust"]})
 type Script = {
   id: string;
   name: string;
+  path?: string;
   source: string;
   output: Output[];
   running: boolean;
@@ -32,6 +34,18 @@ type Script = {
   controlling?: boolean;
   error?: string;
 };
+function intelligenceLabel(summary: DiagnosticsSummary): string {
+  if (summary.message) return summary.message;
+  const parts: string[] = [];
+  if (summary.errors)
+    parts.push(`${summary.errors} error${summary.errors === 1 ? "" : "s"}`);
+  if (summary.warnings)
+    parts.push(
+      `${summary.warnings} warning${summary.warnings === 1 ? "" : "s"}`,
+    );
+  return parts.length ? parts.join(" · ") : "No type problems";
+}
+
 const newScript = (number: number): Script => ({
   id: `scratch-${number}`,
   name: `Scratch ${number}.py`,
@@ -46,6 +60,10 @@ const newScript = (number: number): Script => ({
 export default function App() {
   const [scripts, setScripts] = useState<Script[]>([newScript(1)]);
   const [activeId, setActiveId] = useState("scratch-1");
+  const [intelligence, setIntelligence] = useState<DiagnosticsSummary>({
+    errors: 0,
+    warnings: 0,
+  });
   const counter = useRef(1);
   const [closing, setClosing] = useState(false);
   const generation = useRef(new Map<string, number>());
@@ -308,13 +326,33 @@ export default function App() {
         <section className="editor-pane" aria-label="Python editor">
           <div className="pane-heading">
             <span>EDITOR</span>
-            <span>Ctrl / ⌘ + Enter to run</span>
+            <span className="pane-heading-right">
+              <span
+                className={`intelligence ${
+                  intelligence.message
+                    ? ""
+                    : intelligence.errors
+                      ? "error"
+                      : intelligence.warnings
+                        ? "warning"
+                        : ""
+                }`}
+                role="status"
+                aria-live="polite"
+                title={intelligenceLabel(intelligence)}
+              >
+                {intelligenceLabel(intelligence)}
+              </span>
+              <span>Ctrl / ⌘ + Enter to run</span>
+            </span>
           </div>
           <div className="editor">
             <CodeEditor
               key={active.id}
               id={active.id}
               source={active.source}
+              scriptPath={active.path}
+              onDiagnostics={setIntelligence}
               onChange={(source) =>
                 update(active.id, (script) => ({ ...script, source }))
               }

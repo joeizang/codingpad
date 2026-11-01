@@ -20,19 +20,45 @@ vi.mock("./CodeEditor", () => ({
   default: ({
     source,
     onChange,
+    onDiagnostics,
   }: {
     source: string;
     onChange: (source: string) => void;
+    onDiagnostics?: (summary: {
+      errors: number;
+      warnings: number;
+      message?: string;
+    }) => void;
   }) => (
-    <textarea
-      aria-label="Code"
-      value={source}
-      onChange={(e) => onChange(e.target.value)}
-    />
+    <div>
+      <textarea
+        aria-label="Code"
+        value={source}
+        onChange={(e) => onChange(e.target.value)}
+      />
+      {onDiagnostics && (
+        <button
+          aria-label="Diagnostics"
+          onClick={() => onDiagnostics({ errors: 1, warnings: 2 })}
+        />
+      )}
+    </div>
   ),
 }));
 beforeEach(() => {
   invoke.mockReset();
+});
+
+test("type diagnostics are shown without disabling Run", async () => {
+  invoke.mockResolvedValue({ ok: true });
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "Diagnostics" }));
+  expect(screen.getByText("1 error · 2 warnings")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "▶ Run" })).toBeEnabled();
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  expect(
+    invoke.mock.calls.filter(([command]) => command === "run_script"),
+  ).toHaveLength(1);
 });
 
 test("Run renders streamed text, structured dumps and completion", async () => {

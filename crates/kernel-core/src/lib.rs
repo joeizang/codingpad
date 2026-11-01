@@ -1,4 +1,5 @@
 //! Desktop-independent supervisor for one warm Python process per script.
+pub mod lsp;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
@@ -10,7 +11,7 @@ use tokio::{
 };
 
 const KERNEL: &str = include_str!("../../../kernels/python/kernel.py");
-const RUNTIME: &str = include_str!("../../../runtimes/python/codingpad/__init__.py");
+pub(crate) const RUNTIME: &str = include_str!("../../../runtimes/python/codingpad/__init__.py");
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -86,7 +87,7 @@ fn uv_search_dirs(
     directories
 }
 
-fn find_uv() -> PathBuf {
+pub(crate) fn find_uv() -> PathBuf {
     let name = if cfg!(windows) { "uv.exe" } else { "uv" };
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
     uv_search_dirs(std::env::var_os("PATH"), home, cfg!(target_os = "macos"))

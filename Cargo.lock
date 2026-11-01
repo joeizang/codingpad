@@ -327,6 +327,7 @@ name = "codingpad-desktop"
 version = "0.1.0"
 dependencies = [
  "codingpad-kernel-core",
+ "serde_json",
  "tauri",
  "tauri-build",
 ]
@@ -339,6 +340,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "toml 0.8.2",
+ "url",
 ]
 
 [[package]]

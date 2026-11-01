@@ -1,6 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use codingpad_kernel_core::{ExpandResult, KernelEvent, RunResult, Supervisor};
+use codingpad_kernel_core::{
+    lsp::{LanguageServers, LspEvent, LspStartResult},
+    ExpandResult, KernelEvent, RunResult, Supervisor,
+};
 use tauri::{ipc::Channel, Manager, State};
 
 #[tauri::command]
@@ -18,6 +21,49 @@ async fn run_script(
 }
 
 #[tauri::command]
+async fn start_language_server(
+    language_servers: State<'_, LanguageServers>,
+    script_id: String,
+    source: String,
+    script_path: Option<String>,
+    on_event: Channel<LspEvent>,
+) -> Result<LspStartResult, String> {
+    language_servers
+        .start_python(&script_id, &source, script_path.as_deref(), move |event| {
+            let _ = on_event.send(event);
+        })
+        .await
+}
+
+#[tauri::command]
+async fn change_language_server(
+    language_servers: State<'_, LanguageServers>,
+    script_id: String,
+    source: String,
+) -> Result<(), String> {
+    language_servers.did_change(&script_id, &source).await
+}
+
+#[tauri::command]
+async fn request_language_server(
+    language_servers: State<'_, LanguageServers>,
+    script_id: String,
+    method: String,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    language_servers.request(&script_id, &method, params).await
+}
+
+#[tauri::command]
+async fn stop_language_server(
+    language_servers: State<'_, LanguageServers>,
+    script_id: String,
+) -> Result<(), String> {
+    language_servers.stop(&script_id).await;
+    Ok(())
+}
+
+#[tauri::command]
 async fn expand_node(
     supervisor: State<'_, Supervisor>,
     script_id: String,
@@ -31,8 +77,9 @@ async fn expand_node(
 }
 
 #[tauri::command]
-async fn stop_script(supervisor: State<'_, Supervisor>, script_id: String) {
+async fn stop_script(supervisor: State<'_, Supervisor>, script_id: String) -> Result<(), String> {
     supervisor.stop(&script_id).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -49,18 +96,26 @@ async fn close_script(supervisor: State<'_, Supervisor>, script_id: String) -> R
 fn main() {
     tauri::Builder::default()
         .manage(Supervisor::default())
+        .manage(LanguageServers::default())
         .invoke_handler(tauri::generate_handler![
             run_script,
             stop_script,
             reset_script,
             expand_node,
-            close_script
+            close_script,
+            start_language_server,
+            change_language_server,
+            request_language_server,
+            stop_language_server
         ])
         .build(tauri::generate_context!())
         .expect("Could not start CodingPad")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
-                tauri::async_runtime::block_on(app.state::<Supervisor>().shutdown());
+                tauri::async_runtime::block_on(async {
+                    app.state::<Supervisor>().shutdown().await;
+                    app.state::<LanguageServers>().shutdown().await;
+                });
             }
         });
 }

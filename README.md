@@ -1,10 +1,10 @@
 # CodingPad
 
 A desktop scratchpad for running plain scripts and inspecting their values. This
-M1 build supports Python with a Monaco editor, streamed stdout/stderr, rich dumps
-(lazy nodes, paged virtualised tables, images, sandboxed HTML, live updates),
-structured errors with clickable tracebacks, and automatic display of the last
-expression.
+M1 build supports Python with a Monaco editor, Python completions and hover,
+type diagnostics, streamed stdout/stderr, rich dumps (lazy nodes, paged
+virtualised tables, images, sandboxed HTML, live updates), structured errors with
+clickable tracebacks, and automatic display of the last expression.
 
 ## Develop locally
 
@@ -99,8 +99,8 @@ value wins. Factories can wait on worker threads that also use `cache()`.
 Change the key or Reset to recompute a value. A forced restart or closing the tab
 also clears its cache. Globals still start fresh on every run.
 
-File saving, package installation and language servers arrive later in M1.
-Scripts execute with your user privileges, as
+File saving and package installation arrive later in M1. Python code intelligence
+is described below. Scripts execute with your user privileges, as
 specified in the architecture. A run gets fresh globals, while imported modules
 and the interpreter remain warm; this is not interpreter isolation.
 
@@ -119,6 +119,17 @@ last 100,000 characters of each adjacent text stream. Stream fragments are
 coalesced once per animation frame, with stable output IDs preserving
 expanded/collapsed trees. Monaco, its Python syntax definition, and its worker are
 bundled locally; there is no editor CDN dependency.
+
+## Code intelligence
+
+Python completions, hover and type diagnostics come from **basedpyright** through
+the app's language-server bridge. The first editor start may download basedpyright
+with `uv`; later starts reuse the cache. PEP 723 inline dependencies are installed
+for the editor environment, so completions work for the packages a script
+declares.
+
+Type errors appear as squiggles and a count in the editor header, but they never
+stop **Run**; Python executes regardless.
 
 Dual-licensed MIT OR Apache-2.0.
 

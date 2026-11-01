@@ -16,6 +16,14 @@ vi.mock("@tauri-apps/api/core", () => ({
     onmessage = (_: KernelEvent) => {};
   },
 }));
+const dialog = vi.hoisted(() => ({
+  open: vi.fn(),
+  save: vi.fn(),
+}));
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: dialog.open,
+  save: dialog.save,
+}));
 vi.mock("./CodeEditor", () => ({
   default: ({
     source,
@@ -33,6 +41,8 @@ vi.mock("./CodeEditor", () => ({
 }));
 beforeEach(() => {
   invoke.mockReset();
+  dialog.open.mockReset();
+  dialog.save.mockReset();
 });
 
 test("Run renders streamed text, structured dumps and completion", async () => {
@@ -117,7 +127,9 @@ test("running script cannot be submitted twice", async () => {
   expect(screen.getByRole("button", { name: "Running…" })).toBeDisabled();
   finish({ ok: true });
   await screen.findByText("Finished");
-  expect(invoke).toHaveBeenCalledTimes(1);
+  expect(
+    invoke.mock.calls.filter(([command]) => command === "run_script"),
+  ).toHaveLength(1);
 });
 
 afterEach(() => {
@@ -134,7 +146,8 @@ test("many stream fragments flush once per animation frame and at completion", a
   vi.stubGlobal("cancelAnimationFrame", vi.fn());
   let channel!: { onmessage: (event: KernelEvent) => void };
   let finish!: (value: { ok: boolean }) => void;
-  invoke.mockImplementation((_command, args) => {
+  invoke.mockImplementation((command, args) => {
+    if (command === "load_library_settings") return Promise.resolve(undefined);
     channel = args.onEvent;
     return new Promise((resolve) => {
       finish = resolve;
@@ -207,7 +220,8 @@ test("collapsed dump stays attached to its output when old blocks are dropped", 
 
 test("late events from an earlier run cannot contaminate a rerun", async () => {
   const channels: { onmessage: (event: KernelEvent) => void }[] = [];
-  invoke.mockImplementation(async (_command, args) => {
+  invoke.mockImplementation(async (command, args) => {
+    if (command === "load_library_settings") return undefined;
     channels.push(args.onEvent);
     return { ok: true };
   });
@@ -215,7 +229,11 @@ test("late events from an earlier run cannot contaminate a rerun", async () => {
   fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
   await screen.findByText("Finished");
   fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
-  await waitFor(() => expect(invoke).toHaveBeenCalledTimes(2));
+  await waitFor(() =>
+    expect(
+      invoke.mock.calls.filter(([command]) => command === "run_script"),
+    ).toHaveLength(2),
+  );
   await act(async () => {
     channels[0].onmessage({
       method: "stream",
@@ -271,7 +289,8 @@ test("live updates share the animation-frame batch instead of re-rendering each"
   vi.stubGlobal("cancelAnimationFrame", vi.fn());
   let channel!: { onmessage: (event: KernelEvent) => void };
   let finish!: (value: { ok: boolean }) => void;
-  invoke.mockImplementation((_command, args) => {
+  invoke.mockImplementation((command, args) => {
+    if (command === "load_library_settings") return Promise.resolve(undefined);
     channel = args.onEvent;
     return new Promise((resolve) => {
       finish = resolve;
@@ -375,4 +394,121 @@ test("a run finishing successfully during Stop still shows Finished", async () =
   fireEvent.click(screen.getByRole("button", { name: "Stop" }));
   await screen.findByText("Finished");
   expect(screen.queryByText("Stopped")).not.toBeInTheDocument();
+});
+
+test("opens a library script and preserves its header when saving", async () => {
+  const source = "# codingpad: connection=northwind\nprint(1)\n";
+  invoke.mockImplementation(async (command, args) => {
+    if (command === "load_library_settings")
+      return { libraryPath: "/library", pinnedFolders: [] };
+    if (command === "list_folder")
+      return args.path === "/library"
+        ? [{ name: "hello.py", path: "/library/hello.py", isDir: false }]
+        : [];
+    if (command === "read_script")
+      return {
+        path: "/library/hello.py",
+        name: "hello.py",
+        source,
+        header: {
+          line: "# codingpad: connection=northwind",
+          settings: { connection: "northwind" },
+        },
+      };
+    if (command === "write_script")
+      return {
+        path: args.path,
+        name: "hello.py",
+        source: args.source,
+        header: {
+          line: "# codingpad: connection=northwind",
+          settings: { connection: "northwind" },
+        },
+      };
+    return undefined;
+  });
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "hello.py" }));
+  await waitFor(() =>
+    expect(screen.getByLabelText("Code")).toHaveValue(source),
+  );
+  expect(screen.getByText(/Header: connection=northwind/)).toBeInTheDocument();
+
+  const edited = "# codingpad: connection=northwind\nprint(2)\n";
+  fireEvent.change(screen.getByLabelText("Code"), { target: { value: edited } });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() =>
+    expect(invoke).toHaveBeenCalledWith("write_script", {
+      path: "/library/hello.py",
+      source: edited,
+    }),
+  );
+  expect(screen.getByText("/library/hello.py")).toBeInTheDocument();
+});
+
+test("a scratch script saves through the dialog, then saves in place", async () => {
+  invoke.mockImplementation(async (command, args) => {
+    if (command === "load_library_settings")
+      return { libraryPath: "/library", pinnedFolders: [] };
+    if (command === "list_folder") return [];
+    if (command === "write_script")
+      return {
+        path: args.path,
+        name: "Saved.py",
+        source: args.source,
+        header: null,
+      };
+    return undefined;
+  });
+  dialog.save.mockResolvedValue("/library/Saved.py");
+  render(<App />);
+  await screen.findByText("Library");
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() =>
+    expect(dialog.save).toHaveBeenCalledWith(
+      expect.objectContaining({ defaultPath: "/library/Scratch 1.py" }),
+    ),
+  );
+  await waitFor(() =>
+    expect(invoke).toHaveBeenCalledWith("write_script", {
+      path: "/library/Saved.py",
+      source: expect.stringContaining("from codingpad import dump"),
+    }),
+  );
+  expect(screen.getByRole("button", { name: "Saved.py" })).toBeInTheDocument();
+
+  fireEvent.change(screen.getByLabelText("Code"), {
+    target: { value: "print(2)" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() =>
+    expect(invoke).toHaveBeenCalledWith("write_script", {
+      path: "/library/Saved.py",
+      source: "print(2)",
+    }),
+  );
+  expect(dialog.save).toHaveBeenCalledTimes(1);
+});
+
+test("pinned folders can be added and removed", async () => {
+  invoke.mockImplementation(async (command) => {
+    if (command === "load_library_settings")
+      return { libraryPath: "/library", pinnedFolders: [] };
+    if (command === "list_folder") return [];
+    return undefined;
+  });
+  dialog.open.mockResolvedValue("/pinned");
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "Pin folder" }));
+  await waitFor(() =>
+    expect(invoke).toHaveBeenCalledWith("save_library_settings", {
+      settings: { libraryPath: "/library", pinnedFolders: ["/pinned"] },
+    }),
+  );
+  fireEvent.click(await screen.findByRole("button", { name: "Unpin pinned" }));
+  await waitFor(() =>
+    expect(invoke).toHaveBeenCalledWith("save_library_settings", {
+      settings: { libraryPath: "/library", pinnedFolders: [] },
+    }),
+  );
 });

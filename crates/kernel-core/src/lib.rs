@@ -1,4 +1,6 @@
 //! Desktop-independent supervisor for one warm Python process per script.
+pub mod store;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};

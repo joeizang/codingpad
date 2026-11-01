@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import CodeEditor, { type EditorHandle } from "./CodeEditor";
 import { DumpTree } from "./DumpTree";
 import {
@@ -9,6 +10,14 @@ import {
   type KernelEvent,
   type Output,
 } from "./protocol";
+import { Sidebar } from "./Sidebar";
+import {
+  headerSummary,
+  parentPath,
+  type LibrarySettings,
+  type ScriptFile,
+  type ScriptHeader,
+} from "./library";
 
 const SAMPLE = `from codingpad import dump
 
@@ -20,10 +29,18 @@ dump({"name": "Ada", "languages": ["Python", "C#", "Rust"]})
 6 * 7
 `;
 
+const SCRIPT_FILTERS = [
+  { name: "Scripts", extensions: ["py", "cs", "rs", "ts", "sql"] },
+  { name: "All files", extensions: ["*"] },
+];
+
 type Script = {
   id: string;
   name: string;
+  path?: string;
   source: string;
+  header: ScriptHeader | null;
+  dirty: boolean;
   output: Output[];
   running: boolean;
   status: string;
@@ -36,6 +53,8 @@ const newScript = (number: number): Script => ({
   id: `scratch-${number}`,
   name: `Scratch ${number}.py`,
   source: SAMPLE,
+  header: null,
+  dirty: false,
   output: [],
   running: false,
   status: "Ready",
@@ -46,6 +65,9 @@ const newScript = (number: number): Script => ({
 export default function App() {
   const [scripts, setScripts] = useState<Script[]>([newScript(1)]);
   const [activeId, setActiveId] = useState("scratch-1");
+  const [settings, setSettings] = useState<LibrarySettings | null>(null);
+  const [libraryError, setLibraryError] = useState<string | undefined>();
+  const [refresh, setRefresh] = useState(0);
   const counter = useRef(1);
   const [closing, setClosing] = useState(false);
   const generation = useRef(new Map<string, number>());
@@ -57,6 +79,19 @@ export default function App() {
     if (frame !== undefined) cancelAnimationFrame(frame);
     frames.current.delete(id);
   };
+  useEffect(() => {
+    invoke<LibrarySettings | null>("load_library_settings")
+      .then((loaded) => {
+        if (
+          loaded &&
+          typeof loaded.libraryPath === "string" &&
+          Array.isArray(loaded.pinnedFolders)
+        ) {
+          setSettings(loaded);
+        }
+      })
+      .catch((error) => setLibraryError(String(error)));
+  }, []);
   useEffect(
     () => () => {
       for (const frame of frames.current.values()) cancelAnimationFrame(frame);
@@ -234,11 +269,142 @@ export default function App() {
     }
   }
 
-  // The editor command reads current state instead of its mount-time closure.
+  async function openPath(path: string) {
+    const existing = scripts.find((script) => script.path === path);
+    if (existing) {
+      setActiveId(existing.id);
+      return;
+    }
+    try {
+      const file = await invoke<ScriptFile>("read_script", { path });
+      const script: Script = {
+        id: `file-${++counter.current}`,
+        name: file.name,
+        path: file.path,
+        source: file.source,
+        header: file.header,
+        dirty: false,
+        output: [],
+        running: false,
+        status: "Ready",
+        version: 0,
+        updates: {},
+      };
+      setScripts((all) => [...all, script]);
+      setActiveId(script.id);
+      setRefresh((value) => value + 1);
+      setLibraryError(undefined);
+    } catch (error) {
+      setLibraryError(String(error));
+    }
+  }
+
+  async function openFile() {
+    const selected = await openDialog({
+      multiple: false,
+      title: "Open script",
+      filters: SCRIPT_FILTERS,
+    });
+    if (typeof selected === "string") await openPath(selected);
+  }
+
+  async function saveScript(script: Script, saveAs = false) {
+    let path = script.path;
+    if (!path || saveAs) {
+      const directory = script.path ? parentPath(script.path) : settings?.libraryPath;
+      const defaultPath = directory
+        ? `${directory.replace(/[\\/]$/, "")}/${script.name}`
+        : script.name;
+      const selected = await saveDialog({
+        title: "Save script",
+        defaultPath,
+        filters: SCRIPT_FILTERS,
+      });
+      if (typeof selected !== "string" || !selected) return;
+      path = selected;
+    }
+    try {
+      const saved = await invoke<ScriptFile>("write_script", {
+        path,
+        source: script.source,
+      });
+      update(script.id, (item) => ({
+        ...item,
+        path: saved.path,
+        name: saved.name,
+        header: saved.header,
+        dirty: false,
+        error: undefined,
+      }));
+      setRefresh((value) => value + 1);
+      setLibraryError(undefined);
+    } catch (error) {
+      update(script.id, (item) => ({ ...item, error: String(error) }));
+    }
+  }
+
+  async function persistSettings(next: LibrarySettings) {
+    try {
+      await invoke("save_library_settings", { settings: next });
+      setSettings(next);
+      setRefresh((value) => value + 1);
+      setLibraryError(undefined);
+    } catch (error) {
+      setLibraryError(String(error));
+    }
+  }
+
+  async function changeLibrary() {
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "Choose library folder",
+    });
+    if (typeof selected !== "string" || !settings) return;
+    await persistSettings({ ...settings, libraryPath: selected });
+  }
+
+  async function addPinnedFolder() {
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "Pin a folder",
+    });
+    if (typeof selected !== "string" || !settings) return;
+    if (selected === settings.libraryPath) return;
+    await persistSettings({
+      ...settings,
+      pinnedFolders: [...new Set([...settings.pinnedFolders, selected])],
+    });
+  }
+
+  async function removePinnedFolder(path: string) {
+    if (!settings) return;
+    await persistSettings({
+      ...settings,
+      pinnedFolders: settings.pinnedFolders.filter((folder) => folder !== path),
+    });
+  }
+
+  // Editor commands read current state instead of their mount-time closure.
   const runActive = useRef(() => {});
   runActive.current = () => {
     void runScript(active);
   };
+  const saveActive = useRef(() => {});
+  saveActive.current = () => {
+    void saveScript(active);
+  };
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        saveActive.current();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   return (
     <main className="app">
@@ -249,6 +415,20 @@ export default function App() {
           <span className="language">Python</span>
         </div>
         <div className="run-controls">
+          <button
+            className="control-button"
+            aria-label="Save"
+            onClick={() => void saveScript(active)}
+          >
+            Save
+          </button>
+          <button
+            className="control-button"
+            aria-label="Save as"
+            onClick={() => void saveScript(active, true)}
+          >
+            Save as…
+          </button>
           <button
             className="run-button"
             disabled={active.running || active.controlling}
@@ -272,7 +452,7 @@ export default function App() {
           </button>
         </div>
       </header>
-      <nav className="tabs" aria-label="Scratch scripts">
+      <nav className="tabs" aria-label="Open scripts">
         {scripts.map((script) => (
           <div
             className={`tab ${script.id === activeId ? "active" : ""}`}
@@ -280,9 +460,16 @@ export default function App() {
           >
             <button
               aria-current={script.id === activeId ? "page" : undefined}
+              title={script.path}
               onClick={() => setActiveId(script.id)}
             >
               {script.name}
+              {script.dirty && (
+                <span className="dirty-dot" aria-hidden>
+                  {" "}
+                  •
+                </span>
+              )}
               {script.running ? " · running" : ""}
             </button>
             {scripts.length > 1 && (
@@ -304,73 +491,98 @@ export default function App() {
           +
         </button>
       </nav>
-      <div className="workspace">
-        <section className="editor-pane" aria-label="Python editor">
-          <div className="pane-heading">
-            <span>EDITOR</span>
-            <span>Ctrl / ⌘ + Enter to run</span>
-          </div>
-          <div className="editor">
-            <CodeEditor
-              key={active.id}
-              id={active.id}
-              source={active.source}
-              onChange={(source) =>
-                update(active.id, (script) => ({ ...script, source }))
-              }
-              onRun={() => runActive.current()}
-              onMount={(instance) => {
-                editor.current = instance;
-              }}
-            />
-          </div>
-        </section>
-        <section className="results-pane" aria-label="Results">
-          <div className="pane-heading">
-            <span>RESULTS</span>
-            <span role="status">{active.status}</span>
-          </div>
-          <div className="results" aria-busy={active.running}>
-            {active.error && (
-              <div className="error" role="alert">
-                {active.error}
-              </div>
-            )}
-            {active.output.length === 0 && !active.error && (
-              <div className="empty">
-                {active.running
-                  ? "Waiting for output…"
-                  : "Run your script to see printed output and values here."}
-              </div>
-            )}
-            {active.output.map((output) =>
-              output.kind === "stream" ? (
-                <pre
-                  className={`stream ${output.stream}`}
-                  key={`${active.id}:${active.version}:${output.id}`}
-                >
-                  {output.text}
-                </pre>
-              ) : (
-                <div
-                  className="dump"
-                  key={`${active.id}:${active.version}:${output.id}`}
-                >
-                  <DumpTree
-                    node={output.node}
-                    updates={active.updates}
-                    expand={expandNode}
-                    onOpenLine={openLine}
-                  />
+      <div className="main-area">
+        <Sidebar
+          settings={settings}
+          activePath={active.path}
+          refresh={refresh}
+          onOpen={(path) => void openPath(path)}
+          onOpenFile={() => void openFile()}
+          onChangeLibrary={() => void changeLibrary()}
+          onAddPinned={() => void addPinnedFolder()}
+          onRemovePinned={(path) => void removePinnedFolder(path)}
+          error={libraryError}
+        />
+        <div className="workspace">
+          <section className="editor-pane" aria-label="Python editor">
+            <div className="pane-heading">
+              <span>EDITOR</span>
+              <span>Ctrl / ⌘ + Enter to run · ⌘ + S to save</span>
+            </div>
+            <div className="editor">
+              <CodeEditor
+                key={active.id}
+                id={active.id}
+                source={active.source}
+                onChange={(source) =>
+                  update(active.id, (script) => ({
+                    ...script,
+                    source,
+                    dirty: true,
+                  }))
+                }
+                onRun={() => runActive.current()}
+                onMount={(instance) => {
+                  editor.current = instance;
+                }}
+              />
+            </div>
+          </section>
+          <section className="results-pane" aria-label="Results">
+            <div className="pane-heading">
+              <span>RESULTS</span>
+              <span role="status">{active.status}</span>
+            </div>
+            <div className="results" aria-busy={active.running}>
+              {active.error && (
+                <div className="error" role="alert">
+                  {active.error}
                 </div>
-              ),
-            )}
-          </div>
-        </section>
+              )}
+              {active.output.length === 0 && !active.error && (
+                <div className="empty">
+                  {active.running
+                    ? "Waiting for output…"
+                    : "Run your script to see printed output and values here."}
+                </div>
+              )}
+              {active.output.map((output) =>
+                output.kind === "stream" ? (
+                  <pre
+                    className={`stream ${output.stream}`}
+                    key={`${active.id}:${active.version}:${output.id}`}
+                  >
+                    {output.text}
+                  </pre>
+                ) : (
+                  <div
+                    className="dump"
+                    key={`${active.id}:${active.version}:${output.id}`}
+                  >
+                    <DumpTree
+                      node={output.node}
+                      updates={active.updates}
+                      expand={expandNode}
+                      onOpenLine={openLine}
+                    />
+                  </div>
+                ),
+              )}
+            </div>
+          </section>
+        </div>
       </div>
       <footer>
-        <span>{active.name} · Scratch scripts are unsaved</span>
-        <span>Python · Run control</span>
+        <span>
+          {active.path
+            ? active.path
+            : `${active.name} · Not saved to the library`}
+        </span>
+        <span>
+          {active.header
+            ? `Header: ${headerSummary(active.header) || active.header.line}`
+            : "Python · Library and files"}
+        </span>
       </footer>
     </main>
   );

@@ -14,7 +14,7 @@ import threading
 import traceback
 import types
 from pathlib import Path
-from queue import SimpleQueue
+from queue import SimpleQueue, Queue
 
 # -I isolates us from user site packages and PYTHONPATH. Add only our bundled helper.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "runtime"))
@@ -438,6 +438,7 @@ def run(request):
             "__file__": filename,
             "__builtins__": dict(vars(builtins)),
             "dump": codingpad.dump,
+            "cache": codingpad.cache,
         }
     )
     auto_name = "__codingpad_auto_dump__"
@@ -491,7 +492,23 @@ def run(request):
                     wrapped = ast.Call(ast.Name(auto_name, ast.Load()), arguments, [])
                     tree.body[-1] = ast.copy_location(ast.Expr(wrapped), last)
                     ast.fix_missing_locations(tree)
-                exec(compile(tree, filename, "exec"), scope)
+                code = compile(tree, filename, "exec")
+                cancelled = request["_cancel"]
+
+                def check_cancel(frame, event, arg):
+                    if frame.f_code.co_filename != filename:
+                        return None
+                    if cancelled.is_set():
+                        cancelled.clear()
+                        raise KeyboardInterrupt("Run stopped")
+                    return check_cancel
+
+                previous_trace = sys.gettrace()
+                try:
+                    sys.settrace(check_cancel)
+                    exec(code, scope)
+                finally:
+                    sys.settrace(previous_trace)
                 ok = True
             except BaseException as error:
                 # Finish preceding output before reporting the script failure.
@@ -545,7 +562,42 @@ def expand(request):
 
 
 def main():
-    for line in _protocol_in:
+    requests = Queue()
+    cancellations = {}
+    gate = threading.Lock()
+
+    def read_requests():
+        try:
+            for line in _protocol_in:
+                cancelled = None
+                try:
+                    message = json.loads(line)
+                    if isinstance(message, dict) and message.get("jsonrpc") == "2.0":
+                        if message.get("method") == "cancel":
+                            params = message.get("params")
+                            if isinstance(params, dict) and isinstance(
+                                params.get("runId"), int
+                            ):
+                                with gate:
+                                    event = cancellations.get(params["runId"])
+                                    if event is not None:
+                                        event.set()
+                            continue
+                        if message.get("method") == "run" and isinstance(
+                            message.get("id"), int
+                        ):
+                            cancelled = threading.Event()
+                            with gate:
+                                cancellations[message["id"]] = cancelled
+                except (ValueError, TypeError):
+                    pass
+                requests.put((line, cancelled))
+        finally:
+            requests.put(None)
+
+    threading.Thread(target=read_requests, daemon=True).start()
+    while (record := requests.get()) is not None:
+        line, cancelled = record
         request = None
         try:
             request = json.loads(line)
@@ -571,7 +623,12 @@ def main():
                 ):
                     raise ValueError("run requires params.source as a string")
                 try:
-                    run(request)
+                    request["_cancel"] = cancelled
+                    try:
+                        run(request)
+                    finally:
+                        with gate:
+                            cancellations.pop(request["id"], None)
                 except BaseException as error:
                     # Execution/cleanup failures are request errors, not malformed
                     # input and not a reason to terminate the warm kernel.

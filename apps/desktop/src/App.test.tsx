@@ -309,3 +309,52 @@ test("live updates share the animation-frame batch instead of re-rendering each"
   await act(async () => finish({ ok: true }));
   expect(screen.getByText("Finished")).toBeInTheDocument();
 });
+
+test("Stop keeps results and reports a forced restart clearing the cache", async () => {
+  let finish: (value: unknown) => void = () => {};
+  invoke.mockImplementation((command, args) => {
+    if (command === "run_script") {
+      args.onEvent.onmessage({
+        method: "stream",
+        params: { runId: 1, stream: "stdout", text: "before stop" },
+      });
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    }
+    if (command === "stop_script") {
+      finish({ ok: false, stopped: true, cacheCleared: true });
+    }
+    return Promise.resolve();
+  });
+  render(<App />);
+  expect(screen.getByRole("button", { name: "Stop" })).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  expect(screen.getByRole("button", { name: "Reset" })).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+  await screen.findByText("Stopped · kernel restarted; cache cleared");
+  expect(screen.getByText("before stop")).toBeInTheDocument();
+  expect(invoke).toHaveBeenCalledWith("stop_script", { scriptId: "scratch-1" });
+  expect(screen.getByRole("button", { name: "▶ Run" })).toBeEnabled();
+});
+
+test("Reset clears old output and targets only the active script", async () => {
+  invoke.mockImplementation(async (command, args) => {
+    if (command === "run_script") {
+      args.onEvent.onmessage({
+        method: "stream",
+        params: { runId: 1, stream: "stdout", text: "old output" },
+      });
+      return { ok: true };
+    }
+  });
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  await screen.findByText("Finished");
+  fireEvent.click(screen.getByRole("button", { name: "Reset" }));
+  await screen.findByText("Reset · cache cleared");
+  expect(screen.queryByText("old output")).not.toBeInTheDocument();
+  expect(invoke).toHaveBeenCalledWith("reset_script", {
+    scriptId: "scratch-1",
+  });
+});

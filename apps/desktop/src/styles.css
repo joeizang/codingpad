@@ -62,6 +62,16 @@ button:disabled {
   margin-left: 8px;
   color: #aab4c4;
 }
+.run-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.control-button {
+  background: #323640;
+  border-radius: 5px;
+  padding: 9px 14px;
+}
 .run-button {
   background: #b9d6ac;
   color: #19251a;

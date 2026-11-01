@@ -2,6 +2,7 @@
 
 import base64
 import math
+import threading
 import os
 from itertools import islice
 from pathlib import Path
@@ -459,3 +460,18 @@ def dump(value):
     else:
         _sink(_tree(value))
     return value
+
+
+_cache = {}
+_cache_lock = threading.RLock()
+
+
+def cache(key, factory):
+    """Compute a value once per key in this script's warm kernel.
+
+    Failed computations are not cached. Reset clears every cached value.
+    """
+    with _cache_lock:
+        if key not in _cache:
+            _cache[key] = factory()
+        return _cache[key]

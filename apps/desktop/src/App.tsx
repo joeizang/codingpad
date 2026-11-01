@@ -29,6 +29,7 @@ type Script = {
   status: string;
   version: number;
   updates: Record<string, DumpNode>;
+  controlling?: boolean;
   error?: string;
 };
 const newScript = (number: number): Script => ({
@@ -72,7 +73,7 @@ export default function App() {
     );
 
   async function runScript(script: Script) {
-    if (running.current.has(script.id)) return;
+    if (running.current.has(script.id) || script.controlling) return;
     running.current.add(script.id);
     const version = (generation.current.get(script.id) ?? 0) + 1;
     generation.current.set(script.id, version);
@@ -113,14 +114,24 @@ export default function App() {
       }
     };
     try {
-      const result = await invoke<{ ok: boolean }>("run_script", {
+      const result = await invoke<{
+        ok: boolean;
+        stopped?: boolean;
+        cacheCleared?: boolean;
+      }>("run_script", {
         scriptId: script.id,
         source: script.source,
         onEvent,
       });
       update(script.id, (item) => ({
         ...item,
-        status: result.ok ? "Finished" : "Script error",
+        status: result.cacheCleared
+          ? "Stopped · kernel restarted; cache cleared"
+          : result.stopped
+            ? "Stopped"
+            : result.ok
+              ? "Finished"
+              : "Script error",
       }));
     } catch (error) {
       update(script.id, (item) => ({
@@ -132,6 +143,50 @@ export default function App() {
       flush();
       running.current.delete(script.id);
       update(script.id, (item) => ({ ...item, running: false }));
+    }
+  }
+
+  async function controlScript(script: Script, action: "stop" | "reset") {
+    if (script.controlling) return;
+    update(script.id, (item) => ({
+      ...item,
+      controlling: true,
+      error: undefined,
+      status: action === "stop" ? "Stopping…" : "Resetting…",
+    }));
+    try {
+      await invoke(`${action}_script`, { scriptId: script.id });
+      if (action === "stop") {
+        update(script.id, (item) => ({
+          ...item,
+          status:
+            !item.running && item.status === "Stopping…"
+              ? "Stopped"
+              : item.status,
+        }));
+      }
+      if (action === "reset") {
+        cancelFrame(script.id);
+        generation.current.set(
+          script.id,
+          (generation.current.get(script.id) ?? 0) + 1,
+        );
+        update(script.id, (item) => ({
+          ...item,
+          output: [],
+          updates: {},
+          version: item.version + 1,
+          status: "Reset · cache cleared",
+        }));
+      }
+    } catch (error) {
+      update(script.id, (item) => ({
+        ...item,
+        status: "Could not " + action,
+        error: String(error),
+      }));
+    } finally {
+      update(script.id, (item) => ({ ...item, controlling: false }));
     }
   }
 
@@ -163,7 +218,8 @@ export default function App() {
   }
 
   async function closeScript(script: Script) {
-    if (script.running || closing || scripts.length === 1) return;
+    if (script.running || script.controlling || closing || scripts.length === 1)
+      return;
     setClosing(true);
     try {
       await invoke("close_script", { scriptId: script.id });
@@ -197,13 +253,29 @@ export default function App() {
           <strong>CodingPad</strong>
           <span className="language">Python</span>
         </div>
-        <button
-          className="run-button"
-          disabled={active.running}
-          onClick={() => void runScript(active)}
-        >
-          {active.running ? "Running…" : "▶ Run"}
-        </button>
+        <div className="run-controls">
+          <button
+            className="run-button"
+            disabled={active.running || active.controlling}
+            onClick={() => void runScript(active)}
+          >
+            {active.running ? "Running…" : "▶ Run"}
+          </button>
+          <button
+            className="control-button"
+            disabled={!active.running || active.controlling}
+            onClick={() => void controlScript(active, "stop")}
+          >
+            Stop
+          </button>
+          <button
+            className="control-button"
+            disabled={active.running || active.controlling}
+            onClick={() => void controlScript(active, "reset")}
+          >
+            Reset
+          </button>
+        </div>
       </header>
       <nav className="tabs" aria-label="Scratch scripts">
         {scripts.map((script) => (
@@ -221,7 +293,7 @@ export default function App() {
             {scripts.length > 1 && (
               <button
                 aria-label={`Close ${script.name}`}
-                disabled={script.running || closing}
+                disabled={script.running || script.controlling || closing}
                 onClick={() => void closeScript(script)}
               >
                 ×
@@ -303,7 +375,7 @@ export default function App() {
       </div>
       <footer>
         <span>{active.name} · Scratch scripts are unsaved</span>
-        <span>Python · Full dump</span>
+        <span>Python · Run control</span>
       </footer>
     </main>
   );

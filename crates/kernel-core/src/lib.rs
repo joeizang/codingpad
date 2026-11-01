@@ -22,6 +22,10 @@ pub struct KernelEvent {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RunResult {
     pub ok: bool,
+    #[serde(default)]
+    pub stopped: bool,
+    #[serde(default, rename = "cacheCleared")]
+    pub cache_cleared: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -32,6 +36,7 @@ pub struct ExpandResult {
 struct Slot {
     kernel: Mutex<Option<Kernel>>,
     closed: watch::Sender<bool>,
+    stop: watch::Sender<u64>,
 }
 
 impl Slot {
@@ -39,6 +44,7 @@ impl Slot {
         Self {
             kernel: Mutex::new(None),
             closed: watch::channel(false).0,
+            stop: watch::channel(0).0,
         }
     }
 }
@@ -115,6 +121,7 @@ impl Supervisor {
             .or_insert_with(|| Arc::new(Slot::new()))
             .clone();
         let mut closed = slot.closed.subscribe();
+        let mut stop = slot.stop.subscribe();
         let mut guard = slot.kernel.lock().await;
         if *closed.borrow() {
             return Err("Script was closed".into());
@@ -123,14 +130,44 @@ impl Supervisor {
             *guard = Some(Kernel::start(&self.uv).await?);
         }
         let result = tokio::select! {
-            result = guard.as_mut().unwrap().run(source, &mut emit) => result,
+            result = guard.as_mut().unwrap().run(source, &mut emit, &mut stop) => result,
             _ = closed.changed() => Err("Script was closed".into()),
         };
+        if result.as_ref().is_ok_and(|result| result.cache_cleared) {
+            *guard = None;
+            *guard = Some(Kernel::start(&self.uv).await?);
+        }
         if result.is_err() {
             // Dropping the child kills it. Next run starts a fresh kernel.
             *guard = None;
         }
         result
+    }
+
+    pub async fn stop(&self, script_id: &str) {
+        let slot = self.kernels.lock().await.get(script_id).cloned();
+        if let Some(slot) = slot {
+            // An idle kernel has nothing to cancel. Never hold the map lock
+            // while waiting for a running script to release its kernel.
+            if slot.kernel.try_lock().is_err() {
+                slot.stop.send_modify(|version| *version += 1);
+                drop(slot.kernel.lock().await);
+            }
+        }
+    }
+
+    pub async fn reset(&self, script_id: &str) -> Result<(), String> {
+        self.stop(script_id).await;
+        let slot = self.kernels.lock().await.get(script_id).cloned();
+        if let Some(slot) = slot {
+            let mut guard = slot.kernel.lock().await;
+            if *slot.closed.borrow() {
+                return Err("Script was closed".into());
+            }
+            *guard = None;
+            *guard = Some(Kernel::start(&self.uv).await?);
+        }
+        Ok(())
     }
 
     pub async fn close(&self, script_id: &str) {
@@ -290,6 +327,7 @@ impl Kernel {
         &mut self,
         source: &str,
         emit: &mut (impl FnMut(KernelEvent) + Send),
+        stop: &mut watch::Receiver<u64>,
     ) -> Result<RunResult, String> {
         self.next_id += 1;
         let id = self.next_id;
@@ -303,12 +341,31 @@ impl Kernel {
             .await
             .map_err(|e| format!("Could not send script to Python: {e}"))?;
         self.input.flush().await.map_err(|e| e.to_string())?;
+        let mut stopped = false;
+        let mut deadline = None;
         loop {
-            let message = self.next_message().await.map_err(CallError::message)?;
+            let message = tokio::select! {
+                message = self.next_message() => message.map_err(CallError::message)?,
+                _ = stop.changed(), if !stopped => {
+                    stopped = true;
+                    let message = json!({"jsonrpc": "2.0", "method": "cancel", "params": {"runId": id}});
+                    self.input.write_all(format!("{message}\n").as_bytes()).await.map_err(|e| e.to_string())?;
+                    self.input.flush().await.map_err(|e| e.to_string())?;
+                    deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(2));
+                    continue;
+                }
+                _ = async { tokio::time::sleep_until(deadline.unwrap()).await }, if deadline.is_some() => {
+                    emit(KernelEvent { method: "run_finished".into(), params: json!({"runId": id, "ok": false}) });
+                    return Ok(RunResult { ok: false, stopped: true, cache_cleared: true });
+                }
+            };
             if message["jsonrpc"] != "2.0" {
                 return Err("Invalid kernel protocol version".into());
             }
             if message.get("id").is_some() {
+                if message["id"] != id {
+                    return Err("Unexpected kernel response id".into());
+                }
                 if message["error"]["code"] == -32603 {
                     let text = message["error"]["message"]
                         .as_str()
@@ -321,11 +378,17 @@ impl Kernel {
                         method: "run_finished".into(),
                         params: json!({"runId": id, "ok": false}),
                     });
-                    return Ok(RunResult { ok: false });
+                    return Ok(RunResult {
+                        ok: false,
+                        stopped,
+                        cache_cleared: false,
+                    });
                 }
-                return response_result(&message, id)
-                    .map_err(CallError::message)
-                    .and_then(|value| serde_json::from_value(value).map_err(|e| e.to_string()));
+                let value = response_result(&message, id).map_err(CallError::message)?;
+                let mut result: RunResult =
+                    serde_json::from_value(value).map_err(|e| e.to_string())?;
+                result.stopped = stopped;
+                return Ok(result);
             }
             if message["params"]["runId"] != id {
                 return Err("Unexpected kernel notification run id".into());

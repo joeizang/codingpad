@@ -18,7 +18,6 @@ export type ScriptFile = {
   path: string;
   name: string;
   source: string;
-  header: ScriptHeader | null;
 };
 
 // Mirror of the Rust parser so the footer stays accurate while the header line

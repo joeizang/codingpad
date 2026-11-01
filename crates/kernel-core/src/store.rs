@@ -126,10 +126,31 @@ pub fn load_settings(path: &Path, default_library: &Path) -> LibrarySettings {
 
 /// Write through a temporary file in the destination folder, then rename it
 /// over the original so a crash or full disk cannot leave a truncated file.
-fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
+fn save_destination(path: &Path) -> PathBuf {
     // Follow symlinks so saving a linked script updates its target instead of
-    // replacing the link with a regular file.
-    let destination = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // replacing the link with a regular file. A dangling link is resolved by
+    // hand, so saving creates the missing target and keeps the link.
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let Ok(target) = fs::read_link(path) else {
+                return path.to_path_buf();
+            };
+            let target = if target.is_absolute() {
+                target
+            } else {
+                path.parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(target)
+            };
+            fs::canonicalize(&target).unwrap_or(target)
+        }
+        _ => fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+    }
+}
+
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let destination = save_destination(path);
     let permissions = fs::metadata(&destination)
         .ok()
         .map(|metadata| metadata.permissions());
@@ -226,7 +247,6 @@ pub struct ScriptFile {
     pub path: String,
     pub name: String,
     pub source: String,
-    pub header: Option<ScriptHeader>,
 }
 
 fn script_file(path: &Path, source: String) -> ScriptFile {
@@ -236,7 +256,6 @@ fn script_file(path: &Path, source: String) -> ScriptFile {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned()),
-        header: parse_header(&source),
         source,
     }
 }
@@ -259,37 +278,63 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[test]
-    fn parses_a_python_header_and_keeps_the_original_line() {
-        let header = parse_header("# codingpad: connection=northwind\nprint(1)\n").unwrap();
-        assert_eq!(header.line, "# codingpad: connection=northwind");
-        assert_eq!(header.settings.get("connection").unwrap(), "northwind");
+    type ExpectedHeader = (&'static str, &'static [(&'static str, &'static str)]);
+    type HeaderExample = (&'static str, Option<ExpectedHeader>);
+
+    // Keep this example set in sync with apps/desktop/src/library.test.ts so
+    // the Rust and TypeScript header parsers cannot drift.
+    fn parser_examples() -> Vec<HeaderExample> {
+        vec![
+            (
+                "# codingpad: connection=northwind\nprint(1)\n",
+                Some((
+                    "# codingpad: connection=northwind",
+                    &[("connection", "northwind")],
+                )),
+            ),
+            (
+                "// codingpad: connection=\"north wind\" theme=dark\n",
+                Some((
+                    "// codingpad: connection=\"north wind\" theme=dark",
+                    &[("connection", "north wind"), ("theme", "dark")],
+                )),
+            ),
+            (
+                "\u{feff}  # codingpad: readOnly\r\n",
+                Some(("  # codingpad: readOnly", &[("readOnly", "")])),
+            ),
+            (
+                "  // codingpad: a=1  b='two words'\n",
+                Some((
+                    "  // codingpad: a=1  b='two words'",
+                    &[("a", "1"), ("b", "two words")],
+                )),
+            ),
+            ("print(1)\n# codingpad: connection=one\n", None),
+            ("# a normal comment\n", None),
+            ("", None),
+        ]
     }
 
     #[test]
-    fn parses_csharp_style_headers_and_quoted_values() {
-        let header = parse_header("// codingpad: connection=\"north wind\" theme=dark\n").unwrap();
-        assert_eq!(header.settings.get("connection").unwrap(), "north wind");
-        assert_eq!(header.settings.get("theme").unwrap(), "dark");
-    }
-
-    #[test]
-    fn accepts_a_byte_order_mark_and_indentation() {
-        let header = parse_header("\u{feff}  # codingpad: connection=one\n").unwrap();
-        assert_eq!(header.line, "  # codingpad: connection=one");
-    }
-
-    #[test]
-    fn ignores_scripts_without_a_header_on_the_first_line() {
-        assert!(parse_header("print(1)\n# codingpad: connection=one\n").is_none());
-        assert!(parse_header("# a normal comment\n").is_none());
-        assert!(parse_header("").is_none());
-    }
-
-    #[test]
-    fn keeps_keys_without_values() {
-        let header = parse_header("# codingpad: readOnly").unwrap();
-        assert_eq!(header.settings.get("readOnly").unwrap(), "");
+    fn python_and_typescript_header_parsers_share_these_examples() {
+        for (source, expected) in parser_examples() {
+            match (parse_header(source), expected) {
+                (None, None) => {}
+                (Some(header), Some((line, settings))) => {
+                    assert_eq!(header.line, line);
+                    let actual: Vec<_> = header
+                        .settings
+                        .iter()
+                        .map(|(key, value)| (key.as_str(), value.as_str()))
+                        .collect();
+                    assert_eq!(actual, settings);
+                }
+                (actual, expected) => {
+                    panic!("header mismatch for {source:?}: {actual:?} != {expected:?}")
+                }
+            }
+        }
     }
 
     #[test]
@@ -299,12 +344,12 @@ mod tests {
         let source = "# codingpad: connection=northwind\nprint('hi')\n";
         let written = write_script(&path, source).unwrap();
         assert_eq!(
-            written.header.as_ref().unwrap().line,
+            parse_header(&written.source).unwrap().line,
             "# codingpad: connection=northwind"
         );
         let read = read_script(&path).unwrap();
         assert_eq!(read.source, source);
-        assert_eq!(read.header, written.header);
+        assert_eq!(parse_header(&read.source), parse_header(source));
         let names: Vec<_> = list_folder(directory.path())
             .unwrap()
             .into_iter()

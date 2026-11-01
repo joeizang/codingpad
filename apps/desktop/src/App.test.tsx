@@ -419,20 +419,12 @@ test("opens a library script and preserves its header when saving", async () => 
         path: "/library/hello.py",
         name: "hello.py",
         source,
-        header: {
-          line: "# codingpad: connection=northwind",
-          settings: { connection: "northwind" },
-        },
       };
     if (command === "write_script")
       return {
         path: args.path,
         name: "hello.py",
         source: args.source,
-        header: {
-          line: "# codingpad: connection=northwind",
-          settings: { connection: "northwind" },
-        },
       };
     return undefined;
   });
@@ -470,7 +462,6 @@ test("a scratch script saves through the dialog, then saves in place", async () 
         path: args.path,
         name: "Saved.py",
         source: args.source,
-        header: null,
       };
     return undefined;
   });
@@ -540,7 +531,6 @@ test("saving keeps the tab dirty when the editor changes during the write", asyn
             path: "/library/x.py",
             name: "x.py",
             source: args.source,
-            header: null,
           });
       });
     return Promise.resolve(undefined);
@@ -600,7 +590,6 @@ test("a non-Python file opens but Run is disabled", async () => {
         path: "/library/notes.rs",
         name: "notes.rs",
         source: "fn main() {}",
-        header: null,
       };
     return undefined;
   });
@@ -630,7 +619,6 @@ test("a rapid double-open only reads the file once", async () => {
             path: "/library/x.py",
             name: "x.py",
             source: "print(1)",
-            header: null,
           });
       });
     }
@@ -677,14 +665,12 @@ test("saving refreshes the tree without collapsing an expanded folder", async ()
         path: "/library/sub/x.py",
         name: "x.py",
         source: "print(1)",
-        header: null,
       };
     if (command === "write_script")
       return {
         path: args.path,
         name: "x.py",
         source: args.source,
-        header: null,
       };
     return undefined;
   });
@@ -726,14 +712,12 @@ test("a failed refresh shows an error but keeps the last tree", async () => {
         path: "/library/x.py",
         name: "x.py",
         source: "print(1)",
-        header: null,
       };
     if (command === "write_script")
       return {
         path: args.path,
         name: "x.py",
         source: args.source,
-        header: null,
       };
     return undefined;
   });

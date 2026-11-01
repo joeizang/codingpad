@@ -19,10 +19,17 @@ vi.mock("@tauri-apps/api/core", () => ({
 const dialog = vi.hoisted(() => ({
   open: vi.fn(),
   save: vi.fn(),
+  ask: vi.fn(),
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: dialog.open,
   save: dialog.save,
+  ask: dialog.ask,
+}));
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({
+    onCloseRequested: vi.fn().mockResolvedValue(() => {}),
+  }),
 }));
 vi.mock("./CodeEditor", () => ({
   default: ({
@@ -43,6 +50,8 @@ beforeEach(() => {
   invoke.mockReset();
   dialog.open.mockReset();
   dialog.save.mockReset();
+  dialog.ask.mockReset();
+  dialog.ask.mockResolvedValue(true);
 });
 
 test("Run renders streamed text, structured dumps and completion", async () => {
@@ -510,5 +519,189 @@ test("pinned folders can be added and removed", async () => {
     expect(invoke).toHaveBeenCalledWith("save_library_settings", {
       settings: { libraryPath: "/library", pinnedFolders: [] },
     }),
+  );
+});
+
+test("saving keeps the tab dirty when the editor changes during the write", async () => {
+  let finishWrite!: () => void;
+  invoke.mockImplementation((command, args) => {
+    if (command === "load_library_settings")
+      return Promise.resolve({ libraryPath: "/library", pinnedFolders: [] });
+    if (command === "list_folder") return Promise.resolve([]);
+    if (command === "write_script")
+      return new Promise((resolve) => {
+        finishWrite = () =>
+          resolve({
+            path: "/library/x.py",
+            name: "x.py",
+            source: args.source,
+            header: null,
+          });
+      });
+    return Promise.resolve(undefined);
+  });
+  dialog.save.mockResolvedValue("/library/x.py");
+  render(<App />);
+  await screen.findByText("Library");
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() =>
+    expect(
+      invoke.mock.calls.some(([command]) => command === "write_script"),
+    ).toBe(true),
+  );
+  fireEvent.change(screen.getByLabelText("Code"), {
+    target: { value: "print('new')" },
+  });
+  await act(async () => finishWrite());
+  await waitFor(() =>
+    expect(document.querySelector(".dirty-dot")).toBeInTheDocument(),
+  );
+});
+
+test("closing a dirty tab asks first and keeps it when cancelled", async () => {
+  invoke.mockResolvedValue(undefined);
+  dialog.ask.mockResolvedValueOnce(false).mockResolvedValue(true);
+  render(<App />);
+  fireEvent.change(screen.getByLabelText("Code"), {
+    target: { value: "a = 1" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "New scratch script" }));
+  fireEvent.click(screen.getByRole("button", { name: "Close Scratch 1.py" }));
+  await waitFor(() =>
+    expect(dialog.ask).toHaveBeenCalledWith(
+      expect.stringContaining("Discard unsaved changes"),
+      expect.objectContaining({ kind: "warning" }),
+    ),
+  );
+  expect(
+    screen.getByRole("button", { name: "Scratch 1.py" }),
+  ).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Close Scratch 1.py" }));
+  await waitFor(() =>
+    expect(
+      screen.queryByRole("button", { name: "Scratch 1.py" }),
+    ).not.toBeInTheDocument(),
+  );
+});
+
+test("a non-Python file opens but Run is disabled", async () => {
+  invoke.mockImplementation(async (command, args) => {
+    if (command === "load_library_settings")
+      return { libraryPath: "/library", pinnedFolders: [] };
+    if (command === "list_folder")
+      return [{ name: "notes.rs", path: "/library/notes.rs", isDir: false }];
+    if (command === "read_script")
+      return {
+        path: "/library/notes.rs",
+        name: "notes.rs",
+        source: "fn main() {}",
+        header: null,
+      };
+    return undefined;
+  });
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "notes.rs" }));
+  await waitFor(() =>
+    expect(screen.getByLabelText("Code")).toHaveValue("fn main() {}"),
+  );
+  expect(screen.getByRole("button", { name: "▶ Run" })).toBeDisabled();
+});
+
+test("a rapid double-open only reads the file once", async () => {
+  let finishRead!: () => void;
+  let reads = 0;
+  invoke.mockImplementation((command) => {
+    if (command === "load_library_settings")
+      return Promise.resolve({ libraryPath: "/library", pinnedFolders: [] });
+    if (command === "list_folder")
+      return Promise.resolve([
+        { name: "x.py", path: "/library/x.py", isDir: false },
+      ]);
+    if (command === "read_script") {
+      reads += 1;
+      return new Promise((resolve) => {
+        finishRead = () =>
+          resolve({
+            path: "/library/x.py",
+            name: "x.py",
+            source: "print(1)",
+            header: null,
+          });
+      });
+    }
+    return Promise.resolve(undefined);
+  });
+  render(<App />);
+  const file = await screen.findByRole("button", { name: "x.py" });
+  fireEvent.click(file);
+  fireEvent.click(file);
+  await act(async () => finishRead());
+  expect(reads).toBe(1);
+  await waitFor(() => expect(document.querySelectorAll(".tab")).toHaveLength(2));
+});
+
+test("changing the library removes that path from pinned folders", async () => {
+  invoke.mockImplementation(async (command) => {
+    if (command === "load_library_settings")
+      return { libraryPath: "/library", pinnedFolders: ["/pinned"] };
+    if (command === "list_folder") return [];
+    return undefined;
+  });
+  dialog.open.mockResolvedValue("/pinned");
+  render(<App />);
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Change library folder" }),
+  );
+  await waitFor(() =>
+    expect(invoke).toHaveBeenCalledWith("save_library_settings", {
+      settings: { libraryPath: "/pinned", pinnedFolders: [] },
+    }),
+  );
+});
+
+test("saving refreshes the tree without collapsing an expanded folder", async () => {
+  invoke.mockImplementation(async (command, args) => {
+    if (command === "load_library_settings")
+      return { libraryPath: "/library", pinnedFolders: [] };
+    if (command === "list_folder")
+      return args.path === "/library"
+        ? [{ name: "sub", path: "/library/sub", isDir: true }]
+        : [{ name: "x.py", path: "/library/sub/x.py", isDir: false }];
+    if (command === "read_script")
+      return {
+        path: "/library/sub/x.py",
+        name: "x.py",
+        source: "print(1)",
+        header: null,
+      };
+    if (command === "write_script")
+      return {
+        path: args.path,
+        name: "x.py",
+        source: args.source,
+        header: null,
+      };
+    return undefined;
+  });
+  render(<App />);
+  const sub = await screen.findByRole("button", { name: /sub/ });
+  fireEvent.click(sub);
+  expect(sub).toHaveAttribute("aria-expanded", "true");
+  fireEvent.click(await screen.findByRole("button", { name: "x.py" }));
+  await waitFor(() =>
+    expect(screen.getByLabelText("Code")).toHaveValue("print(1)"),
+  );
+  fireEvent.change(screen.getByLabelText("Code"), {
+    target: { value: "print(2)" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() =>
+    expect(
+      invoke.mock.calls.some(([command]) => command === "write_script"),
+    ).toBe(true),
+  );
+  expect(screen.getByRole("button", { name: /sub/ })).toHaveAttribute(
+    "aria-expanded",
+    "true",
   );
 });

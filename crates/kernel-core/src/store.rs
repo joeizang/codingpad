@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -116,23 +117,50 @@ pub fn load_settings(path: &Path, default_library: &Path) -> LibrarySettings {
         settings.library_path = default_library.to_string_lossy().into_owned();
     }
     let mut seen = HashSet::new();
+    let library_path = settings.library_path.clone();
+    settings.pinned_folders.retain(|folder| {
+        !folder.trim().is_empty() && folder != &library_path && seen.insert(folder.clone())
+    });
     settings
-        .pinned_folders
-        .retain(|folder| !folder.trim().is_empty() && seen.insert(folder.clone()));
-    settings
+}
+
+/// Write through a temporary file in the destination folder, then rename it
+/// over the original so a crash or full disk cannot leave a truncated file.
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("Could not create a temporary file: {error}"))?;
+    temp.write_all(contents)
+        .and_then(|()| temp.as_file().sync_all())
+        .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
+    temp.persist(path)
+        .map_err(|error| format!("Could not save {}: {}", path.display(), error.error))?;
+    Ok(())
+}
+
+fn backup_corrupt_settings(path: &Path) {
+    if let Ok(bytes) = fs::read(path) {
+        if serde_json::from_slice::<LibrarySettings>(&bytes).is_err() {
+            let mut backup = path.as_os_str().to_os_string();
+            backup.push(".bak");
+            let _ = fs::copy(path, PathBuf::from(backup));
+        }
+    }
 }
 
 pub fn save_settings(path: &Path, settings: &LibrarySettings) -> Result<(), String> {
     if settings.library_path.trim().is_empty() {
         return Err("The library folder cannot be empty".into());
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Could not create the settings folder: {error}"))?;
-    }
     let text = serde_json::to_string_pretty(settings)
         .map_err(|error| format!("Could not encode settings: {error}"))?;
-    fs::write(path, text).map_err(|error| format!("Could not save settings: {error}"))
+    backup_corrupt_settings(path);
+    write_atomic(path, text.as_bytes())
 }
 
 /// One directory entry for the sidebar tree.
@@ -204,12 +232,7 @@ pub fn read_script(path: &Path) -> Result<ScriptFile, String> {
 /// Write a plain native file exactly as edited. The header line is part of the
 /// source, so it is preserved untouched.
 pub fn write_script(path: &Path, source: &str) -> Result<ScriptFile, String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
-    }
-    fs::write(path, source)
-        .map_err(|error| format!("Could not save {}: {error}", path.display()))?;
+    write_atomic(path, source.as_bytes())?;
     Ok(script_file(path, source.to_string()))
 }
 
@@ -264,6 +287,12 @@ mod tests {
         let read = read_script(&path).unwrap();
         assert_eq!(read.source, source);
         assert_eq!(read.header, written.header);
+        let names: Vec<_> = list_folder(directory.path())
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(names, vec!["example.py"]);
     }
 
     #[test]
@@ -282,6 +311,33 @@ mod tests {
         let loaded = load_settings(&config, &default_library);
         assert_eq!(loaded.library_path, "/scripts");
         assert_eq!(loaded.pinned_folders, vec!["/one", "/two"]);
+    }
+
+    #[test]
+    fn removes_pins_that_point_at_the_library() {
+        let directory = tempdir().unwrap();
+        let config = directory.path().join("settings.json");
+        let saved = LibrarySettings {
+            library_path: "/scripts".into(),
+            pinned_folders: vec!["/scripts".into(), "/other".into()],
+        };
+        save_settings(&config, &saved).unwrap();
+        let loaded = load_settings(&config, &directory.path().join("CodingPad"));
+        assert_eq!(loaded.pinned_folders, vec!["/other"]);
+    }
+
+    #[test]
+    fn backs_up_a_corrupt_settings_file_before_replacing_it() {
+        let directory = tempdir().unwrap();
+        let config = directory.path().join("settings.json");
+        fs::write(&config, "{ not json").unwrap();
+        save_settings(&config, &LibrarySettings::new("/scripts")).unwrap();
+        let backup = format!("{}.bak", config.display());
+        assert_eq!(fs::read_to_string(backup).unwrap(), "{ not json");
+        assert_eq!(
+            load_settings(&config, &directory.path().join("CodingPad")).library_path,
+            "/scripts"
+        );
     }
 
     #[test]

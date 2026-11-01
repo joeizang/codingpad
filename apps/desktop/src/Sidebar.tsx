@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   baseName,
@@ -32,15 +32,22 @@ function FolderTree({
   onOpen: (path: string) => void;
 }) {
   const [loaded, setLoaded] = useState<Loaded | null>(null);
+  const previousPath = useRef(path);
   useEffect(() => {
     let cancelled = false;
-    setLoaded(null);
+    // Keep the tree (and its expanded folders) on screen while refreshing, so
+    // opening or saving a file does not collapse the branch that holds it.
+    if (previousPath.current !== path) {
+      previousPath.current = path;
+      setLoaded(null);
+    }
     invoke<FolderEntry[]>("list_folder", { path })
       .then((entries) => {
         if (!cancelled) setLoaded({ entries });
       })
       .catch((error) => {
-        if (!cancelled) setLoaded({ error: String(error) });
+        if (!cancelled)
+          setLoaded((current) => current ?? { error: String(error) });
       });
     return () => {
       cancelled = true;

@@ -83,7 +83,15 @@ in the footer. For Python it is a `#` comment; C#, Rust and TypeScript use `//`:
 # codingpad: connection=northwind
 ```
 
-The line is preserved byte-for-byte when reading, editing and saving.
+The line is preserved byte-for-byte when reading, editing and saving. Saves go
+through a temporary file and rename, so a crash mid-save cannot truncate a
+script; a corrupt settings file is copied to `settings.json.bak` before it is
+replaced.
+
+The file commands accept paths from the local webview (the library, pinned
+folders and dialog choices); there is no filesystem sandbox between the UI and
+your user account. This build runs Python only, so **Run** is disabled for other
+file types while they remain editable and saveable.
 
 ## Repository layout
 

@@ -26,6 +26,11 @@ export function baseName(path: string): string {
   return parts.at(-1) ?? path;
 }
 
+export function joinPath(directory: string, name: string): string {
+  const separator = directory.includes("\\") ? "\\" : "/";
+  return `${directory.replace(/[\\/]+$/, "")}${separator}${name}`;
+}
+
 export function parentPath(path: string): string {
   const index = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
   return index > 0 ? path.slice(0, index) : path;

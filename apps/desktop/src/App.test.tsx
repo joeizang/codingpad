@@ -36,7 +36,9 @@ vi.mock("./CodeEditor", () => ({
     source,
     onChange,
     onDiagnostics,
+    toolchainVersion,
   }: {
+    toolchainVersion?: number;
     source: string;
     onChange: (source: string) => void;
     onDiagnostics?: (summary: {
@@ -48,6 +50,7 @@ vi.mock("./CodeEditor", () => ({
     <div>
       <textarea
         aria-label="Code"
+        data-toolchain-version={toolchainVersion}
         value={source}
         onChange={(e) => onChange(e.target.value)}
       />
@@ -809,6 +812,7 @@ test("missing uv offers one-click installation and reruns the latest source", as
   fireEvent.change(screen.getByLabelText("Code"), { target: { value: "42" } });
   await act(async () => finish());
   await screen.findByText("Finished");
+  expect(screen.getByLabelText("Code")).toHaveAttribute("data-toolchain-version", "1");
   expect(invoke).toHaveBeenLastCalledWith("run_script", expect.objectContaining({ source: "42" }));
   expect(screen.queryByRole("button", { name: "Install uv and run" })).not.toBeInTheDocument();
 });
@@ -822,6 +826,7 @@ test("failed uv installation can be retried without rerunning prematurely", asyn
   fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
   fireEvent.click(await screen.findByRole("button", { name: "Install uv and run" }));
   expect(await screen.findByRole("alert")).toHaveTextContent("SHA-256 verification");
+  expect(screen.getByLabelText("Code")).toHaveAttribute("data-toolchain-version", "0");
   expect(screen.getByRole("button", { name: "Install uv and run" })).toBeEnabled();
   expect(invoke.mock.calls.filter(([command]) => command === "run_script")).toHaveLength(1);
 });

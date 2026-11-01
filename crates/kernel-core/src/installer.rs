@@ -28,7 +28,9 @@ pub async fn download_verified(
     let client = reqwest::Client::builder()
         .https_only(true)
         .connect_timeout(Duration::from_secs(20))
-        .timeout(Duration::from_secs(180))
+        // Permit slow but progressing links; fail promptly when reads stall.
+        .read_timeout(Duration::from_secs(60))
+        .timeout(Duration::from_secs(30 * 60))
         .build()
         .map_err(|e| e.to_string())?;
     let mut response = client
@@ -37,7 +39,10 @@ pub async fn download_verified(
         .await
         .and_then(reqwest::Response::error_for_status)
         .map_err(|e| format!("Tool download failed. Check your connection and retry: {e}"))?;
-    let mut file = NamedTempFile::new_in(directory).map_err(|e| e.to_string())?;
+    let mut file = tempfile::Builder::new()
+        .prefix(".codingpad-install-")
+        .tempfile_in(directory)
+        .map_err(|e| e.to_string())?;
     let mut hash = Sha256::new();
     let mut total = 0;
     while let Some(chunk) = response
@@ -83,6 +88,7 @@ fn extract_binary(
     directory: &Path,
 ) -> Result<NamedTempFile, String> {
     let mut output = tempfile::Builder::new()
+        .prefix(".codingpad-install-")
         .suffix(if cfg!(windows) { ".exe" } else { ".bin" })
         .tempfile_in(directory)
         .map_err(|e| e.to_string())?;

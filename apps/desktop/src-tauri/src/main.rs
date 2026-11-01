@@ -166,8 +166,8 @@ fn main() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             app.manage(Supervisor::with_data_dir(data_dir.clone()));
-            app.manage(Toolchains::new(data_dir));
-            app.manage(LanguageServers::default());
+            app.manage(Toolchains::new(data_dir.clone()));
+            app.manage(LanguageServers::with_data_dir(data_dir));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -104,10 +104,41 @@ impl Toolchains {
     }
 }
 
+// The OS releases this lock after a crash. Keep the lock file in place: deleting
+// it would let different processes lock different inodes and sweep active files.
+fn prepare_install(directory: &Path) -> Result<std::fs::File, String> {
+    std::fs::create_dir_all(directory)
+        .map_err(|e| format!("Could not create the tool folder: {e}"))?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join(".install.lock"))
+        .map_err(|e| format!("Could not open the tool installer lock: {e}"))?;
+    lock.try_lock().map_err(|e| format!("Could not lock the tool installer. Another CodingPad instance may be installing uv; retry when it finishes: {e}"))?;
+    for entry in std::fs::read_dir(directory).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Include the original tempfile prefix for interrupted older installs.
+        if name.starts_with(".codingpad-install-") || name.starts_with(".tmp") {
+            let kind = entry.file_type().map_err(|e| e.to_string())?;
+            if kind.is_file() || kind.is_symlink() {
+                std::fs::remove_file(entry.path())
+                    .map_err(|e| format!("Could not remove an interrupted tool download: {e}"))?;
+            }
+        }
+    }
+    Ok(lock)
+}
+
 async fn install_private_uv(
     data_dir: &Path,
     mut progress: impl FnMut(&str) + Send,
 ) -> Result<PathBuf, String> {
+    let destination = private_uv(data_dir);
+    let _lock = prepare_install(destination.parent().ok_or("Missing tool directory")?)?;
     let (asset, sha256) = release(
         std::env::consts::OS,
         std::env::consts::ARCH,
@@ -133,7 +164,7 @@ async fn install_private_uv(
             Archive::TarGz
         },
         &member,
-        &private_uv(data_dir),
+        &destination,
     )
     .await?;
     progress("uv installed. Starting script…");
@@ -173,6 +204,29 @@ mod tests {
         assert_eq!(prefer_user(user.clone(), private.clone()), private);
         std::fs::write(&user, "user").unwrap();
         assert_eq!(prefer_user(user.clone(), private), user);
+    }
+
+    #[test]
+    fn cleans_interrupted_installs_without_touching_active_or_unrelated_files() {
+        let data = tempfile::tempdir().unwrap();
+        let directory = data.path();
+        for name in ["uv", ".tmp-old", ".codingpad-install-old", "notes"] {
+            std::fs::write(directory.join(name), name).unwrap();
+        }
+        std::fs::create_dir(directory.join(".tmp-directory")).unwrap();
+        let lock = prepare_install(directory).unwrap();
+        assert!(!directory.join(".tmp-old").exists());
+        assert!(!directory.join(".codingpad-install-old").exists());
+        assert!(directory.join("uv").exists());
+        assert!(directory.join("notes").exists());
+        assert!(directory.join(".tmp-directory").is_dir());
+        let active = directory.join(".codingpad-install-active");
+        std::fs::write(&active, "active download").unwrap();
+        assert!(prepare_install(directory).is_err());
+        assert!(active.exists());
+        drop(lock); // Also happens automatically if the process exits.
+        let _lock = prepare_install(directory).unwrap();
+        assert!(!active.exists());
     }
 
     /// Network acceptance test, separate from the offline default test suite.
@@ -224,7 +278,7 @@ mod tests {
             std::fs::read_dir(installed.parent().unwrap())
                 .unwrap()
                 .count(),
-            1
+            2 // Installed executable plus the persistent process lock.
         );
     }
 }

@@ -99,6 +99,7 @@ export default function App() {
   const [closing, setClosing] = useState(false);
   const [installProgress, setInstallProgress] = useState<string | null>(null);
   const installingUv = useRef(false);
+  const [toolchainVersion, setToolchainVersion] = useState(0);
   const generation = useRef(new Map<string, number>());
   const running = useRef(new Set<string>());
   const editor = useRef<EditorHandle | null>(null);
@@ -240,6 +241,7 @@ export default function App() {
     try {
       await invoke("install_uv", { onProgress });
       installed = true;
+      setToolchainVersion((version) => version + 1);
     } catch (error) {
       update(script.id, (item) => ({
         ...item,
@@ -699,6 +701,7 @@ export default function App() {
               <CodeEditor
                 key={active.id}
                 id={active.id}
+                toolchainVersion={toolchainVersion}
                 source={active.source}
                 onDiagnostics={setIntelligence}
                 onChange={(source) =>

@@ -49,6 +49,10 @@ missing, Results offers **Install uv and run**. One click downloads a pinned
 official uv release, verifies its SHA-256, installs it privately under the app data
 folder (`toolchains/uv/0.13.6`), and retries the script without restarting the app.
 The download requires an internet connection; a failed download can be retried.
+Code intelligence reconnects automatically after installation. Downloads allow up
+to 30 minutes overall, with a 60-second read idle timeout. Retrying an interrupted
+installation removes abandoned staging files while holding a process lock, so
+another app instance's active download is preserved.
 The app prefers your existing `uv` over its private copy and never changes your
 shell profiles or `PATH`. Private installation supports x86-64 and ARM64 on macOS,
 Linux (GNU and musl), and Windows. Other architectures can use a manually installed

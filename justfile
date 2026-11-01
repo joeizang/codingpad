@@ -18,6 +18,12 @@ run:
     npm --prefix apps/desktop ci
     npm --prefix apps/desktop run tauri -- dev
 
+# Measure the M1 speed targets (D38, D48). Needs a desktop session; Windows skips app metrics.
+bench:
+    npm --prefix apps/desktop ci
+    npm --prefix apps/desktop run tauri -- build --no-bundle
+    cargo run --release --locked -p codingpad-kernel-core --bin codingpad-bench
+
 # Optional native UI smoke: install tauri-driver and the platform WebDriver first.
 # For a headless Linux desktop, prefix the command with xvfb-run.
 smoke application="target/debug/codingpad-desktop":

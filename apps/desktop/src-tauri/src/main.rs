@@ -6,8 +6,25 @@ use codingpad_kernel_core::{
     toolchains::Toolchains,
     ExpandResult, KernelEvent, RunResult, Supervisor,
 };
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tauri::{ipc::Channel, Manager, State};
+
+/// Record when the interface is ready for `just bench`. A no-op in normal use.
+#[tauri::command]
+fn ui_ready() {
+    let Some(path) = std::env::var_os("CODINGPAD_BENCH_MARKER") else {
+        return;
+    };
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let _ = fs::write(path, nanos.to_string());
+}
 
 #[tauri::command]
 async fn install_uv(
@@ -171,6 +188,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            ui_ready,
             install_uv,
             run_script,
             stop_script,

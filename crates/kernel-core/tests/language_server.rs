@@ -38,10 +38,11 @@ def greet(name: str) -> str:
 value: int = "not an int"
 dump(greet("Ada"))
 "#;
+    servers.begin_session("test").await;
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let started = timeout(
         Duration::from_secs(120),
-        servers.start_python("one", source, move |event| {
+        servers.start_python("one", source, "test", move |event| {
             let _ = sender.send(event);
         }),
     )
@@ -98,10 +99,11 @@ async fn python_code_intelligence_uses_inline_packages() {
 from requests import get
 value: int = "not an int"
 "#;
+    servers.begin_session("test").await;
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let _started = timeout(
         Duration::from_secs(120),
-        servers.start_python("packages", source, move |event| {
+        servers.start_python("packages", source, "test", move |event| {
             let _ = sender.send(event);
         }),
     )
@@ -127,11 +129,12 @@ value: int = "not an int"
 #[ignore = "requires uv and downloads basedpyright; run with --ignored"]
 async fn reuses_the_warm_server_and_restarts_when_packages_change() {
     let servers = LanguageServers::default();
+    servers.begin_session("test").await;
     let source = "value: int = \"bad\"\n";
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let first = timeout(
         Duration::from_secs(120),
-        servers.start_python("reuse", source, move |event| {
+        servers.start_python("reuse", source, "test", move |event| {
             let _ = sender.send(event);
         }),
     )
@@ -144,7 +147,7 @@ async fn reuses_the_warm_server_and_restarts_when_packages_change() {
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let second = timeout(
         Duration::from_secs(120),
-        servers.start_python("reuse", source, move |event| {
+        servers.start_python("reuse", source, "test", move |event| {
             let _ = sender.send(event);
         }),
     )
@@ -164,7 +167,7 @@ value: int = "bad"
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
     let third = timeout(
         Duration::from_secs(120),
-        servers.start_python("reuse", package_source, move |event| {
+        servers.start_python("reuse", package_source, "test", move |event| {
             let _ = sender.send(event);
         }),
     )

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import CodeEditor, { type EditorHandle } from "./CodeEditor";
 import { DumpTree } from "./DumpTree";
-import type { DiagnosticsSummary } from "./lsp";
+import { uniqueId, type DiagnosticsSummary } from "./lsp";
 import {
   appendOutputBatch,
   collectDumpUpdates,
@@ -46,7 +46,7 @@ function intelligenceLabel(summary: DiagnosticsSummary): string {
 }
 
 const newScript = (number: number): Script => ({
-  id: `scratch-${number}`,
+  id: uniqueId("scratch"),
   name: `Scratch ${number}.py`,
   source: SAMPLE,
   output: [],
@@ -57,8 +57,8 @@ const newScript = (number: number): Script => ({
 });
 
 export default function App() {
-  const [scripts, setScripts] = useState<Script[]>([newScript(1)]);
-  const [activeId, setActiveId] = useState("scratch-1");
+  const [scripts, setScripts] = useState<Script[]>(() => [newScript(1)]);
+  const [activeId, setActiveId] = useState(() => scripts[0].id);
   const [intelligence, setIntelligence] = useState<DiagnosticsSummary>({
     errors: 0,
     warnings: 0,

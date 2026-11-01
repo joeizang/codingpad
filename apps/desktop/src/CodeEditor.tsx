@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import Editor, { loader } from "@monaco-editor/react";
 import * as monaco from "monaco-editor/editor/editor.api.js";
@@ -12,6 +12,7 @@ import {
   diagnosticsFor,
   hoverMarkdown,
   inlineDependencyKey,
+  LSP_SESSION,
   summarizeDiagnostics,
   type DiagnosticsSummary,
   type LspCompletionItem,
@@ -125,7 +126,16 @@ export default function CodeEditor({
     }).catch(() => {});
   };
 
-  const dependencyKey = inlineDependencyKey(source);
+  const [dependencyKey, setDependencyKey] = useState(() =>
+    inlineDependencyKey(source),
+  );
+
+  useEffect(() => {
+    const next = inlineDependencyKey(source);
+    if (next === dependencyKey) return;
+    const timer = window.setTimeout(() => setDependencyKey(next), 1000);
+    return () => window.clearTimeout(timer);
+  }, [source, dependencyKey]);
 
   const applyDiagnostics = (diagnostics: LspDiagnostic[]) => {
     onDiagnosticsRef.current?.(summarizeDiagnostics(diagnostics));
@@ -165,13 +175,19 @@ export default function CodeEditor({
       warnings: 0,
       message: "Starting code intelligence…",
     });
-    invoke<{ uri: string }>("start_language_server", {
-      scriptId: id,
-      source: initial,
-      onEvent: channel,
-    })
+    invoke("begin_language_server_session", { session: LSP_SESSION })
+      .catch(() => undefined)
+      .then(() => {
+        if (stopped || current !== generation.current) return null;
+        return invoke<{ uri: string }>("start_language_server", {
+          scriptId: id,
+          source: initial,
+          session: LSP_SESSION,
+          onEvent: channel,
+        });
+      })
       .then((result) => {
-        if (stopped || current !== generation.current) return;
+        if (!result || stopped || current !== generation.current) return;
         lsp.current = { id, uri: result.uri, ready: true };
         if (!seenDiagnostics.current) {
           onDiagnosticsRef.current?.({
@@ -202,7 +218,7 @@ export default function CodeEditor({
       const model = editorRef.current?.getModel();
       if (model) monaco.editor.setModelMarkers(model, "codingpad-lsp", []);
     };
-  }, [id, dependencyKey]);
+  }, [id, dependencyKey, LSP_SESSION]);
 
   useEffect(
     () => () => {

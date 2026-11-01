@@ -58,7 +58,8 @@ type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 pub struct LanguageServers {
     uv: PathBuf,
     servers: Mutex<HashMap<String, Arc<LspServer>>>,
-    start: Mutex<()>,
+    starts: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    session: Mutex<Option<String>>,
     closed: Mutex<HashSet<String>>,
 }
 
@@ -73,7 +74,8 @@ impl LanguageServers {
         Self {
             uv,
             servers: Mutex::new(HashMap::new()),
-            start: Mutex::new(()),
+            starts: Mutex::new(HashMap::new()),
+            session: Mutex::new(None),
             closed: Mutex::new(HashSet::new()),
         }
     }
@@ -84,6 +86,7 @@ impl LanguageServers {
         &self,
         script_id: &str,
         source: &str,
+        session: &str,
         emit: impl Fn(LspEvent) + Send + Sync + 'static,
     ) -> Result<LspStartResult, String> {
         if script_id.is_empty() {
@@ -92,19 +95,33 @@ impl LanguageServers {
         let dependencies = inline_dependencies(source);
         let events: EventSink = Arc::new(emit);
 
-        let _start = self.start.lock().await;
+        let start = {
+            let mut starts = self.starts.lock().await;
+            starts
+                .entry(script_id.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _start = start.lock().await;
         if self.closed.lock().await.contains(script_id) {
             return Err("The script was closed".into());
+        }
+        if self.session.lock().await.as_deref() != Some(session) {
+            return Err(
+                "The editor session is stale. Reload the tab to restart code intelligence.".into(),
+            );
         }
         let existing = self.servers.lock().await.get(script_id).cloned();
         if let Some(existing) = existing {
             if existing.dependencies == dependencies && existing.alive() {
                 existing.set_events(events.clone());
                 if existing.did_change(source).await.is_ok() {
-                    if self.closed.lock().await.contains(script_id) {
+                    if self.closed.lock().await.contains(script_id)
+                        || self.session.lock().await.as_deref() != Some(session)
+                    {
                         self.servers.lock().await.remove(script_id);
                         existing.stop().await;
-                        return Err("The script was closed".into());
+                        return Err("The editor session is stale. Reload the tab to restart code intelligence.".into());
                     }
                     return Ok(LspStartResult {
                         uri: existing.document_uri.clone(),
@@ -149,6 +166,13 @@ impl LanguageServers {
             server.stop().await;
             return Err("The script was closed".into());
         }
+        if self.session.lock().await.as_deref() != Some(session) {
+            self.remove_if_same(script_id, &server).await;
+            server.stop().await;
+            return Err(
+                "The editor session is stale. Reload the tab to restart code intelligence.".into(),
+            );
+        }
         Ok(LspStartResult {
             uri: server.document_uri.clone(),
         })
@@ -179,13 +203,37 @@ impl LanguageServers {
         }
     }
 
+    /// Start a fresh editor session, stopping servers left by a reload.
+    pub async fn begin_session(&self, session: &str) {
+        let mut current = self.session.lock().await;
+        if current.as_deref() == Some(session) {
+            return;
+        }
+        *current = Some(session.to_owned());
+        self.closed.lock().await.clear();
+        self.starts.lock().await.clear();
+        let servers: Vec<_> = self
+            .servers
+            .lock()
+            .await
+            .drain()
+            .map(|(_, server)| server)
+            .collect();
+        drop(current);
+        for server in servers {
+            server.stop().await;
+        }
+    }
+
     /// Stop a closed tab's server and remember not to start it again.
     pub async fn close(&self, script_id: &str) {
         self.closed.lock().await.insert(script_id.to_owned());
+        self.starts.lock().await.remove(script_id);
         self.stop(script_id).await;
     }
 
     pub async fn shutdown(&self) {
+        self.starts.lock().await.clear();
         let servers: Vec<_> = self
             .servers
             .lock()
@@ -821,6 +869,7 @@ fn inline_dependencies(source: &str) -> Vec<String> {
 
 fn inline_metadata(source: &str) -> Option<toml::Value> {
     let mut inside = false;
+    let mut closed = false;
     let mut body = String::new();
     for line in source.lines() {
         let trimmed = line.trim_start();
@@ -833,12 +882,13 @@ fn inline_metadata(source: &str) -> Option<toml::Value> {
         let content = trimmed.strip_prefix('#').unwrap_or(trimmed);
         let content = content.strip_prefix(' ').unwrap_or(content);
         if content.trim() == "///" {
+            closed = true;
             break;
         }
         body.push_str(content);
         body.push('\n');
     }
-    if !inside {
+    if !inside || !closed {
         return None;
     }
     toml::from_str(&body).ok()
@@ -872,6 +922,11 @@ print("hi")
     #[test]
     fn ignores_a_broken_inline_metadata_block() {
         assert!(inline_dependencies("# /// script\n# dependencies = [\n# ///\n").is_empty());
+    }
+
+    #[test]
+    fn ignores_an_unclosed_inline_metadata_block() {
+        assert!(inline_dependencies("# /// script\n# dependencies = [\"requests\"]\n").is_empty());
     }
 
     #[test]
@@ -981,11 +1036,22 @@ print("hi")
     }
 
     #[tokio::test]
+    async fn rejects_a_stale_editor_session() {
+        let servers = LanguageServers::with_uv(PathBuf::from("/missing/uv"));
+        servers.begin_session("current").await;
+        let error = servers
+            .start_python("one", "42", "old", |_| {})
+            .await
+            .unwrap_err();
+        assert!(error.contains("stale"));
+    }
+
+    #[tokio::test]
     async fn a_closed_script_is_not_started_again() {
         let servers = LanguageServers::with_uv(PathBuf::from("uv"));
         servers.close("closed").await;
         let error = servers
-            .start_python("closed", "42", |_| {})
+            .start_python("closed", "42", "test", |_| {})
             .await
             .unwrap_err();
         assert!(error.contains("closed"));

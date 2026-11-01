@@ -165,6 +165,7 @@ export function completionKind(kind?: number): number {
 export function inlineDependencyKey(source: string): string {
   const lines = source.split(/\r?\n/);
   let inside = false;
+  let closed = false;
   const body: string[] = [];
   for (const line of lines) {
     const trimmed = line.trimStart();
@@ -173,10 +174,13 @@ export function inlineDependencyKey(source: string): string {
       continue;
     }
     const content = trimmed.replace(/^# ?/, "");
-    if (content.trim() === "///") break;
+    if (content.trim() === "///") {
+      closed = true;
+      break;
+    }
     body.push(content);
   }
-  if (!inside) return "";
+  if (!inside || !closed) return "";
   const metadata = body.join("\n");
   const block = dependencyArray(metadata);
   if (block === null) return "";
@@ -219,3 +223,16 @@ function dependencyArray(metadata: string): string | null {
   }
   return null;
 }
+
+function randomId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+export function uniqueId(prefix: string): string {
+  return `${prefix}-${randomId()}`;
+}
+
+export const LSP_SESSION = uniqueId("session");

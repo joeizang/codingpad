@@ -90,7 +90,7 @@ test("Run renders streamed text, structured dumps and completion", async () => {
   expect(invoke).toHaveBeenCalledWith(
     "run_script",
     expect.objectContaining({
-      scriptId: "scratch-1",
+      scriptId: expect.stringMatching(/^scratch-/),
       source: expect.stringContaining("from codingpad import dump"),
     }),
   );
@@ -126,9 +126,12 @@ test("tabs preserve source and close their kernel", async () => {
       screen.queryByRole("button", { name: "Scratch 1.py" }),
     ).not.toBeInTheDocument(),
   );
-  expect(invoke).toHaveBeenCalledWith("close_script", {
-    scriptId: "scratch-1",
-  });
+  expect(invoke).toHaveBeenCalledWith(
+    "close_script",
+    expect.objectContaining({
+      scriptId: expect.stringMatching(/^scratch-/),
+    }),
+  );
 });
 
 test("running script cannot be submitted twice", async () => {
@@ -360,7 +363,12 @@ test("Stop keeps results and reports a forced restart clearing the cache", async
   fireEvent.click(screen.getByRole("button", { name: "Stop" }));
   await screen.findByText("Stopped · cache cleared");
   expect(screen.getByText("before stop")).toBeInTheDocument();
-  expect(invoke).toHaveBeenCalledWith("stop_script", { scriptId: "scratch-1" });
+  expect(invoke).toHaveBeenCalledWith(
+    "stop_script",
+    expect.objectContaining({
+      scriptId: expect.stringMatching(/^scratch-/),
+    }),
+  );
   expect(screen.getByRole("button", { name: "▶ Run" })).toBeEnabled();
 });
 
@@ -380,9 +388,12 @@ test("Reset clears old output and targets only the active script", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Reset" }));
   await screen.findByText("Reset · cache cleared");
   expect(screen.queryByText("old output")).not.toBeInTheDocument();
-  expect(invoke).toHaveBeenCalledWith("reset_script", {
-    scriptId: "scratch-1",
-  });
+  expect(invoke).toHaveBeenCalledWith(
+    "reset_script",
+    expect.objectContaining({
+      scriptId: expect.stringMatching(/^scratch-/),
+    }),
+  );
 });
 
 test("a run finishing successfully during Stop still shows Finished", async () => {

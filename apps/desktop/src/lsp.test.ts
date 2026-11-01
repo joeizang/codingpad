@@ -8,6 +8,7 @@ import {
   hoverMarkdown,
   inlineDependencyKey,
   markerSeverity,
+  uniqueId,
   summarizeDiagnostics,
   type LspDiagnostic,
 } from "./lsp";
@@ -66,6 +67,13 @@ describe("language-server diagnostics", () => {
   });
 });
 
+describe("language-server identity", () => {
+  test("creates unique ids for scripts and sessions", () => {
+    expect(uniqueId("scratch")).toMatch(/^scratch-/);
+    expect(uniqueId("scratch")).not.toBe(uniqueId("scratch"));
+  });
+});
+
 describe("language-server presentation", () => {
   test("flattens hover contents", () => {
     expect(
@@ -81,6 +89,9 @@ describe("language-server presentation", () => {
 
   test("restarts only when the inline dependency set changes", () => {
     expect(inlineDependencyKey("print(1)")).toBe("");
+    expect(
+      inlineDependencyKey('# /// script\n# dependencies = ["requests"]\n'),
+    ).toBe("");
     const source = '# /// script\n# dependencies = ["requests"]\n# ///\nimport requests';
     expect(inlineDependencyKey(source)).toBe("requests");
     expect(

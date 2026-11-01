@@ -21,14 +21,24 @@ async fn run_script(
 }
 
 #[tauri::command]
+async fn begin_language_server_session(
+    language_servers: State<'_, LanguageServers>,
+    session: String,
+) -> Result<(), String> {
+    language_servers.begin_session(&session).await;
+    Ok(())
+}
+
+#[tauri::command]
 async fn start_language_server(
     language_servers: State<'_, LanguageServers>,
     script_id: String,
     source: String,
+    session: String,
     on_event: Channel<LspEvent>,
 ) -> Result<LspStartResult, String> {
     language_servers
-        .start_python(&script_id, &source, move |event| {
+        .start_python(&script_id, &source, &session, move |event| {
             let _ = on_event.send(event);
         })
         .await
@@ -98,6 +108,7 @@ fn main() {
             reset_script,
             expand_node,
             close_script,
+            begin_language_server_session,
             start_language_server,
             change_language_server,
             request_language_server

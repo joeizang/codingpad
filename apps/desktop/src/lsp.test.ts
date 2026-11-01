@@ -92,6 +92,11 @@ describe("language-server presentation", () => {
     expect(
       inlineDependencyKey(extras.replace("[security]", "[socks]")),
     ).toBe("requests[socks]");
+    expect(
+      inlineDependencyKey(
+        '# /// script\n# dependencies = [\n#   "requests", # a ] comment\n# ]\n# ///',
+      ),
+    ).toBe("requests");
   });
 
   test("maps completion labels, documentation and kinds", () => {

@@ -204,7 +204,11 @@ function dependencyArray(metadata: string): string | null {
       }
       continue;
     }
-    if (character === '"' || character === "'") {
+    if (character === "#") {
+      const newline = metadata.indexOf("\n", index);
+      if (newline === -1) break;
+      index = newline;
+    } else if (character === '"' || character === "'") {
       quote = character;
     } else if (character === "[") {
       depth++;

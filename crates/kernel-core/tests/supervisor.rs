@@ -334,3 +334,166 @@ kernel["notify"] = fail_finished
     let after = run(&supervisor, "one", "import os\nos.getpid()").await;
     assert_eq!(value(&before), value(&after));
 }
+
+async fn start_until_ready(
+    supervisor: std::sync::Arc<Supervisor>,
+    source: &'static str,
+) -> tokio::task::JoinHandle<codingpad_kernel_core::RunResult> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut tx = Some(tx);
+    let task = tokio::spawn(async move {
+        supervisor
+            .run("one", source, |event| {
+                if event.params["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("ready"))
+                {
+                    if let Some(tx) = tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            })
+            .await
+            .unwrap()
+    });
+    timeout(Duration::from_secs(5), rx).await.unwrap().unwrap();
+    task
+}
+
+#[tokio::test]
+async fn cooperative_stop_preserves_cache_and_warm_process() {
+    let supervisor = std::sync::Arc::new(Supervisor::default());
+    let before = run(
+        &supervisor,
+        "one",
+        "import os\ncache('pid', os.getpid)\nos.getpid()",
+    )
+    .await;
+    let task = start_until_ready(
+        supervisor.clone(),
+        "print('ready', flush=True)\nwhile True: pass",
+    )
+    .await;
+    timeout(Duration::from_secs(5), supervisor.stop("one"))
+        .await
+        .unwrap();
+    let result = task.await.unwrap();
+    assert!(result.stopped);
+    assert!(!result.ok);
+    assert!(!result.cache_cleared);
+    let after = run(&supervisor, "one", "cache('pid', lambda: 'lost')").await;
+    assert_eq!(value(&before), value(&after));
+    let pid = run(&supervisor, "one", "import os\nos.getpid()").await;
+    assert_eq!(value(&before), value(&pid));
+    // Idle Stop must not cancel the next run.
+    supervisor.stop("one").await;
+    run(&supervisor, "one", "42").await;
+}
+
+#[tokio::test]
+async fn unresponsive_stop_restarts_kernel_and_clears_cache() {
+    let supervisor = std::sync::Arc::new(Supervisor::default());
+    let before = run(
+        &supervisor,
+        "one",
+        "import os\ncache('saved', lambda: 42)\nos.getpid()",
+    )
+    .await;
+    // Ignoring SIGINT exercises the fallback for uncooperative/native code.
+    let task = start_until_ready(
+        supervisor.clone(),
+        "import signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nprint('ready', flush=True)\ntime.sleep(60)",
+    )
+    .await;
+    timeout(Duration::from_secs(6), supervisor.stop("one"))
+        .await
+        .unwrap();
+    let result = task.await.unwrap();
+    assert!(result.stopped);
+    assert!(result.cache_cleared);
+    let after = run(&supervisor, "one", "import os\nos.getpid()").await;
+    assert_ne!(value(&before), value(&after));
+    let cached = run(&supervisor, "one", "cache('saved', lambda: 'cleared')").await;
+    assert_eq!(value(&cached), "cleared");
+}
+
+#[tokio::test]
+async fn reset_clears_cache_and_handles_without_affecting_other_scripts() {
+    let supervisor = Supervisor::default();
+    run(&supervisor, "one", "cache('key', lambda: 42)").await;
+    run(&supervisor, "two", "cache('key', lambda: 99)").await;
+    let table = run(&supervisor, "one", "[{'n': i} for i in range(200)]").await;
+    let handle = table
+        .iter()
+        .find(|event| event.method == "dump")
+        .unwrap()
+        .params["node"]["handle"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    supervisor.reset("one").await.unwrap();
+    assert!(supervisor.expand("one", &handle, None, None).await.is_err());
+    let one = run(&supervisor, "one", "cache('key', lambda: 'new')").await;
+    let two = run(&supervisor, "two", "cache('key', lambda: 'new')").await;
+    assert_eq!(value(&one), "new");
+    assert_eq!(value(&two), 99);
+}
+
+#[tokio::test]
+async fn stop_interrupts_imported_python_code_without_clearing_cache() {
+    let supervisor = std::sync::Arc::new(Supervisor::default());
+    let task = start_until_ready(
+        supervisor.clone(),
+        r#"library = {}
+exec(compile('def spin():\n    while True: pass', 'library.py', 'exec'), library)
+print('ready', flush=True)
+library['spin']()
+"#,
+    )
+    .await;
+    timeout(Duration::from_secs(5), supervisor.stop("one"))
+        .await
+        .unwrap();
+    let result = task.await.unwrap();
+    assert!(result.stopped);
+    assert!(!result.cache_cleared);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stop_interrupts_sleep_without_restarting_kernel() {
+    let supervisor = std::sync::Arc::new(Supervisor::default());
+    let task = start_until_ready(
+        supervisor.clone(),
+        "import time\nprint('ready', flush=True)\ntime.sleep(60)",
+    )
+    .await;
+    timeout(Duration::from_secs(5), supervisor.stop("one"))
+        .await
+        .unwrap();
+    let result = task.await.unwrap();
+    assert!(result.stopped);
+    assert!(!result.cache_cleared);
+}
+
+#[tokio::test]
+async fn successful_run_after_stop_request_is_not_reported_as_stopped() {
+    let supervisor = std::sync::Arc::new(Supervisor::default());
+    let task = start_until_ready(
+        supervisor.clone(),
+        r#"import signal, time
+signal.signal(signal.SIGINT, lambda *args: None)
+print('ready', flush=True)
+time.sleep(0.2)
+42
+"#,
+    )
+    .await;
+    timeout(Duration::from_secs(5), supervisor.stop("one"))
+        .await
+        .unwrap();
+    let result = task.await.unwrap();
+    assert!(result.ok);
+    assert!(!result.stopped);
+    assert!(!result.cache_cleared);
+}

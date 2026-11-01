@@ -77,9 +77,30 @@ Scratch scripts are **unsaved** until the library/files work in #4 lands.
 - `docs`: design decisions and [kernel protocol](docs/kernel-protocol.md)
 - `packaging/placeholders`: registry name reservations, separate from the runtime
 
-This build deliberately has no Stop/Reset, file saving, package installation or
-language server yet. Stop/Reset arrives in #3; until then, close the application
-to terminate a runaway script. Scripts execute with your user privileges, as
+**Stop** requests cancellation first. If the script has not finished after about
+two seconds (for example, it is blocked in native code), CodingPad kills its
+kernel and reports that the cache was cleared; the next Run starts a fresh kernel. An interruptible
+Python loop stops without clearing its cache. **Reset**, available when idle,
+discards that script's kernel and clears cached values and old results.
+
+Use `cache(key, factory)` (also importable from `codingpad`) to keep slow results
+across reruns. Each script has its own cache; failed computations are not saved:
+
+```python
+from codingpad import cache
+
+rows = cache("rows", lambda: expensive_query())
+dump(rows)
+```
+
+Concurrent cache misses may run the factory more than once; the first stored
+value wins. Factories can wait on worker threads that also use `cache()`.
+
+Change the key or Reset to recompute a value. A forced restart or closing the tab
+also clears its cache. Globals still start fresh on every run.
+
+File saving, package installation and language servers arrive later in M1.
+Scripts execute with your user privileges, as
 specified in the architecture. A run gets fresh globals, while imported modules
 and the interpreter remain warm; this is not interpreter isolation.
 

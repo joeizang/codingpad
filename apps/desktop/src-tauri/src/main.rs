@@ -31,6 +31,16 @@ async fn expand_node(
 }
 
 #[tauri::command]
+async fn stop_script(supervisor: State<'_, Supervisor>, script_id: String) {
+    supervisor.stop(&script_id).await;
+}
+
+#[tauri::command]
+async fn reset_script(supervisor: State<'_, Supervisor>, script_id: String) -> Result<(), String> {
+    supervisor.reset(&script_id).await
+}
+
+#[tauri::command]
 async fn close_script(supervisor: State<'_, Supervisor>, script_id: String) -> Result<(), String> {
     supervisor.close(&script_id).await;
     Ok(())
@@ -41,6 +51,8 @@ fn main() {
         .manage(Supervisor::default())
         .invoke_handler(tauri::generate_handler![
             run_script,
+            stop_script,
+            reset_script,
             expand_node,
             close_script
         ])

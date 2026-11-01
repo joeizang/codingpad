@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import io
 import json
@@ -84,6 +85,15 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(len(cell["v"]), 1000)
         self.assertTrue(cell["truncated"])
         self.assertEqual(cell["total"], 2000)
+
+    def test_cache_factory_can_wait_for_worker_using_another_key(self):
+        outer, inner = object(), object()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            value = codingpad.cache(outer, lambda: pool.submit(
+                codingpad.cache, inner, lambda: 42
+            ).result(timeout=2))
+        self.assertEqual(value, 42)
+        self.assertEqual(codingpad.cache(outer, lambda: 99), 42)
 
     def test_dump_is_still_text_outside_the_app(self):
         self.assertIsNone(codingpad._sink)

@@ -1,5 +1,6 @@
 """CodingPad protocol v1: newline-delimited JSON-RPC 2.0 on stdio."""
 
+import _thread
 import ast
 import builtins
 import codecs
@@ -14,7 +15,7 @@ import threading
 import traceback
 import types
 from pathlib import Path
-from queue import SimpleQueue
+from queue import SimpleQueue, Queue
 
 # -I isolates us from user site packages and PYTHONPATH. Add only our bundled helper.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "runtime"))
@@ -420,6 +421,58 @@ def script_timers():
                     stop(timer, 0)
 
 
+# No tracing on normal runs. Only an actual cancellation delivers SIGINT.
+_cancel_gate = threading.RLock()
+_executing_cancel = None
+_main_ident = threading.get_ident()
+
+
+def check_cancelled(event):
+    if event.is_set():
+        event.clear()
+        raise KeyboardInterrupt("Run stopped")
+
+
+def handle_interrupt(signum, frame):
+    with _cancel_gate:
+        event = _executing_cancel
+        if event is None or not event.is_set():
+            return
+        # A queued interrupt can arrive after exec returned. Never raise in
+        # request teardown or carry an old interrupt into the next run.
+        while frame is not None:
+            if frame.f_code.co_filename == "<codingpad>":
+                check_cancelled(event)
+                return
+            frame = frame.f_back
+
+
+@contextlib.contextmanager
+def script_cancellation(event):
+    global _executing_cancel
+    try:
+        with _cancel_gate:
+            signal.signal(signal.SIGINT, handle_interrupt)
+            _executing_cancel = event
+        check_cancelled(event)
+        yield
+    finally:
+        with _cancel_gate:
+            _executing_cancel = None
+            # Scripts may have replaced SIGINT. Ignore late signals while idle.
+            signal.signal(signal.SIGINT, handle_interrupt)
+
+
+def cancel_run(event):
+    with _cancel_gate:
+        event.set()
+        if _executing_cancel is event:
+            if os.name == "posix" and hasattr(signal, "pthread_kill"):
+                signal.pthread_kill(_main_ident, signal.SIGINT)
+            else:
+                _thread.interrupt_main()
+
+
 def run(request):
     run_id = request["id"]
     source = request["params"]["source"]
@@ -438,6 +491,7 @@ def run(request):
             "__file__": filename,
             "__builtins__": dict(vars(builtins)),
             "dump": codingpad.dump,
+            "cache": codingpad.cache,
         }
     )
     auto_name = "__codingpad_auto_dump__"
@@ -491,7 +545,35 @@ def run(request):
                     wrapped = ast.Call(ast.Name(auto_name, ast.Load()), arguments, [])
                     tree.body[-1] = ast.copy_location(ast.Expr(wrapped), last)
                     ast.fix_missing_locations(tree)
-                exec(compile(tree, filename, "exec"), scope)
+                cancelled = request["_cancel"]
+                # One entry check closes the gap between enabling cancellation
+                # and entering exec. Preserve docstrings and future directives.
+                check_name = "__codingpad_check_cancel__"
+                scope[check_name] = lambda: check_cancelled(cancelled)
+                index = 0
+                if (
+                    tree.body
+                    and isinstance(tree.body[0], ast.Expr)
+                    and isinstance(tree.body[0].value, ast.Constant)
+                    and isinstance(tree.body[0].value.value, str)
+                ):
+                    index = 1
+                while (
+                    index < len(tree.body)
+                    and isinstance(tree.body[index], ast.ImportFrom)
+                    and tree.body[index].module == "__future__"
+                ):
+                    index += 1
+                check = ast.Expr(ast.Call(ast.Name(check_name, ast.Load()), [], []))
+                if index < len(tree.body):
+                    ast.copy_location(check, tree.body[index])
+                else:
+                    check.lineno, check.col_offset = 1, 0
+                tree.body.insert(index, check)
+                ast.fix_missing_locations(tree)
+                code = compile(tree, filename, "exec")
+                with script_cancellation(cancelled):
+                    exec(code, scope)
                 ok = True
             except BaseException as error:
                 # Finish preceding output before reporting the script failure.
@@ -545,7 +627,43 @@ def expand(request):
 
 
 def main():
-    for line in _protocol_in:
+    signal.signal(signal.SIGINT, handle_interrupt)
+    requests = Queue()
+    cancellations = {}
+    gate = threading.Lock()
+
+    def read_requests():
+        try:
+            for line in _protocol_in:
+                cancelled = None
+                try:
+                    message = json.loads(line)
+                    if isinstance(message, dict) and message.get("jsonrpc") == "2.0":
+                        if message.get("method") == "cancel":
+                            params = message.get("params")
+                            if isinstance(params, dict) and isinstance(
+                                params.get("runId"), int
+                            ):
+                                with gate:
+                                    event = cancellations.get(params["runId"])
+                                    if event is not None:
+                                        cancel_run(event)
+                            continue
+                        if message.get("method") == "run" and isinstance(
+                            message.get("id"), int
+                        ):
+                            cancelled = threading.Event()
+                            with gate:
+                                cancellations[message["id"]] = cancelled
+                except (ValueError, TypeError):
+                    pass
+                requests.put((line, cancelled))
+        finally:
+            requests.put(None)
+
+    threading.Thread(target=read_requests, daemon=True).start()
+    while (record := requests.get()) is not None:
+        line, cancelled = record
         request = None
         try:
             request = json.loads(line)
@@ -571,6 +689,7 @@ def main():
                 ):
                     raise ValueError("run requires params.source as a string")
                 try:
+                    request["_cancel"] = cancelled
                     run(request)
                 except BaseException as error:
                     # Execution/cleanup failures are request errors, not malformed
@@ -595,6 +714,10 @@ def main():
                     "error": {"code": -32600, "message": str(error)},
                 }
             )
+        finally:
+            if cancelled is not None:
+                with gate:
+                    cancellations.pop(request["id"], None)
 
 
 if __name__ == "__main__":

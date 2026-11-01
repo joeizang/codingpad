@@ -15,7 +15,7 @@ The supervisor allocates monotonically increasing integer request IDs per kernel
 {"jsonrpc":"2.0","id":1,"method":"run","params":{"source":"print('hello')\ndump([1, 2])\n42"}}
 ```
 
-A new globals dictionary includes `dump`, `__name__ = "__main__"`, a virtual
+A new globals dictionary includes `dump`, `cache`, `__name__ = "__main__"`, a virtual
 `__file__` and a copy of builtins. Imported modules remain cached in the process.
 The script is registered as `__main__` for dataclasses and other module-aware
 libraries. The final expression is instrumented through the AST so it is evaluated once,
@@ -90,6 +90,46 @@ per animation frame and flushed at run completion. Stable output IDs are retaine
 when the 500-block limit evicts old output. Per-run generation checks discard late
 notifications from an earlier invocation.
 
+## Stop, Reset and cache
+
+The supervisor sends cancellation as a notification targeting the active run ID:
+
+```json
+{"jsonrpc":"2.0","method":"cancel","params":{"runId":1}}
+```
+
+A dedicated Python input thread receives notifications while the main thread
+executes a script. Cancellation sets an event registered when the run request is
+received, so a Stop arriving before execution starts is retained. Wrong or
+expired run IDs are ignored. While a script executes, cancellation signals the
+main thread with `pthread_kill(SIGINT)` on Unix, or `interrupt_main()` elsewhere.
+The SIGINT handler raises `KeyboardInterrupt("Run stopped")` only when the active
+run's cancellation is pending and the stack still contains a script frame. Late
+interrupts during cleanup are ignored. One entry check handles cancellation that
+arrives before `exec` begins. Ordinary runs install no trace hook, preserving user
+tracers and avoiding per-call/per-line overhead. Imported Python code is covered;
+Unix signals also interrupt `sleep()`. Scripts may catch or ignore SIGINT, and
+some native calls (including Windows sleep) may delay signal handling.
+
+After two seconds without a run response, the supervisor kills the process and
+discards it; the next Run starts a fresh kernel. The desktop `run_script` result
+adds `stopped` and `cacheCleared` booleans to the kernel's `ok` result. A forced stop sets both flags,
+reports the cleared cache, and retains output already received. Cooperative Stop
+sets only `stopped`, retaining the kernel and cache. A successful response remains
+Finished even when Stop was requested concurrently. Idle Stop cannot cancel a
+later run because new watch subscribers start with the current version consumed.
+
+`reset_script` stops any active run and discards the kernel, clearing all handles,
+imports and cached values. Kernel startup is deferred until the next Run, so a
+missing toolchain cannot turn a completed Stop or Reset into a startup error.
+The desktop offers Reset when idle and clears old output and pending updates. Stop and Reset operate on one script only.
+
+The built-in `cache(key, factory)` helper stores successful factory results by
+hashable key in the warm process. Cached `None` values count as hits. Exceptions
+are never cached. Factories run outside the shared lock; concurrent misses may
+compute more than once and the first stored result wins. Each script's process
+owns its cache, which survives clean execution scopes and cooperative Stop, but ends on Reset, close or restart.
+
 ## Expanding values
 
 Lazy nodes and pages use handles created by the kernel. Expand when the user
@@ -106,7 +146,7 @@ clicks or scrolls:
   page. Merge `items`, `fields` or `rows` and continue with its `next` cursor.
 - A lazy node expands at depth zero, so a deep object shows another six useful
   levels with another lazy node at the end.
-- Handles stay valid until the next run begins (Reset in #3 also replaces them).
+- Handles stay valid until the next run begins or the kernel is reset/restarted.
   An unknown or expired handle returns error `-32001` with a message telling the
   user to run the script again. The desktop shows that message in place of the
   preview. A handle is cached per value within a run, so paging and repeated

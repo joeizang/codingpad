@@ -1,5 +1,9 @@
 //! Desktop-independent supervisor for one warm Python process per script.
 pub mod lsp;
+mod packages;
+pub mod store;
+
+use packages::Packages;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
@@ -9,6 +13,10 @@ use tokio::{
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::{watch, Mutex},
 };
+
+// Write bytes explicitly: Windows piped stdout may use an ANSI code page.
+const PYTHON_EXECUTABLE_PROBE: &str =
+    "import sys; sys.stdout.buffer.write(sys.executable.encode('utf-8'))";
 
 const KERNEL: &str = include_str!("../../../kernels/python/kernel.py");
 pub(crate) const RUNTIME: &str = include_str!("../../../runtimes/python/codingpad/__init__.py");
@@ -127,8 +135,26 @@ impl Supervisor {
         if *closed.borrow() {
             return Err("Script was closed".into());
         }
+        let packages = Packages::parse(source)?;
+        if guard
+            .as_ref()
+            .is_some_and(|kernel| kernel.packages != packages)
+        {
+            *guard = None;
+            emit(KernelEvent {
+                method: "stream".into(),
+                params: json!({"runId": 0, "stream": "stderr", "text": "Dependencies changed; restarting Python and clearing cache.\n"}),
+            });
+        }
+        // Startup includes resolution/downloads. Stop and Close must cancel that
+        // work too, before there is a Python kernel to send a cancel request to.
         if guard.is_none() {
-            *guard = Some(Kernel::start(&self.uv).await?);
+            let startup = tokio::select! {
+                result = Kernel::start(&self.uv, packages, &mut emit) => result,
+                _ = closed.changed() => return Err("Script was closed".into()),
+                _ = stop.changed() => return Ok(RunResult { ok: false, stopped: true, cache_cleared: true }),
+            };
+            *guard = Some(startup?);
         }
         let result = tokio::select! {
             result = guard.as_mut().unwrap().run(source, &mut emit, &mut stop) => result,
@@ -233,13 +259,19 @@ struct Kernel {
     output: Lines<BufReader<ChildStdout>>,
     next_id: u64,
     _files: TempDir,
+    packages: Packages,
 }
 
 impl Kernel {
-    async fn start(uv: &PathBuf) -> Result<Self, String> {
+    async fn start(
+        uv: &PathBuf,
+        packages: Packages,
+        emit: &mut (impl FnMut(KernelEvent) + Send),
+    ) -> Result<Self, String> {
         let mut discover = Command::new(uv);
         #[cfg(windows)]
         discover.creation_flags(0x08000000); // CREATE_NO_WINDOW, also for uv
+        discover.kill_on_drop(true);
         let python = discover
             .args(["python", "find", ">=3.10", "--offline", "--no-config"])
             .output().await.map_err(|e| {
@@ -250,7 +282,14 @@ impl Kernel {
         if !python.status.success() {
             return Err(format!("uv could not find an installed Python. Install Python 3.10+ (for example, `uv python install`) and try again. {}", String::from_utf8_lossy(&python.stderr).trim()));
         }
-        let executable = String::from_utf8(python.stdout).map_err(|e| e.to_string())?;
+        let mut executable = String::from_utf8(python.stdout).map_err(|e| e.to_string())?;
+        if packages.declared {
+            emit(KernelEvent {
+                method: "stream".into(),
+                params: json!({"runId": 0, "stream": "stderr", "text": "Preparing Python packages (uv cache)…\n"}),
+            });
+            executable = prepare_packages(uv, &packages, emit).await?;
+        }
         let files = tempfile::tempdir().map_err(|e| e.to_string())?;
         let runtime = files.path().join("runtime/codingpad");
         std::fs::create_dir_all(&runtime).map_err(|e| e.to_string())?;
@@ -276,6 +315,7 @@ impl Kernel {
             child,
             next_id: 0,
             _files: files,
+            packages,
         })
     }
 
@@ -398,6 +438,108 @@ impl Kernel {
     }
 }
 
+// A stable launcher per dependency set lets uv manage persistent script
+// environments, including locking concurrent installs. Launch Python directly
+// afterwards so Stop/Close own the actual kernel process on every platform.
+async fn prepare_packages(
+    uv: &PathBuf,
+    packages: &Packages,
+    emit: &mut (impl FnMut(KernelEvent) + Send),
+) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    let mut metadata = packages.clone();
+    metadata.requires_python = Some(
+        packages
+            .requires_python
+            .as_ref()
+            .map(|spec| format!(">=3.10,{spec}"))
+            .unwrap_or_else(|| ">=3.10".into()),
+    );
+    let metadata = toml::to_string(&metadata).map_err(|e| e.to_string())?;
+    let launcher = format!(
+        "# /// script\n{}# ///\n{PYTHON_EXECUTABLE_PROBE}\n",
+        metadata
+            .lines()
+            .map(|line| format!("# {line}\n"))
+            .collect::<String>()
+    );
+    let cache = dirs::cache_dir()
+        .ok_or("Could not locate the user cache directory")?
+        .join("codingpad/python-packages-v1");
+    std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+    let path = cache.join(format!("{:x}.py", Sha256::digest(launcher.as_bytes())));
+    if !path.exists() {
+        let mut file = tempfile::NamedTempFile::new_in(&cache).map_err(|e| e.to_string())?;
+        file.write_all(launcher.as_bytes())
+            .map_err(|e| e.to_string())?;
+        match file.persist_noclobber(&path) {
+            Ok(_) => (),
+            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let mut command = Command::new(uv);
+    command
+        .args([
+            "run",
+            "--no-project",
+            "--no-config",
+            "--no-env-file",
+            "--no-python-downloads",
+            "--color",
+            "never",
+            "--script",
+        ])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Could not prepare Python packages: {e}"))?;
+    let stderr = child.stderr.take().unwrap();
+    let progress = stream_package_progress(stderr, emit);
+    let (output, ()) = tokio::try_join!(
+        async { child.wait_with_output().await.map_err(|e| e.to_string()) },
+        progress
+    )?;
+    if !output.status.success() {
+        return Err("Python package preparation failed. See uv output in Results; check the dependencies, requires-python and network connection. Python 3.10+ must already be installed.".into());
+    }
+    let executable = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
+    if !std::path::Path::new(executable.trim()).is_file() {
+        return Err("uv did not return a usable Python interpreter".into());
+    }
+    Ok(executable)
+}
+
+async fn stream_package_progress(
+    reader: impl tokio::io::AsyncRead + Unpin,
+    emit: &mut (impl FnMut(KernelEvent) + Send),
+) -> Result<(), String> {
+    // Buffer complete lines before decoding: preserve split UTF-8 sequences,
+    // while tolerating invalid bytes relayed from package build backends.
+    let mut reader = BufReader::new(reader);
+    let mut line = Vec::new();
+    while reader
+        .read_until(b'\n', &mut line)
+        .await
+        .map_err(|e| e.to_string())?
+        != 0
+    {
+        emit(KernelEvent {
+            method: "stream".into(),
+            params: json!({"runId": 0, "stream": "stderr", "text": String::from_utf8_lossy(&line)}),
+        });
+        line.clear();
+    }
+    Ok(())
+}
+
 enum CallError {
     /// A JSON-RPC error reported by a live kernel; keep the process.
     Kernel(String),
@@ -441,6 +583,57 @@ impl Drop for Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn interpreter_probe_writes_utf8_with_an_ascii_stdout_encoding() {
+        let expected = "C:/José/用户/python.exe";
+        let output = Command::new(find_uv())
+            .args(["run", "--offline", "--no-project", "--no-config", "--no-python-downloads", "python", "-I", "-c",
+                "import sys; sys.executable = sys.argv[1]; sys.stdout.reconfigure(encoding='ascii'); exec(sys.argv[2])",
+                expected, PYTHON_EXECUTABLE_PROBE])
+            .output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn package_progress_preserves_unicode_split_across_reads() {
+        // A one-byte pipe forces every multibyte character across read boundaries.
+        let (mut writer, reader) = tokio::io::duplex(1);
+        let expected = "error: × failure\n╰─▶ dependency missing\n";
+        let mut events = Vec::new();
+        let mut emit = |event| events.push(event);
+        let write = async {
+            writer.write_all(expected.as_bytes()).await.unwrap();
+            writer.shutdown().await.unwrap();
+        };
+        let (result, ()) = tokio::join!(stream_package_progress(reader, &mut emit), write);
+        result.unwrap();
+        let text: String = events
+            .iter()
+            .map(|event| event.params["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(text, expected);
+    }
+
+    #[tokio::test]
+    async fn package_progress_tolerates_invalid_bytes_and_preserves_final_line() {
+        let input = b"build backend: \xff\nactual uv error: \xfe";
+        let mut events = Vec::new();
+        stream_package_progress(&input[..], &mut |event| events.push(event))
+            .await
+            .unwrap();
+        let text: String = events
+            .iter()
+            .map(|event| event.params["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(text, "build backend: \u{fffd}\nactual uv error: \u{fffd}");
+        assert_eq!(events.len(), 2);
+    }
 
     #[tokio::test]
     async fn stop_notifies_a_run_subscribed_before_taking_kernel_lock() {

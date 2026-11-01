@@ -497,3 +497,161 @@ time.sleep(0.2)
     assert!(!result.stopped);
     assert!(!result.cache_cleared);
 }
+
+// Build a tiny real wheel locally: these package tests never depend on PyPI.
+fn package_fixture(folder: &std::path::Path, version: u8) -> String {
+    let output = std::process::Command::new("uv")
+        .args(["run", "--offline", "--no-project", "--no-config", "--no-python-downloads", "python", "-c", r#"
+import pathlib, sys, zipfile
+folder, version = pathlib.Path(sys.argv[1]), sys.argv[2]
+name = 'cpad_package_fixture'
+wheel = folder / f'{name}-{version}-py3-none-any.whl'
+info = f'{name}-{version}.dist-info'
+with zipfile.ZipFile(wheel, 'w') as z:
+    z.writestr(f'{name}.py', f'VALUE = {version}\n')
+    z.writestr(f'{info}/METADATA', f'Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n')
+    z.writestr(f'{info}/WHEEL', 'Wheel-Version: 1.0\nGenerator: CodingPad test\nRoot-Is-Purelib: true\nTag: py3-none-any\n')
+    z.writestr(f'{info}/RECORD', '')
+print(f'{name} @ {wheel.as_uri()}')
+"#])
+        .arg(folder).arg(version.to_string()).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn package_source(requirement: &str, code: &str) -> String {
+    format!(
+        "# /// script\n# dependencies = [{}]\n# ///\n{code}",
+        serde_json::to_string(requirement).unwrap()
+    )
+}
+
+#[tokio::test]
+async fn inline_packages_install_reuse_and_change_without_leaking_imports() {
+    let folder = tempfile::tempdir().unwrap();
+    let first = package_fixture(folder.path(), 1);
+    let second = package_fixture(folder.path(), 2);
+    let supervisor = Supervisor::default();
+    let code = "import cpad_package_fixture as fixture\nassert fixture.VALUE == 1\ncache('saved', lambda: 42)\nimport os\nimport sys\nos.path.realpath(sys.executable)";
+    let source = package_source(&first, code);
+    let events = run(&supervisor, "one", &source).await;
+    assert!(events.iter().any(|event| event.params["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("Preparing Python packages"))));
+    let again = run(
+        &supervisor,
+        "one",
+        &package_source(&first, "cache('saved', lambda: 'lost')"),
+    )
+    .await;
+    assert_eq!(value(&again), 42);
+    // A different tab and Reset reuse the environment, with independent kernels.
+    let other = run(&supervisor, "two", &source).await;
+    assert_eq!(value(&events), value(&other));
+    supervisor.reset("one").await.unwrap();
+    let reset = run(&supervisor, "one", &source).await;
+    assert_eq!(value(&events), value(&reset));
+    let changed = run(&supervisor, "one", &package_source(&second, "import cpad_package_fixture as fixture\nassert fixture.VALUE == 2\ncache('saved', lambda: 'cleared')")).await;
+    assert_eq!(value(&changed), "cleared");
+    let removed = run(&supervisor, "one", "import importlib.util\nassert importlib.util.find_spec('cpad_package_fixture') is None\n42").await;
+    assert_eq!(value(&removed), 42);
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn package_errors_stream_details_and_recover() {
+    let supervisor = Supervisor::default();
+    let mut events = Vec::new();
+    let error = supervisor
+        .run(
+            "one",
+            &package_source(
+                "invalid requirement >>>",
+                "raise AssertionError('must not execute')",
+            ),
+            |e| events.push(e),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("package preparation failed"));
+    assert!(events.iter().any(|event| event.params["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("error:"))));
+    let source = "# /// script\n# requires-python = '>=99'\n# ///\n42";
+    assert!(supervisor
+        .run("one", source, |_| {})
+        .await
+        .unwrap_err()
+        .contains("package preparation failed"));
+    run(&supervisor, "one", "42").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stop_and_close_cancel_package_preparation() {
+    use std::os::unix::fs::PermissionsExt;
+    let folder = tempfile::tempdir().unwrap();
+    let wrapper = folder.path().join("uv-wrapper");
+    std::fs::write(&wrapper, "#!/bin/sh\nif [ \"$1\" = python ]; then exec uv \"$@\"; fi\nprintf 'install-ready\\n' >&2\nexec sleep 60\n").unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let supervisor = Supervisor::with_uv(wrapper);
+    for close in [false, true] {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut tx = Some(tx);
+        let source = package_source("requests", "42");
+        let running = supervisor.run("one", &source, |event| {
+            if event.params["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("install-ready"))
+            {
+                if let Some(tx) = tx.take() {
+                    let _ = tx.send(());
+                }
+            }
+        });
+        let control = async {
+            rx.await.unwrap();
+            if close {
+                supervisor.close("one").await;
+            } else {
+                supervisor.stop("one").await;
+            }
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(running, control)
+        })
+        .await
+        .unwrap();
+        if close {
+            assert!(result.unwrap_err().contains("closed"));
+        } else {
+            assert!(result.unwrap().stopped);
+        }
+        run(&supervisor, "one", "42").await;
+    }
+}
+
+#[tokio::test]
+async fn empty_metadata_uses_an_isolated_environment() {
+    let supervisor = Supervisor::default();
+    run(&supervisor, "empty", "# /// script\n# dependencies = []\n# ///\nimport sys\nassert sys.prefix != sys.base_prefix\n42").await;
+}
+
+#[tokio::test]
+#[ignore = "optional PyPI acceptance check; needs network or a populated uv cache"]
+async fn requests_first_run_and_cached_environment_after_restart() {
+    let source = package_source(
+        "requests>=2,<3",
+        "import requests, sys\nassert requests.__version__.startswith('2.')\nsys.executable",
+    );
+    let supervisor = Supervisor::default();
+    let first = run(&supervisor, "requests", &source).await;
+    supervisor.shutdown().await;
+    let supervisor = Supervisor::default();
+    let second = run(&supervisor, "requests", &source).await;
+    assert_eq!(value(&first), value(&second));
+}

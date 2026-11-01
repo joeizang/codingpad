@@ -4,7 +4,9 @@ A desktop scratchpad for running plain scripts and inspecting their values. This
 M1 build supports Python with a Monaco editor, Python completions and hover,
 type diagnostics, streamed stdout/stderr, rich dumps (lazy nodes, paged
 virtualised tables, images, sandboxed HTML, live updates), structured errors with
-clickable tracebacks, and automatic display of the last expression.
+clickable tracebacks, automatic display of the last expression, Stop/Reset, a
+library sidebar with pinned folders and plain-file saving, and inline Python
+packages (PEP 723).
 
 ## Develop locally
 
@@ -44,7 +46,8 @@ locations for `uv`, plus `/opt/homebrew/bin` and `/usr/local/bin` on macOS.
 Launch from a terminal if your toolchain lives elsewhere.
 Each scratch tab gets its own warm Python process on its first run. Missing `uv` or Python produces an actionable
 message in Results. The app uses the installed Python selected by `uv python find`
-and does not download a toolchain or dependencies automatically.
+and does not download a toolchain automatically. Scripts with inline dependencies
+install their packages through `uv` when Run is pressed.
 
 Try the initial script, or paste:
 
@@ -65,7 +68,32 @@ Click **Run** or press **Ctrl+Enter** (**Cmd+Enter** on macOS). Results should s
 the greeting, a table of records, rendered markup, a live value that changes to
 `done`, and `42`. Edit and rerun to replace the previous output. New scratch tabs
 keep independent source and results; closing a tab terminates its Python process.
-Scratch scripts are **unsaved** until the library/files work in #4 lands.
+
+## Library and files
+
+The sidebar shows your **library** at `Documents/CodingPad` (created on first
+launch and changeable from **Change…**) plus any **pinned folders** you add. Click
+a file to open it, or use **Open file…** for any single file. **Save** (or
+**Cmd/Ctrl+S**) writes the script back as a plain native file; a scratch tab
+prompts for its location the first time and can use **Save as…** afterwards.
+CodingPad settings live in the app config folder, never in your scripts.
+
+A script's optional single-line header stays at the top of the file and is shown
+in the footer. For Python it is a `#` comment; C#, Rust and TypeScript use `//`:
+
+```python
+# codingpad: connection=northwind
+```
+
+The line is preserved byte-for-byte when reading, editing and saving. Saves go
+through a temporary file and rename, so a crash mid-save cannot truncate a
+script; a corrupt settings file is copied to `settings.json.bak` before it is
+replaced.
+
+The file commands accept paths from the local webview (the library, pinned
+folders and dialog choices); there is no filesystem sandbox between the UI and
+your user account. This build runs Python only, so **Run** is disabled for other
+file types while they remain editable and saveable.
 
 ## Repository layout
 
@@ -99,8 +127,38 @@ value wins. Factories can wait on worker threads that also use `cache()`.
 Change the key or Reset to recompute a value. A forced restart or closing the tab
 also clears its cache. Globals still start fresh on every run.
 
-File saving and package installation arrive later in M1. Python code intelligence
-is described below. Scripts execute with your user privileges, as
+Declare Python packages in a [PEP 723](https://peps.python.org/pep-0723/) comment block:
+
+```python
+# /// script
+# dependencies = ["requests>=2,<3"]
+# requires-python = ">=3.10"
+# ///
+
+import requests
+requests.__version__
+```
+
+Run installs missing packages and streams `uv` progress/errors into Results.
+Environments are cached by the sorted dependency declarations and Python constraint,
+shared across tabs and app restarts; ordinary edits keep the tab's warm process.
+Changing or removing metadata restarts that tab's kernel and clears `cache()`.
+Reset clears the running kernel but keeps installed packages. Stop also cancels
+package preparation. A first install needs network access unless packages are already
+cached or local. Use version pins for repeatable resolution.
+
+`requires-python` selects an already installed Python compatible with both the
+script and CodingPad's Python 3.10+ minimum. An empty metadata block creates an
+isolated environment without additional packages. CodingPad always supplies its
+bundled `codingpad` runtime. `[tool]` metadata is accepted but does not configure
+package resolution yet; project `uv.toml` and `.env` files are not loaded. Package
+launchers live in the user's cache folder under `codingpad/python-packages-v1`;
+`uv` manages the environments in its own cache. Relative local dependency paths
+are not supported for either saved scripts or scratch scripts; use absolute file
+URLs. Saved scripts do not resolve package paths against their containing folder.
+
+Language servers arrive later in M1.
+Scripts execute with your user privileges, as
 specified in the architecture. A run gets fresh globals, while imported modules
 and the interpreter remain warm; this is not interpreter isolation.
 

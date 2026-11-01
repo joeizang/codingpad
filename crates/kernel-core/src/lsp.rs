@@ -116,9 +116,12 @@ impl LanguageServers {
             if existing.dependencies == dependencies && existing.alive() {
                 existing.set_events(events.clone());
                 if existing.did_change(source).await.is_ok() {
-                    if self.closed.lock().await.contains(script_id)
-                        || self.session.lock().await.as_deref() != Some(session)
-                    {
+                    if self.closed.lock().await.contains(script_id) {
+                        self.servers.lock().await.remove(script_id);
+                        existing.stop().await;
+                        return Err("The script was closed".into());
+                    }
+                    if self.session.lock().await.as_deref() != Some(session) {
                         self.servers.lock().await.remove(script_id);
                         existing.stop().await;
                         return Err("The editor session is stale. Reload the tab to restart code intelligence.".into());

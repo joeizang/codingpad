@@ -218,7 +218,7 @@ export default function CodeEditor({
       const model = editorRef.current?.getModel();
       if (model) monaco.editor.setModelMarkers(model, "codingpad-lsp", []);
     };
-  }, [id, dependencyKey, LSP_SESSION]);
+  }, [id, dependencyKey]);
 
   useEffect(
     () => () => {

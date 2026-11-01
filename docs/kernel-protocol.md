@@ -5,7 +5,13 @@ one warm Python process per open script, writes requests to stdin and reads stdo
 The kernel and its runtime are embedded in the Rust build and extracted to a
 private temporary directory for the process lifetime; installed apps do not need
 the source checkout or a registry package. Python starts with `-I -u -X utf8` and adds only
-the bundled runtime path explicitly.
+the bundled runtime path explicitly. Before starting a kernel, the supervisor
+parses PEP 723 metadata and asks `uv` to prepare a cached script environment. Only
+the metadata and a fixed interpreter-discovery command are passed to `uv`; user
+source still runs through the kernel protocol. Metadata changes replace the kernel.
+Preparation progress uses `stream` notifications with `runId: 0`, reserved for
+supervisor output before a kernel request exists. Startup failures reject the Run
+invocation after streaming diagnostics. Stop/Close also cancel preparation.
 
 ## Run
 

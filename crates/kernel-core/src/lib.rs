@@ -241,6 +241,18 @@ impl Kernel {
                     return Err("Unexpected kernel response id".into());
                 }
                 if let Some(error) = message.get("error") {
+                    if error["code"] == -32603 {
+                        let text = error["message"].as_str().unwrap_or("Kernel run failed");
+                        emit(KernelEvent {
+                            method: "stream".into(),
+                            params: json!({"runId": id, "stream": "stderr", "text": format!("{text}\n")}),
+                        });
+                        emit(KernelEvent {
+                            method: "run_finished".into(),
+                            params: json!({"runId": id, "ok": false}),
+                        });
+                        return Ok(RunResult { ok: false });
+                    }
                     return Err(format!("Kernel request failed: {error}"));
                 }
                 return serde_json::from_value(message["result"].clone())

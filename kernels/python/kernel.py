@@ -8,11 +8,13 @@ import io
 import json
 import linecache
 import os
+import signal
 import sys
 import threading
 import traceback
 import types
 from pathlib import Path
+from queue import SimpleQueue
 
 # -I isolates us from user site packages and PYTHONPATH. Add only our bundled helper.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "runtime"))
@@ -43,7 +45,23 @@ def redirect_fd(source, target):
 with open(os.devnull, "r+b", buffering=0) as sink:
     redirect_fd(sink.fileno(), 0)
     redirect_fd(sink.fileno(), 1)
-_write_lock = threading.Lock()
+_write_lock = threading.RLock()
+_io_state = threading.local()
+_io_state.busy = False
+
+
+@contextlib.contextmanager
+def io_busy():
+    previous = getattr(_io_state, "busy", False)
+    _io_state.busy = True
+    try:
+        yield
+    finally:
+        _io_state.busy = previous
+
+
+class IOThread(threading.Thread):
+    """Identify output workers before their first allocation can run a finalizer."""
 
 
 def json_safe(value):
@@ -57,7 +75,7 @@ def json_safe(value):
 
 
 def send(message):
-    with _write_lock:
+    with io_busy(), _write_lock:
         _protocol_out.write(
             json.dumps(
                 json_safe({"jsonrpc": "2.0", **message}),
@@ -113,6 +131,35 @@ def capture_native(run_id):
     live = True
     write_gate = threading.Lock()
     last_stream = None
+    deferred = SimpleQueue()
+
+    def busy():
+        # The role survives across runs if an old reader is still shutting down.
+        return getattr(_io_state, "busy", False) or isinstance(
+            threading.current_thread(), IOThread
+        )
+
+    def deferred_pump():
+        while (record := deferred.get()) is not None:
+            if isinstance(record, threading.Event):
+                record.set()
+                continue
+            descriptor, data = record
+            # Share the lifecycle check and protocol write lock: no deferred
+            # notification may escape after this run has finished.
+            with _write_lock:
+                if live:
+                    notify(
+                        "stream",
+                        {
+                            "runId": run_id,
+                            "stream": "stdout" if descriptor == 1 else "stderr",
+                            "text": data.decode("utf-8", "replace"),
+                        },
+                    )
+
+    deferred_thread = IOThread(target=deferred_pump, daemon=True)
+    deferred_started = False
 
     def pump(reader, name, active, gate, fence):
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -167,10 +214,12 @@ def capture_native(run_id):
         finally:
             os.close(reader)
 
-    def drain(only_descriptor=None):
-        # Each waiter requires its sequence, so a late old marker cannot release
-        # a newer drain after the earlier call timed out.
-        with flush_gate:
+    def _drain(only_descriptor=None):
+        # Never wait for a gate held by another writer/callback. Sequence
+        # acknowledgements still protect each fence whenever a drain proceeds.
+        if not flush_gate.acquire(blocking=False):
+            return
+        try:
             if not live:
                 return
             waiting = []
@@ -181,22 +230,43 @@ def capture_native(run_id):
                 try:
                     write_all(descriptor, marker)
                 except OSError:
-                    continue  # Script may have closed its own stdout/stderr.
+                    continue
                 waiting.append((fence, sequence))
             for fence, sequence in waiting:
                 fence.wait(sequence)
+        finally:
+            flush_gate.release()
+
+    def drain(only_descriptor=None):
+        if busy():
+            return
+        with io_busy():
+            _drain(only_descriptor)
 
     def ordered_write(descriptor, data):
         nonlocal last_stream
-        if not data:
+        if not data or not live:
             return
-        with write_gate:
-            if last_stream is not None and last_stream != descriptor:
-                drain(last_stream)
-            write_all(descriptor, data)
-            last_stream = descriptor
+        if busy():
+            # CPython's SimpleQueue.put is reentrant, including in __del__ and
+            # weakref callbacks. Never write to a pipe its own pump must read.
+            deferred.put((descriptor, data))
+            return
+        with io_busy():
+            if not write_gate.acquire(blocking=False):
+                deferred.put((descriptor, data))
+                return
+            try:
+                if last_stream is not None and last_stream != descriptor:
+                    _drain(last_stream)
+                write_all(descriptor, data)
+                last_stream = descriptor
+            finally:
+                write_gate.release()
 
     try:
+        deferred_thread.start()
+        deferred_started = True
         for descriptor, name in [(1, "stdout"), (2, "stderr")]:
             reader, writer = os.pipe()
             original = os.dup(descriptor)
@@ -204,7 +274,7 @@ def capture_native(run_id):
             os.close(writer)
             active, gate, fence = threading.Event(), threading.Lock(), Fence()
             active.set()
-            thread = threading.Thread(
+            thread = IOThread(
                 target=pump,
                 args=(reader, name, active, gate, fence),
                 daemon=True,
@@ -213,17 +283,26 @@ def capture_native(run_id):
             thread.start()
         yield drain, ordered_write
     finally:
-        drain()
-        with flush_gate:
-            live = False
-        for descriptor, original, *_ in streams:
-            redirect_fd(original, descriptor)
-            os.close(original)
-        for _, _, thread, active, gate, _ in streams:
-            # Background children may retain a pipe; never wait for them forever.
-            thread.join(timeout=0.5)
-            with gate:
-                active.clear()
+        with io_busy():
+            try:
+                _drain()
+                if deferred_started:
+                    complete = threading.Event()
+                    deferred.put(complete)
+                    complete.wait(timeout=0.5)
+            finally:
+                with _write_lock:
+                    live = False
+                for descriptor, original, *_ in streams:
+                    redirect_fd(original, descriptor)
+                    os.close(original)
+                for _, _, thread, active, gate, _ in streams:
+                    thread.join(timeout=0.5)
+                    with gate:
+                        active.clear()
+                if deferred_started:
+                    deferred.put(None)
+                    deferred_thread.join(timeout=0.5)
 
 
 class Stream(io.TextIOBase):
@@ -253,6 +332,26 @@ class Stream(io.TextIOBase):
 class NoInput(io.TextIOBase):
     def readline(self, *args):
         raise RuntimeError("Interactive input is not supported in CodingPad yet")
+
+
+@contextlib.contextmanager
+def script_timers():
+    # Interval timers otherwise keep invoking user handlers during cleanup and
+    # subsequent requests in this warm interpreter. Stop them before restoring
+    # the ordinary idle streams; the handler may itself print from any bytecode.
+    stop = getattr(signal, "setitimer", None)
+    timers = [
+        getattr(signal, name)
+        for name in ("ITIMER_REAL", "ITIMER_VIRTUAL", "ITIMER_PROF")
+        if hasattr(signal, name)
+    ]
+    try:
+        yield
+    finally:
+        if stop is not None:
+            with io_busy():
+                for timer in timers:
+                    stop(timer, 0)
 
 
 def run(request):
@@ -294,6 +393,7 @@ def run(request):
             capture_native(run_id) as (drain, ordered_write),
             contextlib.redirect_stdout(Stream(1, drain, ordered_write)),
             contextlib.redirect_stderr(Stream(2, drain, ordered_write)),
+            script_timers(),
         ):
 
             def emit_dump(node):
@@ -357,7 +457,20 @@ def main():
                 params.get("source"), str
             ):
                 raise ValueError("run requires params.source as a string")
-            run(request)
+            try:
+                run(request)
+            except BaseException as error:
+                # Execution/cleanup failures are request errors, not malformed
+                # input and not a reason to terminate the warm kernel.
+                send(
+                    {
+                        "id": request["id"],
+                        "error": {
+                            "code": -32603,
+                            "message": f"Kernel run failed: {type(error).__name__}",
+                        },
+                    }
+                )
         except (ValueError, TypeError) as error:
             send(
                 {

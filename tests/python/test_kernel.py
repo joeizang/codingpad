@@ -1,8 +1,10 @@
 import json
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -17,8 +19,16 @@ class KernelTests(unittest.TestCase):
         shutil.copytree(
             ROOT / "runtimes/python/codingpad", folder / "runtime/codingpad"
         )
+        self.command = [
+            sys.executable,
+            "-I",
+            "-u",
+            "-X",
+            "utf8",
+            str(folder / "kernel.py"),
+        ]
         self.process = subprocess.Popen(
-            [sys.executable, "-I", "-u", "-X", "utf8", str(folder / "kernel.py")],
+            self.command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -39,28 +49,73 @@ class KernelTests(unittest.TestCase):
         self.process.stderr.close()
         self.directory.cleanup()
 
-    def run_script(self, source):
-        self.request_id += 1
-        self.process.stdin.write(
+    def run_script(self, source, timeout=10):
+        # Every request is bounded so a kernel deadlock fails the suite instead
+        # of hanging the test runner indefinitely.
+        watchdog = threading.Timer(timeout, self.process.kill)
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            self.request_id += 1
+            self.process.stdin.write(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": self.request_id,
+                        "method": "run",
+                        "params": {"source": source},
+                    }
+                )
+                + "\n"
+            )
+            self.process.stdin.flush()
+            messages = []
+            while True:
+                line = self.process.stdout.readline()
+                self.assertTrue(line, f"Kernel exited or request exceeded {timeout}s")
+                message = json.loads(line)
+                messages.append(message)
+                if "id" in message:
+                    return messages
+        finally:
+            watchdog.cancel()
+
+    def fresh_run_and_check_recovery(self, source, timeout=20):
+        scripts = ["import os\nos.getpid()", source, "import os\nos.getpid()"]
+        requests = [
             json.dumps(
                 {
                     "jsonrpc": "2.0",
-                    "id": self.request_id,
+                    "id": index + 1,
                     "method": "run",
-                    "params": {"source": source},
+                    "params": {"source": script},
                 }
             )
-            + "\n"
+            for index, script in enumerate(scripts)
+        ]
+        result = subprocess.run(
+            self.command,
+            input="\n".join(requests) + "\n",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout,
         )
-        self.process.stdin.flush()
-        messages = []
-        while True:
-            line = self.process.stdout.readline()
-            self.assertTrue(line, "Kernel exited before responding")
-            message = json.loads(line)
-            messages.append(message)
-            if "id" in message:
-                return messages
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        messages = [json.loads(line) for line in result.stdout.splitlines()]
+        responses = [message for message in messages if "id" in message]
+        self.assertEqual(len(responses), 3, responses)
+        self.assertTrue(
+            all(message.get("result", {}).get("ok") for message in responses), responses
+        )
+        pids = [
+            message["params"]["node"]["v"]
+            for message in messages
+            if message.get("method") == "dump" and message["params"]["runId"] in (1, 3)
+        ]
+        self.assertEqual(len(pids), 2)
+        self.assertEqual(pids[0], pids[1], "Stress run must preserve the warm kernel")
+        return messages
 
     def test_acceptance_print_dump_and_final_expression(self):
         messages = self.run_script(
@@ -339,6 +394,116 @@ finally:
         self.assertEqual({v["v"] for v in nodes[3]["items"]}, {4, 5})
         self.assertEqual(nodes[4]["v"], "b'abc'")
         self.assertEqual(nodes[5]["v"], "(1+2j)")
+
+    def test_gc_finalizer_printing_does_not_deadlock_readers(self):
+        self.fresh_run_and_check_recovery(
+            """import gc, sys
+old_threshold = gc.get_threshold()
+gc.set_threshold(1)
+class Noisy:
+    def __init__(self): self.me = self
+    def __del__(self): print('finalized')
+for i in range(2000):
+    Noisy()
+    print('err', i, file=sys.stderr)
+    print('out', i)
+gc.collect()
+gc.set_threshold(*old_threshold)
+""",
+            timeout=10,
+        )
+
+    def test_finalizers_on_reader_thread_never_write_to_its_own_pipe(self):
+        messages = self.run_script(
+            r"""import gc, sys, weakref
+kernel = sys.stdout.drain.__globals__
+notify = kernel["notify"]
+collected = [False]
+was_enabled = gc.isenabled()
+gc.disable()
+class Noisy:
+    def __init__(self): self.me = self
+    def __del__(self): sys.stdout.write("F" * 2048)
+for i in range(32):
+    obj = Noisy()
+    weakref.finalize(obj, sys.stdout.write, "W" * 2048)
+del obj
+
+def collect_on_reader(method, params):
+    if method == "stream" and not collected[0]:
+        collected[0] = True
+        gc.collect()
+    notify(method, params)
+
+kernel["notify"] = collect_on_reader
+try:
+    print("trigger", flush=True)
+finally:
+    kernel["notify"] = notify
+    if was_enabled:
+        gc.enable()
+""",
+            timeout=10,
+        )
+        self.assertTrue(messages[-1]["result"]["ok"], messages[-1])
+        text = "".join(
+            message["params"]["text"]
+            for message in messages
+            if message.get("method") == "stream"
+        )
+        self.assertEqual(text.count("F"), 32 * 2048)
+        self.assertEqual(text.count("W"), 32 * 2048)
+
+    @unittest.skipUnless(hasattr(signal, "setitimer"), "interval signals require Unix")
+    def test_signal_handler_printing_stress_and_warm_recovery(self):
+        source = """import signal, sys
+signal.signal(signal.SIGALRM, lambda *a: print('tick', file=sys.stderr))
+signal.setitimer(signal.ITIMER_REAL, 0.0005, 0.0005)
+for i in range(200000): print(i)
+"""
+        # Fresh processes exercise startup, run cleanup and interpreter exit as
+        # well as the write path. The follow-up request checks warm recovery.
+        for _ in range(12):
+            messages = self.fresh_run_and_check_recovery(source, timeout=20)
+            stdout = "".join(
+                message["params"]["text"]
+                for message in messages
+                if message.get("method") == "stream"
+                and message["params"]["runId"] == 2
+                and message["params"]["stream"] == "stdout"
+            )
+            self.assertTrue(stdout.endswith("199999\n"))
+
+    def test_cleanup_exceptions_fail_only_the_request(self):
+        for kind in (
+            "KeyboardInterrupt",
+            "RecursionError",
+            "OSError",
+            "ValueError",
+            "TypeError",
+        ):
+            messages = self.run_script(f"""import os, sys
+kernel = sys.stdout.drain.__globals__
+notify = kernel["notify"]
+def fail_finished(method, params):
+    if method == "run_finished":
+        kernel["notify"] = notify
+        raise {kind}("injected cleanup failure")
+    notify(method, params)
+kernel["notify"] = fail_finished
+os.getpid()
+""")
+            self.assertIn("error", messages[-1], messages)
+            self.assertEqual(messages[-1]["error"]["code"], -32603)
+            self.assertIn(kind, messages[-1]["error"]["message"])
+            before = next(
+                message["params"]["node"]["v"]
+                for message in messages
+                if message.get("method") == "dump"
+            )
+            after = self.run_script("import os\nos.getpid()")
+            self.assertTrue(after[-1]["result"]["ok"])
+            self.assertEqual(before, after[-3]["params"]["node"]["v"])
 
     def test_malformed_request_can_recover(self):
         self.process.stdin.write("not json\n")

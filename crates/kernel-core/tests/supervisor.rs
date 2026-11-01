@@ -176,3 +176,40 @@ async fn native_children_cannot_consume_protocol_input() {
     run(&supervisor, "one", "import subprocess, sys\nresult = subprocess.run([sys.executable, '-c', 'import sys; assert sys.stdin.read() == chr(0)[:0]'], check=True, timeout=2)").await;
     run(&supervisor, "one", "42").await;
 }
+
+#[tokio::test]
+async fn cleanup_failure_reports_run_error_without_restarting_kernel() {
+    let supervisor = Supervisor::default();
+    let before = run(&supervisor, "one", "import os\nos.getpid()").await;
+    let mut events = Vec::new();
+    let result = timeout(
+        Duration::from_secs(5),
+        supervisor.run(
+            "one",
+            r#"import sys
+kernel = sys.stdout.drain.__globals__
+notify = kernel["notify"]
+def fail_finished(method, params):
+    if method == "run_finished":
+        kernel["notify"] = notify
+        raise KeyboardInterrupt("cleanup failure")
+    notify(method, params)
+kernel["notify"] = fail_finished
+"#,
+            |event| events.push(event),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!result.ok);
+    assert!(events.iter().any(|event| event.method == "stream"
+        && event.params["stream"] == "stderr"
+        && event.params["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("KeyboardInterrupt"))));
+    assert_eq!(events.last().unwrap().method, "run_finished");
+    assert_eq!(events.last().unwrap().params["ok"], false);
+    let after = run(&supervisor, "one", "import os\nos.getpid()").await;
+    assert_eq!(value(&before), value(&after));
+}

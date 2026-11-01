@@ -34,7 +34,18 @@ fence cannot release a newer flush.
 Python-level writes are serialized. On a switch between stdout and stderr, the
 previous stream is drained before writing to the next one, preserving their
 relative write order. Both streams are also drained before a script traceback is
-reported. Native-only writes on separate streams still have independent readers
+reported. Ordering gates are acquired without waiting. Reentrant writes (including
+signal handlers and finalizers) and writes on kernel I/O workers use a reentrant
+[`SimpleQueue`](https://docs.python.org/3/library/queue.html#queue.SimpleQueue.put)
+and a separate dispatcher instead of taking gates or writing to a
+pipe the caller might itself be responsible for reading. A thread-local busy
+guard also covers protocol serialization, fence waits and run cleanup. Queued
+callback/concurrent output has best-effort ordering; ordinary sequential script
+writes retain their ordering checks. Worker roles are identifiable before thread
+startup and remain identifiable across run boundaries. Deferred sends are stopped
+under the protocol lock before the run ends, so they cannot leak stale run IDs.
+
+Native-only writes on separate streams still have independent readers
 and no total ordering guarantee. Drain acknowledgements and reader joins each
 wait at most 500 ms per stream if the reader stalls or a script changes descriptors
 or leaves background work; ordering is best-effort after a timeout. Background
@@ -58,9 +69,16 @@ surrogates before JSON encoding so Rust can decode them. Notifications include:
 
 Python exceptions, including `SystemExit` and `KeyboardInterrupt`, stream a plain
 traceback to `stderr`, followed by `run_finished` and a response with `ok: false`.
-A script failure does not discard the warm process. A process crash or malformed
-protocol discards the kernel; the next run creates a fresh one. Unknown methods
-return error `-32601`; invalid requests return `-32600`.
+A script failure does not discard the warm process. Unhandled execution or cleanup
+exceptions are contained at the request boundary and return error `-32603` with
+the exception type. The Rust supervisor displays the failure and completes the
+run with `ok: false`, retaining the same Python process for the next request.
+Interval timers are stopped before restoring idle streams so a script's timer
+handlers cannot continue firing during later requests. Other imported/module
+state remains warm.
+
+A process crash or malformed protocol discards the kernel; the next run creates a
+fresh one. Unknown methods return error `-32601`; invalid requests return `-32600`.
 
 The desktop uses a Tauri IPC channel per invocation so notifications cannot be
 missed between listener registration and execution. Each script serializes its

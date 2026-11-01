@@ -1,8 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
-import CodeEditor from "./CodeEditor";
+import CodeEditor, { type EditorHandle } from "./CodeEditor";
 import { DumpTree } from "./DumpTree";
-import { appendOutputBatch, type KernelEvent, type Output } from "./protocol";
+import {
+  appendOutputBatch,
+  collectDumpUpdates,
+  type DumpNode,
+  type KernelEvent,
+  type Output,
+} from "./protocol";
 
 const SAMPLE = `from codingpad import dump
 
@@ -22,6 +28,7 @@ type Script = {
   running: boolean;
   status: string;
   version: number;
+  updates: Record<string, DumpNode>;
   error?: string;
 };
 const newScript = (number: number): Script => ({
@@ -32,6 +39,7 @@ const newScript = (number: number): Script => ({
   running: false,
   status: "Ready",
   version: 0,
+  updates: {},
 });
 
 export default function App() {
@@ -41,6 +49,7 @@ export default function App() {
   const [closing, setClosing] = useState(false);
   const generation = useRef(new Map<string, number>());
   const running = useRef(new Set<string>());
+  const editor = useRef<EditorHandle | null>(null);
   const frames = useRef(new Map<string, number>());
   const cancelFrame = (id: string) => {
     const frame = frames.current.get(id);
@@ -74,6 +83,7 @@ export default function App() {
       running: true,
       status: "Running…",
       version,
+      updates: {},
       error: undefined,
     }));
     const pending: KernelEvent[] = [];
@@ -81,9 +91,13 @@ export default function App() {
       cancelFrame(script.id);
       const batch = pending.splice(0);
       if (generation.current.get(script.id) === version && batch.length) {
+        const updates = collectDumpUpdates(batch);
         update(script.id, (item) => ({
           ...item,
           output: appendOutputBatch(item.output, batch),
+          updates: Object.keys(updates).length
+            ? { ...item.updates, ...updates }
+            : item.updates,
         }));
       }
     };
@@ -91,11 +105,8 @@ export default function App() {
     onEvent.onmessage = (event) => {
       // A channel can deliver late, even after its invocation resolved. Keep the
       // generation check so an earlier run cannot append to a newer run's output.
-      if (
-        generation.current.get(script.id) !== version ||
-        event.method === "run_finished"
-      )
-        return;
+      if (generation.current.get(script.id) !== version) return;
+      if (event.method === "run_finished") return;
       pending.push(event);
       if (!frames.current.has(script.id)) {
         frames.current.set(script.id, requestAnimationFrame(flush));
@@ -122,6 +133,27 @@ export default function App() {
       running.current.delete(script.id);
       update(script.id, (item) => ({ ...item, running: false }));
     }
+  }
+
+  async function expandNode(
+    handle: string,
+    cursor: string | null,
+  ): Promise<DumpNode> {
+    const result = await invoke<{ node: DumpNode }>("expand_node", {
+      scriptId: active.id,
+      handle,
+      cursor,
+      limit: 100,
+    });
+    return result.node;
+  }
+
+  function openLine(line: number) {
+    const current = editor.current;
+    if (!current) return;
+    current.revealLineInCenter(line);
+    current.setPosition({ lineNumber: line, column: 1 });
+    current.focus();
   }
 
   function addScript() {
@@ -220,6 +252,9 @@ export default function App() {
                 update(active.id, (script) => ({ ...script, source }))
               }
               onRun={() => runActive.current()}
+              onMount={(instance) => {
+                editor.current = instance;
+              }}
             />
           </div>
         </section>
@@ -254,7 +289,12 @@ export default function App() {
                   className="dump"
                   key={`${active.id}:${active.version}:${output.id}`}
                 >
-                  <DumpTree node={output.node} />
+                  <DumpTree
+                    node={output.node}
+                    updates={active.updates}
+                    expand={expandNode}
+                    onOpenLine={openLine}
+                  />
                 </div>
               ),
             )}
@@ -263,7 +303,7 @@ export default function App() {
       </div>
       <footer>
         <span>{active.name} · Scratch scripts are unsaved</span>
-        <span>Python · Basic dump preview</span>
+        <span>Python · Full dump</span>
       </footer>
     </main>
   );

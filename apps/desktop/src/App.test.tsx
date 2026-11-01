@@ -229,3 +229,83 @@ test("late events from an earlier run cannot contaminate a rerun", async () => {
   await screen.findByText("current output");
   expect(screen.queryByText("stale output")).not.toBeInTheDocument();
 });
+
+test("live dump updates replace their inner block and keep the badge", async () => {
+  invoke.mockImplementation(async (_command, args) => {
+    args.onEvent.onmessage({
+      method: "dump",
+      params: {
+        runId: 1,
+        node: {
+          id: "wrapper",
+          kind: "live",
+          node: { id: "inner", kind: "primitive", v: 1 },
+        },
+      },
+    });
+    args.onEvent.onmessage({
+      method: "dump_update",
+      params: {
+        runId: 1,
+        nodeId: "inner",
+        node: { id: "inner-2", kind: "primitive", v: 2 },
+      },
+    });
+    return { ok: true };
+  });
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  await screen.findByText("Finished");
+  expect(screen.getByText("2")).toBeInTheDocument();
+  expect(screen.queryByText("1")).not.toBeInTheDocument();
+  expect(screen.getByText("live")).toBeInTheDocument();
+});
+
+test("live updates share the animation-frame batch instead of re-rendering each", async () => {
+  let callback!: FrameRequestCallback;
+  const schedule = vi.fn((next: FrameRequestCallback) => {
+    callback = next;
+    return 1;
+  });
+  vi.stubGlobal("requestAnimationFrame", schedule);
+  vi.stubGlobal("cancelAnimationFrame", vi.fn());
+  let channel!: { onmessage: (event: KernelEvent) => void };
+  let finish!: (value: { ok: boolean }) => void;
+  invoke.mockImplementation((_command, args) => {
+    channel = args.onEvent;
+    return new Promise((resolve) => {
+      finish = resolve;
+    });
+  });
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  act(() => {
+    channel.onmessage({
+      method: "dump",
+      params: {
+        runId: 1,
+        node: {
+          id: "wrapper",
+          kind: "live",
+          node: { id: "inner", kind: "primitive", v: 0 },
+        },
+      },
+    });
+    for (let index = 1; index <= 100; index++) {
+      channel.onmessage({
+        method: "dump_update",
+        params: {
+          runId: 1,
+          nodeId: "inner",
+          node: { id: `inner-${index}`, kind: "primitive", v: index },
+        },
+      });
+    }
+  });
+  expect(schedule).toHaveBeenCalledTimes(1);
+  expect(screen.queryByText("100")).not.toBeInTheDocument();
+  act(() => callback(0));
+  expect(screen.getByText("100")).toBeInTheDocument();
+  await act(async () => finish({ ok: true }));
+  expect(screen.getByText("Finished")).toBeInTheDocument();
+});

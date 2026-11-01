@@ -178,6 +178,127 @@ async fn native_children_cannot_consume_protocol_input() {
 }
 
 #[tokio::test]
+async fn table_pages_expand_and_expire_between_runs() {
+    let supervisor = Supervisor::default();
+    let events = run(
+        &supervisor,
+        "one",
+        "rows = [{'name': f'row {i}', 'score': i} for i in range(250)]\ndump(rows)",
+    )
+    .await;
+    let table = events
+        .iter()
+        .find(|event| event.method == "dump")
+        .unwrap()
+        .params["node"]
+        .clone();
+    assert_eq!(table["kind"], "table");
+    assert_eq!(table["total"], 250);
+    assert_eq!(table["rows"].as_array().unwrap().len(), 100);
+    let handle = table["handle"].as_str().unwrap().to_owned();
+
+    let page = supervisor
+        .expand("one", &handle, Some("200"), Some(100))
+        .await
+        .unwrap();
+    assert_eq!(page.node["rows"].as_array().unwrap().len(), 50);
+    assert_eq!(page.node["rows"][0][1]["v"], 200);
+    assert!(page.node["next"].is_null());
+
+    run(&supervisor, "one", "42").await;
+    let expired = supervisor
+        .expand("one", &handle, None, None)
+        .await
+        .unwrap_err();
+    assert!(expired.contains("no longer available"));
+}
+
+#[tokio::test]
+async fn lazy_values_expand_on_request() {
+    let supervisor = Supervisor::default();
+    let events = run(
+        &supervisor,
+        "one",
+        "x = 1\nfor _ in range(8): x = (x,)\ndump(x)",
+    )
+    .await;
+    let node = events
+        .iter()
+        .find(|event| event.method == "dump")
+        .unwrap()
+        .params["node"]
+        .clone();
+
+    fn find_lazy(node: &Value) -> Option<String> {
+        if node["kind"] == "lazy" {
+            return node["handle"].as_str().map(str::to_owned);
+        }
+        for field in node["fields"].as_array().into_iter().flatten() {
+            if let Some(handle) = find_lazy(&field["value"]) {
+                return Some(handle);
+            }
+        }
+        for item in node["items"].as_array().into_iter().flatten() {
+            if let Some(handle) = find_lazy(item) {
+                return Some(handle);
+            }
+        }
+        None
+    }
+
+    let handle = find_lazy(&node).unwrap();
+    let expanded = supervisor.expand("one", &handle, None, None).await.unwrap();
+    assert_ne!(expanded.node["kind"], "lazy");
+}
+
+#[tokio::test]
+async fn expanding_an_unknown_script_is_actionable() {
+    let supervisor = Supervisor::default();
+    let error = supervisor
+        .expand("missing", "h1", None, None)
+        .await
+        .unwrap_err();
+    assert!(error.contains("no longer available"));
+}
+
+#[tokio::test]
+async fn expand_drops_a_kernel_that_died() {
+    let supervisor = Supervisor::default();
+    run(
+        &supervisor,
+        "one",
+        "import os, threading\nthreading.Timer(0.05, lambda: os._exit(1)).start()\n42",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let error = supervisor
+        .expand("one", "h1", None, None)
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("exited")
+            || error.contains("Could not")
+            || error.contains("Invalid kernel message"),
+        "{error}"
+    );
+    // A failed expand must not leave the dead process behind for the next run.
+    run(&supervisor, "one", "42").await;
+}
+
+#[tokio::test]
+async fn an_expired_handle_keeps_the_warm_kernel() {
+    let supervisor = Supervisor::default();
+    let first = run(&supervisor, "one", "import os\nos.getpid()").await;
+    let error = supervisor
+        .expand("one", "missing", None, None)
+        .await
+        .unwrap_err();
+    assert!(error.contains("no longer available"));
+    let second = run(&supervisor, "one", "import os\nos.getpid()").await;
+    assert_eq!(value(&first), value(&second));
+}
+
+#[tokio::test]
 async fn cleanup_failure_reports_run_error_without_restarting_kernel() {
     let supervisor = Supervisor::default();
     let before = run(&supervisor, "one", "import os\nos.getpid()").await;

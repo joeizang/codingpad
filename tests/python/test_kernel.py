@@ -49,7 +49,7 @@ class KernelTests(unittest.TestCase):
         self.process.stderr.close()
         self.directory.cleanup()
 
-    def run_script(self, source, timeout=10):
+    def request(self, method, params, timeout=10):
         # Every request is bounded so a kernel deadlock fails the suite instead
         # of hanging the test runner indefinitely.
         watchdog = threading.Timer(timeout, self.process.kill)
@@ -62,8 +62,8 @@ class KernelTests(unittest.TestCase):
                     {
                         "jsonrpc": "2.0",
                         "id": self.request_id,
-                        "method": "run",
-                        "params": {"source": source},
+                        "method": method,
+                        "params": params,
                     }
                 )
                 + "\n"
@@ -79,6 +79,9 @@ class KernelTests(unittest.TestCase):
                     return messages
         finally:
             watchdog.cancel()
+
+    def run_script(self, source, timeout=10):
+        return self.request("run", {"source": source}, timeout)
 
     def fresh_run_and_check_recovery(self, source, timeout=20):
         scripts = ["import os\nos.getpid()", source, "import os\nos.getpid()"]
@@ -129,31 +132,49 @@ class KernelTests(unittest.TestCase):
         )
         dumps = [m["params"]["node"] for m in messages if m.get("method") == "dump"]
         self.assertEqual(dumps[0]["fields"][1]["value"]["items"][1]["v"], 2)
-        self.assertEqual(dumps[1], {"kind": "primitive", "v": 42})
+        self.assertEqual(dumps[1]["kind"], "primitive")
+        self.assertEqual(dumps[1]["v"], 42)
         self.assertEqual(messages[-2]["method"], "run_finished")
         self.assertTrue(messages[-1]["result"]["ok"])
 
     def test_globals_clean_but_process_warm(self):
         first = self.run_script("import os\nx = 99\nos.getpid()")
         second = self.run_script('import os\nassert "x" not in globals()\nos.getpid()')
-        self.assertEqual(first[-3]["params"]["node"], second[-3]["params"]["node"])
+        self.assertEqual(
+            first[-3]["params"]["node"]["v"], second[-3]["params"]["node"]["v"]
+        )
 
-    def test_errors_stderr_and_system_exit_do_not_kill_kernel(self):
-        for source in [
-            "1 / 0",
-            "def broken(",
-            "raise SystemExit(4)",
-            'input("Name: ")',
+    def test_errors_are_structured_and_do_not_kill_kernel(self):
+        for source, type_name in [
+            ("1 / 0", "ZeroDivisionError"),
+            ("def broken(", "SyntaxError"),
+            ("raise SystemExit(4)", "SystemExit"),
+            ('input("Name: ")', "RuntimeError"),
         ]:
             messages = self.run_script(source)
             self.assertFalse(messages[-1]["result"]["ok"])
-            self.assertTrue(
-                any(
-                    m.get("method") == "stream" and m["params"]["stream"] == "stderr"
-                    for m in messages
-                )
-            )
+            errors = [
+                m["params"]["node"]
+                for m in messages
+                if m.get("method") == "dump"
+                and m["params"]["node"]["kind"] == "error"
+            ]
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(errors[0]["type"], type_name)
+            self.assertTrue(errors[0]["message"])
+            self.assertTrue(any(frame["script"] for frame in errors[0]["traceback"]))
         self.assertTrue(self.run_script('print("still alive")')[-1]["result"]["ok"])
+
+    def test_script_error_frame_points_at_the_failing_line(self):
+        messages = self.run_script("x = 1\nraise ValueError('boom')\n")
+        error = next(
+            m["params"]["node"]
+            for m in messages
+            if m.get("method") == "dump"
+        )
+        frames = [frame for frame in error["traceback"] if frame["script"]]
+        self.assertEqual(frames[-1]["line"], 2)
+        self.assertEqual(frames[-1]["text"], "raise ValueError('boom')")
 
     def test_none_and_explicit_dump_are_not_duplicated(self):
         self.assertEqual(
@@ -280,8 +301,8 @@ class KernelTests(unittest.TestCase):
         first_error = next(
             i
             for i, message in enumerate(messages)
-            if message.get("method") == "stream"
-            and message["params"]["stream"] == "stderr"
+            if message.get("method") == "dump"
+            and message["params"]["node"]["kind"] == "error"
         )
         preceding = "".join(
             message["params"]["text"]
@@ -394,6 +415,202 @@ finally:
         self.assertEqual({v["v"] for v in nodes[3]["items"]}, {4, 5})
         self.assertEqual(nodes[4]["v"], "b'abc'")
         self.assertEqual(nodes[5]["v"], "(1+2j)")
+
+    def test_lazy_nodes_expand_and_expire_with_the_next_run(self):
+        messages = self.run_script(
+            "x = 1\nfor _ in range(8): x = (x,)\ndump(x)"
+        )
+        node = next(m["params"]["node"] for m in messages if m.get("method") == "dump")
+        lazy = []
+
+        def find(value):
+            if value.get("kind") == "lazy":
+                lazy.append(value)
+            for item in value.get("items", []):
+                find(item)
+            for field in value.get("fields", []):
+                find(field["value"])
+
+        find(node)
+        self.assertTrue(lazy)
+        expanded = self.request(
+            "expand", {"handle": lazy[0]["handle"], "cursor": None, "limit": 100}
+        )
+        self.assertIn("result", expanded[-1])
+        self.assertNotEqual(expanded[-1]["result"]["node"]["kind"], "lazy")
+        self.run_script("42")
+        expired = self.request(
+            "expand", {"handle": lazy[0]["handle"], "cursor": None, "limit": 100}
+        )
+        self.assertEqual(expired[-1]["error"]["code"], -32001)
+
+    def test_records_become_tables_and_page_over_the_protocol(self):
+        messages = self.run_script(
+            'rows = [{"name": f"row {i}", "score": i, "tags": [i]} for i in range(250)]\ndump(rows)'
+        )
+        table = next(m["params"]["node"] for m in messages if m.get("method") == "dump")
+        self.assertEqual(table["kind"], "table")
+        self.assertEqual(table["total"], 250)
+        self.assertEqual(len(table["rows"]), 100)
+        self.assertEqual(table["next"], "100")
+        self.assertEqual([column["name"] for column in table["columns"]], ["name", "score", "tags"])
+        self.assertEqual(table["rows"][0][0]["v"], "row 0")
+        self.assertEqual(table["rows"][0][2]["kind"], "lazy")
+        page = self.request(
+            "expand", {"handle": table["handle"], "cursor": "200", "limit": 100}
+        )[-1]["result"]["node"]
+        self.assertEqual(len(page["rows"]), 50)
+        self.assertIsNone(page["next"])
+        self.assertEqual(page["rows"][0][1]["v"], 200)
+
+    def test_large_tables_send_only_the_first_page(self):
+        messages = self.run_script(
+            'rows = [{"name": f"row {i}", "score": i} for i in range(100000)]\ndump(rows)'
+        )
+        table = next(m["params"]["node"] for m in messages if m.get("method") == "dump")
+        self.assertEqual(table["total"], 100000)
+        self.assertEqual(len(table["rows"]), 100)
+        self.assertEqual(table["next"], "100")
+        self.assertEqual(table["rows"][-1][1]["v"], 99)
+
+    def test_images_html_and_live_updates(self):
+        messages = self.run_script(
+            'from codingpad import dump, html, image, live\n'
+            'dump(html("<b>hi</b>"))\n'
+            'dump(image(b"\\x89PNG\\r\\n\\x1a\\nx"))\n'
+            'value = live({"n": 1})\n'
+            'dump(value)\n'
+            'value.value = {"n": 2}'
+        )
+        nodes = [m["params"]["node"] for m in messages if m.get("method") == "dump"]
+        self.assertEqual(nodes[0], {**nodes[0], "kind": "html", "html": "<b>hi</b>"})
+        self.assertEqual(nodes[1]["kind"], "image")
+        self.assertEqual(nodes[1]["mime"], "image/png")
+        self.assertTrue(nodes[1]["src"].startswith("data:image/png;base64,"))
+        self.assertEqual(nodes[2]["kind"], "live")
+        update = next(
+            m for m in messages if m.get("method") == "dump_update"
+        )
+        self.assertEqual(update["params"]["nodeId"], nodes[2]["node"]["id"])
+        self.assertEqual(update["params"]["node"]["fields"][0]["value"]["v"], 2)
+
+    def test_exception_with_broken_str_keeps_the_kernel_alive(self):
+        messages = self.run_script(
+            "class E(Exception):\n"
+            "    def __str__(self): raise RuntimeError('bad str')\n"
+            "raise E()"
+        )
+        error = next(
+            message["params"]["node"]
+            for message in messages
+            if message.get("method") == "dump"
+        )
+        self.assertEqual(error["type"], "E")
+        self.assertEqual(error["message"], "<exception str() failed>")
+        self.assertFalse(messages[-1]["result"]["ok"])
+        self.assertTrue(self.run_script("42")[-1]["result"]["ok"])
+
+    def test_chained_exceptions_keep_their_cause(self):
+        messages = self.run_script(
+            "try:\n"
+            "    1 / 0\n"
+            "except Exception as error:\n"
+            "    raise ValueError('outer') from error"
+        )
+        error = next(
+            message["params"]["node"]
+            for message in messages
+            if message.get("method") == "dump"
+        )
+        self.assertEqual(error["type"], "ValueError")
+        self.assertEqual(error["causes"][0]["type"], "ZeroDivisionError")
+
+    def test_expand_failure_is_reported_and_kernel_survives(self):
+        messages = self.run_script(
+            "class S:\n"
+            "    __slots__ = ('a',)\n"
+            "    def __repr__(self): raise RuntimeError('repr boom')\n"
+            "x = S()\n"
+            "for _ in range(6): x = [x]\n"
+            "dump(x)"
+        )
+        node = next(m["params"]["node"] for m in messages if m.get("method") == "dump")
+        lazy = []
+
+        def find(value):
+            if value.get("kind") == "lazy" and value.get("type") == "S":
+                lazy.append(value)
+            for item in value.get("items", []):
+                find(item)
+            for field in value.get("fields", []):
+                find(field["value"])
+
+        find(node)
+        self.assertTrue(lazy)
+        response = self.request(
+            "expand", {"handle": lazy[0]["handle"], "cursor": None, "limit": 100}
+        )[-1]
+        self.assertEqual(response["error"]["code"], -32603)
+        self.assertIn("RuntimeError", response["error"]["message"])
+        self.assertTrue(self.run_script("42")[-1]["result"]["ok"])
+
+    def test_tables_support_non_string_keys(self):
+        messages = self.run_script(
+            "dump([{1: 'a', 2: 'b'}, {1: 'c', 2: 'd'}])"
+        )
+        table = next(m["params"]["node"] for m in messages if m.get("method") == "dump")
+        self.assertEqual(table["kind"], "table")
+        self.assertEqual(
+            [column["name"] for column in table["columns"]], ["1", "2"]
+        )
+        self.assertEqual(table["rows"][0][0]["v"], "a")
+        self.assertEqual(table["rows"][1][1]["v"], "d")
+
+    def test_node_ids_are_unique_across_runs(self):
+        first = self.run_script("42")
+        second = self.run_script("42")
+        first_id = next(m["params"]["node"]["id"] for m in first if m.get("method") == "dump")
+        second_id = next(m["params"]["node"]["id"] for m in second if m.get("method") == "dump")
+        self.assertNotEqual(first_id, second_id)
+
+    def test_expand_catches_base_exceptions_from_user_code(self):
+        messages = self.run_script(
+            "import sys\n"
+            "class S:\n"
+            "    __slots__ = ('a',)\n"
+            "    def __repr__(self): sys.exit(3)\n"
+            "x = S()\n"
+            "for _ in range(6): x = [x]\n"
+            "dump(x)"
+        )
+        node = next(m["params"]["node"] for m in messages if m.get("method") == "dump")
+        lazy = []
+
+        def find(value):
+            if value.get("kind") == "lazy" and value.get("type") == "S":
+                lazy.append(value)
+            for item in value.get("items", []):
+                find(item)
+            for field in value.get("fields", []):
+                find(field["value"])
+
+        find(node)
+        self.assertTrue(lazy)
+        response = self.request(
+            "expand", {"handle": lazy[0]["handle"], "cursor": None, "limit": 100}
+        )[-1]
+        self.assertEqual(response["error"]["code"], -32603)
+        self.assertIn("SystemExit", response["error"]["message"])
+        self.assertTrue(self.run_script("42")[-1]["result"]["ok"])
+
+    def test_a_live_value_kept_between_runs_ignores_old_targets(self):
+        self.run_script(
+            "import sys\nfrom codingpad import dump, live\n"
+            "sys.shared = live(1)\ndump(sys.shared)"
+        )
+        messages = self.run_script("import sys\nsys.shared.value = 2\n42")
+        self.assertFalse(any(m.get("method") == "dump_update" for m in messages))
+        self.assertTrue(messages[-1]["result"]["ok"])
 
     def test_gc_finalizer_printing_does_not_deadlock_readers(self):
         self.fresh_run_and_check_recovery(

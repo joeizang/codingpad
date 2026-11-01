@@ -126,7 +126,7 @@ export default function App() {
       update(script.id, (item) => ({
         ...item,
         status: result.cacheCleared
-          ? "Stopped · kernel restarted; cache cleared"
+          ? "Stopped · cache cleared"
           : result.stopped
             ? "Stopped"
             : result.ok
@@ -147,7 +147,11 @@ export default function App() {
   }
 
   async function controlScript(script: Script, action: "stop" | "reset") {
-    if (script.controlling) return;
+    if (
+      script.controlling ||
+      (action === "stop" && !running.current.has(script.id))
+    )
+      return;
     update(script.id, (item) => ({
       ...item,
       controlling: true,
@@ -156,15 +160,6 @@ export default function App() {
     }));
     try {
       await invoke(`${action}_script`, { scriptId: script.id });
-      if (action === "stop") {
-        update(script.id, (item) => ({
-          ...item,
-          status:
-            !item.running && item.status === "Stopping…"
-              ? "Stopped"
-              : item.status,
-        }));
-      }
       if (action === "reset") {
         cancelFrame(script.id);
         generation.current.set(

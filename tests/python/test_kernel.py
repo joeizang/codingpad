@@ -140,6 +140,42 @@ class KernelTests(unittest.TestCase):
         self.assertFalse(responses[0]["result"]["ok"])
         self.assertTrue(responses[1]["result"]["ok"])
 
+    def test_runs_preserve_user_tracing(self):
+        self.run_script("import sys\ndef trace(frame, event, arg): return trace\nsys.settrace(trace)")
+        messages = self.run_script("import sys\nassert sys.gettrace() is not None\nsys.settrace(None)")
+        self.assertTrue(messages[-1]["result"]["ok"])
+
+    def test_empty_and_future_only_scripts_run(self):
+        for source in ("", "# comment", "from __future__ import annotations"):
+            self.assertTrue(self.run_script(source)[-1]["result"]["ok"])
+
+    def test_late_interrupt_is_ignored_during_request_cleanup(self):
+        messages = self.run_script("""import sys, signal
+kernel = sys.stdout.drain.__globals__
+notify = kernel['notify']
+def late_interrupt(method, params):
+    if method == 'run_finished':
+        # exec has returned: a delayed signal must not abort request cleanup,
+        # even though this callback itself was defined in the script.
+        signal.raise_signal(signal.SIGINT)
+        kernel['notify'] = notify
+    notify(method, params)
+kernel['notify'] = late_interrupt
+42
+""")
+        self.assertTrue(messages[-1]["result"]["ok"])
+        self.assertTrue(self.run_script("42")[-1]["result"]["ok"])
+
+    def test_invalid_run_releases_cancellation_registration(self):
+        self.assertIn("error", self.request("run", {"source": 123})[-1])
+        # The input thread owns the registry; inspect its frame from a later run.
+        messages = self.run_script("""import sys
+frames = sys._current_frames().values()
+registries = [frame.f_locals['cancellations'] for frame in frames if 'cancellations' in frame.f_locals]
+assert registries and all(1 not in registry for registry in registries)
+""")
+        self.assertTrue(messages[-1]["result"]["ok"], messages)
+
     def test_cache_reuses_values_and_retries_failed_factories(self):
         first = self.run_script("cache('value', lambda: [42])")
         second = self.run_script("from codingpad import cache\ncache('value', lambda: [99])")

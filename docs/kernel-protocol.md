@@ -101,25 +101,34 @@ The supervisor sends cancellation as a notification targeting the active run ID:
 A dedicated Python input thread receives notifications while the main thread
 executes a script. Cancellation sets an event registered when the run request is
 received, so a Stop arriving before execution starts is retained. Wrong or
-expired run IDs are ignored. The script's trace hook checks the event at Python
-execution boundaries and raises `KeyboardInterrupt("Run stopped")`; the ordinary
-error/result path completes the request. Imported/native code may not reach a
-script boundary promptly, and scripts may catch the interrupt or disable tracing.
+expired run IDs are ignored. While a script executes, cancellation signals the
+main thread with `pthread_kill(SIGINT)` on Unix, or `interrupt_main()` elsewhere.
+The SIGINT handler raises `KeyboardInterrupt("Run stopped")` only when the active
+run's cancellation is pending and the stack still contains a script frame. Late
+interrupts during cleanup are ignored. One entry check handles cancellation that
+arrives before `exec` begins. Ordinary runs install no trace hook, preserving user
+tracers and avoiding per-call/per-line overhead. Imported Python code is covered;
+Unix signals also interrupt `sleep()`. Scripts may catch or ignore SIGINT, and
+some native calls (including Windows sleep) may delay signal handling.
 
 After two seconds without a run response, the supervisor kills the process and
-starts a fresh kernel. The desktop `run_script` result adds `stopped` and
-`cacheCleared` booleans to the kernel's `ok` result. A forced stop sets both flags,
+discards it; the next Run starts a fresh kernel. The desktop `run_script` result
+adds `stopped` and `cacheCleared` booleans to the kernel's `ok` result. A forced stop sets both flags,
 reports the cleared cache, and retains output already received. Cooperative Stop
-sets only `stopped`, retaining the kernel and cache. Idle Stop is a no-op.
+sets only `stopped`, retaining the kernel and cache. A successful response remains
+Finished even when Stop was requested concurrently. Idle Stop cannot cancel a
+later run because new watch subscribers start with the current version consumed.
 
-`reset_script` stops any active run and replaces the kernel, clearing all handles,
-imports and cached values. The desktop offers Reset when idle and clears old
-output and pending updates. Stop and Reset operate on one script only.
+`reset_script` stops any active run and discards the kernel, clearing all handles,
+imports and cached values. Kernel startup is deferred until the next Run, so a
+missing toolchain cannot turn a completed Stop or Reset into a startup error.
+The desktop offers Reset when idle and clears old output and pending updates. Stop and Reset operate on one script only.
 
 The built-in `cache(key, factory)` helper stores successful factory results by
 hashable key in the warm process. Cached `None` values count as hits. Exceptions
-are never cached. Each script's process owns its cache, which survives clean
-execution scopes and cooperative Stop, but ends on Reset, close or restart.
+are never cached. Factories run outside the shared lock; concurrent misses may
+compute more than once and the first stored result wins. Each script's process
+owns its cache, which survives clean execution scopes and cooperative Stop, but ends on Reset, close or restart.
 
 ## Expanding values
 

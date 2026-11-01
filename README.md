@@ -78,10 +78,10 @@ Scratch scripts are **unsaved** until the library/files work in #4 lands.
 - `packaging/placeholders`: registry name reservations, separate from the runtime
 
 **Stop** requests cancellation first. If the script has not finished after about
-two seconds (for example, it is blocked in native code), CodingPad kills and
-restarts its kernel and reports that the cache was cleared. An interruptible
+two seconds (for example, it is blocked in native code), CodingPad kills its
+kernel and reports that the cache was cleared; the next Run starts a fresh kernel. An interruptible
 Python loop stops without clearing its cache. **Reset**, available when idle,
-restarts that script's kernel and clears cached values and old results.
+discards that script's kernel and clears cached values and old results.
 
 Use `cache(key, factory)` (also importable from `codingpad`) to keep slow results
 across reruns. Each script has its own cache; failed computations are not saved:
@@ -92,6 +92,9 @@ from codingpad import cache
 rows = cache("rows", lambda: expensive_query())
 dump(rows)
 ```
+
+Concurrent cache misses may run the factory more than once; the first stored
+value wins. Factories can wait on worker threads that also use `cache()`.
 
 Change the key or Reset to recompute a value. A forced restart or closing the tab
 also clears its cache. Globals still start fresh on every run.

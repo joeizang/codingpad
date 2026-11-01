@@ -135,7 +135,6 @@ impl Supervisor {
         };
         if result.as_ref().is_ok_and(|result| result.cache_cleared) {
             *guard = None;
-            *guard = Some(Kernel::start(&self.uv).await?);
         }
         if result.is_err() {
             // Dropping the child kills it. Next run starts a fresh kernel.
@@ -147,12 +146,10 @@ impl Supervisor {
     pub async fn stop(&self, script_id: &str) {
         let slot = self.kernels.lock().await.get(script_id).cloned();
         if let Some(slot) = slot {
-            // An idle kernel has nothing to cancel. Never hold the map lock
-            // while waiting for a running script to release its kernel.
-            if slot.kernel.try_lock().is_err() {
-                slot.stop.send_modify(|version| *version += 1);
-                drop(slot.kernel.lock().await);
-            }
+            // New subscribers see the current version as already consumed.
+            // Always notify runs subscribed before Stop, even before they lock.
+            slot.stop.send_modify(|version| *version += 1);
+            drop(slot.kernel.lock().await);
         }
     }
 
@@ -165,7 +162,6 @@ impl Supervisor {
                 return Err("Script was closed".into());
             }
             *guard = None;
-            *guard = Some(Kernel::start(&self.uv).await?);
         }
         Ok(())
     }
@@ -387,7 +383,7 @@ impl Kernel {
                 let value = response_result(&message, id).map_err(CallError::message)?;
                 let mut result: RunResult =
                     serde_json::from_value(value).map_err(|e| e.to_string())?;
-                result.stopped = stopped;
+                result.stopped = stopped && !result.ok;
                 return Ok(result);
             }
             if message["params"]["runId"] != id {
@@ -444,6 +440,54 @@ impl Drop for Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stop_notifies_a_run_subscribed_before_taking_kernel_lock() {
+        let supervisor = Supervisor::default();
+        let slot = Arc::new(Slot::new());
+        supervisor
+            .kernels
+            .lock()
+            .await
+            .insert("one".into(), slot.clone());
+        // Reproduce the window between run's subscription and lock acquisition.
+        let pending_run = slot.stop.subscribe();
+        supervisor.stop("one").await;
+        assert!(pending_run.has_changed().unwrap());
+        let next_run = slot.stop.subscribe();
+        assert!(!next_run.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn stop_and_reset_succeed_when_the_toolchain_becomes_unavailable() {
+        let mut supervisor = Supervisor::default();
+        assert!(supervisor.run("one", "42", |_| {}).await.unwrap().ok);
+        supervisor.uv = PathBuf::from("/codingpad-missing-toolchain/uv");
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let mut ready = Some(ready);
+        let run = supervisor.run("one", "import signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nprint('ready', flush=True)\ntime.sleep(60)", |event| {
+            if event.method == "stream" && event.params["text"].as_str().is_some_and(|text| text.contains("ready")) {
+                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            }
+        });
+        let stop = async {
+            started.await.unwrap();
+            supervisor.stop("one").await;
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+            tokio::join!(run, stop)
+        })
+        .await
+        .unwrap();
+        let result = result.unwrap();
+        assert!(result.stopped && result.cache_cleared);
+        supervisor.reset("one").await.unwrap();
+        assert!(supervisor
+            .run("one", "42", |_| {})
+            .await
+            .unwrap_err()
+            .contains("uv was not found"));
+    }
 
     #[test]
     fn finder_path_includes_both_homebrew_prefixes_after_user_tools() {

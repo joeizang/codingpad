@@ -399,10 +399,10 @@ async fn unresponsive_stop_restarts_kernel_and_clears_cache() {
         "import os\ncache('saved', lambda: 42)\nos.getpid()",
     )
     .await;
-    // Disabling tracing also exercises the escape hatch for native blocking code.
+    // Ignoring SIGINT exercises the fallback for uncooperative/native code.
     let task = start_until_ready(
         supervisor.clone(),
-        "import sys, time\nsys.settrace(None)\nprint('ready', flush=True)\ntime.sleep(60)",
+        "import signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nprint('ready', flush=True)\ntime.sleep(60)",
     )
     .await;
     timeout(Duration::from_secs(6), supervisor.stop("one"))
@@ -437,4 +437,63 @@ async fn reset_clears_cache_and_handles_without_affecting_other_scripts() {
     let two = run(&supervisor, "two", "cache('key', lambda: 'new')").await;
     assert_eq!(value(&one), "new");
     assert_eq!(value(&two), 99);
+}
+
+#[tokio::test]
+async fn stop_interrupts_imported_python_code_without_clearing_cache() {
+    let supervisor = std::sync::Arc::new(Supervisor::default());
+    let task = start_until_ready(
+        supervisor.clone(),
+        r#"library = {}
+exec(compile('def spin():\n    while True: pass', 'library.py', 'exec'), library)
+print('ready', flush=True)
+library['spin']()
+"#,
+    )
+    .await;
+    timeout(Duration::from_secs(5), supervisor.stop("one"))
+        .await
+        .unwrap();
+    let result = task.await.unwrap();
+    assert!(result.stopped);
+    assert!(!result.cache_cleared);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stop_interrupts_sleep_without_restarting_kernel() {
+    let supervisor = std::sync::Arc::new(Supervisor::default());
+    let task = start_until_ready(
+        supervisor.clone(),
+        "import time\nprint('ready', flush=True)\ntime.sleep(60)",
+    )
+    .await;
+    timeout(Duration::from_secs(5), supervisor.stop("one"))
+        .await
+        .unwrap();
+    let result = task.await.unwrap();
+    assert!(result.stopped);
+    assert!(!result.cache_cleared);
+}
+
+#[tokio::test]
+async fn successful_run_after_stop_request_is_not_reported_as_stopped() {
+    let supervisor = std::sync::Arc::new(Supervisor::default());
+    let task = start_until_ready(
+        supervisor.clone(),
+        r#"import signal, time
+signal.signal(signal.SIGINT, lambda *args: None)
+print('ready', flush=True)
+time.sleep(0.2)
+42
+"#,
+    )
+    .await;
+    timeout(Duration::from_secs(5), supervisor.stop("one"))
+        .await
+        .unwrap();
+    let result = task.await.unwrap();
+    assert!(result.ok);
+    assert!(!result.stopped);
+    assert!(!result.cache_cleared);
 }

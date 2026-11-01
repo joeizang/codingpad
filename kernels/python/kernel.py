@@ -1,5 +1,6 @@
 """CodingPad protocol v1: newline-delimited JSON-RPC 2.0 on stdio."""
 
+import _thread
 import ast
 import builtins
 import codecs
@@ -420,6 +421,58 @@ def script_timers():
                     stop(timer, 0)
 
 
+# No tracing on normal runs. Only an actual cancellation delivers SIGINT.
+_cancel_gate = threading.RLock()
+_executing_cancel = None
+_main_ident = threading.get_ident()
+
+
+def check_cancelled(event):
+    if event.is_set():
+        event.clear()
+        raise KeyboardInterrupt("Run stopped")
+
+
+def handle_interrupt(signum, frame):
+    with _cancel_gate:
+        event = _executing_cancel
+        if event is None or not event.is_set():
+            return
+        # A queued interrupt can arrive after exec returned. Never raise in
+        # request teardown or carry an old interrupt into the next run.
+        while frame is not None:
+            if frame.f_code.co_filename == "<codingpad>":
+                check_cancelled(event)
+                return
+            frame = frame.f_back
+
+
+@contextlib.contextmanager
+def script_cancellation(event):
+    global _executing_cancel
+    try:
+        with _cancel_gate:
+            signal.signal(signal.SIGINT, handle_interrupt)
+            _executing_cancel = event
+        check_cancelled(event)
+        yield
+    finally:
+        with _cancel_gate:
+            _executing_cancel = None
+            # Scripts may have replaced SIGINT. Ignore late signals while idle.
+            signal.signal(signal.SIGINT, handle_interrupt)
+
+
+def cancel_run(event):
+    with _cancel_gate:
+        event.set()
+        if _executing_cancel is event:
+            if os.name == "posix" and hasattr(signal, "pthread_kill"):
+                signal.pthread_kill(_main_ident, signal.SIGINT)
+            else:
+                _thread.interrupt_main()
+
+
 def run(request):
     run_id = request["id"]
     source = request["params"]["source"]
@@ -492,23 +545,35 @@ def run(request):
                     wrapped = ast.Call(ast.Name(auto_name, ast.Load()), arguments, [])
                     tree.body[-1] = ast.copy_location(ast.Expr(wrapped), last)
                     ast.fix_missing_locations(tree)
-                code = compile(tree, filename, "exec")
                 cancelled = request["_cancel"]
-
-                def check_cancel(frame, event, arg):
-                    if frame.f_code.co_filename != filename:
-                        return None
-                    if cancelled.is_set():
-                        cancelled.clear()
-                        raise KeyboardInterrupt("Run stopped")
-                    return check_cancel
-
-                previous_trace = sys.gettrace()
-                try:
-                    sys.settrace(check_cancel)
+                # One entry check closes the gap between enabling cancellation
+                # and entering exec. Preserve docstrings and future directives.
+                check_name = "__codingpad_check_cancel__"
+                scope[check_name] = lambda: check_cancelled(cancelled)
+                index = 0
+                if (
+                    tree.body
+                    and isinstance(tree.body[0], ast.Expr)
+                    and isinstance(tree.body[0].value, ast.Constant)
+                    and isinstance(tree.body[0].value.value, str)
+                ):
+                    index = 1
+                while (
+                    index < len(tree.body)
+                    and isinstance(tree.body[index], ast.ImportFrom)
+                    and tree.body[index].module == "__future__"
+                ):
+                    index += 1
+                check = ast.Expr(ast.Call(ast.Name(check_name, ast.Load()), [], []))
+                if index < len(tree.body):
+                    ast.copy_location(check, tree.body[index])
+                else:
+                    check.lineno, check.col_offset = 1, 0
+                tree.body.insert(index, check)
+                ast.fix_missing_locations(tree)
+                code = compile(tree, filename, "exec")
+                with script_cancellation(cancelled):
                     exec(code, scope)
-                finally:
-                    sys.settrace(previous_trace)
                 ok = True
             except BaseException as error:
                 # Finish preceding output before reporting the script failure.
@@ -562,6 +627,7 @@ def expand(request):
 
 
 def main():
+    signal.signal(signal.SIGINT, handle_interrupt)
     requests = Queue()
     cancellations = {}
     gate = threading.Lock()
@@ -581,7 +647,7 @@ def main():
                                 with gate:
                                     event = cancellations.get(params["runId"])
                                     if event is not None:
-                                        event.set()
+                                        cancel_run(event)
                             continue
                         if message.get("method") == "run" and isinstance(
                             message.get("id"), int
@@ -624,11 +690,7 @@ def main():
                     raise ValueError("run requires params.source as a string")
                 try:
                     request["_cancel"] = cancelled
-                    try:
-                        run(request)
-                    finally:
-                        with gate:
-                            cancellations.pop(request["id"], None)
+                    run(request)
                 except BaseException as error:
                     # Execution/cleanup failures are request errors, not malformed
                     # input and not a reason to terminate the warm kernel.
@@ -652,6 +714,10 @@ def main():
                     "error": {"code": -32600, "message": str(error)},
                 }
             )
+        finally:
+            if cancelled is not None:
+                with gate:
+                    cancellations.pop(request["id"], None)
 
 
 if __name__ == "__main__":

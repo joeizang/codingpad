@@ -332,7 +332,7 @@ test("Stop keeps results and reports a forced restart clearing the cache", async
   fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
   expect(screen.getByRole("button", { name: "Reset" })).toBeDisabled();
   fireEvent.click(screen.getByRole("button", { name: "Stop" }));
-  await screen.findByText("Stopped · kernel restarted; cache cleared");
+  await screen.findByText("Stopped · cache cleared");
   expect(screen.getByText("before stop")).toBeInTheDocument();
   expect(invoke).toHaveBeenCalledWith("stop_script", { scriptId: "scratch-1" });
   expect(screen.getByRole("button", { name: "▶ Run" })).toBeEnabled();
@@ -357,4 +357,22 @@ test("Reset clears old output and targets only the active script", async () => {
   expect(invoke).toHaveBeenCalledWith("reset_script", {
     scriptId: "scratch-1",
   });
+});
+
+test("a run finishing successfully during Stop still shows Finished", async () => {
+  let finish: (value: unknown) => void = () => {};
+  invoke.mockImplementation((command) => {
+    if (command === "run_script")
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    if (command === "stop_script")
+      finish({ ok: true, stopped: false, cacheCleared: false });
+    return Promise.resolve();
+  });
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+  await screen.findByText("Finished");
+  expect(screen.queryByText("Stopped")).not.toBeInTheDocument();
 });

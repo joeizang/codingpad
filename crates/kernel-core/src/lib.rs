@@ -520,13 +520,21 @@ async fn stream_package_progress(
     reader: impl tokio::io::AsyncRead + Unpin,
     emit: &mut (impl FnMut(KernelEvent) + Send),
 ) -> Result<(), String> {
-    // The buffered decoder retains UTF-8 sequences split across pipe reads.
-    let mut lines = BufReader::new(reader).lines();
-    while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
+    // Buffer complete lines before decoding: preserve split UTF-8 sequences,
+    // while tolerating invalid bytes relayed from package build backends.
+    let mut reader = BufReader::new(reader);
+    let mut line = Vec::new();
+    while reader
+        .read_until(b'\n', &mut line)
+        .await
+        .map_err(|e| e.to_string())?
+        != 0
+    {
         emit(KernelEvent {
             method: "stream".into(),
-            params: json!({"runId": 0, "stream": "stderr", "text": format!("{line}\n")}),
+            params: json!({"runId": 0, "stream": "stderr", "text": String::from_utf8_lossy(&line)}),
         });
+        line.clear();
     }
     Ok(())
 }
@@ -609,6 +617,21 @@ mod tests {
             .map(|event| event.params["text"].as_str().unwrap())
             .collect();
         assert_eq!(text, expected);
+    }
+
+    #[tokio::test]
+    async fn package_progress_tolerates_invalid_bytes_and_preserves_final_line() {
+        let input = b"build backend: \xff\nactual uv error: \xfe";
+        let mut events = Vec::new();
+        stream_package_progress(&input[..], &mut |event| events.push(event))
+            .await
+            .unwrap();
+        let text: String = events
+            .iter()
+            .map(|event| event.params["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(text, "build backend: \u{fffd}\nactual uv error: \u{fffd}");
+        assert_eq!(events.len(), 2);
     }
 
     #[tokio::test]

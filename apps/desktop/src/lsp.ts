@@ -23,6 +23,7 @@ export type LspEvent =
 
 export type LspCompletionItem = {
   label: string | { label: string; detail?: string; description?: string };
+  data?: unknown;
   kind?: number;
   detail?: string;
   documentation?: string | { kind: string; value: string };
@@ -157,4 +158,60 @@ const COMPLETION_KINDS: Record<number, number> = {
 
 export function completionKind(kind?: number): number {
   return kind === undefined ? 18 : (COMPLETION_KINDS[kind] ?? 18);
+}
+
+// A stable value for the script's inline dependency set. The editor restarts
+// basedpyright only when this changes, not on every keystroke.
+export function inlineDependencyKey(source: string): string {
+  const lines = source.split(/\r?\n/);
+  let inside = false;
+  const body: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trimStart();
+    if (!inside) {
+      if (trimmed === "# /// script") inside = true;
+      continue;
+    }
+    const content = trimmed.replace(/^# ?/, "");
+    if (content.trim() === "///") break;
+    body.push(content);
+  }
+  if (!inside) return "";
+  const metadata = body.join("\n");
+  const block = dependencyArray(metadata);
+  if (block === null) return "";
+  return (block.match(/"([^"]*)"|'([^']*)'/g) ?? [])
+    .map((value) => value.slice(1, -1))
+    .join("\n");
+}
+
+function dependencyArray(metadata: string): string | null {
+  const start = metadata.match(/dependencies\s*=\s*\[/);
+  if (start?.index === undefined) return null;
+  const content = start.index + start[0].length;
+  let depth = 1;
+  let quote: string | null = null;
+  let escaped = false;
+  for (let index = content; index < metadata.length; index++) {
+    const character = metadata[index];
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+    } else if (character === "[") {
+      depth++;
+    } else if (character === "]") {
+      depth--;
+      if (depth === 0) return metadata.slice(content, index);
+    }
+  }
+  return null;
 }

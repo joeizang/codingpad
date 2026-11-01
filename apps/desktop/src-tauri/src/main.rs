@@ -25,11 +25,10 @@ async fn start_language_server(
     language_servers: State<'_, LanguageServers>,
     script_id: String,
     source: String,
-    script_path: Option<String>,
     on_event: Channel<LspEvent>,
 ) -> Result<LspStartResult, String> {
     language_servers
-        .start_python(&script_id, &source, script_path.as_deref(), move |event| {
+        .start_python(&script_id, &source, move |event| {
             let _ = on_event.send(event);
         })
         .await
@@ -52,15 +51,6 @@ async fn request_language_server(
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     language_servers.request(&script_id, &method, params).await
-}
-
-#[tauri::command]
-async fn stop_language_server(
-    language_servers: State<'_, LanguageServers>,
-    script_id: String,
-) -> Result<(), String> {
-    language_servers.stop(&script_id).await;
-    Ok(())
 }
 
 #[tauri::command]
@@ -88,8 +78,13 @@ async fn reset_script(supervisor: State<'_, Supervisor>, script_id: String) -> R
 }
 
 #[tauri::command]
-async fn close_script(supervisor: State<'_, Supervisor>, script_id: String) -> Result<(), String> {
+async fn close_script(
+    supervisor: State<'_, Supervisor>,
+    language_servers: State<'_, LanguageServers>,
+    script_id: String,
+) -> Result<(), String> {
     supervisor.close(&script_id).await;
+    language_servers.close(&script_id).await;
     Ok(())
 }
 
@@ -105,8 +100,7 @@ fn main() {
             close_script,
             start_language_server,
             change_language_server,
-            request_language_server,
-            stop_language_server
+            request_language_server
         ])
         .build(tauri::generate_context!())
         .expect("Could not start CodingPad")

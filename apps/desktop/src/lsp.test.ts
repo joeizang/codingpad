@@ -6,6 +6,7 @@ import {
   diagnosticMarkers,
   diagnosticsFor,
   hoverMarkdown,
+  inlineDependencyKey,
   markerSeverity,
   summarizeDiagnostics,
   type LspDiagnostic,
@@ -76,6 +77,21 @@ describe("language-server presentation", () => {
       }),
     ).toBe("First\n\n**Second**");
     expect(hoverMarkdown(null)).toBe("");
+  });
+
+  test("restarts only when the inline dependency set changes", () => {
+    expect(inlineDependencyKey("print(1)")).toBe("");
+    const source = '# /// script\n# dependencies = ["requests"]\n# ///\nimport requests';
+    expect(inlineDependencyKey(source)).toBe("requests");
+    expect(
+      inlineDependencyKey(source.replace('"requests"', '"requests", "rich"')),
+    ).toBe("requests\nrich");
+    const extras =
+      '# /// script\n# dependencies = ["requests[security]"]\n# ///';
+    expect(inlineDependencyKey(extras)).toBe("requests[security]");
+    expect(
+      inlineDependencyKey(extras.replace("[security]", "[socks]")),
+    ).toBe("requests[socks]");
   });
 
   test("maps completion labels, documentation and kinds", () => {

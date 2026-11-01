@@ -126,7 +126,9 @@ Python completions, hover and type diagnostics come from **basedpyright** throug
 the app's language-server bridge. The first editor start may download basedpyright
 with `uv`; later starts reuse the cache. PEP 723 inline dependencies are installed
 for the editor environment, so completions work for the packages a script
-declares.
+declares. Editing the inline metadata restarts the language server for the new
+dependency set; only wheels are used, so an sdist is never built just by opening
+a script.
 
 Type errors appear as squiggles and a count in the editor header, but they never
 stop **Run**; Python executes regardless.

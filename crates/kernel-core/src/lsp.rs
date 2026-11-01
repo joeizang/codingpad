@@ -8,14 +8,14 @@
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicI64, AtomicU64, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex as StdMutex,
     },
     time::Duration,
 };
@@ -24,8 +24,8 @@ use tokio::{
     io::{
         AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines,
     },
-    process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{oneshot, Mutex},
+    process::{Child, ChildStdout, Command},
+    sync::{mpsc, oneshot, Mutex},
     time::timeout,
 };
 use url::Url;
@@ -52,11 +52,14 @@ pub struct LspStartResult {
 }
 
 type EventSink = Arc<dyn Fn(LspEvent) + Send + Sync>;
+type Events = Arc<StdMutex<EventSink>>;
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 
 pub struct LanguageServers {
     uv: PathBuf,
     servers: Mutex<HashMap<String, Arc<LspServer>>>,
+    start: Mutex<()>,
+    closed: Mutex<HashSet<String>>,
 }
 
 impl Default for LanguageServers {
@@ -70,24 +73,50 @@ impl LanguageServers {
         Self {
             uv,
             servers: Mutex::new(HashMap::new()),
+            start: Mutex::new(()),
+            closed: Mutex::new(HashSet::new()),
         }
     }
 
-    /// Start (or replace) the Python language server for one script.
+    /// Start the Python language server for one script, or reuse the warm one
+    /// when the script's inline dependency set has not changed.
     pub async fn start_python(
         &self,
         script_id: &str,
         source: &str,
-        script_path: Option<&str>,
         emit: impl Fn(LspEvent) + Send + Sync + 'static,
     ) -> Result<LspStartResult, String> {
         if script_id.is_empty() {
             return Err("A script id is required".into());
         }
         let dependencies = inline_dependencies(source);
-        let workspace = PythonWorkspace::create(source, script_path)?;
-        let server = LspServer::start(&self.uv, &dependencies, workspace, Arc::new(emit)).await?;
+        let events: EventSink = Arc::new(emit);
 
+        let _start = self.start.lock().await;
+        if self.closed.lock().await.contains(script_id) {
+            return Err("The script was closed".into());
+        }
+        let existing = self.servers.lock().await.get(script_id).cloned();
+        if let Some(existing) = existing {
+            if existing.dependencies == dependencies && existing.alive() {
+                existing.set_events(events.clone());
+                if existing.did_change(source).await.is_ok() {
+                    if self.closed.lock().await.contains(script_id) {
+                        self.servers.lock().await.remove(script_id);
+                        existing.stop().await;
+                        return Err("The script was closed".into());
+                    }
+                    return Ok(LspStartResult {
+                        uri: existing.document_uri.clone(),
+                    });
+                }
+            }
+            self.servers.lock().await.remove(script_id);
+            existing.stop().await;
+        }
+
+        let workspace = PythonWorkspace::create(source)?;
+        let server = LspServer::start(&self.uv, dependencies, workspace, events).await?;
         let previous = self
             .servers
             .lock()
@@ -115,6 +144,11 @@ impl LanguageServers {
             server.stop().await;
             return Err("The language server was stopped".into());
         }
+        if self.closed.lock().await.contains(script_id) {
+            self.remove_if_same(script_id, &server).await;
+            server.stop().await;
+            return Err("The script was closed".into());
+        }
         Ok(LspStartResult {
             uri: server.document_uri.clone(),
         })
@@ -132,8 +166,8 @@ impl LanguageServers {
         method: &str,
         params: Value,
     ) -> Result<Value, String> {
-        if !method.starts_with("textDocument/") {
-            return Err("Only text-document language-server requests are allowed".into());
+        if !method.starts_with("textDocument/") && method != "completionItem/resolve" {
+            return Err("Only text-document and completion-resolve requests are allowed".into());
         }
         self.server(script_id).await?.request(method, params).await
     }
@@ -143,6 +177,12 @@ impl LanguageServers {
         if let Some(server) = server {
             server.stop().await;
         }
+    }
+
+    /// Stop a closed tab's server and remember not to start it again.
+    pub async fn close(&self, script_id: &str) {
+        self.closed.lock().await.insert(script_id.to_owned());
+        self.stop(script_id).await;
     }
 
     pub async fn shutdown(&self) {
@@ -194,10 +234,13 @@ impl LanguageServers {
 
 struct LspServer {
     child: Mutex<Child>,
-    stdin: Arc<Mutex<ChildStdin>>,
+    writer: mpsc::UnboundedSender<Value>,
     pending: Pending,
     next_id: AtomicU64,
-    version: AtomicI64,
+    version: Arc<Mutex<i64>>,
+    alive: Arc<AtomicBool>,
+    events: Events,
+    dependencies: Vec<String>,
     document_uri: String,
     workspace_uri: String,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
@@ -207,11 +250,11 @@ struct LspServer {
 impl LspServer {
     async fn start(
         uv: &Path,
-        dependencies: &[String],
+        dependencies: Vec<String>,
         workspace: PythonWorkspace,
         events: EventSink,
     ) -> Result<Arc<Self>, String> {
-        let mut command = server_command(uv, dependencies);
+        let mut command = server_command(uv, &dependencies);
         command
             .current_dir(&workspace.root)
             .stdin(Stdio::piped())
@@ -221,10 +264,12 @@ impl LspServer {
         if let Ok(paths) = std::env::join_paths(&workspace.extra_paths) {
             command.env("PYTHONPATH", paths);
         }
+        #[cfg(unix)]
+        command.process_group(0);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            command.creation_flags(0x08000000 | 0x00000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         }
 
         let mut child = command.spawn().map_err(|error| {
@@ -246,16 +291,30 @@ impl LspServer {
             .stderr
             .take()
             .ok_or_else(|| "Could not open the language server error stream".to_owned())?;
-        let stdin = Arc::new(Mutex::new(stdin));
+        let (writer, mut writer_rx) = mpsc::unbounded_channel::<Value>();
+        tokio::spawn(async move {
+            let mut stdin = stdin;
+            while let Some(message) = writer_rx.recv().await {
+                if write_message(&mut stdin, &message).await.is_err() {
+                    break;
+                }
+            }
+        });
         let pending = Arc::new(Mutex::new(HashMap::new()));
+        let version = Arc::new(Mutex::new(0));
+        let alive = Arc::new(AtomicBool::new(true));
+        let events: Events = Arc::new(StdMutex::new(events));
         let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
 
         let server = Arc::new(Self {
             child: Mutex::new(child),
-            stdin: stdin.clone(),
+            writer: writer.clone(),
             pending: pending.clone(),
             next_id: AtomicU64::new(1),
-            version: AtomicI64::new(0),
+            version: version.clone(),
+            alive: alive.clone(),
+            events: events.clone(),
+            dependencies,
             document_uri: workspace.document_uri.clone(),
             workspace_uri: workspace.root_uri.clone(),
             stderr_tail: stderr_tail.clone(),
@@ -263,18 +322,31 @@ impl LspServer {
         });
 
         let response_config = ResponseConfig {
+            document_uri: server.document_uri.clone(),
             workspace_uri: server.workspace_uri.clone(),
             extra_paths: server._workspace.extra_paths.clone(),
+            version,
         };
         tokio::spawn(read_loop(
             BufReader::new(stdout),
             pending,
             events,
-            stdin,
+            writer,
             response_config,
+            alive,
         ));
         tokio::spawn(read_stderr(stderr, stderr_tail));
         Ok(server)
+    }
+
+    fn set_events(&self, events: EventSink) {
+        if let Ok(mut slot) = self.events.lock() {
+            *slot = events;
+        }
+    }
+
+    fn alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
     }
 
     async fn initialize(&self) -> Result<(), String> {
@@ -293,7 +365,10 @@ impl LspServer {
                         "completionItem": {
                             "snippetSupport": true,
                             "documentationFormat": ["markdown", "plaintext"],
-                            "insertReplaceSupport": true
+                            "insertReplaceSupport": true,
+                            "resolveSupport": {
+                                "properties": ["documentation", "detail", "additionalTextEdits"]
+                            }
                         }
                     },
                     "hover": { "contentFormat": ["markdown", "plaintext"] },
@@ -314,31 +389,33 @@ impl LspServer {
     }
 
     async fn did_open(&self, source: &str) -> Result<(), String> {
-        self.version.store(1, Ordering::Relaxed);
-        self.notify(
-            "textDocument/didOpen",
-            json!({
+        let mut version = self.version.lock().await;
+        *version = 1;
+        self.write(json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
                 "textDocument": {
                     "uri": &self.document_uri,
                     "languageId": "python",
                     "version": 1,
                     "text": source
                 }
-            }),
-        )
-        .await
+            }
+        }))
     }
 
     async fn did_change(&self, source: &str) -> Result<(), String> {
-        let version = self.version.fetch_add(1, Ordering::Relaxed) + 1;
-        self.notify(
-            "textDocument/didChange",
-            json!({
-                "textDocument": { "uri": &self.document_uri, "version": version },
+        let mut version = self.version.lock().await;
+        *version += 1;
+        self.write(json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didChange",
+            "params": {
+                "textDocument": { "uri": &self.document_uri, "version": *version },
                 "contentChanges": [{ "text": source }]
-            }),
-        )
-        .await
+            }
+        }))
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -361,7 +438,7 @@ impl LspServer {
             "method": method,
             "params": params
         });
-        if let Err(error) = self.write(&message).await {
+        if let Err(error) = self.write(message) {
             self.pending.lock().await.remove(&id);
             return Err(error);
         }
@@ -381,17 +458,18 @@ impl LspServer {
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<(), String> {
-        self.write(&json!({
+        self.write(json!({
             "jsonrpc": "2.0",
             "method": method,
             "params": params
         }))
-        .await
     }
 
-    async fn write(&self, message: &Value) -> Result<(), String> {
-        let mut stdin = self.stdin.lock().await;
-        write_message(&mut *stdin, message).await
+    fn write(&self, message: Value) -> Result<(), String> {
+        self.writer.send(message).map_err(|_| {
+            "The Python language server is not accepting messages. Reopen the tab to restart it."
+                .to_owned()
+        })
     }
 
     async fn failure_message(&self, error: String) -> String {
@@ -419,7 +497,17 @@ impl LspServer {
             .await
             .is_err()
         {
-            let _ = child.start_kill();
+            kill_process_tree(&mut child);
+        }
+    }
+}
+
+impl Drop for LspServer {
+    fn drop(&mut self) {
+        if let Ok(mut child) = self.child.try_lock() {
+            if !matches!(child.try_wait(), Ok(Some(_))) {
+                kill_process_tree(&mut child);
+            }
         }
     }
 }
@@ -433,7 +521,7 @@ struct PythonWorkspace {
 }
 
 impl PythonWorkspace {
-    fn create(source: &str, script_path: Option<&str>) -> Result<Self, String> {
+    fn create(source: &str) -> Result<Self, String> {
         let directory = tempfile::tempdir()
             .map_err(|error| format!("Could not create a code-intelligence workspace: {error}"))?;
         let root = directory.path().join("workspace");
@@ -451,12 +539,7 @@ impl PythonWorkspace {
             format!("Could not stage the script for code intelligence: {error}")
         })?;
 
-        let mut extra_paths = vec![runtime.to_string_lossy().into_owned()];
-        if let Some(parent) = script_path.and_then(|path| Path::new(path).parent()) {
-            if parent.is_dir() {
-                extra_paths.push(parent.to_string_lossy().into_owned());
-            }
-        }
+        let extra_paths = vec![runtime.to_string_lossy().into_owned()];
 
         let config = json!({
             "include": ["script.py"],
@@ -485,16 +568,19 @@ impl PythonWorkspace {
 }
 
 struct ResponseConfig {
+    document_uri: String,
     workspace_uri: String,
     extra_paths: Vec<String>,
+    version: Arc<Mutex<i64>>,
 }
 
 async fn read_loop(
     mut stdout: BufReader<ChildStdout>,
     pending: Pending,
-    events: EventSink,
-    stdin: Arc<Mutex<ChildStdin>>,
+    events: Events,
+    writer: mpsc::UnboundedSender<Value>,
     config: ResponseConfig,
+    alive: Arc<AtomicBool>,
 ) {
     loop {
         let message = match read_message(&mut stdout).await {
@@ -511,14 +597,21 @@ async fn read_loop(
                     "id": id,
                     "result": result
                 });
-                let _ = write_message(&mut *stdin.lock().await, &response).await;
+                let _ = writer.send(response);
             }
             (Some(method), None) => {
                 if method == DIAGNOSTICS_METHOD {
-                    events(LspEvent {
-                        method: method.to_owned(),
-                        params: message["params"].clone(),
-                    });
+                    let params = &message["params"];
+                    let current = *config.version.lock().await;
+                    if diagnostics_are_current(params, &config.document_uri, current) {
+                        let sink = events.lock().ok().map(|events| (*events).clone());
+                        if let Some(sink) = sink {
+                            sink(LspEvent {
+                                method: method.to_owned(),
+                                params: params.clone(),
+                            });
+                        }
+                    }
                 }
             }
             (None, Some(id)) => {
@@ -538,12 +631,23 @@ async fn read_loop(
         }
     }
 
+    alive.store(false, Ordering::Relaxed);
     let mut pending = pending.lock().await;
     for (_, sender) in pending.drain() {
         let _ = sender.send(Err(
             "The Python language server stopped. Reopen the tab to restart it.".to_owned(),
         ));
     }
+}
+
+fn diagnostics_are_current(params: &Value, document_uri: &str, version: i64) -> bool {
+    if params.get("uri").and_then(Value::as_str) != Some(document_uri) {
+        return false;
+    }
+    params
+        .get("version")
+        .and_then(Value::as_i64)
+        .is_none_or(|incoming| incoming >= version)
 }
 
 fn server_request_result(method: &str, message: &Value, config: &ResponseConfig) -> Value {
@@ -605,12 +709,32 @@ async fn read_stderr(stderr: tokio::process::ChildStderr, tail: Arc<Mutex<VecDeq
 
 fn server_command(uv: &Path, dependencies: &[String]) -> Command {
     let mut command = Command::new(uv);
-    command.args(["tool", "run", "--from", "basedpyright"]);
+    command.args(["tool", "run", "--no-build", "--from", "basedpyright"]);
     for dependency in dependencies {
         command.arg("--with").arg(dependency);
     }
     command.args(["--", "basedpyright-langserver", "--stdio"]);
     command
+}
+
+fn kill_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // The server was started in its own process group, so this also stops
+        // basedpyright's Python and Node descendants.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.start_kill();
 }
 
 fn error_message(error: &Value) -> String {
@@ -753,8 +877,10 @@ print("hi")
     #[test]
     fn answers_configuration_for_python_sections() {
         let config = ResponseConfig {
+            document_uri: "file:///tmp/workspace/script.py".into(),
             workspace_uri: "file:///tmp/workspace".into(),
             extra_paths: vec!["/tmp/runtime".into()],
+            version: Arc::new(Mutex::new(0)),
         };
         let result = configuration_result(
             &json!({"params": {"items": [{"section": "python"}, {"section": "python.analysis"}, {"section": "other"}]}}),
@@ -791,9 +917,83 @@ print("hi")
     }
 
     #[test]
+    fn filters_diagnostics_from_another_document_or_an_older_version() {
+        let params = json!({
+            "uri": "file:///workspace/script.py",
+            "version": 3,
+            "diagnostics": []
+        });
+        assert!(diagnostics_are_current(
+            &params,
+            "file:///workspace/script.py",
+            3
+        ));
+        assert!(diagnostics_are_current(
+            &params,
+            "file:///workspace/script.py",
+            2
+        ));
+        assert!(!diagnostics_are_current(
+            &params,
+            "file:///workspace/script.py",
+            4
+        ));
+        assert!(!diagnostics_are_current(
+            &params,
+            "file:///workspace/other.py",
+            3
+        ));
+        assert!(diagnostics_are_current(
+            &json!({
+                "uri": "file:///workspace/script.py",
+                "diagnostics": []
+            }),
+            "file:///workspace/script.py",
+            4
+        ));
+    }
+
+    #[test]
+    fn starts_the_language_server_with_wheels_only() {
+        let command = server_command(Path::new("uv"), &["requests".into()]);
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.iter().any(|argument| argument == "--no-build"));
+        assert!(args.windows(2).any(|pair| pair == ["--with", "requests"]));
+    }
+
+    #[tokio::test]
+    async fn allows_completion_resolve_but_not_arbitrary_commands() {
+        let servers = LanguageServers::with_uv(PathBuf::from("uv"));
+        let allowed = servers
+            .request("missing", "completionItem/resolve", json!({}))
+            .await
+            .unwrap_err();
+        assert!(allowed.contains("not running"));
+        let rejected = servers
+            .request("missing", "workspace/executeCommand", json!({}))
+            .await
+            .unwrap_err();
+        assert!(rejected.contains("Only text-document"));
+    }
+
+    #[tokio::test]
+    async fn a_closed_script_is_not_started_again() {
+        let servers = LanguageServers::with_uv(PathBuf::from("uv"));
+        servers.close("closed").await;
+        let error = servers
+            .start_python("closed", "42", |_| {})
+            .await
+            .unwrap_err();
+        assert!(error.contains("closed"));
+    }
+
+    #[test]
     fn creates_a_workspace_that_exposes_the_codingpad_runtime() {
-        let workspace =
-            PythonWorkspace::create("from codingpad import dump\ndump(1)", None).unwrap();
+        let workspace = PythonWorkspace::create("from codingpad import dump\ndump(1)").unwrap();
         let config = fs::read_to_string(workspace.root.join("pyrightconfig.json")).unwrap();
         assert!(config.contains("runtime"));
         assert!(workspace

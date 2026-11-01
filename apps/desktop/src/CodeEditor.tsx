@@ -11,6 +11,7 @@ import {
   diagnosticMarkers,
   diagnosticsFor,
   hoverMarkdown,
+  inlineDependencyKey,
   summarizeDiagnostics,
   type DiagnosticsSummary,
   type LspCompletionItem,
@@ -34,7 +35,6 @@ export type EditorHandle = {
 type Props = {
   id: string;
   source: string;
-  scriptPath?: string;
   onChange: (source: string) => void;
   onRun: () => void;
   onMount?: (editor: EditorHandle) => void;
@@ -42,6 +42,10 @@ type Props = {
 };
 
 const COMPLETION_TRIGGERS = [".", "'", '"', "/"];
+
+type MonacoCompletionItem = monaco.languages.CompletionItem & {
+  data?: unknown;
+};
 
 function toRange(range: LspRange): monaco.Range {
   return new monaco.Range(
@@ -55,7 +59,7 @@ function toRange(range: LspRange): monaco.Range {
 function toCompletionItem(
   item: LspCompletionItem,
   fallback: monaco.Range,
-): monaco.languages.CompletionItem {
+): MonacoCompletionItem {
   const edit = item.textEdit;
   const range = edit
     ? "range" in edit
@@ -65,6 +69,7 @@ function toCompletionItem(
   const documentation = completionDocumentation(item);
   return {
     label: completionLabel(item),
+    data: item,
     kind: completionKind(item.kind) as monaco.languages.CompletionItemKind,
     detail: item.detail,
     documentation: documentation ? { value: documentation } : undefined,
@@ -88,7 +93,6 @@ function toCompletionItem(
 export default function CodeEditor({
   id,
   source,
-  scriptPath,
   onChange,
   onRun,
   onMount,
@@ -121,6 +125,8 @@ export default function CodeEditor({
     }).catch(() => {});
   };
 
+  const dependencyKey = inlineDependencyKey(source);
+
   const applyDiagnostics = (diagnostics: LspDiagnostic[]) => {
     onDiagnosticsRef.current?.(summarizeDiagnostics(diagnostics));
     const model = editorRef.current?.getModel();
@@ -137,7 +143,6 @@ export default function CodeEditor({
 
   useEffect(() => {
     const current = ++generation.current;
-    const lspId = `${id}:${current}`;
     let stopped = false;
     const initial = source;
     pendingChange.current = null;
@@ -149,6 +154,8 @@ export default function CodeEditor({
     channel.onmessage = (event) => {
       if (stopped || current !== generation.current) return;
       if (event.method !== "textDocument/publishDiagnostics") return;
+      const params = event.params as { uri: string };
+      if (lsp.current && params.uri !== lsp.current.uri) return;
       seenDiagnostics.current = true;
       applyDiagnostics(diagnosticsFor(event));
     };
@@ -159,19 +166,13 @@ export default function CodeEditor({
       message: "Starting code intelligence…",
     });
     invoke<{ uri: string }>("start_language_server", {
-      scriptId: lspId,
+      scriptId: id,
       source: initial,
-      scriptPath: scriptPath ?? null,
       onEvent: channel,
     })
       .then((result) => {
-        if (stopped || current !== generation.current) {
-          void invoke("stop_language_server", { scriptId: lspId }).catch(
-            () => {},
-          );
-          return;
-        }
-        lsp.current = { id: lspId, uri: result.uri, ready: true };
+        if (stopped || current !== generation.current) return;
+        lsp.current = { id, uri: result.uri, ready: true };
         if (!seenDiagnostics.current) {
           onDiagnosticsRef.current?.({
             errors: 0,
@@ -200,9 +201,8 @@ export default function CodeEditor({
       pendingChange.current = null;
       const model = editorRef.current?.getModel();
       if (model) monaco.editor.setModelMarkers(model, "codingpad-lsp", []);
-      void invoke("stop_language_server", { scriptId: lspId }).catch(() => {});
     };
-  }, [id, scriptPath]);
+  }, [id, dependencyKey]);
 
   useEffect(
     () => () => {
@@ -271,6 +271,7 @@ export default function CodeEditor({
               const items = Array.isArray(result)
                 ? result
                 : (result.items ?? []);
+              const incomplete = !Array.isArray(result) && !!result.isIncomplete;
               const word = model.getWordUntilPosition(position);
               const fallback = new monaco.Range(
                 position.lineNumber,
@@ -282,7 +283,34 @@ export default function CodeEditor({
                 suggestions: items.map((item) =>
                   toCompletionItem(item, fallback),
                 ),
+                incomplete,
               };
+            },
+            resolveCompletionItem: async (item) => {
+              const endpoint = lsp.current;
+              const data = (item as MonacoCompletionItem).data;
+              if (!endpoint || data === undefined) return item;
+              const resolved = await invoke<LspCompletionItem>(
+                "request_language_server",
+                {
+                  scriptId: endpoint.id,
+                  method: "completionItem/resolve",
+                  params: data,
+                },
+              ).catch(() => null);
+              if (!resolved) return item;
+              const documentation = completionDocumentation(resolved);
+              if (documentation) item.documentation = { value: documentation };
+              if (resolved.detail) item.detail = resolved.detail;
+              if (resolved.additionalTextEdits) {
+                item.additionalTextEdits = resolved.additionalTextEdits.map(
+                  (additional) => ({
+                    range: toRange(additional.range),
+                    text: additional.newText,
+                  }),
+                );
+              }
+              return item;
             },
           },
         );

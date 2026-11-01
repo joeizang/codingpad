@@ -24,7 +24,6 @@ dump({"name": "Ada", "languages": ["Python", "C#", "Rust"]})
 type Script = {
   id: string;
   name: string;
-  path?: string;
   source: string;
   output: Output[];
   running: boolean;
@@ -351,7 +350,6 @@ export default function App() {
               key={active.id}
               id={active.id}
               source={active.source}
-              scriptPath={active.path}
               onDiagnostics={setIntelligence}
               onChange={(source) =>
                 update(active.id, (script) => ({ ...script, source }))

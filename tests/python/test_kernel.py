@@ -196,6 +196,136 @@ class KernelTests(unittest.TestCase):
         self.assertEqual(text(messages[:index]), "a\nb\nc\n")
         self.assertEqual(text(messages[index:]), "d\n")
 
+    def test_python_stdout_stderr_keep_write_order(self):
+        messages = self.run_script(
+            'import sys\nfor i in range(30):\n    print("out", i)\n    print("err", i, file=sys.stderr)'
+        )
+        blocks = []
+        for message in messages:
+            if message.get("method") == "stream":
+                stream, text = message["params"]["stream"], message["params"]["text"]
+                if blocks and blocks[-1][0] == stream:
+                    blocks[-1][1] += text
+                else:
+                    blocks.append([stream, text])
+        actual = [
+            (stream, line) for stream, text in blocks for line in text.splitlines()
+        ]
+        expected = [
+            entry
+            for i in range(30)
+            for entry in [("stdout", f"out {i}"), ("stderr", f"err {i}")]
+        ]
+        self.assertEqual(actual, expected)
+
+    def test_traceback_follows_all_preceding_stdout(self):
+        messages = self.run_script(
+            'for i in range(30): print("line", i)\nraise ValueError("boom")'
+        )
+        first_error = next(
+            i
+            for i, message in enumerate(messages)
+            if message.get("method") == "stream"
+            and message["params"]["stream"] == "stderr"
+        )
+        preceding = "".join(
+            message["params"]["text"]
+            for message in messages[:first_error]
+            if message.get("method") == "stream"
+        )
+        self.assertEqual(preceding, "".join(f"line {i}\n" for i in range(30)))
+        self.assertFalse(messages[-1]["result"]["ok"])
+
+    def test_expired_fence_cannot_acknowledge_a_new_flush(self):
+        # Hold the reader before fence 1 until it times out. Then hold the text
+        # between fences 1 and 2: a second flush must not accept fence 1's ack.
+        messages = self.run_script(r"""import os, sys, threading
+kernel = sys.stdout.drain.__globals__
+notify, write = kernel["notify"], kernel["write_all"]
+first_blocked, middle_blocked = threading.Event(), threading.Event()
+release_first, release_middle = threading.Event(), threading.Event()
+second_written, finished = threading.Event(), threading.Event()
+fence_count = [0]
+
+def delayed_notify(method, params):
+    if method == "stream" and params["stream"] == "stdout":
+        if "first" in params["text"]:
+            first_blocked.set()
+            release_first.wait(3)
+        if "middle" in params["text"]:
+            middle_blocked.set()
+            release_middle.wait(3)
+    notify(method, params)
+
+def observed_write(descriptor, data):
+    write(descriptor, data)
+    if descriptor == 1 and data.startswith(b"\0codingpad:"):
+        fence_count[0] += 1
+        if fence_count[0] == 2:
+            second_written.set()
+
+def second_flush():
+    sys.stdout.flush()
+    finished.set()
+
+worker = None
+kernel["notify"], kernel["write_all"] = delayed_notify, observed_write
+try:
+    os.write(1, b"first")
+    assert first_blocked.wait(2), "reader did not reach first text"
+    sys.stdout.flush()
+    os.write(1, b"middle")
+    worker = threading.Thread(target=second_flush)
+    worker.start()
+    assert second_written.wait(2), "second fence was not written"
+    release_first.set()
+    assert middle_blocked.wait(2), "reader did not reach intervening text"
+    acknowledged_early = finished.wait(0.1)
+finally:
+    release_first.set()
+    release_middle.set()
+    if worker is not None:
+        worker.join(3)
+    kernel["notify"], kernel["write_all"] = notify, write
+assert not acknowledged_early, "old fence acknowledged the second flush"
+assert finished.is_set(), "second flush did not complete after its own fence"
+""")
+        self.assertTrue(messages[-1]["result"]["ok"], messages)
+
+    def test_fence_prefix_and_sequence_can_span_pipe_reads(self):
+        messages = self.run_script(r"""import sys, time
+kernel = sys.stdout.drain.__globals__
+write = kernel["write_all"]
+
+def fragmented_write(descriptor, data):
+    if data.startswith(b"\0codingpad:"):
+        for chunk in (data[:3], data[3:-5], data[-5:-1], data[-1:]):
+            write(descriptor, chunk)
+            time.sleep(0.002)
+    else:
+        write(descriptor, data)
+
+kernel["write_all"] = fragmented_write
+try:
+    print("before λ", end="")
+    sys.stdout.flush()
+    dump(42)
+    print("after λ", end="")
+    sys.stdout.flush()
+finally:
+    kernel["write_all"] = write
+""")
+        self.assertTrue(messages[-1]["result"]["ok"], messages)
+        ordered = [
+            (m["method"], m["params"])
+            for m in messages
+            if m.get("method") in ("stream", "dump")
+        ]
+        self.assertEqual([kind for kind, _ in ordered], ["stream", "dump", "stream"])
+        self.assertEqual(ordered[0][1]["text"], "before λ")
+        self.assertEqual(ordered[1][1]["node"]["v"], 42)
+        self.assertEqual(ordered[2][1]["text"], "after λ")
+
     def test_large_int_and_values_without_instance_dict(self):
         messages = self.run_script(
             'import math\ndump(10**5000)\ndump(math.factorial(2000))\ndump({1, 2, 3})\ndump(frozenset({4, 5}))\ndump(b"abc")\ndump(1+2j)'

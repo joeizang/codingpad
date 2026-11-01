@@ -27,10 +27,18 @@ Python and native/subprocess writes share one pipe per output stream, preserving
 write order within that stream and naturally grouping fragments into read chunks.
 Before a dump, explicit flush, or run completion, a private fence is written to
 each pipe and acknowledged by its reader after preceding text has been sent.
-The two streams have independent readers; there is no total ordering guarantee
-between stdout and stderr. Drain acknowledgements and reader joins each wait at
-most 500 ms per stream if a script changes descriptors or leaves background work.
-Background work that outlives a run is not supported.
+Each fence includes a monotonically increasing sequence number; a waiter checks
+that its own sequence has been acknowledged. A late acknowledgement of a timed-out
+fence cannot release a newer flush.
+
+Python-level writes are serialized. On a switch between stdout and stderr, the
+previous stream is drained before writing to the next one, preserving their
+relative write order. Both streams are also drained before a script traceback is
+reported. Native-only writes on separate streams still have independent readers
+and no total ordering guarantee. Drain acknowledgements and reader joins each
+wait at most 500 ms per stream if the reader stalls or a script changes descriptors
+or leaves background work; ordering is best-effort after a timeout. Background
+work that outlives a run is not supported.
 
 Both protocol input and output use private, non-inheritable duplicate descriptors.
 Fds 0 and 1 are permanently pointed at the null device outside capture, so child

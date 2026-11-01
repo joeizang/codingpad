@@ -79,14 +79,42 @@ def write_all(descriptor, data):
         data = data[written:]
 
 
+class Fence:
+    """Match each drain to its own acknowledgement, including after timeouts."""
+
+    def __init__(self):
+        self.prefix = b"\0codingpad:" + os.urandom(16).hex().encode("ascii") + b":"
+        self.issued = 0
+        self.acknowledged = 0
+        self.condition = threading.Condition()
+
+    def issue(self):
+        with self.condition:
+            self.issued += 1
+            return self.issued, self.prefix + self.issued.to_bytes(8, "big") + b"\0"
+
+    def acknowledge(self, sequence):
+        with self.condition:
+            self.acknowledged = max(self.acknowledged, sequence)
+            self.condition.notify_all()
+
+    def wait(self, sequence):
+        with self.condition:
+            return self.condition.wait_for(
+                lambda: self.acknowledged >= sequence, timeout=0.5
+            )
+
+
 @contextlib.contextmanager
 def capture_native(run_id):
     """One pipe per stream orders Python/native writes and batches fragments."""
     streams = []
     flush_gate = threading.Lock()
     live = True
+    write_gate = threading.Lock()
+    last_stream = None
 
-    def pump(reader, name, active, gate, marker, drained):
+    def pump(reader, name, active, gate, fence):
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         pending = b""
 
@@ -101,21 +129,32 @@ def capture_native(run_id):
                     if not active.is_set():
                         break
                     pending += data
-                    while True:
-                        before, separator, after = pending.partition(marker)
-                        if separator:
-                            emit(before)
-                            drained.set()
-                            pending = after
+                    while pending:
+                        position = pending.find(fence.prefix)
+                        if position >= 0:
+                            emit(pending[:position])
+                            pending = pending[position:]
+                            frame_size = len(fence.prefix) + 9
+                            if len(pending) < frame_size:
+                                break  # Prefix/sequence may span multiple reads.
+                            if pending[frame_size - 1] != 0:
+                                emit(pending[:1])
+                                pending = pending[1:]
+                                continue
+                            sequence = int.from_bytes(
+                                pending[len(fence.prefix) : frame_size - 1], "big"
+                            )
+                            fence.acknowledge(sequence)
+                            pending = pending[frame_size:]
                             continue
-                        # Retain only a possible split marker, not ordinary text.
+                        # Retain only a possible split prefix, not ordinary text.
                         keep = next(
                             (
                                 size
                                 for size in range(
-                                    min(len(pending), len(marker) - 1), 0, -1
+                                    min(len(pending), len(fence.prefix) - 1), 0, -1
                                 )
-                                if pending.endswith(marker[:size])
+                                if pending.endswith(fence.prefix[:size])
                             ),
                             0,
                         )
@@ -128,20 +167,34 @@ def capture_native(run_id):
         finally:
             os.close(reader)
 
-    def drain():
-        # Fences share the output pipes, so acknowledgement means every earlier
-        # write on that stream reached the supervisor before a dump/flush.
+    def drain(only_descriptor=None):
+        # Each waiter requires its sequence, so a late old marker cannot release
+        # a newer drain after the earlier call timed out.
         with flush_gate:
             if not live:
                 return
-            for descriptor, _, _, _, _, marker, drained in streams:
-                drained.clear()
+            waiting = []
+            for descriptor, _, _, _, _, fence in streams:
+                if only_descriptor is not None and descriptor != only_descriptor:
+                    continue
+                sequence, marker = fence.issue()
                 try:
                     write_all(descriptor, marker)
                 except OSError:
-                    drained.set()  # Script may have closed its own stdout/stderr.
-            for *_, drained in streams:
-                drained.wait(timeout=0.5)
+                    continue  # Script may have closed its own stdout/stderr.
+                waiting.append((fence, sequence))
+            for fence, sequence in waiting:
+                fence.wait(sequence)
+
+    def ordered_write(descriptor, data):
+        nonlocal last_stream
+        if not data:
+            return
+        with write_gate:
+            if last_stream is not None and last_stream != descriptor:
+                drain(last_stream)
+            write_all(descriptor, data)
+            last_stream = descriptor
 
     try:
         for descriptor, name in [(1, "stdout"), (2, "stderr")]:
@@ -149,23 +202,16 @@ def capture_native(run_id):
             original = os.dup(descriptor)
             redirect_fd(writer, descriptor)
             os.close(writer)
-            active, gate, drained = (
-                threading.Event(),
-                threading.Lock(),
-                threading.Event(),
-            )
-            marker = b"\0codingpad:" + os.urandom(16).hex().encode("ascii") + b"\0"
+            active, gate, fence = threading.Event(), threading.Lock(), Fence()
             active.set()
             thread = threading.Thread(
                 target=pump,
-                args=(reader, name, active, gate, marker, drained),
+                args=(reader, name, active, gate, fence),
                 daemon=True,
             )
-            streams.append(
-                (descriptor, original, thread, active, gate, marker, drained)
-            )
+            streams.append((descriptor, original, thread, active, gate, fence))
             thread.start()
-        yield drain
+        yield drain, ordered_write
     finally:
         drain()
         with flush_gate:
@@ -173,7 +219,7 @@ def capture_native(run_id):
         for descriptor, original, *_ in streams:
             redirect_fd(original, descriptor)
             os.close(original)
-        for _, _, thread, active, gate, _, _ in streams:
+        for _, _, thread, active, gate, _ in streams:
             # Background children may retain a pipe; never wait for them forever.
             thread.join(timeout=0.5)
             with gate:
@@ -181,9 +227,10 @@ def capture_native(run_id):
 
 
 class Stream(io.TextIOBase):
-    def __init__(self, descriptor, drain):
+    def __init__(self, descriptor, drain, ordered_write):
         self.descriptor = descriptor
         self.drain = drain
+        self.ordered_write = ordered_write
 
     @property
     def encoding(self):
@@ -196,7 +243,7 @@ class Stream(io.TextIOBase):
         return True
 
     def write(self, text):
-        write_all(self.descriptor, text.encode("utf-8", "replace"))
+        self.ordered_write(self.descriptor, text.encode("utf-8", "replace"))
         return len(text)
 
     def flush(self):
@@ -244,9 +291,9 @@ def run(request):
     ok = False
     try:
         with (
-            capture_native(run_id) as drain,
-            contextlib.redirect_stdout(Stream(1, drain)),
-            contextlib.redirect_stderr(Stream(2, drain)),
+            capture_native(run_id) as (drain, ordered_write),
+            contextlib.redirect_stdout(Stream(1, drain, ordered_write)),
+            contextlib.redirect_stderr(Stream(2, drain, ordered_write)),
         ):
 
             def emit_dump(node):
@@ -274,7 +321,9 @@ def run(request):
                 exec(compile(tree, filename, "exec"), scope)
                 ok = True
             except BaseException:
-                # SystemExit/KeyboardInterrupt in a script must not kill the kernel.
+                # Finish preceding output before reporting the script failure.
+                # SystemExit/KeyboardInterrupt must not kill the kernel either.
+                drain()
                 traceback.print_exc()
     finally:
         codingpad._sink = None

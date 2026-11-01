@@ -8,6 +8,7 @@ import {
 } from "@tauri-apps/plugin-dialog";
 import CodeEditor, { type EditorHandle } from "./CodeEditor";
 import { DumpTree } from "./DumpTree";
+import { uniqueId, type DiagnosticsSummary } from "./lsp";
 import {
   appendOutputBatch,
   collectDumpUpdates,
@@ -57,8 +58,20 @@ type Script = {
   error?: string;
   missingUv?: boolean;
 };
+function intelligenceLabel(summary: DiagnosticsSummary): string {
+  if (summary.message) return summary.message;
+  const parts: string[] = [];
+  if (summary.errors)
+    parts.push(`${summary.errors} error${summary.errors === 1 ? "" : "s"}`);
+  if (summary.warnings)
+    parts.push(
+      `${summary.warnings} warning${summary.warnings === 1 ? "" : "s"}`,
+    );
+  return parts.length ? parts.join(" · ") : "No type problems";
+}
+
 const newScript = (number: number): Script => ({
-  id: `scratch-${number}`,
+  id: uniqueId("scratch"),
   name: `Scratch ${number}.py`,
   source: SAMPLE,
   dirty: false,
@@ -70,15 +83,18 @@ const newScript = (number: number): Script => ({
 });
 
 export default function App() {
-  const [scripts, setScripts] = useState<Script[]>([newScript(1)]);
+  const [scripts, setScripts] = useState<Script[]>(() => [newScript(1)]);
   const scriptsRef = useRef(scripts);
   scriptsRef.current = scripts;
-  const [activeId, setActiveId] = useState("scratch-1");
+  const [activeId, setActiveId] = useState(() => scripts[0].id);
+  const [intelligence, setIntelligence] = useState<DiagnosticsSummary>({
+    errors: 0,
+    warnings: 0,
+  });
   const [settings, setSettings] = useState<LibrarySettings | null>(null);
   const [libraryError, setLibraryError] = useState<string | undefined>();
   const [refresh, setRefresh] = useState(0);
   const counter = useRef(1);
-  const fileCounter = useRef(0);
   const opening = useRef(new Set<string>());
   const [closing, setClosing] = useState(false);
   const [installProgress, setInstallProgress] = useState<string | null>(null);
@@ -352,7 +368,7 @@ export default function App() {
         return;
       }
       const script: Script = {
-        id: `file-${++fileCounter.current}`,
+        id: uniqueId("file"),
         name: file.name,
         path: file.path,
         source: file.source,
@@ -659,13 +675,32 @@ export default function App() {
           <section className="editor-pane" aria-label="Python editor">
             <div className="pane-heading">
               <span>EDITOR</span>
-              <span>Ctrl / ⌘ + Enter to run · Ctrl / ⌘ + S to save</span>
+              <span className="pane-heading-right">
+                <span
+                  className={`intelligence ${
+                    intelligence.message
+                      ? ""
+                      : intelligence.errors
+                        ? "error"
+                        : intelligence.warnings
+                          ? "warning"
+                          : ""
+                  }`}
+                  role="status"
+                  aria-live="polite"
+                  title={intelligenceLabel(intelligence)}
+                >
+                  {intelligenceLabel(intelligence)}
+                </span>
+                <span>Ctrl / ⌘ + Enter to run · Ctrl / ⌘ + S to save</span>
+              </span>
             </div>
             <div className="editor">
               <CodeEditor
                 key={active.id}
                 id={active.id}
                 source={active.source}
+                onDiagnostics={setIntelligence}
                 onChange={(source) =>
                   update(active.id, (script) => ({
                     ...script,

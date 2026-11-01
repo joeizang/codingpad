@@ -359,6 +359,7 @@ name = "codingpad-desktop"
 version = "0.1.0"
 dependencies = [
  "codingpad-kernel-core",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -370,6 +371,7 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "flate2",
+ "libc",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -378,6 +380,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml 0.8.2",
+ "url",
  "zip",
 ]
 

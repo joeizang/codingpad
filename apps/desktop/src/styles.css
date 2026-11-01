@@ -264,6 +264,24 @@ button:disabled {
   font-size: 11px;
   letter-spacing: 0;
 }
+.pane-heading-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.intelligence {
+  max-width: 380px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #8d98aa;
+}
+.intelligence.warning {
+  color: #e8c07a;
+}
+.intelligence.error {
+  color: #ffb2ae;
+}
 .editor {
   flex: 1;
   min-height: 0;

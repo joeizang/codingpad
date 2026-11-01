@@ -16,3 +16,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 flate2 = "1"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+url = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

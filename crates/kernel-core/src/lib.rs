@@ -1,5 +1,6 @@
 //! Desktop-independent supervisor for one warm Python process per script.
 pub mod installer;
+pub mod lsp;
 mod packages;
 pub mod store;
 pub mod toolchains;
@@ -20,7 +21,7 @@ const PYTHON_EXECUTABLE_PROBE: &str =
     "import sys; sys.stdout.buffer.write(sys.executable.encode('utf-8'))";
 
 const KERNEL: &str = include_str!("../../../kernels/python/kernel.py");
-const RUNTIME: &str = include_str!("../../../runtimes/python/codingpad/__init__.py");
+pub(crate) const RUNTIME: &str = include_str!("../../../runtimes/python/codingpad/__init__.py");
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -97,7 +98,7 @@ fn uv_search_dirs(
     directories
 }
 
-fn find_uv() -> PathBuf {
+pub(crate) fn find_uv() -> PathBuf {
     let name = if cfg!(windows) { "uv.exe" } else { "uv" };
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
     uv_search_dirs(std::env::var_os("PATH"), home, cfg!(target_os = "macos"))

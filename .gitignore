@@ -8,3 +8,9 @@ node_modules/
 
 # npm bin folders are source, not build output
 !packaging/placeholders/npm/cpad/bin/
+
+# Python and Tauri generated files
+__pycache__/
+*.py[cod]
+.venv/
+apps/desktop/src-tauri/gen/

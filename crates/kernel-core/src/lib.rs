@@ -1,15 +1,21 @@
 //! Desktop-independent supervisor for one warm Python process per script.
 mod packages;
+pub mod store;
+
 use packages::Packages;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
 use tempfile::TempDir;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::{watch, Mutex},
 };
+
+// Write bytes explicitly: Windows piped stdout may use an ANSI code page.
+const PYTHON_EXECUTABLE_PROBE: &str =
+    "import sys; sys.stdout.buffer.write(sys.executable.encode('utf-8'))";
 
 const KERNEL: &str = include_str!("../../../kernels/python/kernel.py");
 const RUNTIME: &str = include_str!("../../../runtimes/python/codingpad/__init__.py");
@@ -451,7 +457,7 @@ async fn prepare_packages(
     );
     let metadata = toml::to_string(&metadata).map_err(|e| e.to_string())?;
     let launcher = format!(
-        "# /// script\n{}# ///\nimport sys; print(sys.executable)\n",
+        "# /// script\n{}# ///\n{PYTHON_EXECUTABLE_PROBE}\n",
         metadata
             .lines()
             .map(|line| format!("# {line}\n"))
@@ -494,20 +500,8 @@ async fn prepare_packages(
     let mut child = command
         .spawn()
         .map_err(|e| format!("Could not prepare Python packages: {e}"))?;
-    let mut stderr = child.stderr.take().unwrap();
-    let progress = async {
-        let mut buffer = [0; 8192];
-        loop {
-            let count = stderr.read(&mut buffer).await.map_err(|e| e.to_string())?;
-            if count == 0 {
-                return Ok::<(), String>(());
-            }
-            emit(KernelEvent {
-                method: "stream".into(),
-                params: json!({"runId": 0, "stream": "stderr", "text": String::from_utf8_lossy(&buffer[..count])}),
-            });
-        }
-    };
+    let stderr = child.stderr.take().unwrap();
+    let progress = stream_package_progress(stderr, emit);
     let (output, ()) = tokio::try_join!(
         async { child.wait_with_output().await.map_err(|e| e.to_string()) },
         progress
@@ -520,6 +514,21 @@ async fn prepare_packages(
         return Err("uv did not return a usable Python interpreter".into());
     }
     Ok(executable)
+}
+
+async fn stream_package_progress(
+    reader: impl tokio::io::AsyncRead + Unpin,
+    emit: &mut (impl FnMut(KernelEvent) + Send),
+) -> Result<(), String> {
+    // The buffered decoder retains UTF-8 sequences split across pipe reads.
+    let mut lines = BufReader::new(reader).lines();
+    while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
+        emit(KernelEvent {
+            method: "stream".into(),
+            params: json!({"runId": 0, "stream": "stderr", "text": format!("{line}\n")}),
+        });
+    }
+    Ok(())
 }
 
 enum CallError {
@@ -565,6 +574,42 @@ impl Drop for Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn interpreter_probe_writes_utf8_with_an_ascii_stdout_encoding() {
+        let expected = "C:/José/用户/python.exe";
+        let output = Command::new(find_uv())
+            .args(["run", "--offline", "--no-project", "--no-config", "--no-python-downloads", "python", "-I", "-c",
+                "import sys; sys.executable = sys.argv[1]; sys.stdout.reconfigure(encoding='ascii'); exec(sys.argv[2])",
+                expected, PYTHON_EXECUTABLE_PROBE])
+            .output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn package_progress_preserves_unicode_split_across_reads() {
+        // A one-byte pipe forces every multibyte character across read boundaries.
+        let (mut writer, reader) = tokio::io::duplex(1);
+        let expected = "error: × failure\n╰─▶ dependency missing\n";
+        let mut events = Vec::new();
+        let mut emit = |event| events.push(event);
+        let write = async {
+            writer.write_all(expected.as_bytes()).await.unwrap();
+            writer.shutdown().await.unwrap();
+        };
+        let (result, ()) = tokio::join!(stream_package_progress(reader, &mut emit), write);
+        result.unwrap();
+        let text: String = events
+            .iter()
+            .map(|event| event.params["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(text, expected);
+    }
 
     #[tokio::test]
     async fn stop_notifies_a_run_subscribed_before_taking_kernel_lock() {

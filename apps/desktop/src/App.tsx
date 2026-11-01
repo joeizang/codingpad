@@ -1,8 +1,8 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import CodeEditor from "./CodeEditor";
 import { DumpTree } from "./DumpTree";
-import { appendOutput, type KernelEvent, type Output } from "./protocol";
+import { appendOutputBatch, type KernelEvent, type Output } from "./protocol";
 
 const SAMPLE = `from codingpad import dump
 
@@ -21,6 +21,7 @@ type Script = {
   output: Output[];
   running: boolean;
   status: string;
+  version: number;
   error?: string;
 };
 const newScript = (number: number): Script => ({
@@ -30,6 +31,7 @@ const newScript = (number: number): Script => ({
   output: [],
   running: false,
   status: "Ready",
+  version: 0,
 });
 
 export default function App() {
@@ -39,6 +41,21 @@ export default function App() {
   const [closing, setClosing] = useState(false);
   const generation = useRef(new Map<string, number>());
   const running = useRef(new Set<string>());
+  const frames = useRef(new Map<string, number>());
+  const cancelFrame = (id: string) => {
+    const frame = frames.current.get(id);
+    if (frame !== undefined) cancelAnimationFrame(frame);
+    frames.current.delete(id);
+  };
+  useEffect(
+    () => () => {
+      for (const frame of frames.current.values()) cancelAnimationFrame(frame);
+      frames.current.clear();
+      generation.current.clear();
+      running.current.clear();
+    },
+    [],
+  );
   const active = scripts.find((script) => script.id === activeId)!;
   const update = (id: string, change: (script: Script) => Script) =>
     setScripts((all) =>
@@ -50,20 +67,38 @@ export default function App() {
     running.current.add(script.id);
     const version = (generation.current.get(script.id) ?? 0) + 1;
     generation.current.set(script.id, version);
+    cancelFrame(script.id);
     update(script.id, (item) => ({
       ...item,
       output: [],
       running: true,
       status: "Running…",
+      version,
       error: undefined,
     }));
-    const onEvent = new Channel<KernelEvent>();
-    onEvent.onmessage = (event) => {
-      if (generation.current.get(script.id) === version) {
+    const pending: KernelEvent[] = [];
+    const flush = () => {
+      cancelFrame(script.id);
+      const batch = pending.splice(0);
+      if (generation.current.get(script.id) === version && batch.length) {
         update(script.id, (item) => ({
           ...item,
-          output: appendOutput(item.output, event),
+          output: appendOutputBatch(item.output, batch),
         }));
+      }
+    };
+    const onEvent = new Channel<KernelEvent>();
+    onEvent.onmessage = (event) => {
+      // A channel can deliver late, even after its invocation resolved. Keep the
+      // generation check so an earlier run cannot append to a newer run's output.
+      if (
+        generation.current.get(script.id) !== version ||
+        event.method === "run_finished"
+      )
+        return;
+      pending.push(event);
+      if (!frames.current.has(script.id)) {
+        frames.current.set(script.id, requestAnimationFrame(flush));
       }
     };
     try {
@@ -83,6 +118,7 @@ export default function App() {
         error: String(error),
       }));
     } finally {
+      flush();
       running.current.delete(script.id);
       update(script.id, (item) => ({ ...item, running: false }));
     }
@@ -99,6 +135,9 @@ export default function App() {
     setClosing(true);
     try {
       await invoke("close_script", { scriptId: script.id });
+      cancelFrame(script.id);
+      generation.current.delete(script.id);
+      running.current.delete(script.id);
       setScripts((all) => all.filter((item) => item.id !== script.id));
       setActiveId((current) =>
         current === script.id
@@ -202,13 +241,19 @@ export default function App() {
                   : "Run your script to see printed output and values here."}
               </div>
             )}
-            {active.output.map((output, index) =>
+            {active.output.map((output) =>
               output.kind === "stream" ? (
-                <pre className={`stream ${output.stream}`} key={index}>
+                <pre
+                  className={`stream ${output.stream}`}
+                  key={`${active.id}:${active.version}:${output.id}`}
+                >
                   {output.text}
                 </pre>
               ) : (
-                <div className="dump" key={index}>
+                <div
+                  className="dump"
+                  key={`${active.id}:${active.version}:${output.id}`}
+                >
                   <DumpTree node={output.node} />
                 </div>
               ),

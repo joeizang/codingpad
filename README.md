@@ -2,7 +2,7 @@
 
 A desktop scratchpad for running plain scripts and inspecting their values. This
 first skeleton supports Python with a Monaco editor, streamed stdout/stderr, basic
-object/list/value trees, and automatic display of the last expression.
+object/collection/value trees, and automatic display of the last expression.
 
 ## Develop locally
 
@@ -38,7 +38,8 @@ command is intended for macOS, Linux and Windows; native builds run on their own
 platforms.
 
 CodingPad checks `PATH`, then the usual `~/.local/bin` and `~/.cargo/bin`
-locations for `uv`. Launch from a terminal if your toolchain lives elsewhere.
+locations for `uv`, plus `/opt/homebrew/bin` and `/usr/local/bin` on macOS.
+Launch from a terminal if your toolchain lives elsewhere.
 Each scratch tab gets its own warm Python process on its first run. Missing `uv` or Python produces an actionable
 message in Results. The app uses the installed Python selected by `uv python find`
 and does not download a toolchain or dependencies automatically.
@@ -78,7 +79,8 @@ and the interpreter remain warm; this is not interpreter isolation.
 Basic dumps show up to 100 children per node, six levels and 1,000 nodes per
 dump, mark cycles, and do not consume arbitrary iterators or evaluate properties. Lazy/paged dumps arrive
 in #2. The results panel retains at most 500 output blocks and the last 100,000
-characters of each adjacent text stream. Monaco, its Python syntax definition,
+characters of each adjacent text stream. Stream fragments are coalesced once per
+animation frame, with stable output IDs preserving expanded/collapsed trees. Monaco, its Python syntax definition,
 and its worker are bundled locally; there is no editor CDN dependency.
 
 Dual-licensed MIT OR Apache-2.0.

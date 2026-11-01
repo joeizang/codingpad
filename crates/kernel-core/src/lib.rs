@@ -51,27 +51,38 @@ impl Default for Supervisor {
     }
 }
 
-// Desktop launchers may omit ~/.local/bin from PATH, even when uv is installed.
-fn find_uv() -> PathBuf {
-    let name = if cfg!(windows) { "uv.exe" } else { "uv" };
-    if let Some(path) = std::env::var_os("PATH") {
-        for directory in std::env::split_paths(&path) {
-            let candidate = directory.join(name);
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-    }
-    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
+// Desktop launchers (especially Finder) often provide only the system PATH.
+fn uv_search_dirs(
+    path: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    macos: bool,
+) -> Vec<PathBuf> {
+    let mut directories: Vec<_> = path
+        .as_ref()
+        .map(|path| std::env::split_paths(path).collect())
+        .unwrap_or_default();
     if let Some(home) = home {
         for directory in [".local/bin", ".cargo/bin"] {
-            let candidate = PathBuf::from(&home).join(directory).join(name);
-            if candidate.is_file() {
-                return candidate;
-            }
+            directories.push(PathBuf::from(&home).join(directory));
         }
     }
-    PathBuf::from(name)
+    if macos {
+        directories.extend([
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr/local/bin"),
+        ]);
+    }
+    directories
+}
+
+fn find_uv() -> PathBuf {
+    let name = if cfg!(windows) { "uv.exe" } else { "uv" };
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
+    uv_search_dirs(std::env::var_os("PATH"), home, cfg!(target_os = "macos"))
+        .into_iter()
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| PathBuf::from(name))
 }
 
 impl Supervisor {
@@ -151,7 +162,10 @@ struct Kernel {
 
 impl Kernel {
     async fn start(uv: &PathBuf) -> Result<Self, String> {
-        let python = Command::new(uv)
+        let mut discover = Command::new(uv);
+        #[cfg(windows)]
+        discover.creation_flags(0x08000000); // CREATE_NO_WINDOW, also for uv
+        let python = discover
             .args(["python", "find", ">=3.10", "--offline", "--no-config"])
             .output().await.map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
@@ -246,5 +260,21 @@ impl Kernel {
 impl Drop for Kernel {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finder_path_includes_both_homebrew_prefixes_after_user_tools() {
+        let path = std::env::join_paths(["/usr/bin", "/bin"]).unwrap();
+        let paths = uv_search_dirs(Some(path), Some("/Users/test".into()), true);
+        assert_eq!(paths[0], PathBuf::from("/usr/bin"));
+        assert!(paths.contains(&PathBuf::from("/Users/test/.local/bin")));
+        assert!(paths.contains(&PathBuf::from("/opt/homebrew/bin")));
+        assert!(paths.contains(&PathBuf::from("/usr/local/bin")));
+        assert!(!uv_search_dirs(None, None, false).contains(&PathBuf::from("/opt/homebrew/bin")));
     }
 }

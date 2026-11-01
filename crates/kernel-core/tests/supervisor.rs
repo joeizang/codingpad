@@ -31,7 +31,9 @@ async fn acceptance_and_streaming() {
     )
     .await;
     assert_eq!(events.iter().filter(|e| e.method == "dump").count(), 2);
-    assert!(events.iter().any(|e| e.params["text"] == "hello"));
+    assert!(events.iter().any(|e| e.params["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("hello"))));
     let (tx, rx) = tokio::sync::oneshot::channel();
     let mut tx = Some(tx);
     let handle = tokio::spawn(async move {
@@ -40,7 +42,10 @@ async fn acceptance_and_streaming() {
                 "one",
                 "import time\nprint('before sleep')\ntime.sleep(1)",
                 |e| {
-                    if e.params["text"] == "before sleep" {
+                    if e.params["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("before sleep"))
+                    {
                         let _ = tx.take().unwrap().send(());
                     }
                 },
@@ -108,7 +113,10 @@ async fn shutdown_terminates_a_running_kernel() {
                 "one",
                 "import time\nprint('started')\ntime.sleep(60)",
                 |event| {
-                    if event.params["text"] == "started" {
+                    if event.params["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("started"))
+                    {
                         let _ = tx.take().unwrap().send(());
                     }
                 },
@@ -120,4 +128,51 @@ async fn shutdown_terminates_a_running_kernel() {
         .await
         .unwrap();
     assert!(task.await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn surrogate_text_and_dump_labels_are_valid_for_serde() {
+    let supervisor = Supervisor::default();
+    let events = run(
+        &supervisor,
+        "one",
+        r#"print('\ud800')
+dump({'\udcff': '\udfff'})
+import os
+os.getpid()"#,
+    )
+    .await;
+    assert!(events.iter().any(|event| event.params["text"]
+        .as_str()
+        .is_some_and(|text| text.contains('?'))));
+    assert!(events
+        .iter()
+        .any(|event| event.params["node"]["fields"][0]["name"] == "?"));
+    run(&supervisor, "one", "42").await;
+}
+
+#[tokio::test]
+async fn delayed_output_between_runs_does_not_corrupt_or_restart_kernel() {
+    let supervisor = Supervisor::default();
+    let folder = tempfile::tempdir().unwrap();
+    let marker = folder.path().join("late-output-finished");
+    let path = serde_json::to_string(&marker.to_string_lossy()).unwrap();
+    let source = format!("import os, threading\ndef late():\n    print('late python')\n    os.write(1, b'late native\\n')\n    open({path}, 'w').close()\nthreading.Timer(0.05, late).start()\nos.getpid()");
+    let first = run(&supervisor, "one", &source).await;
+    timeout(Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let second = run(&supervisor, "one", "import os\nos.getpid()").await;
+    assert_eq!(value(&first), value(&second));
+}
+
+#[tokio::test]
+async fn native_children_cannot_consume_protocol_input() {
+    let supervisor = Supervisor::default();
+    run(&supervisor, "one", "import subprocess, sys\nresult = subprocess.run([sys.executable, '-c', 'import sys; assert sys.stdin.read() == chr(0)[:0]'], check=True, timeout=2)").await;
+    run(&supervisor, "one", "42").await;
 }

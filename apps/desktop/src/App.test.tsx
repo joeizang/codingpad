@@ -1,5 +1,11 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, expect, test, vi } from "vitest";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import App from "./App";
 import type { KernelEvent } from "./protocol";
 
@@ -112,4 +118,114 @@ test("running script cannot be submitted twice", async () => {
   finish({ ok: true });
   await screen.findByText("Finished");
   expect(invoke).toHaveBeenCalledTimes(1);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+test("many stream fragments flush once per animation frame and at completion", async () => {
+  let callback!: FrameRequestCallback;
+  const schedule = vi.fn((next: FrameRequestCallback) => {
+    callback = next;
+    return 1;
+  });
+  vi.stubGlobal("requestAnimationFrame", schedule);
+  vi.stubGlobal("cancelAnimationFrame", vi.fn());
+  let channel!: { onmessage: (event: KernelEvent) => void };
+  let finish!: (value: { ok: boolean }) => void;
+  invoke.mockImplementation((_command, args) => {
+    channel = args.onEvent;
+    return new Promise((resolve) => {
+      finish = resolve;
+    });
+  });
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  act(() => {
+    for (let index = 0; index < 1000; index++) {
+      channel.onmessage({
+        method: "stream",
+        params: { runId: 1, stream: "stdout", text: `${index}\n` },
+      });
+    }
+  });
+  expect(schedule).toHaveBeenCalledTimes(1);
+  expect(screen.queryByText(/999/)).not.toBeInTheDocument();
+  act(() => callback(0));
+  expect(screen.getByText(/999/)).toBeInTheDocument();
+  await act(async () => {
+    channel.onmessage({
+      method: "stream",
+      params: { runId: 1, stream: "stdout", text: "final fragment" },
+    });
+    finish({ ok: true });
+  });
+  expect(screen.getByText(/final fragment/)).toBeInTheDocument();
+  expect(screen.getByText("Finished")).toBeInTheDocument();
+});
+
+test("collapsed dump stays attached to its output when old blocks are dropped", async () => {
+  let channel!: { onmessage: (event: KernelEvent) => void };
+  invoke.mockImplementation(async (_command, args) => {
+    channel = args.onEvent;
+    for (let index = 0; index < 500; index++) {
+      channel.onmessage({
+        method: "dump",
+        params: {
+          runId: 1,
+          node:
+            index === 10
+              ? {
+                  kind: "list",
+                  type: "keep collapsed",
+                  items: [],
+                  truncated: false,
+                }
+              : { kind: "primitive", v: index },
+        },
+      });
+    }
+    return { ok: true };
+  });
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  await screen.findByText("Finished");
+  const details = screen.getByText(/keep collapsed/).closest("details")!;
+  fireEvent.click(details.querySelector("summary")!);
+  expect(details.open).toBe(false);
+  act(() =>
+    channel.onmessage({
+      method: "dump",
+      params: { runId: 1, node: { kind: "primitive", v: 500 } },
+    }),
+  );
+  await screen.findByText("500");
+  expect(screen.getByText(/keep collapsed/).closest("details")).toBe(details);
+  expect(details.open).toBe(false);
+});
+
+test("late events from an earlier run cannot contaminate a rerun", async () => {
+  const channels: { onmessage: (event: KernelEvent) => void }[] = [];
+  invoke.mockImplementation(async (_command, args) => {
+    channels.push(args.onEvent);
+    return { ok: true };
+  });
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  await screen.findByText("Finished");
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  await waitFor(() => expect(invoke).toHaveBeenCalledTimes(2));
+  await act(async () => {
+    channels[0].onmessage({
+      method: "stream",
+      params: { runId: 1, stream: "stdout", text: "stale output" },
+    });
+    channels[1].onmessage({
+      method: "stream",
+      params: { runId: 2, stream: "stdout", text: "current output" },
+    });
+  });
+  await screen.findByText("current output");
+  expect(screen.queryByText("stale output")).not.toBeInTheDocument();
 });

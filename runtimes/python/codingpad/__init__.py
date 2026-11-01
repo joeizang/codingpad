@@ -21,7 +21,11 @@ def _tree(value, seen=None, depth=0, budget=None):
     if isinstance(value, (bool, int)):
         # Keep arbitrarily large Python integers out of JSON's number range.
         if isinstance(value, int) and abs(value) > 2**53 - 1:
-            return {"kind": "string", "type": "int", "v": str(value)}
+            try:
+                text = str(value)
+            except ValueError:
+                text = f"<int with {value.bit_length()} bits>"
+            return {"kind": "string", "type": "int", "v": text[:10000]}
         return {"kind": "primitive", "v": value}
     if isinstance(value, float):
         return (
@@ -40,9 +44,9 @@ def _tree(value, seen=None, depth=0, budget=None):
         def child(item):
             return _tree(item, seen, depth + 1, budget)
 
-        if isinstance(value, (list, tuple)):
+        if isinstance(value, (list, tuple, set, frozenset)):
             items = []
-            for item in value[:_MAX_ITEMS]:
+            for item in islice(value, _MAX_ITEMS):
                 if budget[0] <= 0:
                     break
                 items.append(child(item))
@@ -58,7 +62,11 @@ def _tree(value, seen=None, depth=0, budget=None):
             try:
                 attributes = vars(value)
             except TypeError:
-                attributes = {}
+                return {
+                    "kind": "string",
+                    "type": type(value).__name__,
+                    "v": repr(value)[:10000],
+                }
         fields = []
         for name, item in islice(attributes.items(), _MAX_ITEMS):
             if budget[0] <= 0:

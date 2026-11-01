@@ -175,6 +175,41 @@ class KernelTests(unittest.TestCase):
         messages = self.run_script('[float("nan"), float("inf"), 10**100, "\\ud800"]')
         self.assertTrue(messages[-1]["result"]["ok"])
 
+    def test_child_stdin_is_eof_not_the_protocol_pipe(self):
+        messages = self.run_script(
+            'import subprocess, sys\nresult = subprocess.run([sys.executable, "-c", "import sys; print(repr(sys.stdin.read()))"], timeout=2, check=True)'
+        )
+        self.assertTrue(messages[-1]["result"]["ok"])
+        self.assertTrue(self.run_script("42")[-1]["result"]["ok"])
+
+    def test_python_native_and_dump_order_is_preserved(self):
+        messages = self.run_script(
+            'import subprocess, sys\nprint("a")\nsubprocess.run([sys.executable, "-c", "print(chr(98))"], check=True)\nprint("c")\ndump(42)\nprint("d", flush=True)'
+        )
+        index = next(i for i, m in enumerate(messages) if m.get("method") == "dump")
+
+        def text(part):
+            return "".join(
+                m["params"]["text"] for m in part if m.get("method") == "stream"
+            )
+
+        self.assertEqual(text(messages[:index]), "a\nb\nc\n")
+        self.assertEqual(text(messages[index:]), "d\n")
+
+    def test_large_int_and_values_without_instance_dict(self):
+        messages = self.run_script(
+            'import math\ndump(10**5000)\ndump(math.factorial(2000))\ndump({1, 2, 3})\ndump(frozenset({4, 5}))\ndump(b"abc")\ndump(1+2j)'
+        )
+        self.assertTrue(messages[-1]["result"]["ok"])
+        nodes = [m["params"]["node"] for m in messages if m.get("method") == "dump"]
+        self.assertEqual(nodes[0]["type"], "int")
+        self.assertTrue(nodes[0]["v"])
+        self.assertTrue(nodes[1]["v"])
+        self.assertEqual({v["v"] for v in nodes[2]["items"]}, {1, 2, 3})
+        self.assertEqual({v["v"] for v in nodes[3]["items"]}, {4, 5})
+        self.assertEqual(nodes[4]["v"], "b'abc'")
+        self.assertEqual(nodes[5]["v"], "(1+2j)")
+
     def test_malformed_request_can_recover(self):
         self.process.stdin.write("not json\n")
         self.process.stdin.flush()

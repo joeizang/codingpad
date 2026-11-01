@@ -23,11 +23,21 @@ with original source locations preserved. A final `None` result is suppressed;
 an explicit final `dump(...)` is not emitted twice. `input()` raises an actionable
 script error rather than consuming protocol input.
 
-Python text output is emitted immediately. Native file-descriptor and subprocess
-output is captured through pipes and drained before completion (up to 500 ms per
-stream if a background subprocess retains a pipe). Background work that outlives
-the run is not supported. The protocol uses a dedicated duplicate of stdout so
-native writes cannot corrupt JSON framing. Notifications include:
+Python and native/subprocess writes share one pipe per output stream, preserving
+write order within that stream and naturally grouping fragments into read chunks.
+Before a dump, explicit flush, or run completion, a private fence is written to
+each pipe and acknowledged by its reader after preceding text has been sent.
+The two streams have independent readers; there is no total ordering guarantee
+between stdout and stderr. Drain acknowledgements and reader joins each wait at
+most 500 ms per stream if a script changes descriptors or leaves background work.
+Background work that outlives a run is not supported.
+
+Both protocol input and output use private, non-inheritable duplicate descriptors.
+Fds 0 and 1 are permanently pointed at the null device outside capture, so child
+stdin immediately sees EOF and delayed stdout cannot corrupt protocol framing.
+During a run, fds 1 and 2 are redirected to capture pipes; Windows standard handles
+are updated too. All message strings (including dump labels) replace lone
+surrogates before JSON encoding so Rust can decode them. Notifications include:
 
 ```json
 {"jsonrpc":"2.0","method":"stream","params":{"runId":1,"stream":"stdout","text":"hello"}}
@@ -48,20 +58,26 @@ The desktop uses a Tauri IPC channel per invocation so notifications cannot be
 missed between listener registration and execution. Each script serializes its
 runs; different script kernels can run independently. Closing a tab drops/kills
 its child process. Application exit signals all active runs to finish and kills
-their children before leaving the event loop.
+their children before leaving the event loop. Frontend notifications are batched
+per animation frame and flushed at run completion. Stable output IDs are retained
+when the 500-block limit evicts old output. Per-run generation checks discard late
+notifications from an earlier invocation.
 
 ## Basic dump nodes
 
 - `null`: Python `None`
 - `primitive`: JSON-safe boolean or number
 - `string`: text in `v` (also used for non-finite floats, oversized integers and
-  depth/cycle markers)
-- `list`: list/tuple with `type`, `items`, `truncated`
+  depth/cycle markers, and bounded `repr()` fallbacks for values without an
+  instance dictionary)
+- `list`: list/tuple/set/frozenset with `type`, `items`, `truncated`
 - `object`: dictionary or instance attributes with `type`, `fields` containing
   `{name, value}`, and `truncated`
 
 Strings are limited to 10,000 characters, containers to 100 children and depth to
-six, with a total budget of 1,000 nodes per dump. Repeated references are allowed; only cycles in the current path are marked.
+six, with a total budget of 1,000 nodes per dump. Repeated references are allowed;
+only cycles in the current path are marked. Integers exceeding Python's decimal
+conversion limit show a bit-count summary instead of failing the run.
 Properties and arbitrary iterators are not evaluated. Outside the app, `dump()`
 falls back to terminal pretty-printing.
 

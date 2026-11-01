@@ -21,15 +21,48 @@ import codingpad  # noqa: E402
 _protocol_out = os.fdopen(
     os.dup(sys.stdout.fileno()), "w", encoding="utf-8", buffering=1
 )
-_protocol_in = sys.stdin
+_protocol_in = os.fdopen(os.dup(sys.stdin.fileno()), "r", encoding="utf-8")
+
+
+def redirect_fd(source, target):
+    os.dup2(source, target)
+    if os.name == "nt":
+        # CRT descriptors and inherited Win32 standard handles must agree.
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        set_handle = ctypes.windll.kernel32.SetStdHandle
+        set_handle.argtypes = [wintypes.DWORD, wintypes.HANDLE]
+        set_handle.restype = wintypes.BOOL
+        if not set_handle(-10 - target, msvcrt.get_osfhandle(target)):
+            raise ctypes.WinError()
+
+
+# Only the private duplicates can access the protocol, including between runs.
+with open(os.devnull, "r+b", buffering=0) as sink:
+    redirect_fd(sink.fileno(), 0)
+    redirect_fd(sink.fileno(), 1)
 _write_lock = threading.Lock()
+
+
+def json_safe(value):
+    if isinstance(value, str):
+        return value.encode("utf-8", "replace").decode("utf-8")
+    if isinstance(value, dict):
+        return {json_safe(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [json_safe(item) for item in value]
+    return value
 
 
 def send(message):
     with _write_lock:
         _protocol_out.write(
             json.dumps(
-                {"jsonrpc": "2.0", **message}, ensure_ascii=True, allow_nan=False
+                json_safe({"jsonrpc": "2.0", **message}),
+                ensure_ascii=True,
+                allow_nan=False,
             )
             + "\n"
         )
@@ -40,74 +73,134 @@ def notify(method, params):
     send({"method": method, "params": params})
 
 
+def write_all(descriptor, data):
+    while data:
+        written = os.write(descriptor, data)
+        data = data[written:]
+
+
 @contextlib.contextmanager
 def capture_native(run_id):
-    """Keep subprocess/native writes off the JSON-RPC fd and stream them too."""
+    """One pipe per stream orders Python/native writes and batches fragments."""
     streams = []
+    flush_gate = threading.Lock()
+    live = True
 
-    def pump(reader, name, active, gate):
+    def pump(reader, name, active, gate, marker, drained):
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        pending = b""
+
+        def emit(data, final=False):
+            text = decoder.decode(data, final=final)
+            if text:
+                notify("stream", {"runId": run_id, "stream": name, "text": text})
+
         try:
-            while data := os.read(reader, 4096):
+            while data := os.read(reader, 8192):
                 with gate:
                     if not active.is_set():
                         break
-                    notify(
-                        "stream",
-                        {"runId": run_id, "stream": name, "text": decoder.decode(data)},
-                    )
-            tail = decoder.decode(b"", final=True)
+                    pending += data
+                    while True:
+                        before, separator, after = pending.partition(marker)
+                        if separator:
+                            emit(before)
+                            drained.set()
+                            pending = after
+                            continue
+                        # Retain only a possible split marker, not ordinary text.
+                        keep = next(
+                            (
+                                size
+                                for size in range(
+                                    min(len(pending), len(marker) - 1), 0, -1
+                                )
+                                if pending.endswith(marker[:size])
+                            ),
+                            0,
+                        )
+                        emit(pending[:-keep] if keep else pending)
+                        pending = pending[-keep:] if keep else b""
+                        break
             with gate:
-                if tail and active.is_set():
-                    notify("stream", {"runId": run_id, "stream": name, "text": tail})
+                if active.is_set():
+                    emit(pending, final=True)
         finally:
             os.close(reader)
+
+    def drain():
+        # Fences share the output pipes, so acknowledgement means every earlier
+        # write on that stream reached the supervisor before a dump/flush.
+        with flush_gate:
+            if not live:
+                return
+            for descriptor, _, _, _, _, marker, drained in streams:
+                drained.clear()
+                try:
+                    write_all(descriptor, marker)
+                except OSError:
+                    drained.set()  # Script may have closed its own stdout/stderr.
+            for *_, drained in streams:
+                drained.wait(timeout=0.5)
 
     try:
         for descriptor, name in [(1, "stdout"), (2, "stderr")]:
             reader, writer = os.pipe()
             original = os.dup(descriptor)
-            os.dup2(writer, descriptor)
+            redirect_fd(writer, descriptor)
             os.close(writer)
-            active, gate = threading.Event(), threading.Lock()
+            active, gate, drained = (
+                threading.Event(),
+                threading.Lock(),
+                threading.Event(),
+            )
+            marker = b"\0codingpad:" + os.urandom(16).hex().encode("ascii") + b"\0"
             active.set()
             thread = threading.Thread(
-                target=pump, args=(reader, name, active, gate), daemon=True
+                target=pump,
+                args=(reader, name, active, gate, marker, drained),
+                daemon=True,
             )
-            streams.append((descriptor, original, thread, active, gate))
+            streams.append(
+                (descriptor, original, thread, active, gate, marker, drained)
+            )
             thread.start()
-        yield
+        yield drain
     finally:
+        drain()
+        with flush_gate:
+            live = False
         for descriptor, original, *_ in streams:
-            os.dup2(original, descriptor)
+            redirect_fd(original, descriptor)
             os.close(original)
-        for _, _, thread, active, gate in streams:
-            # A background subprocess can retain a pipe. Do not let it delay the
-            # response indefinitely or emit output attributed to a later run.
+        for _, _, thread, active, gate, _, _ in streams:
+            # Background children may retain a pipe; never wait for them forever.
             thread.join(timeout=0.5)
             with gate:
                 active.clear()
 
 
 class Stream(io.TextIOBase):
-    def __init__(self, run_id, name):
-        self.run_id = run_id
-        self.name = name
+    def __init__(self, descriptor, drain):
+        self.descriptor = descriptor
+        self.drain = drain
 
     @property
     def encoding(self):
         return "utf-8"
 
+    def fileno(self):
+        return self.descriptor
+
     def writable(self):
         return True
 
     def write(self, text):
-        if text:
-            notify("stream", {"runId": self.run_id, "stream": self.name, "text": text})
+        write_all(self.descriptor, text.encode("utf-8", "replace"))
         return len(text)
 
     def flush(self):
-        pass
+        self.drain()
 
 
 class NoInput(io.TextIOBase):
@@ -146,16 +239,21 @@ def run(request):
     scope[auto_name] = auto_dump
     previous_main = sys.modules["__main__"]
     sys.modules["__main__"] = module
-    codingpad._sink = lambda node: notify("dump", {"runId": run_id, "node": node})
     previous_input = sys.stdin
     sys.stdin = NoInput()
     ok = False
     try:
         with (
-            capture_native(run_id),
-            contextlib.redirect_stdout(Stream(run_id, "stdout")),
-            contextlib.redirect_stderr(Stream(run_id, "stderr")),
+            capture_native(run_id) as drain,
+            contextlib.redirect_stdout(Stream(1, drain)),
+            contextlib.redirect_stderr(Stream(2, drain)),
         ):
+
+            def emit_dump(node):
+                drain()
+                notify("dump", {"runId": run_id, "node": node})
+
+            codingpad._sink = emit_dump
             try:
                 tree = ast.parse(source, filename=filename)
                 if tree.body and isinstance(tree.body[-1], ast.Expr):

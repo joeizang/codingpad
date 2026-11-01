@@ -18,7 +18,7 @@ type SidebarProps = {
   error?: string;
 };
 
-type Loaded = { entries: FolderEntry[] } | { error: string };
+type Loaded = { entries?: FolderEntry[]; error?: string };
 
 function FolderTree({
   path,
@@ -46,8 +46,12 @@ function FolderTree({
         if (!cancelled) setLoaded({ entries });
       })
       .catch((error) => {
+        // Keep the previous entries visible, but say why they may be stale.
         if (!cancelled)
-          setLoaded((current) => current ?? { error: String(error) });
+          setLoaded((current) => ({
+            ...current,
+            error: String(error),
+          }));
       });
     return () => {
       cancelled = true;
@@ -55,34 +59,38 @@ function FolderTree({
   }, [path, refresh]);
 
   if (!loaded) return <div className="tree-status">Loading…</div>;
-  if ("error" in loaded) return <div className="tree-error">{loaded.error}</div>;
-  if (!loaded.entries.length)
-    return <div className="tree-status">No files yet</div>;
   return (
-    <ul className="tree">
-      {loaded.entries.map((entry) =>
-        entry.isDir ? (
-          <FolderBranch
-            key={entry.path}
-            entry={entry}
-            activePath={activePath}
-            refresh={refresh}
-            onOpen={onOpen}
-          />
-        ) : (
-          <li key={entry.path}>
-            <button
-              className={`tree-file ${entry.path === activePath ? "active" : ""}`}
-              aria-current={entry.path === activePath ? "page" : undefined}
-              title={entry.path}
-              onClick={() => onOpen(entry.path)}
-            >
-              {entry.name}
-            </button>
-          </li>
-        ),
+    <>
+      {loaded.error && <div className="tree-error">{loaded.error}</div>}
+      {!loaded.entries ? null : loaded.entries.length === 0 ? (
+        <div className="tree-status">No files yet</div>
+      ) : (
+        <ul className="tree">
+          {loaded.entries.map((entry) =>
+            entry.isDir ? (
+              <FolderBranch
+                key={entry.path}
+                entry={entry}
+                activePath={activePath}
+                refresh={refresh}
+                onOpen={onOpen}
+              />
+            ) : (
+              <li key={entry.path}>
+                <button
+                  className={`tree-file ${entry.path === activePath ? "active" : ""}`}
+                  aria-current={entry.path === activePath ? "page" : undefined}
+                  title={entry.path}
+                  onClick={() => onOpen(entry.path)}
+                >
+                  {entry.name}
+                </button>
+              </li>
+            ),
+          )}
+        </ul>
       )}
-    </ul>
+    </>
   );
 }
 

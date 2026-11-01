@@ -127,7 +127,13 @@ pub fn load_settings(path: &Path, default_library: &Path) -> LibrarySettings {
 /// Write through a temporary file in the destination folder, then rename it
 /// over the original so a crash or full disk cannot leave a truncated file.
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
-    let parent = path
+    // Follow symlinks so saving a linked script updates its target instead of
+    // replacing the link with a regular file.
+    let destination = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let permissions = fs::metadata(&destination)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    let parent = destination
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
@@ -138,7 +144,19 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
     temp.write_all(contents)
         .and_then(|()| temp.as_file().sync_all())
         .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
-    temp.persist(path)
+    // Keep the previous mode (including an executable bit) instead of the
+    // 0600 temporary file's mode.
+    if let Some(permissions) = permissions {
+        temp.as_file()
+            .set_permissions(permissions)
+            .map_err(|error| {
+                format!(
+                    "Could not preserve permissions on {}: {error}",
+                    path.display()
+                )
+            })?;
+    }
+    temp.persist(&destination)
         .map_err(|error| format!("Could not save {}: {}", path.display(), error.error))?;
     Ok(())
 }
@@ -293,6 +311,33 @@ mod tests {
             .map(|entry| entry.name)
             .collect();
         assert_eq!(names, vec!["example.py"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_script_preserves_permissions_and_follows_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let executable = directory.path().join("run.py");
+        fs::write(&executable, "old").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        write_script(&executable, "new").unwrap();
+        assert_eq!(
+            fs::metadata(&executable).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        let target = directory.path().join("target.py");
+        fs::write(&target, "old").unwrap();
+        let link = directory.path().join("link.py");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        write_script(&link, "new").unwrap();
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
     }
 
     #[test]

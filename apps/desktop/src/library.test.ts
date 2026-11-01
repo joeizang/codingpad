@@ -1,5 +1,11 @@
 import { expect, test } from "vitest";
-import { baseName, headerSummary, joinPath, parentPath } from "./library";
+import {
+  baseName,
+  headerSummary,
+  joinPath,
+  parentPath,
+  parseHeader,
+} from "./library";
 
 test("paths work with either separator", () => {
   expect(baseName("/library/hello.py")).toBe("hello.py");
@@ -18,4 +24,20 @@ test("header settings render as a summary", () => {
     }),
   ).toBe("connection=northwind · readOnly");
   expect(headerSummary(null)).toBe("");
+});
+
+test("parses the same header forms as the Rust store", () => {
+  expect(parseHeader("# codingpad: connection=northwind\nprint(1)")).toEqual({
+    line: "# codingpad: connection=northwind",
+    settings: { connection: "northwind" },
+  });
+  expect(parseHeader('// codingpad: connection="north wind" theme=dark')).toEqual({
+    line: '// codingpad: connection="north wind" theme=dark',
+    settings: { connection: "north wind", theme: "dark" },
+  });
+  expect(parseHeader("\uFEFF  # codingpad: readOnly")?.settings).toEqual({
+    readOnly: "",
+  });
+  expect(parseHeader("print(1)\n# codingpad: connection=one")).toBeNull();
+  expect(parseHeader("# a normal comment")).toBeNull();
 });

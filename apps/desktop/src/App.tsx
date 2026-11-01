@@ -20,9 +20,9 @@ import {
   headerSummary,
   joinPath,
   parentPath,
+  parseHeader,
   type LibrarySettings,
   type ScriptFile,
-  type ScriptHeader,
 } from "./library";
 
 const SAMPLE = `from codingpad import dump
@@ -47,7 +47,6 @@ type Script = {
   name: string;
   path?: string;
   source: string;
-  header: ScriptHeader | null;
   dirty: boolean;
   output: Output[];
   running: boolean;
@@ -61,7 +60,6 @@ const newScript = (number: number): Script => ({
   id: `scratch-${number}`,
   name: `Scratch ${number}.py`,
   source: SAMPLE,
-  header: null,
   dirty: false,
   output: [],
   running: false,
@@ -115,6 +113,7 @@ export default function App() {
   );
   const active = scripts.find((script) => script.id === activeId)!;
   const runnable = isPython(active);
+  const activeHeader = parseHeader(active.source);
   const update = (id: string, change: (script: Script) => Script) =>
     setScripts((all) =>
       all.map((script) => (script.id === id ? change(script) : script)),
@@ -320,7 +319,6 @@ export default function App() {
         name: file.name,
         path: file.path,
         source: file.source,
-        header: file.header,
         dirty: false,
         output: [],
         running: false,
@@ -399,7 +397,6 @@ export default function App() {
               ...item,
               path: saved.path,
               name: saved.name,
-              header: item.source === source ? saved.header : item.header,
               dirty: item.source !== source,
               error: undefined,
             }
@@ -692,8 +689,8 @@ export default function App() {
             : `${active.name} · Not saved to the library`}
         </span>
         <span>
-          {active.header
-            ? `Header: ${headerSummary(active.header) || active.header.line}`
+          {activeHeader
+            ? `Header: ${headerSummary(activeHeader) || activeHeader.line}`
             : "Python · Library and files"}
         </span>
       </footer>

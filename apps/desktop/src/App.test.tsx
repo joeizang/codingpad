@@ -443,7 +443,12 @@ test("opens a library script and preserves its header when saving", async () => 
   );
   expect(screen.getByText(/Header: connection=northwind/)).toBeInTheDocument();
 
-  const edited = "# codingpad: connection=northwind\nprint(2)\n";
+  fireEvent.change(screen.getByLabelText("Code"), {
+    target: { value: "# codingpad: connection=other\nprint(1)\n" },
+  });
+  expect(screen.getByText(/Header: connection=other/)).toBeInTheDocument();
+
+  const edited = "# codingpad: connection=other\nprint(2)\n";
   fireEvent.change(screen.getByLabelText("Code"), { target: { value: edited } });
   fireEvent.click(screen.getByRole("button", { name: "Save" }));
   await waitFor(() =>
@@ -704,4 +709,43 @@ test("saving refreshes the tree without collapsing an expanded folder", async ()
     "aria-expanded",
     "true",
   );
+});
+
+test("a failed refresh shows an error but keeps the last tree", async () => {
+  let listings = 0;
+  invoke.mockImplementation(async (command, args) => {
+    if (command === "load_library_settings")
+      return { libraryPath: "/library", pinnedFolders: [] };
+    if (command === "list_folder") {
+      listings += 1;
+      if (listings > 1) throw new Error("folder is gone");
+      return [{ name: "x.py", path: "/library/x.py", isDir: false }];
+    }
+    if (command === "read_script")
+      return {
+        path: "/library/x.py",
+        name: "x.py",
+        source: "print(1)",
+        header: null,
+      };
+    if (command === "write_script")
+      return {
+        path: args.path,
+        name: "x.py",
+        source: args.source,
+        header: null,
+      };
+    return undefined;
+  });
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "x.py" }));
+  await waitFor(() =>
+    expect(screen.getByLabelText("Code")).toHaveValue("print(1)"),
+  );
+  fireEvent.change(screen.getByLabelText("Code"), {
+    target: { value: "print(2)" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  expect(await screen.findByText(/folder is gone/)).toBeInTheDocument();
+  expect(screen.getAllByRole("button", { name: "x.py" })).toHaveLength(2);
 });

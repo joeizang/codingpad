@@ -12,3 +12,7 @@ sha2 = "0.10"
 dirs = "7"
 tempfile = "3"
 tokio = { version = "1", features = ["process", "io-util", "sync", "rt-multi-thread", "macros", "time"] }
+url = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

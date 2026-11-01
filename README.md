@@ -1,11 +1,12 @@
 # CodingPad
 
 A desktop scratchpad for running plain scripts and inspecting their values. This
-M1 build supports Python with a Monaco editor, streamed stdout/stderr, rich dumps
-(lazy nodes, paged virtualised tables, images, sandboxed HTML, live updates),
-structured errors with clickable tracebacks, automatic display of the last
-expression, Stop/Reset, a library sidebar with pinned folders and plain-file
-saving, and inline Python packages (PEP 723).
+M1 build supports Python with a Monaco editor, Python completions and hover,
+type diagnostics, streamed stdout/stderr, rich dumps (lazy nodes, paged
+virtualised tables, images, sandboxed HTML, live updates), structured errors with
+clickable tracebacks, automatic display of the last expression, Stop/Reset, a
+library sidebar with pinned folders and plain-file saving, and inline Python
+packages (PEP 723).
 
 ## Develop locally
 
@@ -176,6 +177,19 @@ last 100,000 characters of each adjacent text stream. Stream fragments are
 coalesced once per animation frame, with stable output IDs preserving
 expanded/collapsed trees. Monaco, its Python syntax definition, and its worker are
 bundled locally; there is no editor CDN dependency.
+
+## Code intelligence
+
+Python completions, hover and type diagnostics come from **basedpyright** through
+the app's language-server bridge. The first editor start may download basedpyright
+with `uv`; later starts reuse the cache. PEP 723 inline dependencies are installed
+for the editor environment, so completions work for the packages a script
+declares. Editing the inline metadata restarts the language server for the new
+dependency set; only wheels are used, so an sdist is never built just by opening
+a script.
+
+Type errors appear as squiggles and a count in the editor header, but they never
+stop **Run**; Python executes regardless.
 
 Dual-licensed MIT OR Apache-2.0.
 

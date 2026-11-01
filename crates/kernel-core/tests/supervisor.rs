@@ -536,7 +536,7 @@ async fn inline_packages_install_reuse_and_change_without_leaking_imports() {
     let first = package_fixture(folder.path(), 1);
     let second = package_fixture(folder.path(), 2);
     let supervisor = Supervisor::default();
-    let code = "import cpad_package_fixture as fixture\nassert fixture.VALUE == 1\ncache('saved', lambda: 42)\nimport sys\nsys.executable";
+    let code = "import cpad_package_fixture as fixture\nassert fixture.VALUE == 1\ncache('saved', lambda: 42)\nimport os\nimport sys\nos.path.realpath(sys.executable)";
     let source = package_source(&first, code);
     let events = run(&supervisor, "one", &source).await;
     assert!(events.iter().any(|event| event.params["text"]

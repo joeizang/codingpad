@@ -1,10 +1,12 @@
 //! Desktop-independent supervisor for one warm Python process per script.
+mod packages;
+use packages::Packages;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
 use tempfile::TempDir;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines},
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::{watch, Mutex},
 };
@@ -126,8 +128,26 @@ impl Supervisor {
         if *closed.borrow() {
             return Err("Script was closed".into());
         }
+        let packages = Packages::parse(source)?;
+        if guard
+            .as_ref()
+            .is_some_and(|kernel| kernel.packages != packages)
+        {
+            *guard = None;
+            emit(KernelEvent {
+                method: "stream".into(),
+                params: json!({"runId": 0, "stream": "stderr", "text": "Dependencies changed; restarting Python and clearing cache.\n"}),
+            });
+        }
+        // Startup includes resolution/downloads. Stop and Close must cancel that
+        // work too, before there is a Python kernel to send a cancel request to.
         if guard.is_none() {
-            *guard = Some(Kernel::start(&self.uv).await?);
+            let startup = tokio::select! {
+                result = Kernel::start(&self.uv, packages, &mut emit) => result,
+                _ = closed.changed() => return Err("Script was closed".into()),
+                _ = stop.changed() => return Ok(RunResult { ok: false, stopped: true, cache_cleared: true }),
+            };
+            *guard = Some(startup?);
         }
         let result = tokio::select! {
             result = guard.as_mut().unwrap().run(source, &mut emit, &mut stop) => result,
@@ -232,13 +252,19 @@ struct Kernel {
     output: Lines<BufReader<ChildStdout>>,
     next_id: u64,
     _files: TempDir,
+    packages: Packages,
 }
 
 impl Kernel {
-    async fn start(uv: &PathBuf) -> Result<Self, String> {
+    async fn start(
+        uv: &PathBuf,
+        packages: Packages,
+        emit: &mut (impl FnMut(KernelEvent) + Send),
+    ) -> Result<Self, String> {
         let mut discover = Command::new(uv);
         #[cfg(windows)]
         discover.creation_flags(0x08000000); // CREATE_NO_WINDOW, also for uv
+        discover.kill_on_drop(true);
         let python = discover
             .args(["python", "find", ">=3.10", "--offline", "--no-config"])
             .output().await.map_err(|e| {
@@ -249,7 +275,14 @@ impl Kernel {
         if !python.status.success() {
             return Err(format!("uv could not find an installed Python. Install Python 3.10+ (for example, `uv python install`) and try again. {}", String::from_utf8_lossy(&python.stderr).trim()));
         }
-        let executable = String::from_utf8(python.stdout).map_err(|e| e.to_string())?;
+        let mut executable = String::from_utf8(python.stdout).map_err(|e| e.to_string())?;
+        if packages.declared {
+            emit(KernelEvent {
+                method: "stream".into(),
+                params: json!({"runId": 0, "stream": "stderr", "text": "Preparing Python packages (uv cache)…\n"}),
+            });
+            executable = prepare_packages(uv, &packages, emit).await?;
+        }
         let files = tempfile::tempdir().map_err(|e| e.to_string())?;
         let runtime = files.path().join("runtime/codingpad");
         std::fs::create_dir_all(&runtime).map_err(|e| e.to_string())?;
@@ -275,6 +308,7 @@ impl Kernel {
             child,
             next_id: 0,
             _files: files,
+            packages,
         })
     }
 
@@ -395,6 +429,97 @@ impl Kernel {
             );
         }
     }
+}
+
+// A stable launcher per dependency set lets uv manage persistent script
+// environments, including locking concurrent installs. Launch Python directly
+// afterwards so Stop/Close own the actual kernel process on every platform.
+async fn prepare_packages(
+    uv: &PathBuf,
+    packages: &Packages,
+    emit: &mut (impl FnMut(KernelEvent) + Send),
+) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    let mut metadata = packages.clone();
+    metadata.requires_python = Some(
+        packages
+            .requires_python
+            .as_ref()
+            .map(|spec| format!(">=3.10,{spec}"))
+            .unwrap_or_else(|| ">=3.10".into()),
+    );
+    let metadata = toml::to_string(&metadata).map_err(|e| e.to_string())?;
+    let launcher = format!(
+        "# /// script\n{}# ///\nimport sys; print(sys.executable)\n",
+        metadata
+            .lines()
+            .map(|line| format!("# {line}\n"))
+            .collect::<String>()
+    );
+    let cache = dirs::cache_dir()
+        .ok_or("Could not locate the user cache directory")?
+        .join("codingpad/python-packages-v1");
+    std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+    let path = cache.join(format!("{:x}.py", Sha256::digest(launcher.as_bytes())));
+    if !path.exists() {
+        let mut file = tempfile::NamedTempFile::new_in(&cache).map_err(|e| e.to_string())?;
+        file.write_all(launcher.as_bytes())
+            .map_err(|e| e.to_string())?;
+        match file.persist_noclobber(&path) {
+            Ok(_) => (),
+            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let mut command = Command::new(uv);
+    command
+        .args([
+            "run",
+            "--no-project",
+            "--no-config",
+            "--no-env-file",
+            "--no-python-downloads",
+            "--color",
+            "never",
+            "--script",
+        ])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Could not prepare Python packages: {e}"))?;
+    let mut stderr = child.stderr.take().unwrap();
+    let progress = async {
+        let mut buffer = [0; 8192];
+        loop {
+            let count = stderr.read(&mut buffer).await.map_err(|e| e.to_string())?;
+            if count == 0 {
+                return Ok::<(), String>(());
+            }
+            emit(KernelEvent {
+                method: "stream".into(),
+                params: json!({"runId": 0, "stream": "stderr", "text": String::from_utf8_lossy(&buffer[..count])}),
+            });
+        }
+    };
+    let (output, ()) = tokio::try_join!(
+        async { child.wait_with_output().await.map_err(|e| e.to_string()) },
+        progress
+    )?;
+    if !output.status.success() {
+        return Err("Python package preparation failed. See uv output in Results; check the dependencies, requires-python and network connection. Python 3.10+ must already be installed.".into());
+    }
+    let executable = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
+    if !std::path::Path::new(executable.trim()).is_file() {
+        return Err("uv did not return a usable Python interpreter".into());
+    }
+    Ok(executable)
 }
 
 enum CallError {

@@ -376,3 +376,18 @@ test("a run finishing successfully during Stop still shows Finished", async () =
   await screen.findByText("Finished");
   expect(screen.queryByText("Stopped")).not.toBeInTheDocument();
 });
+
+test("package preparation diagnostics remain visible when installation fails", async () => {
+  invoke.mockImplementation(async (_command, args) => {
+    args.onEvent.onmessage({
+      method: "stream",
+      params: { runId: 0, stream: "stderr", text: "Preparing Python packages…\nerror: No solution found" },
+    });
+    throw "Python package preparation failed. See uv output in Results.";
+  });
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("package preparation failed");
+  expect(screen.getByText(/No solution found/)).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "▶ Run" })).toBeEnabled();
+});

@@ -302,6 +302,16 @@ button:disabled {
   border-radius: 4px;
   margin-bottom: 12px;
 }
+.tool-install {
+  padding: 12px;
+  margin-bottom: 12px;
+  background: #20252d;
+  border: 1px solid #343c48;
+  border-radius: 5px;
+}
+.tool-install p {
+  margin: 0 0 10px;
+}
 .dump {
   margin: 14px 0;
   padding: 12px;

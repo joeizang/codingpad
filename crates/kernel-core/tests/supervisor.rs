@@ -98,6 +98,7 @@ async fn missing_uv_is_actionable() {
     let supervisor = Supervisor::with_uv("/codingpad/nonexistent/uv".into());
     let error = supervisor.run("one", "42", |_| {}).await.unwrap_err();
     assert!(error.contains("uv was not found"));
+    assert!(error.contains("Install uv and run"));
     assert!(error.contains("PATH"));
 }
 

@@ -6,6 +6,7 @@ Windows. On a headless Linux machine run under xvfb-run. No Python dependencies.
 
 import argparse
 import json
+import os
 import subprocess
 import time
 from http.client import HTTPException
@@ -83,7 +84,7 @@ def main():
             execute("document.querySelector('.run-button').click()")
             wait_for(
                 lambda: execute(
-                    "return document.querySelector('[role=status]').textContent === 'Finished'"
+                    "return document.querySelector('.results-pane [role=status]').textContent === 'Finished'"
                 ),
                 "Python run",
             )
@@ -95,7 +96,7 @@ def main():
         execute("document.querySelector('.run-button').click()")
         wait_for(
             lambda: execute(
-                "return document.querySelector('[role=status]').textContent === 'Finished'"
+                "return document.querySelector('.results-pane [role=status]').textContent === 'Finished'"
             ),
             "second script kernel",
         )
@@ -107,7 +108,16 @@ def main():
             if session:
                 request("DELETE", f"/session/{session}")
         finally:
-            process.terminate()
+            if os.name == "nt":
+                # Terminating only tauri-driver leaves msedgedriver holding logs open.
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            else:
+                process.terminate()
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:

@@ -354,7 +354,7 @@ impl Kernel {
         self.input
             .flush()
             .await
-            .map_err(|e| CallError::Transport(e.to_string()))?;
+            .map_err(|e| CallError::Transport(format!("Could not flush request to Python: {e}")))?;
         let message = self.next_message().await?;
         if message.get("id").is_some() {
             return response_result(&message, id);

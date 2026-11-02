@@ -335,10 +335,7 @@ impl LspServer {
         #[cfg(unix)]
         command.process_group(0);
         #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000 | 0x00000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
-        }
+        command.creation_flags(0x08000000 | 0x00000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
 
         let mut child = command.spawn().map_err(|error| {
             if error.kind() == ErrorKind::NotFound {
@@ -674,9 +671,12 @@ async fn read_loop(
                     if diagnostics_are_current(params, &config.document_uri, current) {
                         let sink = events.lock().ok().map(|events| (*events).clone());
                         if let Some(sink) = sink {
+                            let mut params = params.clone();
+                            // The editor identifies this document by the URI we issued.
+                            params["uri"] = config.document_uri.clone().into();
                             sink(LspEvent {
                                 method: method.to_owned(),
-                                params: params.clone(),
+                                params,
                             });
                         }
                     }
@@ -709,13 +709,28 @@ async fn read_loop(
 }
 
 fn diagnostics_are_current(params: &Value, document_uri: &str, version: i64) -> bool {
-    if params.get("uri").and_then(Value::as_str) != Some(document_uri) {
+    let Some(uri) = params.get("uri").and_then(Value::as_str) else {
+        return false;
+    };
+    if !same_document_uri(uri, document_uri) {
         return false;
     }
     params
         .get("version")
         .and_then(Value::as_i64)
         .is_none_or(|incoming| incoming >= version)
+}
+
+fn same_document_uri(incoming: &str, expected: &str) -> bool {
+    if incoming == expected {
+        return true;
+    }
+    let file_path = |uri: &str| Url::parse(uri).ok()?.to_file_path().ok();
+    match (file_path(incoming), file_path(expected)) {
+        // File paths decode URI escapes and normalize Windows drive prefixes.
+        (Some(incoming), Some(expected)) => incoming == expected,
+        _ => false,
+    }
 }
 
 fn server_request_result(method: &str, message: &Value, config: &ResponseConfig) -> Value {
@@ -1024,6 +1039,31 @@ print("hi")
                 "diagnostics": []
             }),
             "file:///workspace/script.py",
+            4
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_diagnostics_accept_equivalent_drive_uris() {
+        let params = json!({
+            "uri": "file:///c%3A/workspace/my%20script.py",
+            "version": 3,
+            "diagnostics": []
+        });
+        assert!(diagnostics_are_current(
+            &params,
+            "file:///C:/workspace/my%20script.py",
+            3
+        ));
+        assert!(!diagnostics_are_current(
+            &params,
+            "file:///C:/workspace/other.py",
+            3
+        ));
+        assert!(!diagnostics_are_current(
+            &params,
+            "file:///C:/workspace/my%20script.py",
             4
         ));
     }

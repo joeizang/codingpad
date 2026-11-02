@@ -152,12 +152,16 @@ async fn main() {
 
     match dump_first_page(&supervisor).await {
         Ok(measured) => rows.push(Row::time(
-            "100k-row dump first rows",
+            "100k-row dump, first page to host",
             measured,
             TARGET_DUMP_FIRST_PAGE,
         )),
         Err(error) => {
-            rows.push(Row::failed("100k-row dump first rows", "< 1000 ms", &error));
+            rows.push(Row::failed(
+                "100k-row dump, first page to host",
+                "< 1000 ms",
+                &error,
+            ));
             failures.push(error);
         }
     }
@@ -228,25 +232,39 @@ async fn dump_first_page(supervisor: &Supervisor) -> Result<Duration, String> {
     first_page.ok_or_else(|| "no table dump arrived".into())
 }
 
+fn completion_params(uri: &str, character: u32) -> serde_json::Value {
+    json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": 1, "character": character },
+        "context": { "triggerKind": 1 },
+    })
+}
+
 async fn completion_latency() -> Result<Duration, String> {
     eprintln!("Warming the Python language server (the first run may download basedpyright)...");
     let servers = LanguageServers::default();
     let measured = async {
         servers.begin_session("bench").await;
         let start = servers
-            .start_python("bench-lsp", "import os\nos.path.join(", "bench", |_| {})
+            .start_python("bench-lsp", "import os\nos.path.join", "bench", |_| {})
             .await?;
-        let params = json!({
-            "textDocument": { "uri": start.uri },
-            "position": { "line": 1, "character": 13 },
-            "context": { "triggerKind": 1 },
-        });
         let _ = servers
-            .request("bench-lsp", "textDocument/completion", params.clone())
+            .request(
+                "bench-lsp",
+                "textDocument/completion",
+                completion_params(&start.uri, 12),
+            )
+            .await?;
+        servers
+            .did_change("bench-lsp", "import os\nos.path.join(")
             .await?;
         let started = Instant::now();
         let result = servers
-            .request("bench-lsp", "textDocument/completion", params)
+            .request(
+                "bench-lsp",
+                "textDocument/completion",
+                completion_params(&start.uri, 13),
+            )
             .await?;
         let elapsed = started.elapsed();
         if result.is_null() {
@@ -354,37 +372,29 @@ fn measure_app_unix() -> Result<AppMeasurement, String> {
         .map_err(|error| format!("could not launch {}: {error}", desktop.display()))?;
     let pid = child.id();
 
-    let ready = wait_for_marker(&marker, launched, &mut child)?;
+    let ready = match wait_for_marker(&marker, launched, &mut child) {
+        Ok(ready) => ready,
+        Err(error) => {
+            let _ = std::fs::remove_file(&marker);
+            stop_app(&mut child, pid);
+            return Err(error);
+        }
+    };
     thread::sleep(IDLE_SETTLE);
 
     #[cfg(target_os = "macos")]
-    let (idle_memory, helpers) = {
-        let helpers: Vec<_> = webkit_pids()
-            .difference(&baseline_helpers)
-            .copied()
-            .collect();
-        let memory = std::iter::once(pid)
-            .chain(helpers.iter().copied())
+    let idle_memory = {
+        let current = webkit_pids();
+        let helpers: Vec<_> = current.difference(&baseline_helpers).copied().collect();
+        std::iter::once(pid)
+            .chain(helpers)
             .map(process_memory)
-            .sum();
-        (memory, helpers)
+            .sum()
     };
     #[cfg(not(target_os = "macos"))]
     let idle_memory = process_group_rss(pid).unwrap_or(0);
     let _ = std::fs::remove_file(&marker);
-
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-
-    #[cfg(target_os = "macos")]
-    for helper in helpers {
-        unsafe {
-            libc::kill(helper as i32, libc::SIGKILL);
-        }
-    }
+    stop_app(&mut child, pid);
 
     if idle_memory == 0 {
         return Err("could not read the app's memory use".into());
@@ -393,6 +403,15 @@ fn measure_app_unix() -> Result<AppMeasurement, String> {
         ready: Duration::from_nanos(ready),
         idle_memory,
     })
+}
+
+#[cfg(unix)]
+fn stop_app(child: &mut std::process::Child, pid: u32) {
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(unix)]

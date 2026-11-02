@@ -6,9 +6,10 @@ type diagnostics, streamed stdout/stderr, rich dumps (lazy nodes, paged
 virtualised tables, images, sandboxed HTML, live updates), structured errors with
 clickable tracebacks, automatic display of the last expression, Stop/Reset, a
 library sidebar with pinned folders and plain-file saving, inline Python
-packages (PEP 723), and one-click private `uv` installation. M2 now starts with a C# kernel: in-memory
-Roslyn compilation, console output, basic `.Dump()`, top-level `await`, and compiler
-diagnostics in the editor and Results.
+packages (PEP 723), and one-click private `uv` installation. The C# kernel adds
+in-memory Roslyn compilation, console output, rich `.Dump()` trees and deferred
+enumerable tables, top-level `await`, and compiler diagnostics in the editor and
+Results.
 
 ## Develop locally
 
@@ -175,7 +176,7 @@ inner exception summaries.
 new { Name = "Ada", Scores = new[] { 90, 95 } }.Dump();
 Enumerable.Range(0, 100_000).Select(i => new { Index = i, Square = i * (long)i }).Dump();
 new HtmlValue("<b>Hello</b>").Dump();
-new ImageValue(File.ReadAllBytes("plot.png"), "image/png", "plot.png").Dump();
+new ImageValue(System.IO.File.ReadAllBytes("plot.png"), "image/png", "plot.png").Dump();
 var progress = new LiveValue(0);
 progress.Dump();
 for (int i = 1; i <= 3; i++) { progress.Value = i; await Task.Delay(100); }

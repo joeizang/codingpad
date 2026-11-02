@@ -224,8 +224,15 @@ mod tests {
         std::fs::write(&active, "active download").unwrap();
         assert!(prepare_install(directory).is_err());
         assert!(active.exists());
-        drop(lock); // Also happens automatically if the process exits.
+        // Model a descriptor inherited by a concurrently spawned subprocess.
+        // Closing our handle alone need not release the shared Unix lock.
+        #[cfg(unix)]
+        let inherited = lock.try_clone().unwrap();
+        lock.unlock().unwrap();
+        drop(lock);
         let _lock = prepare_install(directory).unwrap();
+        #[cfg(unix)]
+        drop(inherited);
         assert!(!active.exists());
     }
 

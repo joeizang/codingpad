@@ -127,6 +127,8 @@ fn prepare_install(directory: &Path) -> Result<InstallLock, String> {
         .open(directory.join(".install.lock"))
         .map_err(|e| format!("Could not open the tool installer lock: {e}"))?;
     lock.try_lock().map_err(|e| format!("Could not lock the tool installer. Another CodingPad instance may be installing uv; retry when it finishes: {e}"))?;
+    // Guard immediately so a failed cleanup below still unlocks explicitly.
+    let lock = InstallLock(lock);
     for entry in std::fs::read_dir(directory).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name();
@@ -140,7 +142,7 @@ fn prepare_install(directory: &Path) -> Result<InstallLock, String> {
             }
         }
     }
-    Ok(InstallLock(lock))
+    Ok(lock)
 }
 
 async fn install_private_uv(

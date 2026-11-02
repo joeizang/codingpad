@@ -105,6 +105,20 @@ async fn csharp_only_valid_value_returning_calls_are_auto_dumped() {
             "{source}"
         );
     }
+    let events = run(
+        &supervisor,
+        "one",
+        "dynamic d = 5; Console.WriteLine(d + 1);",
+        true,
+    )
+    .await;
+    assert!(dumps(&events).is_empty());
+    let stdout: String = events
+        .iter()
+        .filter(|event| event.method == "stream" && event.params["stream"] == "stdout")
+        .filter_map(|event| event.params["text"].as_str())
+        .collect();
+    assert_eq!(stdout.trim(), "6");
     assert_eq!(
         dumps(&run(&supervisor, "one", "42;", false).await)[0]["kind"],
         "error"

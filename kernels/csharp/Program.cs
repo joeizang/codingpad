@@ -144,7 +144,7 @@ internal static class Program
                     var type = model.GetTypeInfo(expression).Type;
                     var symbol = model.GetSymbolInfo(invocation).Symbol as IMethodSymbol;
                     if (type is not null && type.SpecialType != SpecialType.System_Void &&
-                        !type.IsRefLikeType && type.TypeKind is not (TypeKind.Pointer or TypeKind.FunctionPointer) &&
+                        !type.IsRefLikeType && type.TypeKind is not (TypeKind.Dynamic or TypeKind.Pointer or TypeKind.FunctionPointer) &&
                         symbol?.ContainingType.ToDisplayString() != "CodingPad.DumpExtensions")
                     {
                         var wrapped = SyntaxFactory.ParseExpression($"global::CodingPad.DumpExtensions.Dump({expression.WithoutTrivia()})").WithTriviaFrom(expression);

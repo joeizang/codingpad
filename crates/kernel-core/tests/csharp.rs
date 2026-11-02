@@ -81,6 +81,11 @@ async fn csharp_errors_locations_and_warm_recovery() {
     )
     .await;
     assert_eq!(dumps(&events)[0]["message"], "boom");
+    assert!(dumps(&events)[0]["traceback"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|frame| frame["file"] == "script.cs" && frame["script"] == true));
     assert_eq!(dumps(&events)[0]["traceback"][0]["line"], 2);
     let events = run(&supervisor, "one", "42.Dump();", true).await;
     assert_eq!(dumps(&events).len(), 1);
@@ -299,6 +304,11 @@ class Item {
     assert_eq!(error["type"], "InvalidOperationException");
     assert_eq!(error["message"], "getter failed");
     assert_eq!(error["causes"][0]["message"], "inner");
+    assert!(error["traceback"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|frame| frame["file"] == "script.cs" && frame["script"] == true));
     assert!(error["traceback"]
         .as_array()
         .unwrap()
@@ -569,5 +579,233 @@ _ = Task.Run(async () => { await Task.Delay(100); live.Value = 99; Enumerable.Ra
     assert_eq!(dumps(&events).len(), 1);
     assert_eq!(dumps(&events)[0]["v"], 42);
     assert!(!events.iter().any(|event| event.method == "dump_update"));
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_repeated_dumps_and_live_updates_have_independent_sequence_views() {
+    let supervisor = Supervisor::default();
+    let events = run(
+        &supervisor,
+        "views",
+        r#"
+var list = new List<int> { 1 }; list.Dump(); list.Add(2); list.Dump();
+var large = Enumerable.Range(0, 101).ToList(); large.Dump(); large.Add(101); large.Dump();
+var live = new LiveValue(list); live.Dump(); list.Add(3); live.Value = list;
+"#,
+        true,
+    )
+    .await;
+    let nodes = dumps(&events);
+    assert_eq!(nodes[0]["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(nodes[1]["rows"].as_array().unwrap().len(), 2);
+    assert_ne!(nodes[0]["handle"], nodes[1]["handle"]);
+    assert_ne!(nodes[2]["handle"], nodes[3]["handle"]);
+    let page = supervisor
+        .expand(
+            "views",
+            nodes[3]["handle"].as_str().unwrap(),
+            Some("100"),
+            None,
+        )
+        .await
+        .unwrap()
+        .node;
+    assert_eq!(page["rows"][0][0]["v"], 100);
+    assert_eq!(page["rows"][1][0]["v"], 101);
+    assert_eq!(page["total"], 102);
+    let update = events
+        .iter()
+        .find(|event| event.method == "dump_update")
+        .unwrap();
+    assert_eq!(update.params["nodeId"], nodes[4]["node"]["id"]);
+    assert_eq!(update.params["node"]["rows"].as_array().unwrap().len(), 3);
+    // Revisit the first dump without replacing its cached page with the later one.
+    let original = supervisor
+        .expand("views", nodes[0]["handle"].as_str().unwrap(), None, None)
+        .await
+        .unwrap()
+        .node;
+    assert_eq!(original["rows"].as_array().unwrap().len(), 1);
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_property_caches_are_per_dump_and_lazy_getters_read_on_first_expansion() {
+    let supervisor = Supervisor::default();
+    let events = run(
+        &supervisor,
+        "properties",
+        r#"
+var person = new Person(); var people = new List<Person> { person };
+people.Dump(); person.Name = "B"; people.Dump();
+person.Dump(); person.Name = "C"; person.Dump();
+class Person { public string Name { get; set; } = "A"; }
+"#,
+        true,
+    )
+    .await;
+    let nodes = dumps(&events);
+    assert_eq!(nodes[0]["rows"][0][0]["v"], "A");
+    assert_eq!(nodes[1]["rows"][0][0]["v"], "B");
+    let first = field(nodes[2], "Name")["handle"].as_str().unwrap();
+    let second = field(nodes[3], "Name")["handle"].as_str().unwrap();
+    assert_ne!(first, second);
+    // Object getters intentionally evaluate on expansion; an earlier table's
+    // eager getter reads must not leak into either lazy object dump.
+    assert_eq!(
+        supervisor
+            .expand("properties", first, None, None)
+            .await
+            .unwrap()
+            .node["v"],
+        "C"
+    );
+    assert_eq!(
+        supervisor
+            .expand("properties", second, None, None)
+            .await
+            .unwrap()
+            .node["v"],
+        "C"
+    );
+    let old_table = supervisor
+        .expand(
+            "properties",
+            nodes[0]["handle"].as_str().unwrap(),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .node;
+    assert_eq!(old_table["rows"][0][0]["v"], "A");
+    let events = run(&supervisor, "properties", "var c = new Counter(); c.Dump(); c.Dump(); class Counter { private int count; public int Next => ++count; }", true).await;
+    let nodes = dumps(&events);
+    let first = field(nodes[0], "Next")["handle"].as_str().unwrap();
+    let second = field(nodes[1], "Next")["handle"].as_str().unwrap();
+    for (handle, expected) in [(first, 1), (first, 1), (second, 2)] {
+        assert_eq!(
+            supervisor
+                .expand("properties", handle, None, None)
+                .await
+                .unwrap()
+                .node["v"],
+            expected
+        );
+    }
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_wide_tables_keep_scalar_cells_visible_after_the_node_budget() {
+    let supervisor = Supervisor::default();
+    let members: String = (0..16)
+        .map(|i| format!("N{i:02} = i, S{i:02} = i.ToString(), "))
+        .collect();
+    let source = format!("Enumerable.Range(0, 100).Select(i => new {{ {members} }}).Dump();");
+    let events = run(&supervisor, "wide", &source, true).await;
+    let node = dumps(&events)[0];
+    assert_eq!(node["columns"].as_array().unwrap().len(), 32);
+    let rows = node["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 100);
+    for (index, row) in rows.iter().enumerate() {
+        for (column, cell) in row.as_array().unwrap().iter().enumerate() {
+            if column < 16 {
+                assert_eq!(cell["kind"], "primitive");
+                assert_eq!(cell["v"], index);
+            } else {
+                assert_eq!(cell["kind"], "string");
+                assert_eq!(cell["v"], index.to_string());
+            }
+            assert!(cell.get("handle").is_none());
+        }
+    }
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_hung_previews_can_be_stopped_reset_closed_or_shut_down() {
+    let supervisor = Supervisor::default();
+    for action in ["stop", "reset", "close", "shutdown"] {
+        let iterator = matches!(action, "stop" | "close");
+        let source = if iterator {
+            "IEnumerable<int> Gen() { for (var i = 0; i < 100; i++) yield return i; while (true) { } } Gen().Dump(); Environment.ProcessId.Dump();"
+        } else {
+            "new Item().Dump(); Environment.ProcessId.Dump(); class Item { public int Value { get { Thread.Sleep(Timeout.Infinite); return 0; } } }"
+        };
+        let events = run(&supervisor, "hung", source, true).await;
+        let nodes = dumps(&events);
+        let handle = if iterator {
+            &nodes[0]["handle"]
+        } else {
+            &field(nodes[0], "Value")["handle"]
+        }
+        .as_str()
+        .unwrap();
+        let expand = supervisor.expand(
+            "hung",
+            handle,
+            if iterator { Some("100") } else { None },
+            None,
+        );
+        tokio::pin!(expand);
+        // Poll the actual request without dropping it when the wait expires.
+        assert!(timeout(Duration::from_millis(100), &mut expand)
+            .await
+            .is_err());
+        let cancel = async {
+            match action {
+                "stop" => supervisor.stop("hung").await,
+                "reset" => supervisor.reset("hung").await.unwrap(),
+                "close" => supervisor.close("hung").await,
+                "shutdown" => supervisor.shutdown().await,
+                _ => unreachable!(),
+            }
+        };
+        let (result, ()) = timeout(Duration::from_secs(3), async {
+            tokio::join!(expand, cancel)
+        })
+        .await
+        .expect("Preview cancellation blocked");
+        assert!(result.unwrap_err().contains("Run the script again"));
+        let recovered = run(&supervisor, "hung", "Environment.ProcessId.Dump();", true).await;
+        assert_ne!(
+            dumps(&recovered)[0]["v"],
+            nodes[1]["v"],
+            "{action} must discard the hung process"
+        );
+    }
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_live_update_targets_match_complex_inner_node_ids() {
+    let supervisor = Supervisor::default();
+    let events = run(
+        &supervisor,
+        "live",
+        r#"
+foreach (var value in new object[] {
+    new ImageValue(new byte[] { 1, 2, 3 }),
+    new[] { 1, 2 },
+    new { Name = "Ada" },
+    new InvalidOperationException("before")
+}) { var live = new LiveValue(value); live.Dump(); live.Value = "after"; }
+"#,
+        true,
+    )
+    .await;
+    let nodes = dumps(&events);
+    let updates: Vec<_> = events
+        .iter()
+        .filter(|event| event.method == "dump_update")
+        .collect();
+    assert_eq!(nodes.len(), 4);
+    assert_eq!(updates.len(), 4);
+    for (node, update) in nodes.iter().zip(updates) {
+        assert_eq!(update.params["nodeId"], node["node"]["id"]);
+        assert_eq!(update.params["node"]["v"], "after");
+    }
     supervisor.shutdown().await;
 }

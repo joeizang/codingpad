@@ -256,6 +256,24 @@ impl Supervisor {
         cursor: Option<&str>,
         limit: Option<u32>,
     ) -> Result<ExpandResult, String> {
+        self.expand_with_timeout(
+            script_id,
+            handle,
+            cursor,
+            limit,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+    }
+
+    async fn expand_with_timeout(
+        &self,
+        script_id: &str,
+        handle: &str,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+        preview_timeout: std::time::Duration,
+    ) -> Result<ExpandResult, String> {
         let slot = {
             let kernels = self.kernels.lock().await;
             kernels.get(script_id).cloned()
@@ -263,15 +281,29 @@ impl Supervisor {
         let unavailable =
             || "That preview is no longer available. Run the script again.".to_owned();
         let slot = slot.ok_or_else(unavailable)?;
-        let mut guard = slot.kernel.lock().await;
+        // Subscribe before taking the lock so Stop also cancels queued previews.
+        let mut closed = slot.closed.subscribe();
+        let mut stop = slot.stop.subscribe();
+        let mut guard = tokio::select! {
+            biased;
+            _ = closed.changed() => return Err(unavailable()),
+            _ = stop.changed() => return Err(unavailable()),
+            guard = slot.kernel.lock() => guard,
+        };
+        if *closed.borrow() {
+            return Err(unavailable());
+        }
         let outcome = {
             let kernel = guard.as_mut().ok_or_else(unavailable)?;
-            kernel
-                .request(
-                    "expand",
-                    json!({"handle": handle, "cursor": cursor, "limit": limit}),
-                )
-                .await
+            // Getters and iterators can execute arbitrary script code. On
+            // cancellation/timeout, discard the process and its partial response.
+            tokio::select! {
+                biased;
+                _ = closed.changed() => Err(CallError::Transport(unavailable())),
+                _ = stop.changed() => Err(CallError::Transport("Preview stopped; the kernel and cache were cleared. Run the script again.".into())),
+                _ = tokio::time::sleep(preview_timeout) => Err(CallError::Transport("Preview timed out; the kernel and cache were cleared. Run the script again.".into())),
+                result = kernel.request("expand", json!({"handle": handle, "cursor": cursor, "limit": limit})) => result,
+            }
         };
         match outcome {
             Ok(node) => serde_json::from_value(node).map_err(|e| e.to_string()),
@@ -754,6 +786,51 @@ mod tests {
             .await
             .unwrap_err()
             .contains("uv was not found"));
+    }
+
+    #[tokio::test]
+    async fn timed_out_preview_discards_the_kernel_and_the_next_run_recovers() {
+        let supervisor = Supervisor::default();
+        let mut events = Vec::new();
+        supervisor.run_language("timeout", "new Item().Dump(); Environment.ProcessId.Dump(); class Item { public int Value { get { Thread.Sleep(Timeout.Infinite); return 0; } } }", Language::Csharp, |event| events.push(event)).await.unwrap();
+        let nodes: Vec<_> = events
+            .iter()
+            .filter(|event| event.method == "dump")
+            .map(|event| &event.params["node"])
+            .collect();
+        let handle = nodes[0]["fields"][0]["value"]["handle"].as_str().unwrap();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            supervisor.expand_with_timeout(
+                "timeout",
+                handle,
+                None,
+                None,
+                std::time::Duration::from_millis(100),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.contains("Preview timed out"));
+        assert!(error.contains("Run the script again"));
+        let mut recovered = Vec::new();
+        supervisor
+            .run_language(
+                "timeout",
+                "Environment.ProcessId.Dump();",
+                Language::Csharp,
+                |event| recovered.push(event),
+            )
+            .await
+            .unwrap();
+        let pid = &recovered
+            .iter()
+            .find(|event| event.method == "dump")
+            .unwrap()
+            .params["node"]["v"];
+        assert_ne!(pid, &nodes[1]["v"]);
+        supervisor.shutdown().await;
     }
 
     #[test]

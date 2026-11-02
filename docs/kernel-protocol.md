@@ -155,8 +155,9 @@ clicks or scrolls:
 - Handles stay valid until the next run begins or the kernel is reset/restarted.
   An unknown or expired handle returns error `-32001` with a message telling the
   user to run the script again. The desktop shows that message in place of the
-  preview. A handle is cached per value within a run, so paging and repeated
-  cells reuse one registry entry.
+  preview. Python caches handles per value within a run. C# caches them per dump,
+  so paging and repeated cells share a registry entry without later dumps reusing
+  earlier inspection results.
 - If user code raises while a preview is built (for example a broken `__repr__`),
   the kernel answers `-32603` ("Could not expand this value: RuntimeError") and
   keeps serving. `BaseException` is contained too, so a preview cannot `sys.exit`
@@ -267,11 +268,14 @@ kernel and its private Roslyn dependencies.
 C# supports lazy `expand` requests using the same run-scoped handles and expired
 handle error (`-32001`). A new run disposes unfinished iterators and clears all
 handles, even if compilation fails. Reset/close terminate the process and release
-its resources. Lazy property handles cache both their value and evaluation failure;
+its resources. Each dump/live update starts an independent cache for handles,
+sequences and property reads; paging or expanding a child reuses that dump's cache.
+Lazy property handles cache both their first value and evaluation failure;
 expansion failures are returned as `error` nodes so script stack frames remain
 clickable. Object fields are paged in groups of at most 100, with six levels per
 expansion. Public instance fields and readable non-indexed properties are inspected;
-properties evaluate only on expansion. Static members and custom `ToString` are
+fields are read at dump time, while properties evaluate when first expanded,
+possibly after the script has mutated the object. Static members and custom `ToString` are
 not invoked. Cycles in the current field path become a string marker.
 
 Every C# `IEnumerable` (except strings) becomes a table. At most 100 items are read
@@ -282,7 +286,15 @@ arbitrary number of items. Iterator failures are appended as a final error row,
 and the iterator is disposed on completion, failure or the next run. A record
 table uses up to 32 public members from the first item as its stable columns;
 scalar/nested-sequence tables use a single `Value` column. Record properties are
-evaluated and cached for requested rows; nested cells use lazy handles.
+evaluated and cached for requested rows within that dump; nested cells use lazy
+handles. A new dump of the same enumerable creates a fresh iterator. Mutations
+can invalidate an older dump's retained iterator, but not the fresh dump's cache.
+
+The supervisor races each expansion request against Stop, Close (including
+shutdown), and a ten-second timeout. Reset signals Stop before taking the kernel
+lock. Cancellation or timeout drops the process, releases waiting operations, and
+returns an actionable preview error; the next Run starts a fresh kernel. Queued
+previews also subscribe to cancellation before acquiring the kernel lock.
 
 For tables with an unknown length, C# adds `totalKnown: false`: `total` is the
 number of cached rows **plus one placeholder row**. The viewer uses that row to
@@ -295,9 +307,11 @@ random-access behavior. Table page offsets remain aligned to 100 in the desktop.
 C# strings are limited to 10,000 characters (1,000 in cells), with a shared
 200,000-character text budget per dump/page. Object traversal stops near 1,000
 nodes and remains pageable; a table can contain up to 100 × 32 bounded cell
-nodes. Error messages and each of five inner-exception summaries are capped at
-10,000 characters; tracebacks retain up to 100 frames with source locations.
-Script frames use `script.cs` and one-based line numbers.
+nodes. Scalars and null remain visible even when the depth/node budget is
+exhausted; the cut-off applies only to expandable values. Error messages and each
+of five inner-exception summaries are capped at 10,000 characters; tracebacks
+retain up to 100 script frames, using `script.cs` and one-based line numbers.
+Internal kernel/runtime frames and their build paths are omitted.
 
 The `CodingPad` library also provides `HtmlValue(markup)`,
 `ImageValue(bytes, mime = "image/png", name = null)`, and `LiveValue(value)`.

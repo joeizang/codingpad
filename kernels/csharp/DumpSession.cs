@@ -2,23 +2,29 @@ using System.Collections;
 using System.Diagnostics;
 using System.Globalization;
 using System.Reflection;
-using System.Text.Json;
 using CodingPad;
 
 // One registry per run. Retains script objects (and their collectible assembly)
 // only while the result can still be expanded.
 internal sealed class DumpSession(long runId) : IDisposable
 {
-    private readonly Dictionary<string, object> handles = [];
-    private readonly Dictionary<object, string> identities = new(ReferenceEqualityComparer.Instance);
-    private readonly Dictionary<object, Sequence> sequences = new(ReferenceEqualityComparer.Instance);
+    private readonly Dictionary<string, (object Value, View View)> handles = [];
+    private readonly List<Sequence> ownedSequences = [];
+    // Each Dump (including a live update) owns its own inspection cache. Pages
+    // and lazy children reuse that view without sharing stale reads with later dumps.
+    private sealed class View
+    {
+        public readonly Dictionary<object, string> Identities = new(ReferenceEqualityComparer.Instance);
+        public readonly Dictionary<object, Sequence> Sequences = new(ReferenceEqualityComparer.Instance);
+        public readonly Dictionary<object, Dictionary<MemberInfo, PropertyValue>> Properties = new(ReferenceEqualityComparer.Instance);
+    }
     private readonly List<(LiveValue Value, Action<object?> Handler)> subscriptions = [];
     public Action<string, object?>? Update { get; set; }
-    private readonly Dictionary<object, Dictionary<MemberInfo, PropertyValue>> properties = new(ReferenceEqualityComparer.Instance);
     private int serial;
     private const int PageSize = 100;
-    private sealed class Budget
+    private sealed class Budget(View view)
     {
+        public readonly View View = view;
         public int Remaining = 1000;
         public int Characters = 200000;
         public int ImageBytes = 4 * 1024 * 1024;
@@ -50,79 +56,85 @@ internal sealed class DumpSession(long runId) : IDisposable
     }
 
     private string Id() => $"{runId}:n{++serial}";
-    private string Handle(object value)
+    private string Handle(object value, View view)
     {
-        if (identities.TryGetValue(value, out var handle)) return handle;
+        if (view.Identities.TryGetValue(value, out var handle)) return handle;
         handle = $"{runId}:h{++serial}";
-        identities.Add(value, handle);
-        handles.Add(handle, value);
+        view.Identities.Add(value, handle);
+        handles.Add(handle, (value, view));
         return handle;
     }
-    private object Lazy(object value) => new
+    private object Lazy(object value, View view, string? nodeId = null) => new
     {
-        id = Id(),
+        id = nodeId ?? Id(),
         kind = "lazy",
         type = value.GetType().ToString(),
         preview = value is PropertyValue ? "property (evaluate on expand)" : value.GetType().ToString(),
-        handle = Handle(value)
+        handle = Handle(value, view)
     };
 
-    public object Node(object? value) => Node(value, 0, new Budget(), new HashSet<object>(ReferenceEqualityComparer.Instance));
-
-    private object Node(object? value, int depth, Budget budget, HashSet<object> path, bool cell = false)
+    public object Node(object? value)
     {
-        if (value is not null && (depth >= 6 || budget.Remaining <= 1)) return Lazy(value);
+        var view = new View();
+        return Node(value, 0, new Budget(view), new HashSet<object>(ReferenceEqualityComparer.Instance));
+    }
+
+    private object Node(object? value, int depth, Budget budget, HashSet<object> path, bool cell = false, string? nodeId = null)
+    {
+        var id = nodeId ?? Id();
+        if (value is not null && !IsScalar(value) && (depth >= 6 || budget.Remaining <= 1))
+            return Lazy(value, budget.View, id);
         budget.Remaining--;
-        if (value is null) return new { id = Id(), kind = "null" };
+        if (value is null) return new { id, kind = "null" };
         if (value is bool || value is byte or sbyte or short or ushort or int or uint or long or ulong or decimal ||
             value is double d && double.IsFinite(d) || value is float f && float.IsFinite(f))
-            return new { id = Id(), kind = "primitive", v = value };
+            return new { id, kind = "primitive", v = value };
         if (value is string or char or Enum or DateTime or DateTimeOffset or TimeSpan or Guid or double or float)
         {
             var text = Convert.ToString(value, CultureInfo.InvariantCulture) ?? "";
             var limit = Math.Min(cell ? 1000 : 10000, Math.Max(0, budget.Characters));
             budget.Characters -= Math.Min(text.Length, limit);
-            return new { id = Id(), kind = "string", v = text[..Math.Min(text.Length, limit)], type = value.GetType().ToString(), truncated = text.Length > limit, total = text.Length };
+            return new { id, kind = "string", v = text[..Math.Min(text.Length, limit)], type = value.GetType().ToString(), truncated = text.Length > limit, total = text.Length };
         }
-        if (value is Exception exception) return Error(exception, budget);
-        if (cell && !IsScalar(value)) return Lazy(value);
+        if (value is Exception exception) return Error(exception, budget, id);
+        if (cell && !IsScalar(value)) return Lazy(value, budget.View, id);
         if (value is HtmlValue html)
         {
             var length = Math.Min(html.Html.Length, Math.Max(0, budget.Characters));
             budget.Characters -= length;
-            return new { id = Id(), kind = "html", html = html.Html[..length] };
+            return new { id, kind = "html", html = html.Html[..length] };
         }
         if (value is ImageValue image)
         {
-            if (image.Bytes.Length > 4 * 1024 * 1024) return Error(new ArgumentException("Images must be no larger than 4 MiB."), budget);
-            if (image.Bytes.Length > budget.ImageBytes) return Lazy(value);
+            if (image.Bytes.Length > 4 * 1024 * 1024) return Error(new ArgumentException("Images must be no larger than 4 MiB."), budget, id);
+            if (image.Bytes.Length > budget.ImageBytes) return Lazy(value, budget.View, id);
             budget.ImageBytes -= image.Bytes.Length;
             if (image.Mime is not ("image/png" or "image/jpeg" or "image/gif" or "image/webp" or "image/bmp"))
-                return Error(new ArgumentException("Unsupported image MIME type."), budget);
-            return new { id = Id(), kind = "image", mime = image.Mime, src = $"data:{image.Mime};base64,{Convert.ToBase64String(image.Bytes)}", name = image.Name };
+                return Error(new ArgumentException("Unsupported image MIME type."), budget, id);
+            return new { id, kind = "image", mime = image.Mime, src = $"data:{image.Mime};base64,{Convert.ToBase64String(image.Bytes)}", name = image.Name };
         }
         if (value is LiveValue live)
         {
-            if (!path.Add(live)) return new { id = Id(), kind = "string", v = "<cycle>" };
+            if (!path.Add(live)) return new { id, kind = "string", v = "<cycle>" };
             try
             {
-                var node = Node(live.Value, depth + 1, budget, path);
-                var target = JsonSerializer.SerializeToElement(node).GetProperty("id").GetString()!;
+                var target = Id();
+                var node = Node(live.Value, depth + 1, budget, path, nodeId: target);
                 Action<object?> handler = next => Update?.Invoke(target, next);
                 live.Changed += handler;
                 subscriptions.Add((live, handler));
-                return new { id = Id(), kind = "live", node };
+                return new { id, kind = "live", node };
             }
             finally { path.Remove(live); }
         }
-        if (value is PropertyValue) return Lazy(value);
-        if (!path.Add(value)) return new { id = Id(), kind = "string", v = "<cycle>", type = value.GetType().ToString() };
+        if (value is PropertyValue) return Lazy(value, budget.View, id);
+        if (!path.Add(value)) return new { id, kind = "string", v = "<cycle>", type = value.GetType().ToString() };
         try
         {
-            if (value is IEnumerable enumerable) return Table(enumerable, 0, PageSize, depth, budget, path);
-            return Object(value, 0, PageSize, depth, budget, path);
+            if (value is IEnumerable enumerable) return Table(enumerable, 0, PageSize, depth, budget, path, id);
+            return Object(value, 0, PageSize, depth, budget, path, id);
         }
-        catch (Exception error) { return Error(error, budget); }
+        catch (Exception error) { return Error(error, budget, id); }
         finally { path.Remove(value); }
     }
 
@@ -139,14 +151,15 @@ internal sealed class DumpSession(long runId) : IDisposable
         _ => null
     };
 
-    private PropertyValue Property(object value, MemberInfo member)
+    private PropertyValue Property(object value, MemberInfo member, View view)
     {
+        var properties = view.Properties;
         if (!properties.TryGetValue(value, out var members)) properties.Add(value, members = []);
         if (!members.TryGetValue(member, out var property)) members.Add(member, property = new PropertyValue(() => Read(member, value)));
         return property;
     }
 
-    private object Object(object value, int offset, int limit, int depth, Budget budget, HashSet<object> path)
+    private object Object(object value, int offset, int limit, int depth, Budget budget, HashSet<object> path, string? nodeId = null)
     {
         var members = Members(value.GetType());
         var fields = new List<object>();
@@ -156,11 +169,11 @@ internal sealed class DumpSession(long runId) : IDisposable
             fields.Add(new
             {
                 name = member.Name,
-                value = Node(member is PropertyInfo ? Property(value, member) : Read(member, value), depth + 1, budget, path)
+                value = Node(member is PropertyInfo ? Property(value, member, budget.View) : Read(member, value), depth + 1, budget, path)
             });
         }
         var end = Math.Min(offset + fields.Count, members.Length);
-        return new { id = Id(), kind = "object", type = value.GetType().ToString(), fields, total = members.Length, next = end < members.Length ? end.ToString(CultureInfo.InvariantCulture) : null, handle = Handle(value), truncated = end < members.Length };
+        return new { id = nodeId ?? Id(), kind = "object", type = value.GetType().ToString(), fields, total = members.Length, next = end < members.Length ? end.ToString(CultureInfo.InvariantCulture) : null, handle = Handle(value, budget.View), truncated = end < members.Length };
     }
 
     private static void Close(Sequence state)
@@ -170,12 +183,14 @@ internal sealed class DumpSession(long runId) : IDisposable
         catch (Exception error) { state.Failure ??= error; }
     }
 
-    private object Table(IEnumerable value, int offset, int limit, int depth, Budget budget, HashSet<object> path)
+    private object Table(IEnumerable value, int offset, int limit, int depth, Budget budget, HashSet<object> path, string? nodeId = null)
     {
+        var sequences = budget.View.Sequences;
         if (!sequences.TryGetValue(value, out var state))
         {
             state = new Sequence(value.GetEnumerator());
             sequences.Add(value, state);
+            ownedSequences.Add(state);
         }
         // Cursors may revisit cached pages but cannot force a long traversal.
         if (offset > state.Values.Count) throw new ArgumentException("Load the preceding sequence page first.");
@@ -204,7 +219,7 @@ internal sealed class DumpSession(long runId) : IDisposable
                 {
                     object? field = null;
                     if (item is not null && member.DeclaringType!.IsInstanceOfType(item))
-                        field = member is PropertyInfo ? Property(item, member).Read() : Read(member, item);
+                        field = member is PropertyInfo ? Property(item, member, budget.View).Read() : Read(member, item);
                     return Node(field, depth + 1, budget, path, cell: true);
                 }
                 catch (Exception error) { return Node(error, depth + 1, budget, path, cell: true); }
@@ -217,7 +232,7 @@ internal sealed class DumpSession(long runId) : IDisposable
         var end = offset + rows.Count;
         return new
         {
-            id = Id(),
+            id = nodeId ?? Id(),
             kind = "table",
             type = value.GetType().ToString(),
             columns = state.Columns.Length == 0 ? new[] { new { name = "Value" } } : state.Columns.Select(member => new { name = member.Name }).ToArray(),
@@ -225,7 +240,7 @@ internal sealed class DumpSession(long runId) : IDisposable
             total,
             totalKnown = state.Finished,
             next = end < total ? end.ToString(CultureInfo.InvariantCulture) : null,
-            handle = Handle(value)
+            handle = Handle(value, budget.View)
         };
     }
 
@@ -234,25 +249,27 @@ internal sealed class DumpSession(long runId) : IDisposable
     public bool Contains(string handle) => handles.ContainsKey(handle);
     public object Expand(string handle, string? cursor, int limit)
     {
-        var value = handles[handle];
+        var (value, view) = handles[handle];
+        var budget = new Budget(view);
+        var path = new HashSet<object>(ReferenceEqualityComparer.Instance);
         var offset = cursor is null ? 0 : int.Parse(cursor, CultureInfo.InvariantCulture);
         if (offset < 0) throw new ArgumentException("Cursor must be a nonnegative offset.");
         limit = Math.Clamp(limit, 1, PageSize);
-        if (value is PropertyValue property) return Node(property.Read());
+        if (value is PropertyValue property) return Node(property.Read(), 0, budget, path);
         if (value is IEnumerable enumerable && value is not string)
-            return Table(enumerable, offset, limit, 0, new Budget(), new HashSet<object>(ReferenceEqualityComparer.Instance) { value });
-        if (cursor is null) return Node(value);
-        return Object(value, offset, limit, 0, new Budget(), new HashSet<object>(ReferenceEqualityComparer.Instance) { value });
+            return Table(enumerable, offset, limit, 0, budget, new HashSet<object>(ReferenceEqualityComparer.Instance) { value });
+        if (cursor is null) return Node(value, 0, budget, path);
+        return Object(value, offset, limit, 0, budget, new HashSet<object>(ReferenceEqualityComparer.Instance) { value });
     }
 
-    public object Error(Exception exception) => Error(exception, new Budget());
+    public object Error(Exception exception) => Error(exception, new Budget(new View()));
 
-    private object Error(Exception exception, Budget budget)
+    private object Error(Exception exception, Budget budget, string? nodeId = null)
     {
         while (exception is TargetInvocationException { InnerException: { } inner }) exception = inner;
         var message = Bounded(exception.Message, budget);
         var frames = new StackTrace(exception, true).GetFrames()
-            .Where(frame => frame.GetFileName() is not null).Take(Math.Max(0, Math.Min(100, budget.Remaining)))
+            .Where(frame => frame.GetFileName() == "script.cs").Take(Math.Max(0, Math.Min(100, budget.Remaining)))
             .Select(frame => new
             {
                 file = Bounded(frame.GetFileName()!, budget),
@@ -266,7 +283,7 @@ internal sealed class DumpSession(long runId) : IDisposable
         var causes = new List<object>();
         for (var cause = exception.InnerException; cause is not null && causes.Count < 5; cause = cause.InnerException)
             causes.Add(new { type = cause.GetType().Name, message = Bounded(cause.Message, budget) });
-        return new { id = Id(), kind = "error", type = exception.GetType().Name, message, traceback = frames, causes };
+        return new { id = nodeId ?? Id(), kind = "error", type = exception.GetType().Name, message, traceback = frames, causes };
     }
 
     private static string Bounded(string text, Budget budget)
@@ -278,14 +295,12 @@ internal sealed class DumpSession(long runId) : IDisposable
 
     public void Dispose()
     {
-        foreach (var state in sequences.Values)
+        foreach (var state in ownedSequences)
             if (!state.Finished) Close(state);
         foreach (var (value, handler) in subscriptions) value.Changed -= handler;
         subscriptions.Clear();
         Update = null;
-        sequences.Clear();
-        identities.Clear();
+        ownedSequences.Clear();
         handles.Clear();
-        properties.Clear();
     }
 }

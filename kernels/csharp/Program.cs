@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Threading.Channels;
 using System.Runtime.CompilerServices;
 using System.Runtime.Loader;
 using System.Text;
@@ -30,6 +32,7 @@ internal static class Program
         global using System.Threading;
         global using System.Threading.Tasks;
         global using CodingPad;
+        global using static CodingPad.ScriptHelpers;
         """);
 
     private sealed class RunContext(long id)
@@ -71,7 +74,7 @@ internal static class Program
         "CodingPadScript_" + Guid.NewGuid().ToString("N"), [Usings, tree], References,
         new CSharpCompilationOptions(OutputKind.ConsoleApplication, optimizationLevel: OptimizationLevel.Debug));
 
-    private static async Task Run(long id, string source)
+    private static async Task Run(long id, string source, CancellationToken cancel)
     {
         Session?.Dispose();
         var session = Session = new DumpSession(id);
@@ -83,6 +86,8 @@ internal static class Program
                     Notify(context, "dump_update", new { runId = id, nodeId, node });
         };
         Current.Value = context;
+        using var helpers = ScriptHelpers.BeginRun(cancel, text =>
+            Notify(context, "stream", new { runId = id, stream = "stdout", text }));
         Console.SetOut(TextWriter.Synchronized(new OutputWriter("stdout")));
         Console.SetError(TextWriter.Synchronized(new OutputWriter("stderr")));
         Console.SetIn(TextReader.Null);
@@ -94,6 +99,7 @@ internal static class Program
         var ok = false;
         try
         {
+            cancel.ThrowIfCancellationRequested();
             var tree = CSharpSyntaxTree.ParseText(source, path: "script.cs", encoding: Encoding.UTF8);
             var compilation = Compile(tree);
             var last = tree.GetRoot().ChildNodes().OfType<GlobalStatementSyntax>().LastOrDefault();
@@ -162,6 +168,7 @@ internal static class Program
                 return;
             }
             pe.Position = pdb.Position = 0;
+            cancel.ThrowIfCancellationRequested();
             await Execute(pe, pdb);
             ok = true;
         }
@@ -197,24 +204,66 @@ internal static class Program
         finally { load.Unload(); }
     }
 
+    private static readonly ConcurrentDictionary<long, CancellationTokenSource> Cancellations = new();
+    private static readonly Channel<(string Line, CancellationTokenSource? Cancel)> Requests = Channel.CreateUnbounded<(string, CancellationTokenSource?)>();
+
     private static async Task Main()
+    {
+        var worker = Task.Run(ProcessRequests);
+        while (await Input.ReadLineAsync() is { } line)
+        {
+            CancellationTokenSource? cancel = null;
+            try
+            {
+                using var document = JsonDocument.Parse(line);
+                var root = document.RootElement;
+                if (root.GetProperty("jsonrpc").GetString() == "2.0")
+                {
+                    var method = root.GetProperty("method").GetString();
+                    if (method == "cancel")
+                    {
+                        var runId = root.GetProperty("params").GetProperty("runId").GetInt64();
+                        if (Cancellations.TryGetValue(runId, out var active))
+                            _ = CancelSafely(active);
+                        continue;
+                    }
+                    if (method == "run" && root.TryGetProperty("id", out var id))
+                    {
+                        cancel = new CancellationTokenSource();
+                        if (!Cancellations.TryAdd(id.GetInt64(), cancel))
+                        { cancel.Dispose(); cancel = null; }
+                    }
+                }
+            }
+            catch (Exception) { /* Request validation belongs to the worker. */ }
+            await Requests.Writer.WriteAsync((line, cancel));
+        }
+        Requests.Writer.Complete();
+        await worker;
+    }
+
+    private static async Task CancelSafely(CancellationTokenSource source)
+    {
+        try { await source.CancelAsync(); }
+        catch (Exception) { /* User cancellation callbacks may throw. */ }
+    }
+
+    private static async Task ProcessRequests()
     {
         Console.SetOut(TextWriter.Null);
         Console.SetIn(TextReader.Null);
-        while (await Input.ReadLineAsync() is { } line)
+        await foreach (var (line, cancel) in Requests.Reader.ReadAllAsync())
         {
             long? id = null;
             try
             {
                 using var document = JsonDocument.Parse(line);
                 var root = document.RootElement;
-                // Cancel is intentionally handled by the host's forced-stop fallback
-                // until cooperative C# run control lands in M2.2.
                 if (!root.TryGetProperty("id", out var value)) continue;
                 id = value.GetInt64();
                 if (root.GetProperty("jsonrpc").GetString() != "2.0") throw new JsonException("Expected JSON-RPC 2.0");
                 if (root.GetProperty("method").GetString() == "run")
-                    await Run(id.Value, root.GetProperty("params").GetProperty("source").GetString()!);
+                    await Run(id.Value, root.GetProperty("params").GetProperty("source").GetString()!, cancel?.Token ?? CancellationToken.None);
                 else if (root.GetProperty("method").GetString() == "expand")
                 {
                     var parameters = root.GetProperty("params");
@@ -240,6 +289,14 @@ internal static class Program
             catch (Exception error)
             {
                 Send(new { jsonrpc = "2.0", id, error = new { code = -32600, message = error.Message } });
+            }
+            finally
+            {
+                if (cancel is not null)
+                {
+                    if (id is { } runId) Cancellations.TryRemove(runId, out _);
+                    cancel.Dispose();
+                }
             }
         }
         Session?.Dispose();

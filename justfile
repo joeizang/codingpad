@@ -9,6 +9,7 @@ check:
     npm --prefix apps/desktop run build
     npm --prefix apps/desktop test
     uv run --offline --no-project --no-config --no-python-downloads python -m unittest discover -s tests/python -v
+    uv run --offline --no-project --no-config --no-python-downloads python -m unittest discover -s tests/dotnet -v
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets --locked -- -D warnings
     cargo test --workspace --locked

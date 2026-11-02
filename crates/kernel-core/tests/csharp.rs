@@ -1016,3 +1016,178 @@ static class Feed {
     assert_eq!(dumps(&events)[1]["v"], 0);
     supervisor.shutdown().await;
 }
+
+async fn csharp_start_until_ready(
+    supervisor: std::sync::Arc<Supervisor>,
+    source: &'static str,
+) -> tokio::task::JoinHandle<codingpad_kernel_core::RunResult> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut tx = Some(tx);
+        supervisor
+            .run_language("control", source, Language::Csharp, |event| {
+                if event.method == "stream"
+                    && event.params["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("ready"))
+                {
+                    if let Some(tx) = tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            })
+            .await
+            .unwrap()
+    });
+    timeout(Duration::from_secs(30), rx).await.unwrap().unwrap();
+    task
+}
+
+#[tokio::test]
+async fn csharp_cooperative_stop_keeps_cache_and_process() {
+    let supervisor = std::sync::Arc::new(Supervisor::default());
+    let before = run(
+        &supervisor,
+        "control",
+        "Cache(\"pid\", () => Environment.ProcessId).Dump();",
+        true,
+    )
+    .await;
+    for source in [
+        "Console.WriteLine(\"ready\"); await Task.Delay(60000, Cancel);",
+        "Console.WriteLine(\"ready\"); while (true) Cancel.ThrowIfCancellationRequested();",
+    ] {
+        let task = csharp_start_until_ready(supervisor.clone(), source).await;
+        supervisor.stop("control").await;
+        let result = timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.stopped && !result.ok && !result.cache_cleared);
+        let after = run(
+            &supervisor,
+            "control",
+            "Cache(\"pid\", () => -1).Dump(); Environment.ProcessId.Dump();",
+            true,
+        )
+        .await;
+        assert_eq!(dumps(&before)[0]["v"], dumps(&after)[0]["v"]);
+        assert_eq!(dumps(&before)[0]["v"], dumps(&after)[1]["v"]);
+    }
+    supervisor.stop("control").await;
+    run(
+        &supervisor,
+        "control",
+        "Cancel.ThrowIfCancellationRequested();",
+        true,
+    )
+    .await;
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_forced_stop_and_reset_clear_only_the_target_cache() {
+    let supervisor = std::sync::Arc::new(Supervisor::default());
+    let before = run(
+        &supervisor,
+        "control",
+        "Cache(\"saved\", () => 42); Environment.ProcessId.Dump();",
+        true,
+    )
+    .await;
+    run(&supervisor, "other", "Cache(\"saved\", () => 99);", true).await;
+    let task = csharp_start_until_ready(
+        supervisor.clone(),
+        "Console.WriteLine(\"ready\"); Thread.Sleep(60000);",
+    )
+    .await;
+    supervisor.stop("control").await;
+    let result = timeout(Duration::from_secs(6), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.stopped && result.cache_cleared);
+    let after = run(
+        &supervisor,
+        "control",
+        "Cache(\"saved\", () => -1).Dump(); Environment.ProcessId.Dump();",
+        true,
+    )
+    .await;
+    assert_eq!(dumps(&after)[0]["v"], -1);
+    assert_ne!(dumps(&before)[0]["v"], dumps(&after)[1]["v"]);
+    supervisor.reset("control").await.unwrap();
+    let reset = run(
+        &supervisor,
+        "control",
+        "Cache(\"saved\", () => 7).Dump();",
+        true,
+    )
+    .await;
+    assert_eq!(dumps(&reset)[0]["v"], 7);
+    let other = run(
+        &supervisor,
+        "other",
+        "Cache(\"saved\", () => -1).Dump();",
+        true,
+    )
+    .await;
+    assert_eq!(dumps(&other)[0]["v"], 99);
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_cache_reuses_safe_values_and_refreshes_script_graphs() {
+    let supervisor = Supervisor::default();
+    let source = r#"
+Cache("safe", () => new List<int> { 42 }).Dump();
+Cache<string?>("null", () => null).Dump();
+Cache("direct", () => new Item()).GetType().Assembly.FullName.Dump();
+Cache("nested", () => new List<object> { new Item() })[0].GetType().Assembly.FullName.Dump();
+var mutated = Cache("mutated", () => new List<object>());
+mutated.Count.Dump(); mutated.Add(new Item());
+Cache("generic", () => new List<Item>()).GetType().AssemblyQualifiedName.Dump();
+Cache("delegate", () => (Func<int>)Item.Read)().Dump();
+Cache("weak", () => new WeakReference<object>(new Item()));
+class Item { public static int Read() => 17; }
+"#;
+    let first = run(&supervisor, "cache", source, true).await;
+    let second = run(&supervisor, "cache", source, true).await;
+    assert_ne!(dumps(&first)[2]["v"], dumps(&second)[2]["v"]);
+    assert_ne!(dumps(&first)[3]["v"], dumps(&second)[3]["v"]);
+    assert_eq!(
+        dumps(&second)[4]["v"],
+        0,
+        "Mutated cached containers must be rechecked"
+    );
+    assert_ne!(dumps(&first)[5]["v"], dumps(&second)[5]["v"]);
+    assert_eq!(dumps(&second)[6]["v"], 17);
+    let notes: Vec<_> = second
+        .iter()
+        .filter(|event| event.params["text"] == "cache refreshed: script types changed\n")
+        .collect();
+    assert_eq!(notes.len(), 6);
+    let safe = run(
+        &supervisor,
+        "cache",
+        r#"
+Cache("safe", () => new List<int> { -1 })[0].Dump();
+Cache<string?>("null", () => "lost").Dump();
+try { Cache<int>("failed", () => throw new Exception("failure")); } catch {}
+Cache("failed", () => 7).Dump();
+Cache("thread", () => Task.Run(() => Cache("inner", () => 8)).Result).Dump();
+"#,
+        true,
+    )
+    .await;
+    assert_eq!(dumps(&safe)[0]["v"], 42);
+    assert_eq!(dumps(&safe)[1]["kind"], "null");
+    assert_eq!(dumps(&safe)[2]["v"], 7);
+    assert_eq!(dumps(&safe)[3]["v"], 8);
+    let secret = run(&supervisor, "cache", "Secret(\"example\");", false).await;
+    assert!(dumps(&secret)[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("M3"));
+    supervisor.shutdown().await;
+}

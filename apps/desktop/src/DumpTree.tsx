@@ -236,6 +236,8 @@ function TableNode({
     0: node.rows,
   });
   const [start, setStart] = useState(0);
+  const [total, setTotal] = useState(node.total);
+  const [totalKnown, setTotalKnown] = useState(node.totalKnown !== false);
   const [error, setError] = useState<string>();
   const [expanded, setExpanded] = useState<
     { handle: string; node: DumpNode }[]
@@ -246,13 +248,13 @@ function TableNode({
 
   const viewportRows = 10;
   const first = Math.max(0, Math.floor(start) - 2);
-  const last = Math.min(node.total, first + viewportRows + 4);
+  const last = Math.min(total, first + viewportRows + 4);
 
   useEffect(() => {
     if (!node.handle) return;
     for (
       let page = Math.floor(first / TABLE_PAGE) * TABLE_PAGE;
-      page < last && page < node.total;
+      page < last && page < total;
       page += TABLE_PAGE
     ) {
       if (requested.current.has(page)) continue;
@@ -263,15 +265,19 @@ function TableNode({
             throw new Error("Unexpected table page from the kernel");
           }
           setPages((current) => ({ ...current, [page]: result.rows }));
+          if (node.totalKnown === false) {
+            setTotal(result.total);
+            setTotalKnown(result.totalKnown !== false);
+          }
         })
         .catch((problem) => {
           requested.current.delete(page);
           setError(String(problem));
         });
     }
-  }, [first, last, node.handle, node.total]);
+  }, [first, last, node.handle, node.totalKnown, total]);
 
-  const rowCount = Math.max(1, Math.min(node.total, viewportRows));
+  const rowCount = Math.max(1, Math.min(total, viewportRows));
   const rowAt = (index: number) => {
     const page = Math.floor(index / TABLE_PAGE) * TABLE_PAGE;
     return pages[page]?.[index - page];
@@ -303,7 +309,7 @@ function TableNode({
       >
         <div
           className="table-inner"
-          style={{ height: node.total * TABLE_ROW_HEIGHT, minWidth: width }}
+          style={{ height: total * TABLE_ROW_HEIGHT, minWidth: width }}
         >
           {rows.map(({ index, cells }) => (
             <div
@@ -341,7 +347,9 @@ function TableNode({
         </div>
       </div>
       <div className="table-footer">
-        <span className="muted">{node.total} rows</span>
+        <span className="muted">
+          {totalKnown ? total : Math.max(0, total - 1)}{totalKnown ? "" : "+"} rows
+        </span>
         {error && <span className="value-error">{error}</span>}
       </div>
       {expanded.length > 0 && (

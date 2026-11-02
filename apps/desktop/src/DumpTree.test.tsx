@@ -216,3 +216,78 @@ test("strings cut by a limit say they were truncated", () => {
   expect(container.textContent).toContain('"abc"');
   expect(container.textContent).toContain("truncated, 20000 chars");
 });
+
+test("unknown-length tables grow on scroll and stop at the last page", async () => {
+  const expand = vi.fn(async () => ({
+    kind: "table" as const,
+    type: "IEnumerable",
+    columns: [{ name: "name" }, { name: "score" }],
+    rows: tableRows(100, 2),
+    total: 102,
+    totalKnown: true,
+    next: null,
+    handle: "seq",
+  }));
+  const { container } = render(
+    <DumpTree
+      node={{
+        kind: "table",
+        type: "IEnumerable",
+        columns: [{ name: "name" }, { name: "score" }],
+        rows: tableRows(0, 100),
+        total: 101,
+        totalKnown: false,
+        next: "100",
+        handle: "seq",
+      }}
+      expand={expand}
+    />,
+  );
+  expect(screen.getByText("100+ rows")).toBeInTheDocument();
+  const viewport = container.querySelector(".table-viewport")!;
+  Object.defineProperty(viewport, "scrollTop", { value: 95 * 27, configurable: true });
+  fireEvent.scroll(viewport);
+  expect(await screen.findByText(/row 101/)).toBeInTheDocument();
+  expect(screen.getByText("102 rows")).toBeInTheDocument();
+  expect(expand).toHaveBeenCalledExactlyOnceWith("seq", "100");
+  expect(container.querySelectorAll(".table-row").length).toBeLessThanOrEqual(14);
+});
+
+test("an endless table keeps growing one page at a time", async () => {
+  const expand = vi.fn(async (_handle: string, cursor: string | null) => {
+    const offset = Number(cursor);
+    return {
+      kind: "table" as const,
+      type: "IEnumerable",
+      columns: [{ name: "name" }, { name: "score" }],
+      rows: tableRows(offset, 100),
+      total: offset + 101,
+      totalKnown: false,
+      next: String(offset + 100),
+      handle: "seq",
+    };
+  });
+  const { container } = render(
+    <DumpTree
+      node={{
+        kind: "table",
+        type: "IEnumerable",
+        columns: [{ name: "name" }, { name: "score" }],
+        rows: tableRows(0, 100),
+        total: 101,
+        totalKnown: false,
+        next: "100",
+        handle: "seq",
+      }}
+      expand={expand}
+    />,
+  );
+  const viewport = container.querySelector(".table-viewport")!;
+  for (const offset of [100, 200]) {
+    Object.defineProperty(viewport, "scrollTop", { value: (offset - 5) * 27, configurable: true });
+    fireEvent.scroll(viewport);
+    expect(await screen.findByText(`${offset + 100}+ rows`)).toBeInTheDocument();
+    expect(expand).toHaveBeenLastCalledWith("seq", String(offset));
+  }
+  expect(expand).toHaveBeenCalledTimes(2);
+});

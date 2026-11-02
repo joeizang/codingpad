@@ -6,9 +6,10 @@ type diagnostics, streamed stdout/stderr, rich dumps (lazy nodes, paged
 virtualised tables, images, sandboxed HTML, live updates), structured errors with
 clickable tracebacks, automatic display of the last expression, Stop/Reset, a
 library sidebar with pinned folders and plain-file saving, inline Python
-packages (PEP 723), and one-click private `uv` installation. M2 now starts with a C# kernel: in-memory
-Roslyn compilation, console output, basic `.Dump()`, top-level `await`, and compiler
-diagnostics in the editor and Results.
+packages (PEP 723), and one-click private `uv` installation. The C# kernel adds
+in-memory Roslyn compilation, console output, rich `.Dump()` trees and deferred
+enumerable tables, top-level `await`, and compiler diagnostics in the editor and
+Results.
 
 ## Develop locally
 
@@ -127,7 +128,7 @@ folders and dialog choices); there is no filesystem sandbox between the UI and
 your user account. Python (`.py`) and C# (`.cs`) files can run; other file
 types remain editable and saveable.
 
-## C# scripts (M2.0)
+## C# scripts (M2.1)
 
 Click **+ C#** or open a `.cs` file. Install .NET 10 or later first; CodingPad
 finds `dotnet` on `PATH`, in `DOTNET_ROOT`, or in standard install locations and
@@ -160,12 +161,51 @@ validated before auto-dump instrumentation, and compile failures block execution
 Compiler errors have editor squiggles after Run and clickable lines in Results;
 editing clears outdated squiggles. Runtime exceptions also show script frames.
 
-This first C# increment displays scalars and basic text previews. Rich dumps and
-lazy enumerable paging are M2.1; cooperative cancellation and `Cache` are M2.2;
-NuGet directives, Roslyn completions, and SDK installation follow in later M2
-issues. Stop currently uses the existing two-second forced restart fallback for
-C#. Only managed `Console` output is captured; direct native writes are outside
-this increment. Scripts run with your user privileges.
+C# dumps include reflection-based object trees, lazy properties and nested values,
+and virtualised tables for `IEnumerable` values. Each table initially reads at
+most 100 items, then advances the same iterator as you scroll. The footer shows
+`100+ rows` until the iterator ends; even a collection with a known count follows
+this incremental path. Previously read pages are cached without enumerating again.
+Each dump (including a live update) starts a fresh inspection cache, so dumping a
+mutated collection or record again shows its current values. Object fields are
+read at dump time; lazy properties read the value **when first expanded**, which
+can reflect changes made after the dump. That getter result or failure is then
+cached for that dump. Record-table properties are evaluated for the requested
+rows and cached within that table. Indexers, static members and custom `ToString`
+methods are not called. Nested objects in cells expand below the table. Exceptions,
+including property and iterator failures, have clickable script stack frames and
+inner exception summaries.
+
+```csharp
+new { Name = "Ada", Scores = new[] { 90, 95 } }.Dump();
+Enumerable.Range(0, 100_000).Select(i => new { Index = i, Square = i * (long)i }).Dump();
+new HtmlValue("<b>Hello</b>").Dump();
+new ImageValue(System.IO.File.ReadAllBytes("plot.png"), "image/png", "plot.png").Dump();
+var progress = new LiveValue(0);
+progress.Dump();
+for (int i = 1; i <= 3; i++) { progress.Value = i; await Task.Delay(100); }
+```
+
+Handles and partially read iterators remain available after completion and are
+released on the next run, Reset, or close. The next run disposes unfinished
+iterators, including their `finally` blocks. Live updates are accepted only during
+the originating run. Replacing a live value immediately disposes its old iterators,
+expires its old handles, and removes nested live subscriptions; only its latest
+contents remain expandable. Independent dumps and sibling values remain available.
+Object fields are paged, trees stop after six levels, strings
+are bounded, HTML is sandboxed, and images are limited to 4 MiB. Table columns use
+the first item's public fields/properties (up to 32); scalar sequences use one
+`Value` column. Enumeration runs user code. A blocked preview is cancelled by
+Reset or closing the tab, or automatically after ten seconds. Cancelling or timing
+out a preview discards the kernel and its cache; Run then starts a fresh process.
+Stop also cancels pending previews. Mutating a collection may invalidate an older
+dump's retained iterator; the next dump creates a new iterator.
+
+Cooperative cancellation and `Cache` are M2.2; NuGet directives, Roslyn completions,
+and SDK installation follow in later M2 issues. Stop currently uses the existing
+two-second forced restart fallback for C#. Only managed `Console` output is
+captured; direct native writes are outside this increment. Scripts run with your
+user privileges.
 
 ## Repository layout
 

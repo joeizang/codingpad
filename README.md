@@ -41,6 +41,9 @@ processes, and builds the desktop executable. No CI is configured (D39). The sam
 command is intended for macOS, Linux and Windows; native builds run on their own
 platforms.
 
+[Windows verification results](docs/windows-verification.md) record the native
+build, tests, and desktop smoke check with Python 3.14.7 and Node.js 26.
+
 CodingPad checks `PATH`, then the usual `~/.local/bin` and `~/.cargo/bin`
 locations for `uv`, plus `/opt/homebrew/bin` and `/usr/local/bin` on macOS.
 Launch from a terminal if your toolchain lives elsewhere.

@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import signal
 import subprocess
@@ -337,7 +338,8 @@ assert registries and all(1 not in registry for registry in registries)
                 m["params"]["text"] for m in part if m.get("method") == "stream"
             )
 
-        self.assertEqual(text(messages[:index]), "a\nb\nc\n")
+        # The child uses native platform newlines; kernel Python writes stay LF.
+        self.assertEqual(text(messages[:index]), f"a\nb{os.linesep}c\n")
         self.assertEqual(text(messages[index:]), "d\n")
 
     def test_python_stdout_stderr_keep_write_order(self):

@@ -2,13 +2,12 @@
 
 use codingpad_kernel_core::{lsp::LanguageServers, KernelEvent, Supervisor};
 use serde_json::json;
+use std::time::{Duration, Instant};
 #[cfg(unix)]
-use std::path::Path;
-#[cfg(unix)]
-use std::process::{Command, Stdio};
 use std::{
-    path::PathBuf,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 const TARGET_APP_READY: Duration = Duration::from_millis(1_000);
@@ -540,6 +539,7 @@ fn group_rss(pgid: u32, table: &[(u32, u32, u32, u64)]) -> u64 {
         .sum()
 }
 
+#[cfg(unix)]
 fn desktop_binary() -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("CODINGPAD_DESKTOP") {
         return Ok(PathBuf::from(path));
@@ -563,6 +563,7 @@ fn desktop_binary() -> Result<PathBuf, String> {
     Ok(path)
 }
 
+#[cfg(unix)]
 fn now_nanos() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

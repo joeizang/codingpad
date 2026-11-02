@@ -5,6 +5,7 @@ use tokio::time::timeout;
 
 async fn next_diagnostics(
     receiver: &mut tokio::sync::mpsc::UnboundedReceiver<LspEvent>,
+    document_uri: &str,
 ) -> Vec<serde_json::Value> {
     timeout(Duration::from_secs(120), async {
         loop {
@@ -12,6 +13,7 @@ async fn next_diagnostics(
                 panic!("language server closed before publishing diagnostics");
             };
             if event.method == "textDocument/publishDiagnostics" {
+                assert_eq!(event.params["uri"].as_str(), Some(document_uri));
                 let diagnostics = event.params["diagnostics"]
                     .as_array()
                     .cloned()
@@ -50,7 +52,7 @@ dump(greet("Ada"))
     .expect("language server startup timed out")
     .expect("language server failed to start");
 
-    let diagnostics = next_diagnostics(&mut receiver).await;
+    let diagnostics = next_diagnostics(&mut receiver, &started.uri).await;
 
     assert!(
         diagnostics.iter().any(|diagnostic| diagnostic["message"]
@@ -101,7 +103,7 @@ value: int = "not an int"
 "#;
     servers.begin_session("test").await;
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-    let _started = timeout(
+    let started = timeout(
         Duration::from_secs(120),
         servers.start_python("packages", source, "test", move |event| {
             let _ = sender.send(event);
@@ -111,7 +113,7 @@ value: int = "not an int"
     .expect("language server startup timed out")
     .expect("language server failed to start");
 
-    let diagnostics = next_diagnostics(&mut receiver).await;
+    let diagnostics = next_diagnostics(&mut receiver, &started.uri).await;
 
     assert!(
         !diagnostics
@@ -141,7 +143,7 @@ async fn reuses_the_warm_server_and_restarts_when_packages_change() {
     .await
     .expect("language server startup timed out")
     .expect("language server failed to start");
-    let first_diagnostics = next_diagnostics(&mut receiver).await;
+    let first_diagnostics = next_diagnostics(&mut receiver, &first.uri).await;
     assert!(!first_diagnostics.is_empty());
 
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -156,7 +158,7 @@ async fn reuses_the_warm_server_and_restarts_when_packages_change() {
     .expect("language server failed to restart");
     assert_eq!(first.uri, second.uri);
     // The reused server must send diagnostics to the new channel.
-    let _ = next_diagnostics(&mut receiver).await;
+    let _ = next_diagnostics(&mut receiver, &second.uri).await;
 
     let package_source = r#"# /// script
 # dependencies = ["requests"]

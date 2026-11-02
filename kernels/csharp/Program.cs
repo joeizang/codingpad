@@ -19,7 +19,12 @@ internal static class Program
     private static readonly object Gate = new();
     private static readonly AsyncLocal<RunContext?> Current = new();
     private static readonly MetadataReference[] References = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!)
-        .Split(Path.PathSeparator).Append(typeof(DumpExtensions).Assembly.Location)
+        .Split(Path.PathSeparator)
+        // The kernel's TPA also contains Roslyn and the host itself. Scripts get
+        // only framework assemblies and their public CodingPad helper.
+        .Where(path => string.Equals(Path.GetDirectoryName(path), Path.GetDirectoryName(typeof(object).Assembly.Location),
+            OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+        .Append(typeof(DumpExtensions).Assembly.Location)
         .Distinct().Select(path => MetadataReference.CreateFromFile(path)).ToArray();
     private static readonly SyntaxTree Usings = CSharpSyntaxTree.ParseText("""
         global using System;
@@ -92,7 +97,11 @@ internal static class Program
         {
             var tree = CSharpSyntaxTree.ParseText(source, path: "script.cs", encoding: Encoding.UTF8);
             var compilation = Compile(tree);
-            var errors = compilation.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).ToArray();
+            var last = tree.GetRoot().ChildNodes().OfType<GlobalStatementSyntax>().LastOrDefault();
+            // Empty/comment/type-only scripts are useful no-ops. Keep every
+            // other diagnostic, and preserve explicit Main programs when present.
+            var errors = compilation.GetDiagnostics()
+                .Where(d => d.Severity == DiagnosticSeverity.Error && !(last is null && d.Id == "CS5001")).ToArray();
             Notify(context, "diagnostics", new
             {
                 runId = id,
@@ -120,7 +129,11 @@ internal static class Program
             }
             // First validate the original C#: an invalid bare final expression must
             // never become valid as a side effect of auto-dump instrumentation.
-            var last = tree.GetRoot().ChildNodes().OfType<GlobalStatementSyntax>().LastOrDefault();
+            if (last is null && compilation.GetEntryPoint(default) is null)
+            {
+                ok = true;
+                return;
+            }
             if (last?.Statement is ExpressionStatementSyntax statement)
             {
                 var expression = statement.Expression;
@@ -131,6 +144,7 @@ internal static class Program
                     var type = model.GetTypeInfo(expression).Type;
                     var symbol = model.GetSymbolInfo(invocation).Symbol as IMethodSymbol;
                     if (type is not null && type.SpecialType != SpecialType.System_Void &&
+                        !type.IsRefLikeType && type.TypeKind is not (TypeKind.Pointer or TypeKind.FunctionPointer) &&
                         symbol?.ContainingType.ToDisplayString() != "CodingPad.DumpExtensions")
                     {
                         var wrapped = SyntaxFactory.ParseExpression($"global::CodingPad.DumpExtensions.Dump({expression.WithoutTrivia()})").WithTriviaFrom(expression);
@@ -142,7 +156,12 @@ internal static class Program
             using var pe = new MemoryStream();
             using var pdb = new MemoryStream();
             var result = compilation.Emit(pe, pdb, options: new EmitOptions(debugInformationFormat: DebugInformationFormat.PortablePdb));
-            if (!result.Success) throw new InvalidOperationException(string.Join("\n", result.Diagnostics));
+            if (!result.Success)
+            {
+                Error(context, "Kernel error", "Could not emit the C# script after auto-dump instrumentation. " +
+                    string.Join("\n", result.Diagnostics), []);
+                return;
+            }
             pe.Position = pdb.Position = 0;
             await Execute(pe, pdb);
             ok = true;

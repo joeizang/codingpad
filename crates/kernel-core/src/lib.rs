@@ -14,7 +14,7 @@ use tempfile::TempDir;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{watch, Mutex},
+    sync::{watch, Mutex, OnceCell},
 };
 
 // Write bytes explicitly: Windows piped stdout may use an ANSI code page.
@@ -75,6 +75,7 @@ pub struct Supervisor {
     uv: PathBuf,
     data_dir: Option<PathBuf>,
     kernels: Mutex<HashMap<String, SharedSlot>>,
+    csharp: OnceCell<csharp::Installation>,
 }
 
 impl Default for Supervisor {
@@ -123,6 +124,7 @@ impl Supervisor {
             uv,
             data_dir: None,
             kernels: Mutex::new(HashMap::new()),
+            csharp: OnceCell::new(),
         }
     }
 
@@ -195,7 +197,7 @@ impl Supervisor {
             let uv = self.uv_path();
             let startup = tokio::select! {
                 result = async {
-                    if language == Language::Csharp { Kernel::start_csharp().await }
+                    if language == Language::Csharp { Kernel::start_csharp(&self.csharp).await }
                     else { Kernel::start(&uv, packages, &mut emit).await }
                 } => result,
                 _ = closed.changed() => return Err("Script was closed".into()),
@@ -305,14 +307,14 @@ struct Kernel {
     input: ChildStdin,
     output: Lines<BufReader<ChildStdout>>,
     next_id: u64,
-    _files: TempDir,
+    _files: Arc<TempDir>,
     packages: Packages,
     language: Language,
 }
 
 impl Kernel {
-    async fn start_csharp() -> Result<Self, String> {
-        let (mut command, files) = csharp::command().await?;
+    async fn start_csharp(cache: &OnceCell<csharp::Installation>) -> Result<Self, String> {
+        let (mut command, files) = csharp::command(cache).await?;
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -385,7 +387,7 @@ impl Kernel {
             output: BufReader::new(child.stdout.take().unwrap()).lines(),
             child,
             next_id: 0,
-            _files: files,
+            _files: Arc::new(files),
             packages,
             language: Language::Python,
         })

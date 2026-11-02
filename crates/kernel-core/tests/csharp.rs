@@ -96,6 +96,9 @@ async fn csharp_only_valid_value_returning_calls_are_auto_dumped() {
         "var x = 42;",
         "await Task.Delay(1);",
         "void Print() {} Print();",
+        "\"abc\".AsSpan();",
+        "new int[] { 1, 2 }.AsSpan();",
+        "static Value Next() => new(); Next(); ref struct Value {}",
     ] {
         assert!(
             dumps(&run(&supervisor, "one", source, true).await).is_empty(),
@@ -154,5 +157,85 @@ async fn csharp_warm_process_fresh_collectible_assemblies_and_language_switch() 
         dumps(&run(&supervisor, "one", "42.Dump();", true).await)[0]["v"],
         42
     );
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_no_statement_scripts_succeed_but_invalid_types_still_fail() {
+    let supervisor = Supervisor::default();
+    for source in [
+        "",
+        "  \n",
+        "// comment only",
+        "using System;",
+        "class Only {}",
+        "namespace Example { class Only {} }",
+    ] {
+        let events = run(&supervisor, "one", source, true).await;
+        assert!(dumps(&events).is_empty(), "{source}");
+        assert_eq!(
+            events
+                .iter()
+                .find(|e| e.method == "diagnostics")
+                .unwrap()
+                .params["diagnostics"],
+            serde_json::json!([])
+        );
+    }
+    let events = run(
+        &supervisor,
+        "one",
+        "class Invalid { Missing field; }",
+        false,
+    )
+    .await;
+    assert!(dumps(&events)[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("CS0246"));
+    // Explicit entry points were already supported and must keep executing.
+    let events = run(
+        &supervisor,
+        "one",
+        "class Entry { static void Main() { 42.Dump(); } }",
+        true,
+    )
+    .await;
+    assert_eq!(dumps(&events)[0]["v"], 42);
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_scripts_cannot_reference_private_kernel_assemblies() {
+    let supervisor = Supervisor::default();
+    for source in [
+        "Microsoft.CodeAnalysis.CSharp.SyntaxFactory.IdentifierName(\"x\");",
+        "Microsoft.CodeAnalysis.DiagnosticSeverity.Error.Dump();",
+    ] {
+        let events = run(&supervisor, "one", source, false).await;
+        assert_eq!(dumps(&events)[0]["type"], "Compile error");
+    }
+    // Framework references and the public helper still work.
+    let events = run(
+        &supervisor,
+        "one",
+        "Enumerable.Range(1, 3).Sum().Dump();",
+        true,
+    )
+    .await;
+    assert_eq!(dumps(&events)[0]["v"], 6);
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_assets_are_shared_across_tabs_and_resets() {
+    let supervisor = Supervisor::default();
+    let source = "typeof(CodingPad.DumpExtensions).Assembly.Location.Dump();";
+    let first = run(&supervisor, "one", source, true).await;
+    let other = run(&supervisor, "two", source, true).await;
+    assert_eq!(dumps(&first)[0]["v"], dumps(&other)[0]["v"]);
+    supervisor.reset("one").await.unwrap();
+    let restarted = run(&supervisor, "one", source, true).await;
+    assert_eq!(dumps(&first)[0]["v"], dumps(&restarted)[0]["v"]);
     supervisor.shutdown().await;
 }

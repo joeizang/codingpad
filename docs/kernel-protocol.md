@@ -241,7 +241,9 @@ selects the language explicitly and replaces the kernel when a tab changes
 language. C# runs use fresh collectible assemblies inside a warm .NET process.
 The compiler and `CodingPad` library are embedded in the Rust executable at build
 time. At startup the host discovers and explicitly selects the newest installed
-stable .NET runtime, 10 or later.
+stable .NET runtime, 10 or later. Successful discovery and the extracted C# assets
+are shared for the supervisor lifetime, including across kernel restarts. Failed
+or cancelled preparation can be retried.
 
 Each compile sends a `diagnostics` notification, including an empty array on
 success, before any script output:
@@ -256,7 +258,11 @@ an error node and `ok: false`. Compile diagnostics belong to the submitted sourc
 snapshot and must be discarded in the editor when the text changes. Python does
 not emit this notification. The final value-returning top-level invocation is
 instrumented only after the unmodified C# has passed validation; final `.Dump()`
-calls and void calls are excluded. Top-level await is supported.
+calls, void calls, ref-struct results, and pointer results are excluded. Top-level
+await is supported. Empty or type-only scripts are validated and complete as
+successful no-ops when there is no explicit entry point. Script references contain
+only the selected shared framework and the public CodingPad helper, excluding the
+kernel and its private Roslyn dependencies.
 
 M2.0 implements scalar/text dumps and managed Console streams only. It does not
 expose lazy handles, packages or cooperative cancellation yet; Stop uses the

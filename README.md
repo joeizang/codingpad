@@ -132,6 +132,9 @@ types remain editable and saveable.
 Click **+ C#** or open a `.cs` file. Install .NET 10 or later first; CodingPad
 finds `dotnet` on `PATH`, in `DOTNET_ROOT`, or in standard install locations and
 selects the newest installed stable `Microsoft.NETCore.App` runtime, 10 or later.
+The first successful C# startup caches runtime discovery and extracts the bundled
+assets once for the app session; tabs and kernel restarts reuse them. Restart the
+app after installing a newer runtime to select it.
 The application bundles its compiler and helper library. Building CodingPad
 requires the SDK and restores the locked Roslyn NuGet dependency; running the
 installed app does not restore or build a project per script.
@@ -148,6 +151,9 @@ and requests its unload afterwards, so script static fields start fresh. Backgro
 work and references scripts leave in process-wide state can delay unloading.
 A final call returning a value is automatically dumped, including an awaited
 value-returning call. A final `.Dump()` is shown once; void calls are not dumped.
+Ref-struct and pointer results are left unwrapped so valid calls keep running.
+Empty, comment-only, and type-only scripts succeed without output; explicit
+`Main` programs still execute.
 Bare expressions such as `6 * 7;` remain compile errors. Common `System` namespaces
 and `CodingPad` are available without `using` lines. The original source is
 validated before auto-dump instrumentation, and compile failures block execution.

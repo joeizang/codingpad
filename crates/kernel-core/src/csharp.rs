@@ -1,6 +1,6 @@
 //! Bundled compiler/kernel assets; only a .NET runtime is needed by installed apps.
-use std::path::PathBuf;
-use tokio::process::Command;
+use std::{path::PathBuf, sync::Arc};
+use tokio::{process::Command, sync::OnceCell};
 
 include!(concat!(env!("OUT_DIR"), "/csharp_assets.rs"));
 
@@ -40,7 +40,26 @@ fn find_dotnet() -> PathBuf {
         .unwrap_or_else(|| name.into())
 }
 
-pub(super) async fn command() -> Result<(Command, tempfile::TempDir), String> {
+pub(super) struct Installation {
+    executable: PathBuf,
+    version: String,
+    files: Arc<tempfile::TempDir>,
+}
+
+// One successful preparation per supervisor (the desktop's app lifetime).
+// Failed or cancelled preparation remains retryable, including missing .NET.
+pub(super) async fn command(
+    cache: &OnceCell<Installation>,
+) -> Result<(Command, Arc<tempfile::TempDir>), String> {
+    let installation = cache.get_or_try_init(prepare).await?;
+    let mut command = Command::new(&installation.executable);
+    command
+        .args(["exec", "--fx-version", &installation.version])
+        .arg(installation.files.path().join("CodingPad.Kernel.dll"));
+    Ok((command, installation.files.clone()))
+}
+
+async fn prepare() -> Result<Installation, String> {
     let executable = find_dotnet();
     let mut probe = Command::new(&executable);
     probe.arg("--list-runtimes").kill_on_drop(true);
@@ -56,11 +75,11 @@ pub(super) async fn command() -> Result<(Command, tempfile::TempDir), String> {
     for (name, data) in ASSETS {
         std::fs::write(files.path().join(name), data).map_err(|e| e.to_string())?;
     }
-    let mut command = Command::new(executable);
-    command
-        .args(["exec", "--fx-version", &version])
-        .arg(files.path().join("CodingPad.Kernel.dll"));
-    Ok((command, files))
+    Ok(Installation {
+        executable,
+        version,
+        files: Arc::new(files),
+    })
 }
 
 fn newest_runtime(output: &str) -> Option<String> {
@@ -88,6 +107,29 @@ fn newest_runtime(output: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn concurrent_launches_share_one_preparation_and_keep_assets_alive() {
+        let cache = tokio::sync::OnceCell::new();
+        let (first, second) = tokio::join!(super::command(&cache), super::command(&cache));
+        let (first_command, first_files) = first.unwrap();
+        let (second_command, second_files) = second.unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first_files, &second_files));
+        assert_eq!(
+            first_command.as_std().get_program(),
+            second_command.as_std().get_program()
+        );
+        assert_eq!(
+            first_command.as_std().get_args().collect::<Vec<_>>(),
+            second_command.as_std().get_args().collect::<Vec<_>>()
+        );
+        let directory = first_files.path().to_path_buf();
+        drop(cache);
+        assert!(directory.join("CodingPad.Kernel.dll").is_file());
+        drop(first_files);
+        drop(second_files);
+        assert!(!directory.exists());
+    }
+
     #[test]
     fn newest_supported_runtime() {
         assert_eq!(super::newest_runtime("Microsoft.NETCore.App 9.0.9 [/a]\nMicrosoft.NETCore.App 10.0.9 [/b]\nMicrosoft.NETCore.App 10.0.11 [/b]\nMicrosoft.NETCore.App 11.0.0 [/b]\nMicrosoft.NETCore.App 12.0.0-preview.1 [/b]\nMicrosoft.AspNetCore.App 12.0.0 [/b]"), Some("11.0.0".into()));

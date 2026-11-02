@@ -97,8 +97,16 @@ class RuntimeTests(unittest.TestCase):
 
     def test_dump_is_still_text_outside_the_app(self):
         self.assertIsNone(codingpad._sink)
-        with contextlib.redirect_stdout(io.StringIO()):
+        value = {"name": "Ada", "scores": [1, 2]}
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertIs(codingpad.dump(value), value)
             self.assertEqual(codingpad.dump(42), 42)
+            codingpad.dump(codingpad.html("<b>hello</b>"))
+        text = output.getvalue()
+        self.assertIn("'name': 'Ada'", text)
+        self.assertIn("42", text)
+        self.assertIn("<b>hello</b>", text)
 
 
 if __name__ == "__main__":

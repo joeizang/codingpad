@@ -6,6 +6,10 @@ dist/
 node_modules/
 *.nupkg
 
+# Rust source folders named bin/ are not build output
+!crates/**/src/bin/
+!crates/**/src/bin/**
+
 # npm bin folders are source, not build output
 !packaging/placeholders/npm/cpad/bin/
 

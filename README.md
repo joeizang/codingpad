@@ -217,6 +217,28 @@ a script.
 Type errors appear as squiggles and a count in the editor header, but they never
 stop **Run**; Python executes regardless.
 
+## Performance checks
+
+`just bench` builds the release app and measures the M1 targets from D38 on
+macOS and Linux:
+
+| Metric | Target |
+|---|---|
+| App usable | < 1 s |
+| Idle memory | < 300 MB |
+| First Python kernel start | < 3 s |
+| Warm Python rerun | < 200 ms |
+| 100k-row dump, first page to host | < 1 s |
+| Python completion | < 300 ms |
+
+The first completion run may download basedpyright; later runs reuse the cache.
+Idle memory is sampled five seconds after the window is ready, so first-paint
+buffers have been released; on macOS it is the sum of physical footprints, and
+elsewhere it is resident memory. The dump metric ends when the first page reaches
+the Rust host, before the webview renders it. The app metrics need a desktop session and are
+skipped on Windows, where a Windows VM only confirms that `just check` passes
+(D42, D48). Set `CODINGPAD_DESKTOP` to benchmark a different app binary.
+
 Dual-licensed MIT OR Apache-2.0.
 
 For an optional native UI smoke test on Linux/Windows, install

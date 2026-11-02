@@ -127,7 +127,7 @@ folders and dialog choices); there is no filesystem sandbox between the UI and
 your user account. Python (`.py`) and C# (`.cs`) files can run; other file
 types remain editable and saveable.
 
-## C# scripts (M2.0)
+## C# scripts (M2.1)
 
 Click **+ C#** or open a `.cs` file. Install .NET 10 or later first; CodingPad
 finds `dotnet` on `PATH`, in `DOTNET_ROOT`, or in standard install locations and
@@ -160,12 +160,41 @@ validated before auto-dump instrumentation, and compile failures block execution
 Compiler errors have editor squiggles after Run and clickable lines in Results;
 editing clears outdated squiggles. Runtime exceptions also show script frames.
 
-This first C# increment displays scalars and basic text previews. Rich dumps and
-lazy enumerable paging are M2.1; cooperative cancellation and `Cache` are M2.2;
-NuGet directives, Roslyn completions, and SDK installation follow in later M2
-issues. Stop currently uses the existing two-second forced restart fallback for
-C#. Only managed `Console` output is captured; direct native writes are outside
-this increment. Scripts run with your user privileges.
+C# dumps include reflection-based object trees, lazy properties and nested values,
+and virtualised tables for `IEnumerable` values. Each table initially reads at
+most 100 items, then advances the same iterator as you scroll. The footer shows
+`100+ rows` until the iterator ends; even a collection with a known count follows
+this incremental path. Previously read pages are cached without enumerating again.
+Object properties run only when expanded; record-table properties are evaluated
+for the requested rows and cached. Indexers, static members and custom `ToString`
+methods are not called. Nested objects in cells expand below the table. Exceptions,
+including property and iterator failures, have clickable script stack frames and
+inner exception summaries.
+
+```csharp
+new { Name = "Ada", Scores = new[] { 90, 95 } }.Dump();
+Enumerable.Range(0, 100_000).Select(i => new { Index = i, Square = i * (long)i }).Dump();
+new HtmlValue("<b>Hello</b>").Dump();
+new ImageValue(File.ReadAllBytes("plot.png"), "image/png", "plot.png").Dump();
+var progress = new LiveValue(0);
+progress.Dump();
+for (int i = 1; i <= 3; i++) { progress.Value = i; await Task.Delay(100); }
+```
+
+Handles and partially read iterators remain available after completion and are
+released on the next run, Reset, or close. The next run disposes unfinished
+iterators, including their `finally` blocks. Live updates are accepted only during
+the originating run. Object fields are paged, trees stop after six levels, strings
+are bounded, HTML is sandboxed, and images are limited to 4 MiB. Table columns use
+the first item's public fields/properties (up to 32); scalar sequences use one
+`Value` column. Enumeration runs user code: an iterator or property that blocks
+requires Stop's forced restart fallback.
+
+Cooperative cancellation and `Cache` are M2.2; NuGet directives, Roslyn completions,
+and SDK installation follow in later M2 issues. Stop currently uses the existing
+two-second forced restart fallback for C#. Only managed `Console` output is
+captured; direct native writes are outside this increment. Scripts run with your
+user privileges.
 
 ## Repository layout
 

@@ -1,7 +1,3 @@
-using System.Collections;
-using System.Diagnostics;
-using System.Globalization;
-using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.Loader;
 using System.Text;
@@ -17,6 +13,7 @@ internal static class Program
     private static readonly TextWriter Protocol = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
     private static readonly TextReader Input = new StreamReader(Console.OpenStandardInput(), Encoding.UTF8);
     private static readonly object Gate = new();
+    private static readonly object InspectionGate = new();
     private static readonly AsyncLocal<RunContext?> Current = new();
     private static readonly MetadataReference[] References = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!)
         .Split(Path.PathSeparator)
@@ -65,17 +62,7 @@ internal static class Program
         public override void WriteLine(string? value) => Write(value + NewLine);
     }
 
-    private static object Node(object? value)
-    {
-        if (value is null) return new { kind = "null" };
-        if (value is bool || value is byte or sbyte or short or ushort or int or uint or long or ulong or decimal ||
-            value is double d && double.IsFinite(d) || value is float f && float.IsFinite(f))
-            return new { kind = "primitive", v = value };
-        // Rich object inspection and deferred enumerable paging belong to M2.1.
-        // Never consume an arbitrary IEnumerable or execute property getters here.
-        var text = value is IEnumerable and not string ? value.GetType().ToString() : Convert.ToString(value, CultureInfo.InvariantCulture) ?? "";
-        return new { kind = "string", v = text[..Math.Min(text.Length, 10000)], type = value.GetType().ToString(), truncated = text.Length > 10000 };
-    }
+    private static DumpSession? Session;
 
     private static void Error(RunContext context, string type, string message, object[] frames) =>
         Notify(context, "dump", new { runId = context.Id, node = new { kind = "error", type, message, traceback = frames } });
@@ -86,12 +73,23 @@ internal static class Program
 
     private static async Task Run(long id, string source)
     {
+        Session?.Dispose();
+        var session = Session = new DumpSession(id);
         var context = new RunContext(id);
+        session.Update = (nodeId, value) =>
+        {
+            lock (InspectionGate)
+                if (context.Active) Notify(context, "dump_update", new { runId = id, nodeId, node = session.Node(value) });
+        };
         Current.Value = context;
         Console.SetOut(TextWriter.Synchronized(new OutputWriter("stdout")));
         Console.SetError(TextWriter.Synchronized(new OutputWriter("stderr")));
         Console.SetIn(TextReader.Null);
-        DumpExtensions.Output.Value = value => Notify(context, "dump", new { runId = id, node = Node(value) });
+        DumpExtensions.Output.Value = value =>
+        {
+            lock (InspectionGate)
+                if (context.Active) Notify(context, "dump", new { runId = id, node = session.Node(value) });
+        };
         var ok = false;
         try
         {
@@ -168,14 +166,11 @@ internal static class Program
         }
         catch (Exception exception)
         {
-            if (exception is TargetInvocationException { InnerException: { } inner }) exception = inner;
-            var frames = new StackTrace(exception, true).GetFrames()
-                .Where(frame => frame.GetFileName() == "script.cs")
-                .Select(frame => (object)new { file = "script.cs", line = frame.GetFileLineNumber(), column = frame.GetFileColumnNumber(), function = frame.GetMethod()?.Name ?? "", text = "", script = true }).ToArray();
-            Error(context, exception.GetType().Name, exception.Message, frames);
+            lock (InspectionGate) Notify(context, "dump", new { runId = id, node = session.Error(exception) });
         }
         finally
         {
+            lock (InspectionGate)
             lock (Gate)
             {
                 context.Active = false;
@@ -219,6 +214,26 @@ internal static class Program
                 if (root.GetProperty("jsonrpc").GetString() != "2.0") throw new JsonException("Expected JSON-RPC 2.0");
                 if (root.GetProperty("method").GetString() == "run")
                     await Run(id.Value, root.GetProperty("params").GetProperty("source").GetString()!);
+                else if (root.GetProperty("method").GetString() == "expand")
+                {
+                    var parameters = root.GetProperty("params");
+                    var handle = parameters.GetProperty("handle").GetString()!;
+                    if (Session is null || !Session.Contains(handle))
+                        Send(new { jsonrpc = "2.0", id, error = new { code = -32001, message = "That preview is no longer available. Run the script again." } });
+                    else
+                    {
+                        try
+                        {
+                            var cursor = parameters.TryGetProperty("cursor", out var c) ? c.GetString() : null;
+                            var limit = parameters.TryGetProperty("limit", out var l) && l.ValueKind != JsonValueKind.Null ? l.GetInt32() : 100;
+                            Send(new { jsonrpc = "2.0", id, result = new { node = Session.Expand(handle, cursor, limit) } });
+                        }
+                        catch (Exception error)
+                        {
+                            Send(new { jsonrpc = "2.0", id, result = new { node = Session.Error(error) } });
+                        }
+                    }
+                }
                 else Send(new { jsonrpc = "2.0", id, error = new { code = -32601, message = "Unknown method" } });
             }
             catch (Exception error)
@@ -226,5 +241,6 @@ internal static class Program
                 Send(new { jsonrpc = "2.0", id, error = new { code = -32600, message = error.Message } });
             }
         }
+        Session?.Dispose();
     }
 }

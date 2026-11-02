@@ -210,8 +210,8 @@ and astral characters 12, matching `ensure_ascii`). Images, HTML and strings tha
 do not fit become lazy nodes, so expanding starts with a fresh budget. Strings
 cut at the 10,000-character (or 1,000 in a table cell) limit carry
 `truncated: true` and `total`, and the desktop shows the marker. Repeated references
-are allowed; only cycles in the current path are marked. Properties and arbitrary
-iterators are not evaluated. Outside the app, `dump()` falls back to terminal
+are allowed; only cycles in the current path are marked. The Python kernel does not evaluate properties or arbitrary
+iterators; C# inspection and iterator rules are described below. Outside the app, `dump()` falls back to terminal
 pretty-printing, and `html()` prints its markup.
 
 The runtime library provides four helpers:
@@ -234,7 +234,7 @@ scrolled to the end in one webview; split or filter larger data. Cancellation
 arrives in #3.
 
 
-## C# skeleton (M2.0)
+## C# kernel (M2.0–M2.1)
 
 C# reuses `run`, `stream`, `dump`, `run_finished` and the final response. The host
 selects the language explicitly and replaces the kernel when a tab changes
@@ -264,7 +264,47 @@ successful no-ops when there is no explicit entry point. Script references conta
 only the selected shared framework and the public CodingPad helper, excluding the
 kernel and its private Roslyn dependencies.
 
-M2.0 implements scalar/text dumps and managed Console streams only. It does not
-expose lazy handles, packages or cooperative cancellation yet; Stop uses the
-host's forced restart deadline. Background writes through the managed wrappers
-are scoped to their original run and discarded after completion.
+C# supports lazy `expand` requests using the same run-scoped handles and expired
+handle error (`-32001`). A new run disposes unfinished iterators and clears all
+handles, even if compilation fails. Reset/close terminate the process and release
+its resources. Lazy property handles cache both their value and evaluation failure;
+expansion failures are returned as `error` nodes so script stack frames remain
+clickable. Object fields are paged in groups of at most 100, with six levels per
+expansion. Public instance fields and readable non-indexed properties are inspected;
+properties evaluate only on expansion. Static members and custom `ToString` are
+not invoked. Cycles in the current field path become a string marker.
+
+Every C# `IEnumerable` (except strings) becomes a table. At most 100 items are read
+per request, without a lookahead item. The same enumerator and already-read items
+are retained until the next run. Repeated pages do not advance it again; cursors
+beyond the cached frontier are rejected as error nodes rather than traversing an
+arbitrary number of items. Iterator failures are appended as a final error row,
+and the iterator is disposed on completion, failure or the next run. A record
+table uses up to 32 public members from the first item as its stable columns;
+scalar/nested-sequence tables use a single `Value` column. Record properties are
+evaluated and cached for requested rows; nested cells use lazy handles.
+
+For tables with an unknown length, C# adds `totalKnown: false`: `total` is the
+number of cached rows **plus one placeholder row**. The viewer uses that row to
+request the next page when scrolling and grows the viewport as new pages arrive.
+When enumeration finishes, `totalKnown: true` and `total` is the exact row count.
+An exact multiple of 100 requires one final empty request to discover completion.
+The existing Python tables omit `totalKnown` and retain their known-length and
+random-access behavior. Table page offsets remain aligned to 100 in the desktop.
+
+C# strings are limited to 10,000 characters (1,000 in cells), with a shared
+200,000-character text budget per dump/page. Object traversal stops near 1,000
+nodes and remains pageable; a table can contain up to 100 × 32 bounded cell
+nodes. Error messages and each of five inner-exception summaries are capped at
+10,000 characters; tracebacks retain up to 100 frames with source locations.
+Script frames use `script.cs` and one-based line numbers.
+
+The `CodingPad` library also provides `HtmlValue(markup)`,
+`ImageValue(bytes, mime = "image/png", name = null)`, and `LiveValue(value)`.
+Dump these with `.Dump()`. HTML uses the shared text budget and the viewer's
+sandboxed iframe. Images accept PNG, JPEG, GIF, WebP and BMP with a 4 MiB limit
+per image and per dump/page. Assigning `LiveValue.Value` emits `dump_update` for
+each displayed instance during its originating run. Subscriptions are released
+with the session. Background writes/updates are discarded after run completion.
+C# packages and cooperative cancellation follow in later M2 increments; Stop
+continues to use the host's forced restart deadline.

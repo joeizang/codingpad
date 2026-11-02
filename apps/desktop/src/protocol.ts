@@ -60,6 +60,7 @@ export type DumpNode =
       columns: { name: string; type?: string }[];
       rows: DumpNode[][];
       total: number;
+      totalKnown?: boolean;
       next: string | null;
       handle?: string;
     }

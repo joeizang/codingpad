@@ -104,9 +104,19 @@ impl Toolchains {
     }
 }
 
+/// Releases the installer lock explicitly on drop, so a duplicate or inherited
+/// descriptor cannot keep it held after the install finishes.
+struct InstallLock(std::fs::File);
+
+impl Drop for InstallLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 // The OS releases this lock after a crash. Keep the lock file in place: deleting
 // it would let different processes lock different inodes and sweep active files.
-fn prepare_install(directory: &Path) -> Result<std::fs::File, String> {
+fn prepare_install(directory: &Path) -> Result<InstallLock, String> {
     std::fs::create_dir_all(directory)
         .map_err(|e| format!("Could not create the tool folder: {e}"))?;
     let lock = std::fs::OpenOptions::new()
@@ -130,7 +140,7 @@ fn prepare_install(directory: &Path) -> Result<std::fs::File, String> {
             }
         }
     }
-    Ok(lock)
+    Ok(InstallLock(lock))
 }
 
 async fn install_private_uv(
@@ -225,10 +235,10 @@ mod tests {
         assert!(prepare_install(directory).is_err());
         assert!(active.exists());
         // Model a descriptor inherited by a concurrently spawned subprocess.
-        // Closing our handle alone need not release the shared Unix lock.
+        // The guard's Drop unlocks explicitly, so closing our handle is enough
+        // even while the duplicate descriptor is still open.
         #[cfg(unix)]
-        let inherited = lock.try_clone().unwrap();
-        lock.unlock().unwrap();
+        let inherited = lock.0.try_clone().unwrap();
         drop(lock);
         let _lock = prepare_install(directory).unwrap();
         #[cfg(unix)]

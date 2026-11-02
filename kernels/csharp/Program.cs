@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using System.Threading.Channels;
 using System.Runtime.CompilerServices;
 using System.Runtime.Loader;
 using System.Text;
@@ -86,8 +85,7 @@ internal static class Program
                     Notify(context, "dump_update", new { runId = id, nodeId, node });
         };
         Current.Value = context;
-        using var helpers = ScriptHelpers.BeginRun(cancel, text =>
-            Notify(context, "stream", new { runId = id, stream = "stdout", text }));
+        ScriptHelpers.RunScope? helpers = null;
         Console.SetOut(TextWriter.Synchronized(new OutputWriter("stdout")));
         Console.SetError(TextWriter.Synchronized(new OutputWriter("stderr")));
         Console.SetIn(TextReader.Null);
@@ -100,12 +98,14 @@ internal static class Program
         try
         {
             cancel.ThrowIfCancellationRequested();
-            var tree = CSharpSyntaxTree.ParseText(source, path: "script.cs", encoding: Encoding.UTF8);
+            helpers = ScriptHelpers.BeginRun(cancel, text =>
+                Notify(context, "stream", new { runId = id, stream = "stdout", text }));
+            var tree = CSharpSyntaxTree.ParseText(source, path: "script.cs", encoding: Encoding.UTF8, cancellationToken: cancel);
             var compilation = Compile(tree);
-            var last = tree.GetRoot().ChildNodes().OfType<GlobalStatementSyntax>().LastOrDefault();
+            var last = tree.GetRoot(cancel).ChildNodes().OfType<GlobalStatementSyntax>().LastOrDefault();
             // Empty/comment/type-only scripts are useful no-ops. Keep every
             // other diagnostic, and preserve explicit Main programs when present.
-            var errors = compilation.GetDiagnostics()
+            var errors = compilation.GetDiagnostics(cancel)
                 .Where(d => d.Severity == DiagnosticSeverity.Error && !(last is null && d.Id == "CS5001")).ToArray();
             Notify(context, "diagnostics", new
             {
@@ -134,7 +134,7 @@ internal static class Program
             }
             // First validate the original C#: an invalid bare final expression must
             // never become valid as a side effect of auto-dump instrumentation.
-            if (last is null && compilation.GetEntryPoint(default) is null)
+            if (last is null && compilation.GetEntryPoint(cancel) is null)
             {
                 ok = true;
                 return;
@@ -146,21 +146,21 @@ internal static class Program
                 if (call is InvocationExpressionSyntax invocation)
                 {
                     var model = compilation.GetSemanticModel(tree);
-                    var type = model.GetTypeInfo(expression).Type;
-                    var symbol = model.GetSymbolInfo(invocation).Symbol as IMethodSymbol;
+                    var type = model.GetTypeInfo(expression, cancel).Type;
+                    var symbol = model.GetSymbolInfo(invocation, cancel).Symbol as IMethodSymbol;
                     if (type is not null && type.SpecialType != SpecialType.System_Void &&
                         !type.IsRefLikeType && type.TypeKind is not (TypeKind.Dynamic or TypeKind.Pointer or TypeKind.FunctionPointer) &&
                         symbol?.ContainingType.ToDisplayString() != "CodingPad.DumpExtensions")
                     {
                         var wrapped = SyntaxFactory.ParseExpression($"global::CodingPad.DumpExtensions.Dump({expression.WithoutTrivia()})").WithTriviaFrom(expression);
-                        var next = tree.WithRootAndOptions(tree.GetRoot().ReplaceNode(expression, wrapped), tree.Options);
+                        var next = tree.WithRootAndOptions(tree.GetRoot(cancel).ReplaceNode(expression, wrapped), tree.Options);
                         compilation = compilation.ReplaceSyntaxTree(tree, next);
                     }
                 }
             }
             using var pe = new MemoryStream();
             using var pdb = new MemoryStream();
-            var result = compilation.Emit(pe, pdb, options: new EmitOptions(debugInformationFormat: DebugInformationFormat.PortablePdb));
+            var result = compilation.Emit(pe, pdb, options: new EmitOptions(debugInformationFormat: DebugInformationFormat.PortablePdb), cancellationToken: cancel);
             if (!result.Success)
             {
                 Error(context, "Kernel error", "Could not emit the C# script after auto-dump instrumentation. " +
@@ -178,6 +178,8 @@ internal static class Program
         }
         finally
         {
+            // Close the helper context before the host can observe completion.
+            helpers?.Dispose();
             lock (InspectionGate)
             lock (Gate)
             {
@@ -205,65 +207,88 @@ internal static class Program
     }
 
     private static readonly ConcurrentDictionary<long, CancellationTokenSource> Cancellations = new();
-    private static readonly Channel<(string Line, CancellationTokenSource? Cancel)> Requests = Channel.CreateUnbounded<(string, CancellationTokenSource?)>();
+    private sealed record Request(JsonDocument? Document, string? ParseError, CancellationTokenSource? Cancel);
+    private static readonly BlockingCollection<Request> Requests = new();
 
-    private static async Task Main()
+    private static void Main()
     {
-        var worker = Task.Run(ProcessRequests);
-        while (await Input.ReadLineAsync() is { } line)
+        ScriptHelpers.InitializeHost();
+        // Neither stdin nor dispatch needs a free thread-pool thread. User code
+        // may occupy the pool while waiting for its cancellation token.
+        var worker = Task.Factory.StartNew(ProcessRequests, CancellationToken.None,
+            TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        try
         {
-            CancellationTokenSource? cancel = null;
-            try
+            while (Input.ReadLine() is { } line)
             {
-                using var document = JsonDocument.Parse(line);
-                var root = document.RootElement;
-                if (root.GetProperty("jsonrpc").GetString() == "2.0")
+                JsonDocument? document = null;
+                CancellationTokenSource? cancel = null;
+                string? parseError = null;
+                try
                 {
-                    var method = root.GetProperty("method").GetString();
-                    if (method == "cancel")
+                    document = JsonDocument.Parse(line);
+                    var root = document.RootElement;
+                    if (root.GetProperty("jsonrpc").GetString() == "2.0")
                     {
-                        var runId = root.GetProperty("params").GetProperty("runId").GetInt64();
-                        if (Cancellations.TryGetValue(runId, out var active))
-                            _ = CancelSafely(active);
-                        continue;
-                    }
-                    if (method == "run" && root.TryGetProperty("id", out var id))
-                    {
-                        cancel = new CancellationTokenSource();
-                        if (!Cancellations.TryAdd(id.GetInt64(), cancel))
-                        { cancel.Dispose(); cancel = null; }
+                        var method = root.GetProperty("method").GetString();
+                        if (method == "cancel")
+                        {
+                            var runId = root.GetProperty("params").GetProperty("runId").GetInt64();
+                            if (Cancellations.TryGetValue(runId, out var active)) CancelSafely(active);
+                            document.Dispose();
+                            continue;
+                        }
+                        if (method == "run" && root.TryGetProperty("id", out var id))
+                        {
+                            var runId = id.GetInt64();
+                            cancel = new CancellationTokenSource();
+                            if (!Cancellations.TryAdd(runId, cancel))
+                            { cancel.Dispose(); cancel = null; }
+                        }
                     }
                 }
+                catch (Exception error)
+                {
+                    // Keep parsed documents alive for validation by the worker.
+                    // Invalid JSON has no document and carries its parse error.
+                    parseError = error.Message;
+                }
+                Requests.Add(new(document, parseError, cancel));
             }
-            catch (Exception) { /* Request validation belongs to the worker. */ }
-            await Requests.Writer.WriteAsync((line, cancel));
         }
-        Requests.Writer.Complete();
-        await worker;
+        finally { Requests.CompleteAdding(); }
+        worker.GetAwaiter().GetResult();
     }
 
-    private static async Task CancelSafely(CancellationTokenSource source)
+    private static void CancelSafely(CancellationTokenSource source)
     {
-        try { await source.CancelAsync(); }
-        catch (Exception) { /* User cancellation callbacks may throw. */ }
+        // Run callbacks away from both stdin and the pool: callbacks may block,
+        // and pool starvation must not prevent cooperative cancellation.
+        new Thread(() =>
+        {
+            try { source.Cancel(); }
+            catch (Exception) { /* User callbacks may throw, or the run may have ended. */ }
+        }) { IsBackground = true, Name = "CodingPad cancellation" }.Start();
     }
 
-    private static async Task ProcessRequests()
+    private static void ProcessRequests()
     {
         Console.SetOut(TextWriter.Null);
         Console.SetIn(TextReader.Null);
-        await foreach (var (line, cancel) in Requests.Reader.ReadAllAsync())
+        foreach (var request in Requests.GetConsumingEnumerable())
         {
+            using var document = request.Document;
+            var cancel = request.Cancel;
             long? id = null;
             try
             {
-                using var document = JsonDocument.Parse(line);
+                if (document is null) throw new JsonException(request.ParseError);
                 var root = document.RootElement;
                 if (!root.TryGetProperty("id", out var value)) continue;
                 id = value.GetInt64();
                 if (root.GetProperty("jsonrpc").GetString() != "2.0") throw new JsonException("Expected JSON-RPC 2.0");
                 if (root.GetProperty("method").GetString() == "run")
-                    await Run(id.Value, root.GetProperty("params").GetProperty("source").GetString()!, cancel?.Token ?? CancellationToken.None);
+                    Run(id.Value, root.GetProperty("params").GetProperty("source").GetString()!, cancel?.Token ?? CancellationToken.None).GetAwaiter().GetResult();
                 else if (root.GetProperty("method").GetString() == "expand")
                 {
                     var parameters = root.GetProperty("params");

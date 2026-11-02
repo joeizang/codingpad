@@ -1191,3 +1191,187 @@ Cache("thread", () => Task.Run(() => Cache("inner", () => 8)).Result).Dump();
         .contains("M3"));
     supervisor.shutdown().await;
 }
+
+#[tokio::test]
+async fn csharp_large_safe_struct_collections_survive_reruns() {
+    let supervisor = Supervisor::default();
+    run(
+        &supervisor,
+        "large-cache",
+        r#"
+Cache("lookup", () => Enumerable.Range(0, 60_000).ToDictionary(i => i.ToString(), i => i));
+Cache("tuples", () => Enumerable.Range(0, 150_000).Select(i => (i, i + 1)).ToList());
+"#,
+        true,
+    )
+    .await;
+    let events = run(&supervisor, "large-cache", r#"
+Cache<Dictionary<string, int>>("lookup", () => throw new Exception("lookup recomputed"))["59999"].Dump();
+Cache<List<(int, int)>>("tuples", () => throw new Exception("tuples recomputed"))[149999].Item2.Dump();
+"#, true).await;
+    assert_eq!(dumps(&events)[0]["v"], 59_999);
+    assert_eq!(dumps(&events)[1]["v"], 150_000);
+    assert!(!events.iter().any(|event| event.method == "stream"));
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_cache_type_conflicts_do_not_evict_the_winner() {
+    let supervisor = Supervisor::default();
+    let events = run(&supervisor, "types", r#"
+Cache("number", () => 42);
+try { Cache("number", () => 7L); } catch (InvalidOperationException error) { error.Message.Dump(); }
+Cache("number", () => -1).Dump();
+var barrier = new Barrier(2);
+var tasks = new[] {
+    Task.Run(() => { try { Cache("race", () => { barrier.SignalAndWait(); return 1; }); return false; }
+        catch (InvalidOperationException) { return true; } }),
+    Task.Run(() => { try { Cache("race", () => { barrier.SignalAndWait(); return 2L; }); return false; }
+        catch (InvalidOperationException) { return true; } })
+};
+(await Task.WhenAll(tasks)).Count(failed => failed).Dump();
+"#, true).await;
+    let nodes = dumps(&events);
+    assert!(nodes[0]["v"]
+        .as_str()
+        .unwrap()
+        .contains("Cache key 'number'"));
+    assert_eq!(nodes[1]["v"], 42);
+    assert_eq!(
+        nodes[2]["v"], 1,
+        "One incompatible factory loses with an explicit error"
+    );
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_preview_and_late_workers_cannot_write_to_cache() {
+    let supervisor = Supervisor::default();
+    let events = run(&supervisor, "scope", r#"
+IEnumerable<int> Items() {
+    for (int i = 0; i < 101; i++) {
+        if (i == 100) Cache("preview", () => 42);
+        yield return i;
+    }
+}
+Items().Dump();
+var gate = Cache("gate", () => new int[2]);
+new Thread(() => {
+    while (Volatile.Read(ref gate[0]) == 0) Thread.Sleep(1);
+    try { Cache("late", () => 42); }
+    catch (InvalidOperationException) { Environment.SetEnvironmentVariable("CPAD_LATE_REJECTED", "yes"); }
+    finally { Volatile.Write(ref gate[1], 1); }
+}) { IsBackground = true }.Start();
+"#, true).await;
+    let page = supervisor
+        .expand(
+            "scope",
+            dumps(&events)[0]["handle"].as_str().unwrap(),
+            Some("100"),
+            None,
+        )
+        .await
+        .unwrap()
+        .node;
+    assert!(page["rows"][0][0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("active script run"));
+    // Expansion invokes user code outside a run. Besides rejecting its write,
+    // signal the original background worker only after run completion.
+    let next = run(&supervisor, "scope", r#"
+var gate = Cache("gate", () => new int[2]);
+Volatile.Write(ref gate[0], 1);
+if (!SpinWait.SpinUntil(() => Volatile.Read(ref gate[1]) == 1, 5000)) throw new Exception("worker stalled");
+Environment.GetEnvironmentVariable("CPAD_LATE_REJECTED").Dump();
+Cache("preview", () => -1).Dump(); Cache("late", () => -1).Dump();
+"#, true).await;
+    assert_eq!(dumps(&next)[0]["v"], "yes");
+    assert_eq!(dumps(&next)[1]["v"], -1);
+    assert_eq!(dumps(&next)[2]["v"], -1);
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_cooperative_stop_works_with_an_exhausted_thread_pool() {
+    let supervisor = std::sync::Arc::new(Supervisor::default());
+    run(&supervisor, "control", "Cache(\"saved\", () => 42);", true).await;
+    let task = csharp_start_until_ready(supervisor.clone(), r#"
+ThreadPool.GetMinThreads(out var minWorker, out var minIo);
+ThreadPool.GetMaxThreads(out var maxWorker, out var maxIo);
+ThreadPool.SetMinThreads(1, minIo);
+if (!ThreadPool.SetMaxThreads(1, maxIo)) throw new Exception("Could not restrict pool");
+using var started = new ManualResetEventSlim();
+using var registration = Cancel.Register(() => Environment.SetEnvironmentVariable("CPAD_CANCEL_CALLBACK", "yes"));
+var worker = Task.Run(() => { started.Set(); Cancel.WaitHandle.WaitOne(); });
+started.Wait();
+Console.WriteLine("ready");
+try { Cancel.WaitHandle.WaitOne(); worker.GetAwaiter().GetResult(); Cancel.ThrowIfCancellationRequested(); }
+finally { ThreadPool.SetMaxThreads(maxWorker, maxIo); ThreadPool.SetMinThreads(minWorker, minIo); }
+"#).await;
+    supervisor.stop("control").await;
+    let result = timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.stopped && !result.cache_cleared);
+    let next = run(
+        &supervisor,
+        "control",
+        r#"
+Cache("saved", () => -1).Dump();
+Environment.GetEnvironmentVariable("CPAD_CANCEL_CALLBACK").Dump();
+"#,
+        true,
+    )
+    .await;
+    assert_eq!(dumps(&next)[0]["v"], 42);
+    assert_eq!(dumps(&next)[1]["v"], "yes");
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_stop_during_compilation_preserves_cache() {
+    let supervisor = std::sync::Arc::new(Supervisor::default());
+    run(
+        &supervisor,
+        "compile-stop",
+        "Cache(\"saved\", () => 42);",
+        true,
+    )
+    .await;
+    let mut source =
+        String::from("Environment.SetEnvironmentVariable(\"CPAD_COMPILE_EXECUTED\", \"yes\");\n");
+    for i in 0..100_000 {
+        source.push_str(&format!("static int Method{i}() => {i};\n"));
+    }
+    let running = supervisor.clone();
+    let task = tokio::spawn(async move {
+        running
+            .run_language("compile-stop", &source, Language::Csharp, |_| {})
+            .await
+            .unwrap()
+    });
+    // The warm kernel is already ready. Give it time to accept the source and
+    // enter Roslyn, then exercise Stop while there is no script frame yet.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    supervisor.stop("compile-stop").await;
+    let result = timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.stopped && !result.ok && !result.cache_cleared);
+    let next = run(
+        &supervisor,
+        "compile-stop",
+        r#"
+Cache("saved", () => -1).Dump();
+Environment.GetEnvironmentVariable("CPAD_COMPILE_EXECUTED").Dump();
+"#,
+        true,
+    )
+    .await;
+    assert_eq!(dumps(&next)[0]["v"], 42);
+    assert_eq!(dumps(&next)[1]["kind"], "null");
+    supervisor.shutdown().await;
+}

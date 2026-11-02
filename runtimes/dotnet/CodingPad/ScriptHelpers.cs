@@ -11,6 +11,7 @@ public static class ScriptHelpers
     private static readonly Dictionary<string, Entry> Values = new();
     private static readonly HashSet<string> Refreshed = new();
     private static readonly AsyncLocal<RunScope?> Current = new();
+    private static bool hosted;
 
     public static CancellationToken Cancel => Current.Value?.Token ?? CancellationToken.None;
 
@@ -24,16 +25,11 @@ public static class ScriptHelpers
         ArgumentNullException.ThrowIfNull(key);
         ArgumentNullException.ThrowIfNull(factory);
         var scope = Current.Value;
-        var refreshed = false;
+        bool refreshed;
         lock (Gate)
         {
             EnsureActive(scope);
-            if (Values.TryGetValue(key, out var entry))
-            {
-                if (entry.Value is T || (entry.Value is null && default(T) is null))
-                    return (T)entry.Value!;
-                Values.Remove(key);
-            }
+            if (Values.TryGetValue(key, out var entry)) return Cached<T>(key, entry);
             refreshed = Refreshed.Remove(key);
         }
         if (refreshed) scope?.Note("cache refreshed: script types changed\n");
@@ -41,85 +37,133 @@ public static class ScriptHelpers
         lock (Gate)
         {
             EnsureActive(scope);
-            if (Values.TryGetValue(key, out var winner) &&
-                (winner.Value is T || (winner.Value is null && default(T) is null)))
-                return (T)winner.Value!;
+            if (Values.TryGetValue(key, out var winner)) return Cached<T>(key, winner);
             Values[key] = new(value);
         }
         return value;
     }
 
-    private static void EnsureActive(RunScope? scope)
+    private static T Cached<T>(string key, Entry entry)
     {
-        if (scope is { Active: false }) throw new InvalidOperationException("The script run has already finished.");
+        if (entry.Value is T || (entry.Value is null && default(T) is null)) return (T)entry.Value!;
+        throw new InvalidOperationException($"Cache key '{key}' contains {entry.Value?.GetType().FullName ?? "null"}, " +
+            $"which cannot be used as {typeof(T).FullName}. Use a different key or Reset to recompute it.");
     }
 
-    // Inspect storage, not properties or IEnumerable: those can execute user code.
-    // Unknown or oversized graphs are conservatively refreshed on the next run.
-    private static bool IsReusable(object? root)
+    private static void EnsureActive(RunScope? scope)
     {
-        var pending = new Stack<object>();
-        var seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
-        if (root is not null) pending.Push(root);
-        var budget = 100_000;
-        try
+        if (scope is { Active: false } || (hosted && scope is null))
+            throw new InvalidOperationException("Cache is only available during an active script run.");
+    }
+
+    private static bool IsScalar(Type type) =>
+        type != typeof(IntPtr) && type != typeof(UIntPtr) &&
+        (type.IsPrimitive || type.IsEnum || type == typeof(string) || type == typeof(decimal) ||
+         type == typeof(DateTime) || type == typeof(DateTimeOffset) || type == typeof(TimeSpan) || type == typeof(Guid));
+
+    // Metadata is shared across entries for this inspection only. A process-wide
+    // Type dictionary would keep collectible script assemblies alive forever.
+    private sealed class CacheInspection(CancellationToken cancel)
+    {
+        private readonly Dictionary<Type, bool> scriptTypes = new();
+        private readonly Dictionary<Type, bool> safeTypes = new();
+        private readonly Dictionary<Type, FieldInfo[]> fields = new();
+
+        private bool ScriptType(Type type)
         {
-            while (pending.TryPop(out var value))
+            if (scriptTypes.TryGetValue(type, out var result)) return result;
+            return scriptTypes[type] = AssemblyLoadContext.GetLoadContext(type.Assembly)?.IsCollectible == true ||
+                (type.HasElementType && ScriptType(type.GetElementType()!)) ||
+                (type.IsGenericType && type.GetGenericArguments().Any(ScriptType));
+        }
+
+        private FieldInfo[] Fields(Type type)
+        {
+            if (fields.TryGetValue(type, out var result)) return result;
+            var list = new List<FieldInfo>();
+            for (var parent = type; parent is not null; parent = parent.BaseType)
+                list.AddRange(parent.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly));
+            return fields[type] = list.ToArray();
+        }
+
+        private static bool Opaque(Type type) =>
+            type == typeof(IntPtr) || type == typeof(UIntPtr) || type.IsPointer || type.IsFunctionPointer ||
+            typeof(Delegate).IsAssignableFrom(type) || typeof(MemberInfo).IsAssignableFrom(type) ||
+            typeof(Assembly).IsAssignableFrom(type) || typeof(AssemblyLoadContext).IsAssignableFrom(type);
+
+        // Prove safety from storage types when possible. Sealed reference types
+        // cannot conceal a script subclass; object/interface fields need a walk.
+        // Mark recursive shapes uncertain while computing their verdict.
+        private bool AlwaysSafe(Type type)
+        {
+            cancel.ThrowIfCancellationRequested();
+            if (safeTypes.TryGetValue(type, out var result)) return result;
+            safeTypes[type] = false;
+            if (ScriptType(type) || Opaque(type)) return false;
+            if (IsScalar(type)) return safeTypes[type] = true;
+            if (type.IsArray) return safeTypes[type] = AlwaysSafe(type.GetElementType()!);
+            if (!type.IsValueType && !type.IsSealed) return false;
+            return safeTypes[type] = Fields(type).All(field => AlwaysSafe(field.FieldType));
+        }
+
+        // Inspect storage, not properties or IEnumerable: those can execute user code.
+        internal bool IsReusable(object? root)
+        {
+            var pending = new Stack<object>();
+            var seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
+            if (root is not null) pending.Push(root);
+            var budget = 100_000;
+            try
             {
-                if (--budget < 0) return false;
-                if (!seen.Add(value)) continue;
-                var type = value.GetType();
-                if (ScriptType(type)) return false;
-                if (value is Type reflected)
+                while (pending.TryPop(out var value))
                 {
-                    if (ScriptType(reflected)) return false;
-                    continue;
-                }
-                // Delegates and reflection objects can retain code through runtime handles.
-                if (value is Delegate or MemberInfo or Assembly or AssemblyLoadContext) return false;
-                // Native handles can hide managed targets (weak references, GCHandle,
-                // dependent handles). Their storage cannot prove safe reuse.
-                if (value is IntPtr or UIntPtr) return false;
-                if (type.IsPrimitive || type.IsEnum || value is string or decimal or DateTime or DateTimeOffset or TimeSpan or Guid) continue;
-                if (value is Array array)
-                {
-                    var element = type.GetElementType()!;
-                    if (element == typeof(IntPtr) || element == typeof(UIntPtr)) return false;
-                    if (element.IsPrimitive || element.IsEnum || element == typeof(string) ||
-                        element == typeof(decimal) || element == typeof(DateTime) ||
-                        element == typeof(DateTimeOffset) || element == typeof(TimeSpan) || element == typeof(Guid)) continue;
-                    if (array.Length > budget) return false;
-                    foreach (var item in array)
-                        if (item is not null) pending.Push(item);
-                    continue;
-                }
-                for (var parent = type; parent is not null; parent = parent.BaseType)
-                    foreach (var field in parent.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+                    cancel.ThrowIfCancellationRequested();
+                    if (--budget < 0) return false;
+                    if (!seen.Add(value)) continue;
+                    var type = value.GetType();
+                    if (ScriptType(type)) return false;
+                    if (value is Type reflected)
                     {
+                        if (ScriptType(reflected)) return false;
+                        continue;
+                    }
+                    // Native and reflection handles can hide managed/code targets.
+                    if (Opaque(type)) return false;
+                    if (AlwaysSafe(type)) continue;
+                    if (value is Array array)
+                    {
+                        if (array.Length > budget) return false;
+                        foreach (var item in array)
+                            if (item is not null) pending.Push(item);
+                        continue;
+                    }
+                    foreach (var field in Fields(type))
+                    {
+                        if (AlwaysSafe(field.FieldType)) continue;
                         if (field.FieldType.IsPointer || field.FieldType.IsFunctionPointer) return false;
                         if (field.GetValue(value) is { } child) pending.Push(child);
                     }
+                }
+                return true;
             }
-            return true;
+            catch (OperationCanceledException) { throw; }
+            catch { return false; } // Uninspectable storage is conservatively refreshed.
         }
-        catch { return false; }
     }
 
-    private static bool ScriptType(Type type) =>
-        AssemblyLoadContext.GetLoadContext(type.Assembly)?.IsCollectible == true ||
-        (type.HasElementType && ScriptType(type.GetElementType()!)) ||
-        (type.IsGenericType && type.GetGenericArguments().Any(ScriptType));
+    internal static void InitializeHost() => hosted = true;
 
     /// <summary>Host integration: install a fresh run context without clearing safe cached values.</summary>
-    public static RunScope BeginRun(CancellationToken token, Action<string> note)
+    internal static RunScope BeginRun(CancellationToken token, Action<string> note)
     {
         var scope = new RunScope(token, note);
+        var inspection = new CacheInspection(token);
         lock (Gate)
         {
             // Recheck mutable containers too: a previously safe List<object> may
             // have acquired a script-defined value since its factory returned.
             foreach (var (key, entry) in Values.ToArray())
-                if (!IsReusable(entry.Value))
+                if (!inspection.IsReusable(entry.Value))
                 {
                     Values.Remove(key);
                     Refreshed.Add(key);
@@ -129,7 +173,7 @@ public static class ScriptHelpers
         return scope;
     }
 
-    public sealed class RunScope : IDisposable
+    internal sealed class RunScope : IDisposable
     {
         internal RunScope(CancellationToken token, Action<string> note)
         { Token = token; Note = note; }

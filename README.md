@@ -217,21 +217,26 @@ Reset discards that tab's process, cache and previews; other tabs are unaffected
 
 `Cache("key", () => ...)` retains successful values across runs, including null.
 Factories run outside the cache lock; concurrent misses may compute more than
-once and the first stored value wins. Failed factories are not cached. Each run
-rechecks cached object graphs, including mutable containers, without calling
-properties or enumerating user sequences. Values containing script-defined types
-are discarded before the next compilation; requesting their keys again runs the
-factory and shows `cache refreshed: script types changed`. Delegates, reflection/native
-handles and graphs that cannot be safely inspected within the inspection budget
-are conservatively refreshed too. Standard scalar arrays have no size limit for
-this check. Background work must finish within its run; late cache calls fail.
+once and the first stored value wins. An incompatible type requested for an
+existing key throws a clear error and preserves its value. Failed factories are
+not cached. Each run rechecks cached object graphs, including mutable
+containers, without calling properties or enumerating user sequences. Values
+containing script-defined types are discarded before the next compilation;
+requesting their keys again runs the factory and shows `cache refreshed: script
+types changed`. Delegates, reflection/native handles and graphs that cannot be
+safely inspected within the inspection budget are conservatively refreshed too.
+Arrays whose element storage types prove safe, including scalar tuples and
+dictionary entries, have no size limit for this check. Per-type inspection
+metadata is reused within that run boundary. Background work must finish within
+its run; late cache calls and cache calls from idle previews fail.
 `Secret("name")` throws an explanation that vault support is planned for M3.
 
-The runtime is packable as `CodingPad`; its `buildTransitive` imports make the same
-helper names compile in .NET 10 file scripts with `#:package CodingPad@0.1.0`.
-The updated package must be published or supplied through a local NuGet feed;
-the existing registry reservation is not this implementation. Run
-`dotnet pack runtimes/dotnet/CodingPad -o /path/to/feed` to build it locally.
+The runtime is packable as `CodingPad`; its direct-consumer `build` imports make
+the same helper names compile in .NET 10 file scripts with `#:package
+CodingPad@0.1.0`. The updated package must be published or supplied through a
+local NuGet feed; the existing registry reservation is not this implementation.
+Run `dotnet pack runtimes/dotnet/CodingPad -o /path/to/feed` to build it
+locally.
 Package directives inside the app, Roslyn completions and SDK installation follow
 in later M2 issues. Only managed `Console` output is
 captured; direct native writes are outside this increment. Scripts run with your

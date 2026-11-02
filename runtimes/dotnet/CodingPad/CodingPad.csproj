@@ -8,6 +8,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
   <ItemGroup>
-    <None Include="buildTransitive/CodingPad.props" Pack="true" PackagePath="buildTransitive/" />
+    <InternalsVisibleTo Include="CodingPad.Kernel" />
+    <None Include="build/CodingPad.props" Pack="true" PackagePath="build/" />
   </ItemGroup>
 </Project>

@@ -328,33 +328,48 @@ itself trigger an update; only the newest replacement is emitted. Remaining
 subscriptions and views are released with the session. Background writes/updates are discarded after run completion.
 C# package directives follow in M2.3.
 
-C# uses a dedicated protocol reader and a serial request worker. The reader
-registers a cancellation source as soon as a `run` request arrives, so `cancel`
-notifications can be handled during compilation or execution. Wrong and expired
-run IDs are ignored. Cancellation callbacks run asynchronously so a blocking user
-callback cannot block protocol input. Scripts receive the token as `Cancel`;
-entry checks also honor cancellation arriving before execution. No loop rewriting
-or thread abort is used. The supervisor retains its two-second forced-stop path
-for scripts that do not cooperate.
+C# uses a synchronous stdin reader on the main thread and a serial dispatcher on
+a dedicated worker thread, independent of the thread pool. Parsed JSON documents
+are transferred to the worker and disposed after dispatch, without parsing the
+source a second time. The reader registers a cancellation source as soon as a
+`run` request arrives, so `cancel` notifications can be handled during
+compilation or execution. Wrong and expired run IDs are ignored. Cancellation
+callbacks run on a separate dedicated thread so a blocking user callback cannot
+block protocol input or depend on a free pool thread. Scripts receive the token
+as `Cancel`; Roslyn parsing, diagnostics, semantic queries and emit receive the
+same token; entry checks also honor cancellation arriving before execution. No
+loop rewriting or thread abort is used. The supervisor retains its two-second
+forced-stop path for scripts that do not cooperate.
 
-`Cache(key, factory)` lives in the shared CodingPad assembly, outside collectible
-script assemblies. At the next run boundary the helper checks actual field graphs
-(including generic arguments, array elements, and nested mutable containers) for
-collectible types. Unsafe entries are removed before compilation, and looking up
-one of their keys emits `cache refreshed: script types changed` as stdout before
-recomputing. Properties and user iterators are never invoked by this check.
-Delegates, reflection/native handles, inaccessible fields and graphs exceeding 100,000
-inspection steps are conservatively refreshed. Arrays of standard scalar types
-are safe without walking their elements. Failed factories are not cached; null is
-a hit. Concurrent factories execute outside the cache lock and the first stored
-result wins. A completed run's inherited helper context rejects late cache calls.
-Reset or forced Stop discards the process and all cached entries.
+`Cache(key, factory)` lives in the shared CodingPad assembly, outside
+collectible script assemblies. At the next run boundary the helper checks actual
+field graphs (including generic arguments, array elements, and nested mutable
+containers) for collectible types. Unsafe entries are removed before
+compilation, and looking up one of their keys emits `cache refreshed: script
+types changed` as stdout before recomputing. Properties and user iterators are
+never invoked by this check. Delegates, reflection/native handles, inaccessible
+fields and graphs exceeding 100,000 inspection steps are conservatively
+refreshed. Arrays whose element storage types are provably safe (including
+structs made only of safe fields) are reused without walking their elements.
+Scalar checks, field lists, script-type verdicts and storage-type verdicts are
+memoized per inspection across all entries. These Type references are released
+after that inspection so they cannot keep collectible assemblies alive. Failed
+factories are not cached; null is a hit. Concurrent factories execute outside
+the cache lock and the first stored result wins. Incompatible types requested
+under the same key throw an explicit error without evicting the original value,
+including concurrent factory races. The helper scope is closed before
+`run_finished` and the response. In hosted mode a missing or completed scope
+rejects cache calls, including calls from idle preview iterators; standalone
+consumers can still cache without a scope. Reset or forced Stop discards the
+process and all cached entries.
 
-The packable runtime includes `buildTransitive/CodingPad.props`, adding global
-namespace and static helper imports to ordinary .NET 10 consumers. Outside the
-kernel `Cancel` is `CancellationToken.None`; `Cache` lasts for that process.
-`Secret(name)` throws `NotSupportedException` until the M3 vault implementation.
-The standalone acceptance check packs a local feed and runs a file script with
-`#:package CodingPad@0.1.0` and no explicit imports; it disables AOT publishing so
-the test does not need to download an AOT compiler. Registry publication is a
-separate release action.
+The packable runtime includes `build/CodingPad.props`, adding global namespace
+and static helper imports to direct .NET 10 consumers only. Indirect dependents
+receive no imports. Host integration APIs are internal, with friend access
+granted only to the kernel assembly. Outside the kernel `Cancel` is
+`CancellationToken.None`; `Cache` lasts for that process. `Secret(name)` throws
+`NotSupportedException` until the M3 vault implementation. The standalone
+acceptance check packs a local feed and runs a file script with `#:package
+CodingPad@0.1.0` and no explicit imports; it disables AOT publishing so the test
+does not need to download an AOT compiler. Registry publication is a separate
+release action.

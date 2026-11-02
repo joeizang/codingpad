@@ -3,6 +3,8 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import Editor, { loader } from "@monaco-editor/react";
 import * as monaco from "monaco-editor/editor/editor.api.js";
 import "monaco-editor/languages/definitions/python/register.js";
+import "monaco-editor/languages/definitions/csharp/register.js";
+import type { CompileDiagnostic } from "./protocol";
 import EditorWorker from "monaco-editor/editor/editor.worker.js?worker";
 import {
   completionDocumentation,
@@ -35,6 +37,8 @@ export type EditorHandle = {
 
 type Props = {
   id: string;
+  language?: string;
+  compileDiagnostics?: CompileDiagnostic[];
   toolchainVersion?: number;
   source: string;
   onChange: (source: string) => void;
@@ -42,6 +46,8 @@ type Props = {
   onMount?: (editor: EditorHandle) => void;
   onDiagnostics?: (summary: DiagnosticsSummary) => void;
 };
+
+const EMPTY_DIAGNOSTICS: CompileDiagnostic[] = [];
 
 const COMPLETION_TRIGGERS = [".", "'", '"', "/"];
 
@@ -94,6 +100,8 @@ function toCompletionItem(
 
 export default function CodeEditor({
   id,
+  language = "python",
+  compileDiagnostics = EMPTY_DIAGNOSTICS,
   toolchainVersion = 0,
   source,
   onChange,
@@ -153,7 +161,46 @@ export default function CodeEditor({
     );
   };
 
+  const applyCompileDiagnostics = () => {
+    const model = editorRef.current?.getModel();
+    if (model) {
+      monaco.editor.setModelMarkers(
+        model,
+        "codingpad-compiler",
+        compileDiagnostics.map((diagnostic) => ({
+          severity: monaco.MarkerSeverity.Error,
+          message: diagnostic.message,
+          startLineNumber: diagnostic.line,
+          startColumn: diagnostic.column,
+          endLineNumber: diagnostic.endLine,
+          endColumn: diagnostic.endLine === diagnostic.line
+            ? Math.max(diagnostic.column + 1, diagnostic.endColumn)
+            : diagnostic.endColumn,
+        })),
+      );
+    }
+    onDiagnosticsRef.current?.({
+      errors: compileDiagnostics.length,
+      warnings: 0,
+      message: compileDiagnostics.length ? undefined : "Compile diagnostics on Run",
+    });
+  };
+
   useEffect(() => {
+    if (language === "csharp") applyCompileDiagnostics();
+  }, [language, compileDiagnostics]);
+
+  useEffect(() => {
+    if (language !== "python") {
+      if (language !== "csharp") {
+        onDiagnosticsRef.current?.({
+          errors: 0,
+          warnings: 0,
+          message: "Code intelligence unavailable",
+        });
+      }
+      return;
+    }
     const current = ++generation.current;
     let stopped = false;
     const initial = source;
@@ -220,7 +267,7 @@ export default function CodeEditor({
       const model = editorRef.current?.getModel();
       if (model) monaco.editor.setModelMarkers(model, "codingpad-lsp", []);
     };
-  }, [id, dependencyKey, toolchainVersion]);
+  }, [id, dependencyKey, toolchainVersion, language]);
 
   useEffect(
     () => () => {
@@ -233,14 +280,19 @@ export default function CodeEditor({
 
   return (
     <Editor
-      path={`${id}.py`}
-      language="python"
+      path={`${id}.${language === "csharp" ? "cs" : language === "python" ? "py" : "txt"}`}
+      language={language}
       theme="vs-dark"
       value={source}
       onChange={(value) => onChange(value ?? "")}
       onMount={(editor) => {
         editorRef.current = editor;
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, onRun);
+        if (language !== "python") {
+          if (language === "csharp") applyCompileDiagnostics();
+          onMount?.(editor);
+          return;
+        }
         if (pendingDiagnostics.current) {
           const model = editor.getModel();
           if (model) {

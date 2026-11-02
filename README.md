@@ -1,12 +1,14 @@
 # CodingPad
 
 A desktop scratchpad for running plain scripts and inspecting their values. This
-M1 build supports Python with a Monaco editor, Python completions and hover,
+build supports Python with a Monaco editor, Python completions and hover,
 type diagnostics, streamed stdout/stderr, rich dumps (lazy nodes, paged
 virtualised tables, images, sandboxed HTML, live updates), structured errors with
 clickable tracebacks, automatic display of the last expression, Stop/Reset, a
 library sidebar with pinned folders and plain-file saving, inline Python
-packages (PEP 723), and one-click private `uv` installation.
+packages (PEP 723), and one-click private `uv` installation. M2 now starts with a C# kernel: in-memory
+Roslyn compilation, console output, basic `.Dump()`, top-level `await`, and compiler
+diagnostics in the editor and Results.
 
 ## Develop locally
 
@@ -14,6 +16,7 @@ Install:
 
 - Node.js 22.12+ (or 24+) and npm
 - Stable Rust, including `rustfmt` and `clippy`
+- .NET 10 SDK or later on `PATH` (builds the bundled C# kernel and Roslyn compiler)
 - [`just`](https://just.systems/man/en/packages.html)
 - [`uv`](https://docs.astral.sh/uv/getting-started/installation/) and Python 3.10+
   (`uv python install` if needed)
@@ -121,14 +124,50 @@ replaced.
 
 The file commands accept paths from the local webview (the library, pinned
 folders and dialog choices); there is no filesystem sandbox between the UI and
-your user account. This build runs Python only, so **Run** is disabled for other
-file types while they remain editable and saveable.
+your user account. Python (`.py`) and C# (`.cs`) files can run; other file
+types remain editable and saveable.
+
+## C# scripts (M2.0)
+
+Click **+ C#** or open a `.cs` file. Install .NET 10 or later first; CodingPad
+finds `dotnet` on `PATH`, in `DOTNET_ROOT`, or in standard install locations and
+selects the newest installed stable `Microsoft.NETCore.App` runtime, 10 or later.
+The application bundles its compiler and helper library. Building CodingPad
+requires the SDK and restores the locked Roslyn NuGet dependency; running the
+installed app does not restore or build a project per script.
+
+```csharp
+Console.WriteLine("Hello from C#!");
+"explicit dump".Dump();
+await Task.Delay(10);
+Enumerable.Range(1, 10).Sum(); // automatically dumps 55
+```
+
+Each tab keeps a warm process. Each run compiles into a fresh collectible assembly
+and requests its unload afterwards, so script static fields start fresh. Background
+work and references scripts leave in process-wide state can delay unloading.
+A final call returning a value is automatically dumped, including an awaited
+value-returning call. A final `.Dump()` is shown once; void calls are not dumped.
+Bare expressions such as `6 * 7;` remain compile errors. Common `System` namespaces
+and `CodingPad` are available without `using` lines. The original source is
+validated before auto-dump instrumentation, and compile failures block execution.
+Compiler errors have editor squiggles after Run and clickable lines in Results;
+editing clears outdated squiggles. Runtime exceptions also show script frames.
+
+This first C# increment displays scalars and basic text previews. Rich dumps and
+lazy enumerable paging are M2.1; cooperative cancellation and `Cache` are M2.2;
+NuGet directives, Roslyn completions, and SDK installation follow in later M2
+issues. Stop currently uses the existing two-second forced restart fallback for
+C#. Only managed `Console` output is captured; direct native writes are outside
+this increment. Scripts run with your user privileges.
 
 ## Repository layout
 
 - `apps/desktop`: React/TypeScript UI and Tauri shell
 - `crates/kernel-core`: Rust kernel supervisor, independent of the window
 - `kernels/python`: Python stdio kernel
+- `kernels/csharp`: C# stdio kernel and pinned Roslyn dependency
+- `runtimes/dotnet/CodingPad`: bundled C# `.Dump()` extension library
 - `runtimes/python/codingpad`: bundled `dump()` helper (no registry download)
 - `tests/python`: kernel protocol and execution tests
 - `docs`: design decisions and [kernel protocol](docs/kernel-protocol.md)
@@ -186,7 +225,6 @@ launchers live in the user's cache folder under `codingpad/python-packages-v1`;
 are not supported for either saved scripts or scratch scripts; use absolute file
 URLs. Saved scripts do not resolve package paths against their containing folder.
 
-Language servers arrive later in M1.
 Scripts execute with your user privileges, as
 specified in the architecture. A run gets fresh globals, while imported modules
 and the interpreter remain warm; this is not interpreter isolation.

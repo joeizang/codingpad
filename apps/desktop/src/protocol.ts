@@ -1,3 +1,11 @@
+export type CompileDiagnostic = {
+  message: string;
+  line: number;
+  column: number;
+  endLine: number;
+  endColumn: number;
+};
+
 export type TraceFrame = {
   file: string;
   line: number;
@@ -68,6 +76,7 @@ export type DumpNode =
     };
 
 export type KernelEvent =
+  | { method: "diagnostics"; params: { runId: number; diagnostics: CompileDiagnostic[] } }
   | {
       method: "stream";
       params: { runId: number; stream: "stdout" | "stderr"; text: string };
@@ -107,7 +116,7 @@ export function appendOutputBatch(
     }
   };
   for (const event of events) {
-    if (event.method === "run_finished" || event.method === "dump_update")
+    if (event.method === "run_finished" || event.method === "dump_update" || event.method === "diagnostics")
       continue;
     if (event.method === "dump") {
       flush();

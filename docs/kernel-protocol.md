@@ -1,7 +1,7 @@
-# Kernel protocol v1 (M1 full dump)
+# Kernel protocol v1 (Python and C# skeleton)
 
 JSON-RPC 2.0 over UTF-8 stdio, one JSON object per line. The Rust supervisor starts
-one warm Python process per open script, writes requests to stdin and reads stdout.
+one warm kernel process per open script, writes requests to stdin and reads stdout.
 The kernel and its runtime are embedded in the Rust build and extracted to a
 private temporary directory for the process lifetime; installed apps do not need
 the source checkout or a registry package. Python starts with `-I -u -X utf8` and adds only
@@ -232,3 +232,33 @@ a second; scrolling fetches pages by offset. Browsers cap element height in the
 tens of millions of pixels, so tables beyond roughly 500,000 rows cannot be
 scrolled to the end in one webview; split or filter larger data. Cancellation
 arrives in #3.
+
+
+## C# skeleton (M2.0)
+
+C# reuses `run`, `stream`, `dump`, `run_finished` and the final response. The host
+selects the language explicitly and replaces the kernel when a tab changes
+language. C# runs use fresh collectible assemblies inside a warm .NET process.
+The compiler and `CodingPad` library are embedded in the Rust executable at build
+time. At startup the host discovers and explicitly selects the newest installed
+stable .NET runtime, 10 or later.
+
+Each compile sends a `diagnostics` notification, including an empty array on
+success, before any script output:
+
+```json
+{"jsonrpc":"2.0","method":"diagnostics","params":{"runId":1,"diagnostics":[{"message":"CS0103: The name 'missing' does not exist in the current context","line":2,"column":1,"endLine":2,"endColumn":8}]}}
+```
+
+Locations are one-based (end exclusive). Diagnostics also appear as `error` dump
+nodes with script frames. Invalid source never executes; runtime errors produce
+an error node and `ok: false`. Compile diagnostics belong to the submitted source
+snapshot and must be discarded in the editor when the text changes. Python does
+not emit this notification. The final value-returning top-level invocation is
+instrumented only after the unmodified C# has passed validation; final `.Dump()`
+calls and void calls are excluded. Top-level await is supported.
+
+M2.0 implements scalar/text dumps and managed Console streams only. It does not
+expose lazy handles, packages or cooperative cancellation yet; Stop uses the
+host's forced restart deadline. Background writes through the managed wrappers
+are scoped to their original run and discarded after completion.

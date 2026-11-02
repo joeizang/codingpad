@@ -12,6 +12,7 @@ import { uniqueId, type DiagnosticsSummary } from "./lsp";
 import {
   appendOutputBatch,
   collectDumpUpdates,
+  type CompileDiagnostic,
   type DumpNode,
   type KernelEvent,
   type Output,
@@ -36,12 +37,25 @@ dump({"name": "Ada", "languages": ["Python", "C#", "Rust"]})
 6 * 7
 `;
 
+const CSHARP_SAMPLE = `Console.WriteLine("Hello from C#!");
+
+new { Name = "Ada", Language = "C#" }.Dump();
+await Task.Delay(10);
+
+// A final value-returning call is displayed automatically.
+Enumerable.Range(1, 10).Sum();
+`;
+
 const SCRIPT_FILTERS = [
   { name: "Python", extensions: ["py"] },
+  { name: "C#", extensions: ["cs"] },
   { name: "All files", extensions: ["*"] },
 ];
 
-const isPython = (script: Script) => /\.py$/i.test(script.path ?? script.name);
+const scriptLanguage = (script: Script) => {
+  const name = script.path ?? script.name;
+  return /\.py$/i.test(name) ? "python" : /\.cs$/i.test(name) ? "csharp" : "plaintext";
+};
 
 type Script = {
   id: string;
@@ -57,6 +71,7 @@ type Script = {
   controlling?: boolean;
   error?: string;
   missingUv?: boolean;
+  compilation?: { source: string; diagnostics: CompileDiagnostic[] };
 };
 function intelligenceLabel(summary: DiagnosticsSummary): string {
   if (summary.message) return summary.message;
@@ -70,10 +85,10 @@ function intelligenceLabel(summary: DiagnosticsSummary): string {
   return parts.length ? parts.join(" · ") : "No type problems";
 }
 
-const newScript = (number: number): Script => ({
+const newScript = (number: number, language = "python"): Script => ({
   id: uniqueId("scratch"),
-  name: `Scratch ${number}.py`,
-  source: SAMPLE,
+  name: `Scratch ${number}.${language === "csharp" ? "cs" : "py"}`,
+  source: language === "csharp" ? CSHARP_SAMPLE : SAMPLE,
   dirty: false,
   output: [],
   running: false,
@@ -81,6 +96,8 @@ const newScript = (number: number): Script => ({
   version: 0,
   updates: {},
 });
+
+const EMPTY_DIAGNOSTICS: CompileDiagnostic[] = [];
 
 export default function App() {
   const [scripts, setScripts] = useState<Script[]>(() => [newScript(1)]);
@@ -132,7 +149,11 @@ export default function App() {
     [],
   );
   const active = scripts.find((script) => script.id === activeId)!;
-  const runnable = isPython(active);
+  const language = scriptLanguage(active);
+  const runnable = language !== "plaintext";
+  const compileDiagnostics = active.compilation?.source === active.source
+    ? active.compilation.diagnostics
+    : EMPTY_DIAGNOSTICS;
   const activeHeader = parseHeader(active.source);
   const update = (id: string, change: (script: Script) => Script) =>
     setScripts((all) =>
@@ -146,11 +167,11 @@ export default function App() {
       script.controlling
     )
       return;
-    if (!isPython(script)) {
+    if (scriptLanguage(script) === "plaintext") {
       update(script.id, (item) => ({
         ...item,
         status: "Not runnable",
-        error: "Only Python scripts run in this build.",
+        error: "Only Python and C# scripts run in this build.",
       }));
       return;
     }
@@ -166,6 +187,7 @@ export default function App() {
       missingUv: false,
       version,
       updates: {},
+      compilation: undefined,
       error: undefined,
     }));
     const pending: KernelEvent[] = [];
@@ -189,6 +211,13 @@ export default function App() {
       // generation check so an earlier run cannot append to a newer run's output.
       if (generation.current.get(script.id) !== version) return;
       if (event.method === "run_finished") return;
+      if (event.method === "diagnostics") {
+        update(script.id, (item) => ({
+          ...item,
+          compilation: { source: script.source, diagnostics: event.params.diagnostics },
+        }));
+        return;
+      }
       pending.push(event);
       if (!frames.current.has(script.id)) {
         frames.current.set(script.id, requestAnimationFrame(flush));
@@ -202,6 +231,7 @@ export default function App() {
       }>("run_script", {
         scriptId: script.id,
         source: script.source,
+        language: scriptLanguage(script),
         onEvent,
       });
       update(script.id, (item) => ({
@@ -316,8 +346,8 @@ export default function App() {
     current.focus();
   }
 
-  function addScript() {
-    const script = newScript(++counter.current);
+  function addScript(language = "python") {
+    const script = newScript(++counter.current, language);
     setScripts((all) => [...all, script]);
     setActiveId(script.id);
   }
@@ -574,7 +604,7 @@ export default function App() {
         <div className="brand">
           <span className="brand-mark">c.</span>
           <strong>CodingPad</strong>
-          <span className="language">Python</span>
+          <span className="language">{language === "csharp" ? "C#" : language === "python" ? "Python" : "Text"}</span>
         </div>
         <div className="run-controls">
           <button
@@ -600,7 +630,7 @@ export default function App() {
               installProgress !== null
             }
             title={
-              runnable ? undefined : "Only Python scripts run in this build"
+              runnable ? undefined : "Only Python and C# scripts run in this build"
             }
             onClick={() => void runScript(active)}
           >
@@ -656,9 +686,12 @@ export default function App() {
         <button
           className="add-tab"
           aria-label="New scratch script"
-          onClick={addScript}
+          onClick={() => addScript()}
         >
           +
+        </button>
+        <button className="add-tab" aria-label="New C# scratch script" onClick={() => addScript("csharp")}>
+          + C#
         </button>
       </nav>
       <div className="main-area">
@@ -674,7 +707,7 @@ export default function App() {
           error={libraryError}
         />
         <div className="workspace">
-          <section className="editor-pane" aria-label="Python editor">
+          <section className="editor-pane" aria-label={`${language === "csharp" ? "C#" : language === "python" ? "Python" : "Text"} editor`}>
             <div className="pane-heading">
               <span>EDITOR</span>
               <span className="pane-heading-right">
@@ -699,8 +732,10 @@ export default function App() {
             </div>
             <div className="editor">
               <CodeEditor
-                key={active.id}
+                key={`${active.id}:${language}`}
                 id={active.id}
+                language={language}
+                compileDiagnostics={compileDiagnostics}
                 toolchainVersion={toolchainVersion}
                 source={active.source}
                 onDiagnostics={setIntelligence}
@@ -787,7 +822,7 @@ export default function App() {
         <span>
           {activeHeader
             ? `Header: ${headerSummary(activeHeader) || activeHeader.line}`
-            : "Python · Library and files"}
+            : `${language === "csharp" ? "C#" : language === "python" ? "Python" : "Text"} · Library and files`}
         </span>
       </footer>
     </main>

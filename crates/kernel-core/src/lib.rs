@@ -1,4 +1,5 @@
-//! Desktop-independent supervisor for one warm Python process per script.
+//! Desktop-independent supervisor for one warm kernel process per script.
+mod csharp;
 pub mod installer;
 pub mod lsp;
 mod packages;
@@ -22,6 +23,14 @@ const PYTHON_EXECUTABLE_PROBE: &str =
 
 const KERNEL: &str = include_str!("../../../kernels/python/kernel.py");
 pub(crate) const RUNTIME: &str = include_str!("../../../runtimes/python/codingpad/__init__.py");
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Language {
+    #[default]
+    Python,
+    Csharp,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -138,6 +147,17 @@ impl Supervisor {
         source: &str,
         mut emit: impl FnMut(KernelEvent) + Send,
     ) -> Result<RunResult, String> {
+        self.run_language(script_id, source, Language::Python, &mut emit)
+            .await
+    }
+
+    pub async fn run_language(
+        &self,
+        script_id: &str,
+        source: &str,
+        language: Language,
+        mut emit: impl FnMut(KernelEvent) + Send,
+    ) -> Result<RunResult, String> {
         if script_id.is_empty() {
             return Err("A script id is required".into());
         }
@@ -154,15 +174,19 @@ impl Supervisor {
         if *closed.borrow() {
             return Err("Script was closed".into());
         }
-        let packages = Packages::parse(source)?;
+        let packages = if language == Language::Python {
+            Packages::parse(source)?
+        } else {
+            Packages::parse("")?
+        };
         if guard
             .as_ref()
-            .is_some_and(|kernel| kernel.packages != packages)
+            .is_some_and(|kernel| kernel.packages != packages || kernel.language != language)
         {
             *guard = None;
             emit(KernelEvent {
                 method: "stream".into(),
-                params: json!({"runId": 0, "stream": "stderr", "text": "Dependencies changed; restarting Python and clearing cache.\n"}),
+                params: json!({"runId": 0, "stream": "stderr", "text": "Language or dependencies changed; restarting the kernel and clearing cache.\n"}),
             });
         }
         // Startup includes resolution/downloads. Stop and Close must cancel that
@@ -170,7 +194,10 @@ impl Supervisor {
         if guard.is_none() {
             let uv = self.uv_path();
             let startup = tokio::select! {
-                result = Kernel::start(&uv, packages, &mut emit) => result,
+                result = async {
+                    if language == Language::Csharp { Kernel::start_csharp().await }
+                    else { Kernel::start(&uv, packages, &mut emit).await }
+                } => result,
                 _ = closed.changed() => return Err("Script was closed".into()),
                 _ = stop.changed() => return Ok(RunResult { ok: false, stopped: true, cache_cleared: true }),
             };
@@ -280,9 +307,33 @@ struct Kernel {
     next_id: u64,
     _files: TempDir,
     packages: Packages,
+    language: Language,
 }
 
 impl Kernel {
+    async fn start_csharp() -> Result<Self, String> {
+        let (mut command, files) = csharp::command().await?;
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(0x08000000);
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("Could not start C# kernel: {e}"))?;
+        Ok(Self {
+            input: child.stdin.take().unwrap(),
+            output: BufReader::new(child.stdout.take().unwrap()).lines(),
+            child,
+            next_id: 0,
+            _files: files,
+            packages: Packages::parse("")?,
+            language: Language::Csharp,
+        })
+    }
+
     async fn start(
         uv: &PathBuf,
         packages: Packages,
@@ -336,6 +387,7 @@ impl Kernel {
             next_id: 0,
             _files: files,
             packages,
+            language: Language::Python,
         })
     }
 
@@ -350,11 +402,11 @@ impl Kernel {
         self.input
             .write_all(&request)
             .await
-            .map_err(|e| CallError::Transport(format!("Could not send request to Python: {e}")))?;
+            .map_err(|e| CallError::Transport(format!("Could not send request to kernel: {e}")))?;
         self.input
             .flush()
             .await
-            .map_err(|e| CallError::Transport(format!("Could not flush request to Python: {e}")))?;
+            .map_err(|e| CallError::Transport(format!("Could not flush request to kernel: {e}")))?;
         let message = self.next_message().await?;
         if message.get("id").is_some() {
             return response_result(&message, id);
@@ -369,11 +421,10 @@ impl Kernel {
             .output
             .next_line()
             .await
-            .map_err(|e| CallError::Transport(format!("Could not read Python output: {e}")))?
+            .map_err(|e| CallError::Transport(format!("Could not read kernel output: {e}")))?
             .ok_or_else(|| {
                 CallError::Transport(
-                    "Python kernel exited before finishing. Run again to start a fresh kernel."
-                        .to_owned(),
+                    "Kernel exited before finishing. Run again to start a fresh kernel.".to_owned(),
                 )
             })?;
         serde_json::from_str(&line)
@@ -396,7 +447,7 @@ impl Kernel {
         self.input
             .write_all(&request)
             .await
-            .map_err(|e| format!("Could not send script to Python: {e}"))?;
+            .map_err(|e| format!("Could not send script to kernel: {e}"))?;
         self.input.flush().await.map_err(|e| e.to_string())?;
         let mut stopped = false;
         let mut deadline = None;

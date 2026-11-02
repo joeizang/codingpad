@@ -79,7 +79,8 @@ internal static class Program
         session.Update = (nodeId, value) =>
         {
             lock (InspectionGate)
-                if (context.Active) Notify(context, "dump_update", new { runId = id, nodeId, node = session.Node(value) });
+                if (context.Active && session.UpdateNode(nodeId, value) is { } node)
+                    Notify(context, "dump_update", new { runId = id, nodeId, node });
         };
         Current.Value = context;
         Console.SetOut(TextWriter.Synchronized(new OutputWriter("stdout")));

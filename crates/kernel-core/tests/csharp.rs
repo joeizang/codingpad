@@ -809,3 +809,210 @@ foreach (var value in new object[] {
     }
     supervisor.shutdown().await;
 }
+
+#[tokio::test]
+async fn csharp_replaced_live_tables_dispose_iterators_and_expire_only_their_handles() {
+    let supervisor = Supervisor::default();
+    let events = run(
+        &supervisor,
+        "release",
+        r#"
+Feed.Items(-1).Dump();
+var live = new LiveValue(Feed.Items(0)); live.Dump();
+for (int i = 1; i <= 30; i++) {
+    live.Value = Feed.Items(i);
+    if (Feed.Open != 2) throw new Exception($"Leaked iterators: {Feed.Open}");
+}
+Feed.Open.Dump(); Feed.Closed.Dump();
+static class Feed {
+    public static int Open, Closed;
+    public static IEnumerable<int> Items(int value) {
+        Open++;
+        try { for (int i = 0; i < 200; i++) yield return value; }
+        finally { Open--; Closed++; }
+    }
+}
+"#,
+        true,
+    )
+    .await;
+    let nodes = dumps(&events);
+    assert_eq!(nodes[2]["v"], 2);
+    assert_eq!(
+        nodes[3]["v"], 30,
+        "Every replaced iterator must be disposed during the run"
+    );
+    let initial = nodes[1]["node"]["handle"].as_str().unwrap();
+    assert!(supervisor
+        .expand("release", initial, None, None)
+        .await
+        .unwrap_err()
+        .contains("Run the script again"));
+    let updates: Vec<_> = events
+        .iter()
+        .filter(|event| event.method == "dump_update")
+        .collect();
+    assert_eq!(updates.len(), 30);
+    for update in &updates[..29] {
+        let handle = update.params["node"]["handle"].as_str().unwrap();
+        assert!(supervisor
+            .expand("release", handle, None, None)
+            .await
+            .is_err());
+    }
+    let latest = updates[29].params["node"]["handle"].as_str().unwrap();
+    let page = supervisor
+        .expand("release", latest, Some("100"), None)
+        .await
+        .unwrap()
+        .node;
+    assert_eq!(page["rows"][0][0]["v"], 30);
+    let independent = supervisor
+        .expand(
+            "release",
+            nodes[0]["handle"].as_str().unwrap(),
+            Some("100"),
+            None,
+        )
+        .await
+        .unwrap()
+        .node;
+    assert_eq!(independent["rows"][0][0]["v"], -1);
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_replacing_a_live_parent_releases_nested_live_subscriptions() {
+    let supervisor = Supervisor::default();
+    let events = run(
+        &supervisor,
+        "nested",
+        r#"
+var inner = new LiveValue(Feed.Items(0)); inner.Dump();
+var outer = new LiveValue(inner); outer.Dump();
+outer.Value = 42;
+Feed.Open.Dump();
+inner.Value = Feed.Items(1);
+Feed.Open.Dump(); Feed.Closed.Dump();
+static class Feed {
+    public static int Open, Closed;
+    public static IEnumerable<int> Items(int value) {
+        Open++;
+        try { for (int i = 0; i < 200; i++) yield return value; }
+        finally { Open--; Closed++; }
+    }
+}
+"#,
+        true,
+    )
+    .await;
+    let nodes = dumps(&events);
+    assert_eq!(nodes[2]["v"], 1);
+    assert_eq!(nodes[3]["v"], 1);
+    assert_eq!(nodes[4]["v"], 2);
+    let updates: Vec<_> = events
+        .iter()
+        .filter(|event| event.method == "dump_update")
+        .collect();
+    // The old nested subscription must not produce a third, invisible update.
+    assert_eq!(updates.len(), 2);
+    assert_eq!(updates[0].params["nodeId"], nodes[1]["node"]["id"]);
+    assert_eq!(updates[1].params["nodeId"], nodes[0]["node"]["id"]);
+    let expired = nodes[1]["node"]["node"]["handle"].as_str().unwrap();
+    assert!(supervisor
+        .expand("nested", expired, None, None)
+        .await
+        .is_err());
+    let latest = updates[1].params["node"]["handle"].as_str().unwrap();
+    assert_eq!(
+        supervisor
+            .expand("nested", latest, Some("100"), None)
+            .await
+            .unwrap()
+            .node["rows"][0][0]["v"],
+        1
+    );
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_live_replacement_preserves_sibling_handles_and_expires_lazy_children() {
+    let supervisor = Supervisor::default();
+    let events = run(
+        &supervisor,
+        "siblings",
+        r#"
+var live = new LiveValue(new { Value = 7 });
+new Holder { Live = live, Sibling = Enumerable.Range(0, 101).ToArray() }.Dump();
+live.Value = 42;
+class Holder { public LiveValue? Live; public int[]? Sibling; }
+"#,
+        true,
+    )
+    .await;
+    let node = dumps(&events)[0];
+    let old_property = field(&field(node, "Live")["node"], "Value")["handle"]
+        .as_str()
+        .unwrap();
+    assert!(supervisor
+        .expand("siblings", old_property, None, None)
+        .await
+        .is_err());
+    let sibling = field(node, "Sibling")["handle"].as_str().unwrap();
+    assert_eq!(
+        supervisor
+            .expand("siblings", sibling, Some("100"), None)
+            .await
+            .unwrap()
+            .node["rows"][0][0]["v"],
+        100
+    );
+    assert_eq!(
+        supervisor
+            .expand(
+                "siblings",
+                node["handle"].as_str().unwrap(),
+                Some("0"),
+                None
+            )
+            .await
+            .unwrap()
+            .node["kind"],
+        "object"
+    );
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_live_updates_from_iterator_cleanup_keep_the_newest_value() {
+    let supervisor = Supervisor::default();
+    let events = run(
+        &supervisor,
+        "cleanup",
+        r#"
+var live = new LiveValue(Feed.Items()); live.Dump();
+Feed.OnClose = () => { Feed.OnClose = null; live.Value = 42; };
+live.Value = Feed.Items();
+Feed.Open.Dump();
+static class Feed {
+    public static int Open;
+    public static Action? OnClose;
+    public static IEnumerable<int> Items() {
+        Open++;
+        try { for (int i = 0; i < 200; i++) yield return i; }
+        finally { Open--; OnClose?.Invoke(); }
+    }
+}
+"#,
+        true,
+    )
+    .await;
+    let updates: Vec<_> = events
+        .iter()
+        .filter(|event| event.method == "dump_update")
+        .collect();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].params["node"]["v"], 42);
+    assert_eq!(dumps(&events)[1]["v"], 0);
+    supervisor.shutdown().await;
+}

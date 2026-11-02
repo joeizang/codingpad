@@ -189,7 +189,10 @@ for (int i = 1; i <= 3; i++) { progress.Value = i; await Task.Delay(100); }
 Handles and partially read iterators remain available after completion and are
 released on the next run, Reset, or close. The next run disposes unfinished
 iterators, including their `finally` blocks. Live updates are accepted only during
-the originating run. Object fields are paged, trees stop after six levels, strings
+the originating run. Replacing a live value immediately disposes its old iterators,
+expires its old handles, and removes nested live subscriptions; only its latest
+contents remain expandable. Independent dumps and sibling values remain available.
+Object fields are paged, trees stop after six levels, strings
 are bounded, HTML is sandboxed, and images are limited to 4 MiB. Table columns use
 the first item's public fields/properties (up to 32); scalar sequences use one
 `Value` column. Enumeration runs user code. A blocked preview is cancelled by

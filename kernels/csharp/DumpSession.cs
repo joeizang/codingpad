@@ -9,7 +9,8 @@ using CodingPad;
 internal sealed class DumpSession(long runId) : IDisposable
 {
     private readonly Dictionary<string, (object Value, View View)> handles = [];
-    private readonly List<Sequence> ownedSequences = [];
+    private readonly HashSet<View> views = [];
+    private readonly Dictionary<string, (View Owner, View Current)> liveViews = [];
     // Each Dump (including a live update) owns its own inspection cache. Pages
     // and lazy children reuse that view without sharing stale reads with later dumps.
     private sealed class View
@@ -17,14 +18,16 @@ internal sealed class DumpSession(long runId) : IDisposable
         public readonly Dictionary<object, string> Identities = new(ReferenceEqualityComparer.Instance);
         public readonly Dictionary<object, Sequence> Sequences = new(ReferenceEqualityComparer.Instance);
         public readonly Dictionary<object, Dictionary<MemberInfo, PropertyValue>> Properties = new(ReferenceEqualityComparer.Instance);
+        public readonly HashSet<View> Children = [];
+        public readonly List<(LiveValue Value, Action<object?> Handler, string Target)> Subscriptions = [];
+        public bool Released;
     }
-    private readonly List<(LiveValue Value, Action<object?> Handler)> subscriptions = [];
     public Action<string, object?>? Update { get; set; }
     private int serial;
     private const int PageSize = 100;
     private sealed class Budget(View view)
     {
-        public readonly View View = view;
+        public View View = view;
         public int Remaining = 1000;
         public int Characters = 200000;
         public int ImageBytes = 4 * 1024 * 1024;
@@ -58,6 +61,8 @@ internal sealed class DumpSession(long runId) : IDisposable
     private string Id() => $"{runId}:n{++serial}";
     private string Handle(object value, View view)
     {
+        if (view.Released) throw new InvalidOperationException("That live preview has been replaced.");
+        views.Add(view);
         if (view.Identities.TryGetValue(value, out var handle)) return handle;
         handle = $"{runId}:h{++serial}";
         view.Identities.Add(value, handle);
@@ -119,10 +124,15 @@ internal sealed class DumpSession(long runId) : IDisposable
             try
             {
                 var target = Id();
-                var node = Node(live.Value, depth + 1, budget, path, nodeId: target);
+                var owner = budget.View;
+                var current = new View();
+                views.Add(owner);
+                owner.Children.Add(current);
+                liveViews.Add(target, (owner, current));
                 Action<object?> handler = next => Update?.Invoke(target, next);
                 live.Changed += handler;
-                subscriptions.Add((live, handler));
+                owner.Subscriptions.Add((live, handler, target));
+                var node = ViewNode(live.Value, current, depth + 1, budget, path, target);
                 return new { id, kind = "live", node };
             }
             finally { path.Remove(live); }
@@ -188,9 +198,15 @@ internal sealed class DumpSession(long runId) : IDisposable
         var sequences = budget.View.Sequences;
         if (!sequences.TryGetValue(value, out var state))
         {
+            if (budget.View.Released) throw new InvalidOperationException("That live preview has been replaced.");
             state = new Sequence(value.GetEnumerator());
+            if (budget.View.Released)
+            {
+                Close(state);
+                throw new InvalidOperationException("That live preview has been replaced.");
+            }
             sequences.Add(value, state);
-            ownedSequences.Add(state);
+            views.Add(budget.View);
         }
         // Cursors may revisit cached pages but cannot force a long traversal.
         if (offset > state.Values.Count) throw new ArgumentException("Load the preceding sequence page first.");
@@ -293,14 +309,60 @@ internal sealed class DumpSession(long runId) : IDisposable
         return text[..length];
     }
 
+    // A live value's contents own a separate view from its containing dump.
+    // Replacing it must not expire sibling fields or independent normal dumps.
+    private object ViewNode(object? value, View view, int depth, Budget budget, HashSet<object> path, string? nodeId = null)
+    {
+        var previous = budget.View;
+        budget.View = view;
+        try { return Node(value, depth, budget, path, nodeId: nodeId); }
+        finally { budget.View = previous; }
+    }
+
+    public object? UpdateNode(string target, object? value)
+    {
+        if (!liveViews.TryGetValue(target, out var entry)) return null;
+        var current = new View();
+        entry.Owner.Children.Remove(entry.Current);
+        entry.Owner.Children.Add(current);
+        liveViews[target] = (entry.Owner, current);
+        Release(entry.Current);
+        // Iterator cleanup can itself trigger another update. Keep the newest.
+        if (!IsCurrent(target, current)) return null;
+        var node = Node(value, 0, new Budget(current), new HashSet<object>(ReferenceEqualityComparer.Instance));
+        return IsCurrent(target, current) ? node : null;
+    }
+
+    private bool IsCurrent(string target, View view) =>
+        liveViews.TryGetValue(target, out var entry) && ReferenceEquals(entry.Current, view);
+
+    private void Release(View view)
+    {
+        if (view.Released) return;
+        view.Released = true;
+        views.Remove(view);
+        foreach (var (value, handler, target) in view.Subscriptions)
+        {
+            value.Changed -= handler;
+            liveViews.Remove(target);
+        }
+        foreach (var child in view.Children.ToArray()) Release(child);
+        foreach (var handle in view.Identities.Values) handles.Remove(handle);
+        foreach (var state in view.Sequences.Values.ToArray())
+            if (!state.Finished) Close(state);
+        view.Subscriptions.Clear();
+        view.Children.Clear();
+        view.Identities.Clear();
+        view.Sequences.Clear();
+        view.Properties.Clear();
+    }
+
     public void Dispose()
     {
-        foreach (var state in ownedSequences)
-            if (!state.Finished) Close(state);
-        foreach (var (value, handler) in subscriptions) value.Changed -= handler;
-        subscriptions.Clear();
         Update = null;
-        ownedSequences.Clear();
+        foreach (var view in views.ToArray()) Release(view);
+        views.Clear();
+        liveViews.Clear();
         handles.Clear();
     }
 }

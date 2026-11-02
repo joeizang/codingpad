@@ -153,6 +153,7 @@ clicks or scrolls:
 - A lazy node expands at depth zero, so a deep object shows another six useful
   levels with another lazy node at the end.
 - Handles stay valid until the next run begins or the kernel is reset/restarted.
+  C# live contents also expire when replaced by a live update.
   An unknown or expired handle returns error `-32001` with a message telling the
   user to run the script again. The desktop shows that message in place of the
   preview. Python caches handles per value within a run. C# caches them per dump,
@@ -318,7 +319,12 @@ The `CodingPad` library also provides `HtmlValue(markup)`,
 Dump these with `.Dump()`. HTML uses the shared text budget and the viewer's
 sandboxed iframe. Images accept PNG, JPEG, GIF, WebP and BMP with a 4 MiB limit
 per image and per dump/page. Assigning `LiveValue.Value` emits `dump_update` for
-each displayed instance during its originating run. Subscriptions are released
-with the session. Background writes/updates are discarded after run completion.
+each displayed instance during its originating run. Each displayed live target
+owns a separate view for its current contents. Replacement disposes that view's
+unfinished iterators, drops its page/property caches and handles, and unsubscribes
+nested live values. Only the latest view can be expanded. Sibling values and
+independent dumps retain their own handles and iterators. Iterator cleanup may
+itself trigger an update; only the newest replacement is emitted. Remaining
+subscriptions and views are released with the session. Background writes/updates are discarded after run completion.
 C# packages and cooperative cancellation follow in later M2 increments; Stop
 continues to use the host's forced restart deadline.

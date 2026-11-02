@@ -8,7 +8,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
   <ItemGroup>
+    <!-- API organization only: this unsigned friend name does not authenticate callers. -->
     <InternalsVisibleTo Include="CodingPad.Kernel" />
-    <None Include="build/CodingPad.props" Pack="true" PackagePath="build/" />
+    <None Include="build/CodingPad.targets" Pack="true" PackagePath="build/" />
   </ItemGroup>
 </Project>

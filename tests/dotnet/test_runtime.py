@@ -39,6 +39,10 @@ var result = Cache("value", () => 42);
 if (Cache("value", () => -1) != 42) throw new Exception("Cache missed");
 result.Dump();
 await Task.Delay(1, Cancel);
+if (await Cache("async", async () => { await Task.Delay(1); return 7; }) != 7)
+    throw new Exception("Async cache missed");
+if (await Cache("async", () => Task.FromResult(-1)) != 7)
+    throw new Exception("Async cache recomputed");
 try { Secret("test"); throw new Exception("Secret should fail"); }
 catch (NotSupportedException) { }
 Console.WriteLine(result);
@@ -52,6 +56,32 @@ Console.WriteLine(result);
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.strip(), "42")
 
+
+    def test_direct_consumers_can_disable_helper_imports(self):
+        project = self.work / "opt-out"
+        project.mkdir()
+        (project / "OptOut.csproj").write_text('''<Project Sdk="Microsoft.NET.Sdk">
+<PropertyGroup>
+<TargetFramework>net10.0</TargetFramework><OutputType>Exe</OutputType>
+<ImplicitUsings>disable</ImplicitUsings><CodingPadImplicitUsings>false</CodingPadImplicitUsings>
+</PropertyGroup>
+<ItemGroup><PackageReference Include="CodingPad" Version="0.1.0" /></ItemGroup>
+</Project>''', encoding="utf-8")
+        (project / "Program.cs").write_text('''using System;
+using System.Timers;
+using static LocalHelpers;
+using var timer = new Timer();
+if (Cache("own", () => 7) != 7) throw new Exception("Wrong helper");
+if (CodingPad.ScriptHelpers.Cache("explicit", () => 42) != 42) throw new Exception("Package unavailable");
+Console.WriteLine("opted out");
+static class LocalHelpers { public static T Cache<T>(string key, Func<T> factory) => factory(); }
+''', encoding="utf-8")
+        result = subprocess.run(
+            ["dotnet", "run", "--project", str(project / "OptOut.csproj")],
+            cwd=self.work, env=self.env, capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), "opted out")
 
     def test_host_api_is_not_public(self):
         script = self.work / "host-api.cs"

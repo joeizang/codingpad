@@ -1,5 +1,5 @@
 <Project>
-  <ItemGroup>
+  <ItemGroup Condition="'$(CodingPadImplicitUsings)' != 'false'">
     <Using Include="System" />
     <Using Include="System.Collections.Generic" />
     <Using Include="System.Linq" />

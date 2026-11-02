@@ -9,9 +9,9 @@ public static class ScriptHelpers
     private sealed record Entry(object? Value);
     private static readonly object Gate = new();
     private static readonly Dictionary<string, Entry> Values = new();
-    private static readonly HashSet<string> Refreshed = new();
     private static readonly AsyncLocal<RunScope?> Current = new();
     private static bool hosted;
+    private static readonly MethodInfo AsyncCache = typeof(ScriptHelpers).GetMethod(nameof(CacheTask), BindingFlags.Static | BindingFlags.NonPublic)!;
 
     public static CancellationToken Cancel => Current.Value?.Token ?? CancellationToken.None;
 
@@ -25,23 +25,61 @@ public static class ScriptHelpers
         ArgumentNullException.ThrowIfNull(key);
         ArgumentNullException.ThrowIfNull(factory);
         var scope = Current.Value;
-        bool refreshed;
+        // An overload with Func<Task<T>> makes existing null/throw-only factories
+        // ambiguous. Dispatch Task<T> factories here, preserving the public API.
+        if (typeof(T).IsGenericType && typeof(T).GetGenericTypeDefinition() == typeof(Task<>))
+            return (T)AsyncCache.MakeGenericMethod(typeof(T).GetGenericArguments()[0]).Invoke(null, [key, factory, scope])!;
+        if (TryCached<T>(key, scope, out var cached)) return cached;
+        return Store(key, scope, factory()); // Failed factories are never stored.
+    }
+
+    private static async Task<T> CacheTask<T>(string key, Func<Task<T>> factory, RunScope? scope)
+    {
+        if (TryCached<T>(key, scope, out var cached)) return cached;
+        var value = await factory().ConfigureAwait(false);
+        return Store(key, scope, value);
+    }
+
+    private static bool TryCached<T>(string key, RunScope? scope, out T value)
+    {
         lock (Gate)
         {
             EnsureActive(scope);
-            if (Values.TryGetValue(key, out var entry)) return Cached<T>(key, entry);
-            refreshed = Refreshed.Remove(key);
+            if (Values.TryGetValue(key, out var entry))
+            {
+                value = Cached<T>(key, entry);
+                return true;
+            }
         }
-        if (refreshed) scope?.Note("cache refreshed: script types changed\n");
-        var value = factory(); // Failed factories are never stored.
+        value = default!;
+        return false;
+    }
+
+    private static T Store<T>(string key, RunScope? scope, T value)
+    {
+        RefreshReason? reason = null;
         lock (Gate)
         {
             EnsureActive(scope);
             if (Values.TryGetValue(key, out var winner)) return Cached<T>(key, winner);
             Values[key] = new(value);
+            // A failed factory leaves its note pending. Only the first successful
+            // store consumes it; a concurrent winner emits the note exactly once.
+            if (scope is not null && scope.Refreshed.Remove(key, out var refreshed)) reason = refreshed;
         }
+        if (reason is not null) scope?.Note(RefreshMessage(reason.Value));
         return value;
     }
+
+    internal enum RefreshReason { ScriptTypes, OpaqueStorage, Budget, InspectionFailure }
+
+    private static string RefreshMessage(RefreshReason reason) => reason switch
+    {
+        RefreshReason.ScriptTypes => "cache refreshed: script types changed\n",
+        RefreshReason.OpaqueStorage => "cache refreshed: value contains opaque handles or callbacks\n",
+        RefreshReason.Budget => "cache refreshed: inspection budget exceeded\n",
+        _ => "cache refreshed: value could not be inspected safely\n"
+    };
 
     private static T Cached<T>(string key, Entry entry)
     {
@@ -107,7 +145,7 @@ public static class ScriptHelpers
         }
 
         // Inspect storage, not properties or IEnumerable: those can execute user code.
-        internal bool IsReusable(object? root)
+        internal RefreshReason? ReasonToRefresh(object? root)
         {
             var pending = new Stack<object>();
             var seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
@@ -118,21 +156,21 @@ public static class ScriptHelpers
                 while (pending.TryPop(out var value))
                 {
                     cancel.ThrowIfCancellationRequested();
-                    if (--budget < 0) return false;
+                    if (--budget < 0) return RefreshReason.Budget;
                     if (!seen.Add(value)) continue;
                     var type = value.GetType();
-                    if (ScriptType(type)) return false;
+                    if (ScriptType(type)) return RefreshReason.ScriptTypes;
                     if (value is Type reflected)
                     {
-                        if (ScriptType(reflected)) return false;
+                        if (ScriptType(reflected)) return RefreshReason.ScriptTypes;
                         continue;
                     }
                     // Native and reflection handles can hide managed/code targets.
-                    if (Opaque(type)) return false;
+                    if (Opaque(type)) return RefreshReason.OpaqueStorage;
                     if (AlwaysSafe(type)) continue;
                     if (value is Array array)
                     {
-                        if (array.Length > budget) return false;
+                        if (array.Length > budget) return RefreshReason.Budget;
                         foreach (var item in array)
                             if (item is not null) pending.Push(item);
                         continue;
@@ -140,14 +178,14 @@ public static class ScriptHelpers
                     foreach (var field in Fields(type))
                     {
                         if (AlwaysSafe(field.FieldType)) continue;
-                        if (field.FieldType.IsPointer || field.FieldType.IsFunctionPointer) return false;
+                        if (field.FieldType.IsPointer || field.FieldType.IsFunctionPointer) return RefreshReason.OpaqueStorage;
                         if (field.GetValue(value) is { } child) pending.Push(child);
                     }
                 }
-                return true;
+                return null;
             }
             catch (OperationCanceledException) { throw; }
-            catch { return false; } // Uninspectable storage is conservatively refreshed.
+            catch { return RefreshReason.InspectionFailure; }
         }
     }
 
@@ -158,15 +196,21 @@ public static class ScriptHelpers
     {
         var scope = new RunScope(token, note);
         var inspection = new CacheInspection(token);
+        KeyValuePair<string, Entry>[] snapshot;
+        lock (Gate) snapshot = Values.ToArray();
+        var stale = new List<(string Key, Entry Entry, RefreshReason Reason)>();
+        // Reflection runs outside the cache lock. Metadata is reused across this
+        // snapshot, and only unchanged entries are removed when applying results.
+        foreach (var (key, entry) in snapshot)
+            if (inspection.ReasonToRefresh(entry.Value) is { } reason) stale.Add((key, entry, reason));
+        token.ThrowIfCancellationRequested();
         lock (Gate)
         {
-            // Recheck mutable containers too: a previously safe List<object> may
-            // have acquired a script-defined value since its factory returned.
-            foreach (var (key, entry) in Values.ToArray())
-                if (!inspection.IsReusable(entry.Value))
+            foreach (var (key, entry, reason) in stale)
+                if (Values.TryGetValue(key, out var current) && ReferenceEquals(current, entry))
                 {
                     Values.Remove(key);
-                    Refreshed.Add(key);
+                    scope.Refreshed.Add(key, reason);
                 }
         }
         Current.Value = scope;
@@ -179,10 +223,15 @@ public static class ScriptHelpers
         { Token = token; Note = note; }
         internal CancellationToken Token { get; }
         internal Action<string> Note { get; }
+        internal readonly Dictionary<string, RefreshReason> Refreshed = new();
         internal bool Active = true;
         public void Dispose()
         {
-            lock (Gate) Active = false;
+            lock (Gate)
+            {
+                Active = false;
+                Refreshed.Clear(); // Unused notes live only for this run.
+            }
             Current.Value = null;
         }
     }

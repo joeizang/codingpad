@@ -213,30 +213,38 @@ Stop cancels the current run's token first. Pass `Cancel` to async operations, o
 call `Cancel.ThrowIfCancellationRequested()` in long loops. If the script ignores
 cancellation, the supervisor kills its kernel after about two seconds and reports
 that the cache was cleared. Cooperative Stop keeps the process and cached values.
+The token is also cancelled when a run ends, including after failures, so
+cooperative background work can exit. Captured tokens and their wait handles stay
+usable after completion; cancellation callbacks run separately and are not awaited.
 Reset discards that tab's process, cache and previews; other tabs are unaffected.
 
 `Cache("key", () => ...)` retains successful values across runs, including null.
-Factories run outside the cache lock; concurrent misses may compute more than
-once and the first stored value wins. An incompatible type requested for an
-existing key throws a clear error and preserves its value. Failed factories are
-not cached. Each run rechecks cached object graphs, including mutable
-containers, without calling properties or enumerating user sequences. Values
-containing script-defined types are discarded before the next compilation;
-requesting their keys again runs the factory and shows `cache refreshed: script
-types changed`. Delegates, reflection/native handles and graphs that cannot be
-safely inspected within the inspection budget are conservatively refreshed too.
-Arrays whose element storage types prove safe, including scalar tuples and
-dictionary entries, have no size limit for this check. Per-type inspection
-metadata is reused within that run boundary. Background work must finish within
-its run; late cache calls and cache calls from idle previews fail.
+Async factories work with the same call: `await Cache("data", () => LoadAsync())`
+caches the awaited result, rather than retaining the script's task/state machine.
+Failed or cancelled factories are not cached. Concurrent misses may compute more
+than once; the first successful stored result wins. An incompatible type requested
+for an existing key throws a clear error and preserves its value.
+
+After compilation succeeds, cached object graphs are checked without calling
+properties or enumerating user sequences. Inspection takes place outside the
+cache lock; only unchanged entries are removed when applying its results. Values
+containing script-defined types are discarded before execution. A successful
+recompute shows `cache refreshed: script types changed` for those values; opaque
+handles/callbacks, budget limits and inspection failures each have their own reason.
+A failed recompute keeps its note pending for a retry in that run. Unused notes
+expire at run completion. Arrays whose element storage types prove safe,
+including scalar tuples and dictionary entries, have no size limit for this
+check. Inspection metadata is reused within that boundary. Late cache calls and
+cache calls from idle previews fail.
 `Secret("name")` throws an explanation that vault support is planned for M3.
 
 The runtime is packable as `CodingPad`; its direct-consumer `build` imports make
-the same helper names compile in .NET 10 file scripts with `#:package
-CodingPad@0.1.0`. The updated package must be published or supplied through a
-local NuGet feed; the existing registry reservation is not this implementation.
-Run `dotnet pack runtimes/dotnet/CodingPad -o /path/to/feed` to build it
-locally.
+helper names available in .NET 10 file scripts with `#:package CodingPad@0.1.0`.
+Set `<CodingPadImplicitUsings>false</CodingPadImplicitUsings>` in a project, or
+`#:property CodingPadImplicitUsings=false` in a file script, to choose imports
+explicitly. The updated package must be published or supplied through a local
+NuGet feed; the existing registry reservation is not this implementation. Run
+`dotnet pack runtimes/dotnet/CodingPad -o /path/to/feed` to build it locally.
 Package directives inside the app, Roslyn completions and SDK installation follow
 in later M2 issues. Only managed `Console` output is
 captured; direct native writes are outside this increment. Scripts run with your

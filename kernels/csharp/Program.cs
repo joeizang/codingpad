@@ -73,8 +73,9 @@ internal static class Program
         "CodingPadScript_" + Guid.NewGuid().ToString("N"), [Usings, tree], References,
         new CSharpCompilationOptions(OutputKind.ConsoleApplication, optimizationLevel: OptimizationLevel.Debug));
 
-    private static async Task Run(long id, string source, CancellationToken cancel)
+    private static async Task Run(long id, string source, RunCancellation cancellation)
     {
+        var cancel = cancellation.Token;
         Session?.Dispose();
         var session = Session = new DumpSession(id);
         var context = new RunContext(id);
@@ -98,8 +99,6 @@ internal static class Program
         try
         {
             cancel.ThrowIfCancellationRequested();
-            helpers = ScriptHelpers.BeginRun(cancel, text =>
-                Notify(context, "stream", new { runId = id, stream = "stdout", text }));
             var tree = CSharpSyntaxTree.ParseText(source, path: "script.cs", encoding: Encoding.UTF8, cancellationToken: cancel);
             var compilation = Compile(tree);
             var last = tree.GetRoot(cancel).ChildNodes().OfType<GlobalStatementSyntax>().LastOrDefault();
@@ -169,6 +168,10 @@ internal static class Program
             }
             pe.Position = pdb.Position = 0;
             cancel.ThrowIfCancellationRequested();
+            // Do not scan cached graphs for source that fails compilation.
+            helpers = ScriptHelpers.BeginRun(cancel, text =>
+                Notify(context, "stream", new { runId = id, stream = "stdout", text }));
+            cancel.ThrowIfCancellationRequested();
             await Execute(pe, pdb);
             ok = true;
         }
@@ -180,6 +183,7 @@ internal static class Program
         {
             // Close the helper context before the host can observe completion.
             helpers?.Dispose();
+            cancellation.Request();
             lock (InspectionGate)
             lock (Gate)
             {
@@ -206,8 +210,8 @@ internal static class Program
         finally { load.Unload(); }
     }
 
-    private static readonly ConcurrentDictionary<long, CancellationTokenSource> Cancellations = new();
-    private sealed record Request(JsonDocument? Document, string? ParseError, CancellationTokenSource? Cancel);
+    private static readonly ConcurrentDictionary<long, RunCancellation> Cancellations = new();
+    private sealed record Request(JsonDocument? Document, string? ParseError, RunCancellation? Cancel);
     private static readonly BlockingCollection<Request> Requests = new();
 
     private static void Main()
@@ -222,7 +226,7 @@ internal static class Program
             while (Input.ReadLine() is { } line)
             {
                 JsonDocument? document = null;
-                CancellationTokenSource? cancel = null;
+                RunCancellation? cancel = null;
                 string? parseError = null;
                 try
                 {
@@ -234,16 +238,16 @@ internal static class Program
                         if (method == "cancel")
                         {
                             var runId = root.GetProperty("params").GetProperty("runId").GetInt64();
-                            if (Cancellations.TryGetValue(runId, out var active)) CancelSafely(active);
+                            if (Cancellations.TryGetValue(runId, out var active)) active.Request();
                             document.Dispose();
                             continue;
                         }
                         if (method == "run" && root.TryGetProperty("id", out var id))
                         {
                             var runId = id.GetInt64();
-                            cancel = new CancellationTokenSource();
+                            cancel = new RunCancellation();
                             if (!Cancellations.TryAdd(runId, cancel))
-                            { cancel.Dispose(); cancel = null; }
+                            { cancel = null; }
                         }
                     }
                 }
@@ -260,15 +264,31 @@ internal static class Program
         worker.GetAwaiter().GetResult();
     }
 
-    private static void CancelSafely(CancellationTokenSource source)
+    private sealed class RunCancellation
     {
-        // Run callbacks away from both stdin and the pool: callbacks may block,
-        // and pool starvation must not prevent cooperative cancellation.
-        new Thread(() =>
+        private readonly CancellationTokenSource source = new();
+        private int requested;
+        internal CancellationToken Token => source.Token;
+
+        internal void Request()
         {
-            try { source.Cancel(); }
-            catch (Exception) { /* User callbacks may throw, or the run may have ended. */ }
-        }) { IsBackground = true, Name = "CodingPad cancellation" }.Start();
+            if (Interlocked.Exchange(ref requested, 1) == 0)
+            {
+                // Callbacks run away from stdin and the pool, and may block or
+                // throw without holding up completion of the protocol response.
+                new Thread(() =>
+                {
+                    try { source.Cancel(); }
+                    catch (Exception) { /* User cancellation callbacks may throw. */ }
+                }) { IsBackground = true, Name = "CodingPad cancellation" }.Start();
+            }
+            // Wait only for the cancellation flag, which is set before callbacks.
+            // This makes the token cancelled before run_finished is observable.
+            SpinWait.SpinUntil(() => source.IsCancellationRequested);
+        }
+
+        // Do not dispose the source: scripts may retain the token or WaitHandle
+        // after completion. Once they release it, GC reclaims its managed handle.
     }
 
     private static void ProcessRequests()
@@ -288,7 +308,7 @@ internal static class Program
                 id = value.GetInt64();
                 if (root.GetProperty("jsonrpc").GetString() != "2.0") throw new JsonException("Expected JSON-RPC 2.0");
                 if (root.GetProperty("method").GetString() == "run")
-                    Run(id.Value, root.GetProperty("params").GetProperty("source").GetString()!, cancel?.Token ?? CancellationToken.None).GetAwaiter().GetResult();
+                    Run(id.Value, root.GetProperty("params").GetProperty("source").GetString()!, cancel ?? new RunCancellation()).GetAwaiter().GetResult();
                 else if (root.GetProperty("method").GetString() == "expand")
                 {
                     var parameters = root.GetProperty("params");
@@ -320,7 +340,7 @@ internal static class Program
                 if (cancel is not null)
                 {
                     if (id is { } runId) Cancellations.TryRemove(runId, out _);
-                    cancel.Dispose();
+                    cancel.Request();
                 }
             }
         }

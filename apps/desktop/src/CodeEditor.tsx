@@ -35,6 +35,7 @@ export type EditorHandle = {
 
 type Props = {
   id: string;
+  toolchainVersion?: number;
   source: string;
   onChange: (source: string) => void;
   onRun: () => void;
@@ -93,6 +94,7 @@ function toCompletionItem(
 
 export default function CodeEditor({
   id,
+  toolchainVersion = 0,
   source,
   onChange,
   onRun,
@@ -218,7 +220,7 @@ export default function CodeEditor({
       const model = editorRef.current?.getModel();
       if (model) monaco.editor.setModelMarkers(model, "codingpad-lsp", []);
     };
-  }, [id, dependencyKey]);
+  }, [id, dependencyKey, toolchainVersion]);
 
   useEffect(
     () => () => {

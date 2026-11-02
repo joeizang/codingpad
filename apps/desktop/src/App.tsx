@@ -56,6 +56,7 @@ type Script = {
   updates: Record<string, DumpNode>;
   controlling?: boolean;
   error?: string;
+  missingUv?: boolean;
 };
 function intelligenceLabel(summary: DiagnosticsSummary): string {
   if (summary.message) return summary.message;
@@ -96,6 +97,9 @@ export default function App() {
   const counter = useRef(1);
   const opening = useRef(new Set<string>());
   const [closing, setClosing] = useState(false);
+  const [installProgress, setInstallProgress] = useState<string | null>(null);
+  const installingUv = useRef(false);
+  const [toolchainVersion, setToolchainVersion] = useState(0);
   const generation = useRef(new Map<string, number>());
   const running = useRef(new Set<string>());
   const editor = useRef<EditorHandle | null>(null);
@@ -136,7 +140,12 @@ export default function App() {
     );
 
   async function runScript(script: Script) {
-    if (running.current.has(script.id) || script.controlling) return;
+    if (
+      installingUv.current ||
+      running.current.has(script.id) ||
+      script.controlling
+    )
+      return;
     if (!isPython(script)) {
       update(script.id, (item) => ({
         ...item,
@@ -154,6 +163,7 @@ export default function App() {
       output: [],
       running: true,
       status: "Running…",
+      missingUv: false,
       version,
       updates: {},
       error: undefined,
@@ -209,12 +219,41 @@ export default function App() {
         ...item,
         status: "Could not run",
         error: String(error),
+        missingUv: String(error).startsWith("uv was not found."),
       }));
     } finally {
       flush();
       running.current.delete(script.id);
       update(script.id, (item) => ({ ...item, running: false }));
     }
+  }
+
+  async function installUvAndRun(script: Script) {
+    if (installingUv.current) return;
+    installingUv.current = true;
+    setInstallProgress("Downloading and verifying uv…");
+    update(script.id, (item) => ({ ...item, error: undefined }));
+    const onProgress = new Channel<string>();
+    onProgress.onmessage = (message) => {
+      if (installingUv.current) setInstallProgress(message);
+    };
+    let installed = false;
+    try {
+      await invoke("install_uv", { onProgress });
+      installed = true;
+      setToolchainVersion((version) => version + 1);
+    } catch (error) {
+      update(script.id, (item) => ({
+        ...item,
+        error: String(error),
+        missingUv: true,
+      }));
+    } finally {
+      installingUv.current = false;
+      setInstallProgress(null);
+    }
+    const current = scriptsRef.current.find((item) => item.id === script.id);
+    if (installed && current) await runScript(current);
   }
 
   async function controlScript(script: Script, action: "stop" | "reset") {
@@ -554,7 +593,12 @@ export default function App() {
           </button>
           <button
             className="run-button"
-            disabled={!runnable || active.running || active.controlling}
+            disabled={
+              !runnable ||
+              active.running ||
+              active.controlling ||
+              installProgress !== null
+            }
             title={
               runnable ? undefined : "Only Python scripts run in this build"
             }
@@ -657,6 +701,7 @@ export default function App() {
               <CodeEditor
                 key={active.id}
                 id={active.id}
+                toolchainVersion={toolchainVersion}
                 source={active.source}
                 onDiagnostics={setIntelligence}
                 onChange={(source) =>
@@ -678,7 +723,23 @@ export default function App() {
               <span>RESULTS</span>
               <span role="status">{active.status}</span>
             </div>
-            <div className="results" aria-busy={active.running}>
+            <div className="results" aria-busy={active.running || installProgress !== null}>
+              {installProgress && <p role="status">{installProgress}</p>}
+              {active.missingUv && (
+                <div className="tool-install">
+                  <p>
+                    Install uv privately for CodingPad to run Python scripts.
+                    This needs an internet connection.
+                  </p>
+                  <button
+                    className="control-button"
+                    disabled={installProgress !== null || active.running}
+                    onClick={() => void installUvAndRun(active)}
+                  >
+                    {installProgress ? "Installing uv…" : "Install uv and run"}
+                  </button>
+                </div>
+              )}
               {active.error && (
                 <div className="error" role="alert">
                   {active.error}

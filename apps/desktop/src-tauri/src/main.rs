@@ -3,10 +3,24 @@
 use codingpad_kernel_core::{
     lsp::{LanguageServers, LspEvent, LspStartResult},
     store::{self, FolderEntry, LibrarySettings, ScriptFile},
+    toolchains::Toolchains,
     ExpandResult, KernelEvent, RunResult, Supervisor,
 };
 use std::{fs, path::PathBuf};
 use tauri::{ipc::Channel, Manager, State};
+
+#[tauri::command]
+async fn install_uv(
+    tools: State<'_, Toolchains>,
+    on_progress: Channel<String>,
+) -> Result<(), String> {
+    tools
+        .install_uv(|message| {
+            let _ = on_progress.send(message.to_owned());
+        })
+        .await?;
+    Ok(())
+}
 
 #[tauri::command]
 async fn run_script(
@@ -149,9 +163,15 @@ fn write_script(path: String, source: String) -> Result<ScriptFile, String> {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(Supervisor::default())
-        .manage(LanguageServers::default())
+        .setup(|app| {
+            let data_dir = app.path().app_data_dir()?;
+            app.manage(Supervisor::with_data_dir(data_dir.clone()));
+            app.manage(Toolchains::new(data_dir.clone()));
+            app.manage(LanguageServers::with_data_dir(data_dir));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
+            install_uv,
             run_script,
             stop_script,
             reset_script,

@@ -36,7 +36,9 @@ vi.mock("./CodeEditor", () => ({
     source,
     onChange,
     onDiagnostics,
+    toolchainVersion,
   }: {
+    toolchainVersion?: number;
     source: string;
     onChange: (source: string) => void;
     onDiagnostics?: (summary: {
@@ -48,6 +50,7 @@ vi.mock("./CodeEditor", () => ({
     <div>
       <textarea
         aria-label="Code"
+        data-toolchain-version={toolchainVersion}
         value={source}
         onChange={(e) => onChange(e.target.value)}
       />
@@ -785,4 +788,55 @@ test("a failed refresh shows an error but keeps the last tree", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Save" }));
   expect(await screen.findByText(/folder is gone/)).toBeInTheDocument();
   expect(screen.getAllByRole("button", { name: "x.py" })).toHaveLength(2);
+});
+
+test("missing uv offers one-click installation and reruns the latest source", async () => {
+  let installed = false;
+  let finish!: () => void;
+  invoke.mockImplementation(async (command, args) => {
+    if (command === "run_script") {
+      if (!installed) throw "uv was not found. Install a private copy.";
+      return { ok: true };
+    }
+    if (command === "install_uv") {
+      args.onProgress.onmessage("Downloading and verifying uv…");
+      await new Promise<void>((resolve) => { finish = resolve; });
+      installed = true;
+    }
+  });
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Install uv and run" }));
+  expect(screen.getByRole("button", { name: "Installing uv…" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "▶ Run" })).toBeDisabled();
+  fireEvent.change(screen.getByLabelText("Code"), { target: { value: "42" } });
+  await act(async () => finish());
+  await screen.findByText("Finished");
+  expect(screen.getByLabelText("Code")).toHaveAttribute("data-toolchain-version", "1");
+  expect(invoke).toHaveBeenLastCalledWith("run_script", expect.objectContaining({ source: "42" }));
+  expect(screen.queryByRole("button", { name: "Install uv and run" })).not.toBeInTheDocument();
+});
+
+test("failed uv installation can be retried without rerunning prematurely", async () => {
+  invoke.mockImplementation(async (command) => {
+    if (command === "run_script") throw "uv was not found. Install a private copy.";
+    if (command === "install_uv") throw "Tool download failed SHA-256 verification.";
+  });
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Install uv and run" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("SHA-256 verification");
+  expect(screen.getByLabelText("Code")).toHaveAttribute("data-toolchain-version", "0");
+  expect(screen.getByRole("button", { name: "Install uv and run" })).toBeEnabled();
+  expect(invoke.mock.calls.filter(([command]) => command === "run_script")).toHaveLength(1);
+});
+
+test("ordinary script errors never offer a uv installation", async () => {
+  invoke.mockImplementation(async (command) => {
+    if (command === "run_script") throw "Could not start Python: permission denied";
+  });
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  await screen.findByRole("alert");
+  expect(screen.queryByRole("button", { name: "Install uv and run" })).not.toBeInTheDocument();
 });

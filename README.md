@@ -5,8 +5,8 @@ M1 build supports Python with a Monaco editor, Python completions and hover,
 type diagnostics, streamed stdout/stderr, rich dumps (lazy nodes, paged
 virtualised tables, images, sandboxed HTML, live updates), structured errors with
 clickable tracebacks, automatic display of the last expression, Stop/Reset, a
-library sidebar with pinned folders and plain-file saving, and inline Python
-packages (PEP 723).
+library sidebar with pinned folders and plain-file saving, inline Python
+packages (PEP 723), and one-click private `uv` installation.
 
 ## Develop locally
 
@@ -44,10 +44,36 @@ platforms.
 CodingPad checks `PATH`, then the usual `~/.local/bin` and `~/.cargo/bin`
 locations for `uv`, plus `/opt/homebrew/bin` and `/usr/local/bin` on macOS.
 Launch from a terminal if your toolchain lives elsewhere.
-Each scratch tab gets its own warm Python process on its first run. Missing `uv` or Python produces an actionable
-message in Results. The app uses the installed Python selected by `uv python find`
-and does not download a toolchain automatically. Scripts with inline dependencies
-install their packages through `uv` when Run is pressed.
+Each scratch tab gets its own warm Python process on its first run. If `uv` is
+missing, Results offers **Install uv and run**. One click downloads a pinned
+official uv release, verifies its SHA-256, installs it privately under the app data
+folder (`toolchains/uv/0.13.6`), and retries the script without restarting the app.
+The download requires an internet connection; a failed download can be retried.
+Code intelligence reconnects automatically after installation. Downloads allow up
+to 30 minutes overall, with a 60-second read idle timeout. Retrying an interrupted
+installation removes abandoned staging files while holding a process lock, so
+another app instance's active download is preserved.
+The app prefers your existing `uv` over its private copy and never changes your
+shell profiles or `PATH`. Private installation supports x86-64 and ARM64 on macOS,
+Linux (GNU and musl), and Windows. Other architectures can use a manually installed
+`uv`. No tools are bundled in the application installer.
+
+Python 3.10+ must already be installed. The app uses the installed Python selected
+by `uv python find`; a missing Python produces an actionable message in Results.
+The uv install action installs only `uv`. Scripts with inline dependencies install
+their packages through `uv` when Run is pressed.
+
+The default test suite runs offline installer checks. To also download the real
+release into a temporary folder and run Python through it:
+
+```sh
+cargo test -p codingpad-kernel-core --lib toolchains::tests::official_release -- --ignored
+```
+
+This needs network access and an installed Python 3.10+. It leaves user toolchains
+unchanged. Release URLs and SHA-256 digests are pinned in
+`crates/kernel-core/src/toolchains.rs`; update that manifest and the documented
+version together when upgrading the private `uv` release.
 
 Try the initial script, or paste:
 

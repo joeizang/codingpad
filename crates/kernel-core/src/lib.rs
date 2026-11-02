@@ -1,7 +1,9 @@
 //! Desktop-independent supervisor for one warm Python process per script.
+pub mod installer;
 pub mod lsp;
 mod packages;
 pub mod store;
+pub mod toolchains;
 
 use packages::Packages;
 use serde::{Deserialize, Serialize};
@@ -62,6 +64,7 @@ type SharedSlot = Arc<Slot>;
 
 pub struct Supervisor {
     uv: PathBuf,
+    data_dir: Option<PathBuf>,
     kernels: Mutex<HashMap<String, SharedSlot>>,
 }
 
@@ -109,8 +112,24 @@ impl Supervisor {
     pub fn with_uv(uv: PathBuf) -> Self {
         Self {
             uv,
+            data_dir: None,
             kernels: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Resolve user tools first, then the app-private installation on each startup.
+    pub fn with_data_dir(data_dir: PathBuf) -> Self {
+        Self {
+            data_dir: Some(data_dir),
+            ..Self::default()
+        }
+    }
+
+    fn uv_path(&self) -> PathBuf {
+        self.data_dir
+            .as_deref()
+            .map(toolchains::resolve_uv)
+            .unwrap_or_else(|| self.uv.clone())
     }
 
     pub async fn run(
@@ -149,8 +168,9 @@ impl Supervisor {
         // Startup includes resolution/downloads. Stop and Close must cancel that
         // work too, before there is a Python kernel to send a cancel request to.
         if guard.is_none() {
+            let uv = self.uv_path();
             let startup = tokio::select! {
-                result = Kernel::start(&self.uv, packages, &mut emit) => result,
+                result = Kernel::start(&uv, packages, &mut emit) => result,
                 _ = closed.changed() => return Err("Script was closed".into()),
                 _ = stop.changed() => return Ok(RunResult { ok: false, stopped: true, cache_cleared: true }),
             };
@@ -276,7 +296,7 @@ impl Kernel {
             .args(["python", "find", ">=3.10", "--offline", "--no-config"])
             .output().await.map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
-                    "uv was not found. Install uv from https://docs.astral.sh/uv/getting-started/installation/ and restart CodingPad with uv on PATH.".into()
+                    "uv was not found. Choose Install uv and run to install a private copy for CodingPad, or install uv on PATH yourself and run again.".into()
                 } else { format!("Could not start uv: {e}") }
             })?;
         if !python.status.success() {

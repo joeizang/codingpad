@@ -30,7 +30,7 @@ use tokio::{
 };
 use url::Url;
 
-use crate::{find_uv, RUNTIME};
+use crate::{find_uv, toolchains, RUNTIME};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -57,6 +57,7 @@ type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 
 pub struct LanguageServers {
     uv: PathBuf,
+    data_dir: Option<PathBuf>,
     servers: Mutex<HashMap<String, Arc<LspServer>>>,
     starts: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     session: Mutex<Option<String>>,
@@ -73,11 +74,27 @@ impl LanguageServers {
     pub fn with_uv(uv: PathBuf) -> Self {
         Self {
             uv,
+            data_dir: None,
             servers: Mutex::new(HashMap::new()),
             starts: Mutex::new(HashMap::new()),
             session: Mutex::new(None),
             closed: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Resolve user tools and the app-private uv on every server startup.
+    pub fn with_data_dir(data_dir: PathBuf) -> Self {
+        Self {
+            data_dir: Some(data_dir),
+            ..Self::default()
+        }
+    }
+
+    fn uv_path(&self) -> PathBuf {
+        self.data_dir
+            .as_deref()
+            .map(toolchains::resolve_uv)
+            .unwrap_or_else(|| self.uv.clone())
     }
 
     /// Start the Python language server for one script, or reuse the warm one
@@ -136,7 +153,7 @@ impl LanguageServers {
         }
 
         let workspace = PythonWorkspace::create(source)?;
-        let server = LspServer::start(&self.uv, dependencies, workspace, events).await?;
+        let server = LspServer::start(&self.uv_path(), dependencies, workspace, events).await?;
         let previous = self
             .servers
             .lock()
@@ -325,7 +342,7 @@ impl LspServer {
 
         let mut child = command.spawn().map_err(|error| {
             if error.kind() == ErrorKind::NotFound {
-                "uv was not found. Install uv from https://docs.astral.sh/uv/getting-started/installation/ and reopen this tab to enable code intelligence.".to_owned()
+                "uv was not found. Press Run and choose Install uv and run to enable code intelligence, or install uv on PATH yourself and reopen this tab.".to_owned()
             } else {
                 format!("Could not start Python code intelligence: {error}")
             }
@@ -1058,6 +1075,56 @@ print("hi")
             .await
             .unwrap_err();
         assert!(error.contains("closed"));
+    }
+
+    #[tokio::test]
+    async fn missing_uv_points_to_the_install_action() {
+        let data = tempfile::tempdir().unwrap();
+        let servers = LanguageServers::with_uv(data.path().join("missing-uv"));
+        servers.begin_session("test").await;
+        let error = servers
+            .start_python("one", "42", "test", |_| {})
+            .await
+            .unwrap_err();
+        assert!(error.contains("Install uv and run"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn private_uv_is_resolved_after_install_and_on_restart() {
+        // Isolate PATH/HOME in a child process rather than racing other tests'
+        // process-wide environment or depending on a developer's installed uv.
+        if let Some(data) = std::env::var_os("CODINGPAD_LSP_PRIVATE_UV_TEST") {
+            let data = PathBuf::from(data);
+            let servers = LanguageServers::with_data_dir(data.clone());
+            assert!(!servers.uv_path().is_file());
+            let private = toolchains::private_uv(&data);
+            fs::create_dir_all(private.parent().unwrap()).unwrap();
+            fs::write(&private, "installed uv").unwrap();
+            assert_eq!(servers.uv_path(), private);
+            let restarted = LanguageServers::with_data_dir(data);
+            assert_eq!(restarted.uv_path(), private);
+            return;
+        }
+        let data = tempfile::tempdir().unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "lsp::tests::private_uv_is_resolved_after_install_and_on_restart",
+                "--nocapture",
+            ])
+            .env("CODINGPAD_LSP_PRIVATE_UV_TEST", data.path())
+            .env("PATH", "")
+            .env("HOME", data.path())
+            .current_dir(data.path())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 
     #[test]

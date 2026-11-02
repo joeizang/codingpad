@@ -13,8 +13,10 @@ vi.mock("@monaco-editor/react", () => ({
 }));
 vi.mock("monaco-editor/editor/editor.api.js", () => ({
   editor: { setModelMarkers: vi.fn() },
+  MarkerSeverity: { Error: 8 },
 }));
 vi.mock("monaco-editor/languages/definitions/python/register.js", () => ({}));
+vi.mock("monaco-editor/languages/definitions/csharp/register.js", () => ({}));
 vi.mock("monaco-editor/editor/editor.worker.js?worker", () => ({ default: class {} }));
 
 test("retries a failed language server after uv installation using the latest source", async () => {
@@ -36,4 +38,16 @@ test("retries a failed language server after uv installation using the latest so
   await waitFor(() => expect(invoke).toHaveBeenCalledWith("start_language_server", expect.objectContaining({ scriptId: "one", source: "42" })));
   expect(invoke.mock.calls.filter(([command]) => command === "start_language_server")).toHaveLength(2);
   await waitFor(() => expect(diagnostics).toHaveBeenLastCalledWith(expect.objectContaining({ message: "Checking types…" })));
+});
+
+
+test("C# reports compiler diagnostics without starting the Python language server", async () => {
+  invoke.mockClear();
+  const diagnostics = vi.fn();
+  const props = { id: "csharp", language: "csharp", source: "missing();", onChange: vi.fn(), onRun: vi.fn(), onDiagnostics: diagnostics };
+  const view = render(<CodeEditor {...props} compileDiagnostics={[{ message: "CS0103", line: 1, column: 1, endLine: 1, endColumn: 8 }]} />);
+  await waitFor(() => expect(diagnostics).toHaveBeenLastCalledWith(expect.objectContaining({ errors: 1 })));
+  expect(invoke).not.toHaveBeenCalled();
+  view.rerender(<CodeEditor {...props} source="42.Dump();" />);
+  await waitFor(() => expect(diagnostics).toHaveBeenLastCalledWith(expect.objectContaining({ errors: 0 })));
 });

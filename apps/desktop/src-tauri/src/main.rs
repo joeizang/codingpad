@@ -4,7 +4,7 @@ use codingpad_kernel_core::{
     lsp::{LanguageServers, LspEvent, LspStartResult},
     store::{self, FolderEntry, LibrarySettings, ScriptFile},
     toolchains::Toolchains,
-    ExpandResult, KernelEvent, RunResult, Supervisor,
+    ExpandResult, KernelEvent, Language, RunResult, Supervisor,
 };
 use std::{
     fs,
@@ -44,10 +44,11 @@ async fn run_script(
     supervisor: State<'_, Supervisor>,
     script_id: String,
     source: String,
+    language: Option<Language>,
     on_event: Channel<KernelEvent>,
 ) -> Result<RunResult, String> {
     supervisor
-        .run(&script_id, &source, |event| {
+        .run_language(&script_id, &source, language.unwrap_or_default(), |event| {
             let _ = on_event.send(event);
         })
         .await

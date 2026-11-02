@@ -1,4 +1,4 @@
-# Build and test every component locally. No CI required.
+# Build and test every component locally (.NET 10 SDK required). No CI required.
 set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
 
 default:

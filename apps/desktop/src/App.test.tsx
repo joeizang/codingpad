@@ -37,8 +37,10 @@ vi.mock("./CodeEditor", () => ({
     onChange,
     onDiagnostics,
     toolchainVersion,
+    compileDiagnostics,
   }: {
     toolchainVersion?: number;
+    compileDiagnostics?: { message: string }[];
     source: string;
     onChange: (source: string) => void;
     onDiagnostics?: (summary: {
@@ -48,6 +50,7 @@ vi.mock("./CodeEditor", () => ({
     }) => void;
   }) => (
     <div>
+      <span data-testid="compiler-diagnostics">{compileDiagnostics?.map((d) => d.message).join(";")}</span>
       <textarea
         aria-label="Code"
         data-toolchain-version={toolchainVersion}
@@ -839,4 +842,22 @@ test("ordinary script errors never offer a uv installation", async () => {
   fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
   await screen.findByRole("alert");
   expect(screen.queryByRole("button", { name: "Install uv and run" })).not.toBeInTheDocument();
+});
+
+
+test("C# scratch runs with compiler diagnostics and clears stale diagnostics on edits", async () => {
+  invoke.mockImplementation(async (command, args) => {
+    if (command !== "run_script") return;
+    args.onEvent.onmessage({ method: "diagnostics", params: { runId: 1, diagnostics: [{ message: "CS0103: missing name", line: 1, column: 1, endLine: 1, endColumn: 8 }] } });
+    return { ok: false };
+  });
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "New C# scratch script" }));
+  expect(screen.getByRole("region", { name: "C# editor" })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  await screen.findByText("Script error");
+  expect(invoke).toHaveBeenCalledWith("run_script", expect.objectContaining({ language: "csharp", source: expect.stringContaining("Console.WriteLine") }));
+  expect(screen.getByTestId("compiler-diagnostics")).toHaveTextContent("CS0103");
+  fireEvent.change(screen.getByLabelText("Code"), { target: { value: "42.Dump();" } });
+  expect(screen.getByTestId("compiler-diagnostics")).toBeEmptyDOMElement();
 });

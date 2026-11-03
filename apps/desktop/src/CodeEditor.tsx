@@ -10,6 +10,7 @@ import {
   completionDocumentation,
   completionKind,
   completionLabel,
+  csharpDirectiveKey,
   diagnosticMarkers,
   diagnosticsFor,
   hoverMarkdown,
@@ -38,6 +39,7 @@ export type EditorHandle = {
 type Props = {
   id: string;
   language?: string;
+  path?: string;
   compileDiagnostics?: CompileDiagnostic[];
   toolchainVersion?: number;
   source: string;
@@ -98,9 +100,16 @@ function toCompletionItem(
   };
 }
 
+const directiveKey = (source: string, language: string) =>
+  language === "csharp" ? csharpDirectiveKey(source) : inlineDependencyKey(source);
+
+const supportsCodeIntelligence = (language: string) =>
+  language === "python" || language === "csharp";
+
 export default function CodeEditor({
   id,
   language = "python",
+  path,
   compileDiagnostics = EMPTY_DIAGNOSTICS,
   toolchainVersion = 0,
   source,
@@ -137,15 +146,15 @@ export default function CodeEditor({
   };
 
   const [dependencyKey, setDependencyKey] = useState(() =>
-    inlineDependencyKey(source),
+    directiveKey(source, language),
   );
 
   useEffect(() => {
-    const next = inlineDependencyKey(source);
+    const next = directiveKey(source, language);
     if (next === dependencyKey) return;
     const timer = window.setTimeout(() => setDependencyKey(next), 1000);
     return () => window.clearTimeout(timer);
-  }, [source, dependencyKey]);
+  }, [source, dependencyKey, language]);
 
   const applyDiagnostics = (diagnostics: LspDiagnostic[]) => {
     onDiagnosticsRef.current?.(summarizeDiagnostics(diagnostics));
@@ -157,7 +166,10 @@ export default function CodeEditor({
     monaco.editor.setModelMarkers(
       model,
       "codingpad-lsp",
-      diagnosticMarkers(diagnostics) as monaco.editor.IMarkerData[],
+      diagnosticMarkers(
+        diagnostics,
+        language === "csharp" ? "csharp" : "basedpyright",
+      ) as monaco.editor.IMarkerData[],
     );
   };
 
@@ -191,14 +203,12 @@ export default function CodeEditor({
   }, [language, compileDiagnostics]);
 
   useEffect(() => {
-    if (language !== "python") {
-      if (language !== "csharp") {
-        onDiagnosticsRef.current?.({
-          errors: 0,
-          warnings: 0,
-          message: "Code intelligence unavailable",
-        });
-      }
+    if (!supportsCodeIntelligence(language)) {
+      onDiagnosticsRef.current?.({
+        errors: 0,
+        warnings: 0,
+        message: "Code intelligence unavailable",
+      });
       return;
     }
     const current = ++generation.current;
@@ -231,6 +241,8 @@ export default function CodeEditor({
         return invoke<{ uri: string }>("start_language_server", {
           scriptId: id,
           source: initial,
+          language,
+          path: path ?? null,
           session: LSP_SESSION,
           onEvent: channel,
         });
@@ -267,7 +279,7 @@ export default function CodeEditor({
       const model = editorRef.current?.getModel();
       if (model) monaco.editor.setModelMarkers(model, "codingpad-lsp", []);
     };
-  }, [id, dependencyKey, toolchainVersion, language]);
+  }, [id, dependencyKey, toolchainVersion, language, path]);
 
   useEffect(
     () => () => {
@@ -288,11 +300,11 @@ export default function CodeEditor({
       onMount={(editor) => {
         editorRef.current = editor;
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, onRun);
-        if (language !== "python") {
-          if (language === "csharp") applyCompileDiagnostics();
+        if (!supportsCodeIntelligence(language)) {
           onMount?.(editor);
           return;
         }
+        if (language === "csharp") applyCompileDiagnostics();
         if (pendingDiagnostics.current) {
           const model = editor.getModel();
           if (model) {
@@ -316,7 +328,7 @@ export default function CodeEditor({
         });
 
         const completion = monaco.languages.registerCompletionItemProvider(
-          "python",
+          language,
           {
             triggerCharacters: COMPLETION_TRIGGERS,
             provideCompletionItems: async (model, position) => {
@@ -385,7 +397,7 @@ export default function CodeEditor({
           },
         );
 
-        const hover = monaco.languages.registerHoverProvider("python", {
+        const hover = monaco.languages.registerHoverProvider(language, {
           provideHover: async (_model, position) => {
             const endpoint = lsp.current;
             if (!endpoint) return null;

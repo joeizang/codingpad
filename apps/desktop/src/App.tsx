@@ -736,6 +736,7 @@ export default function App() {
                 key={`${active.id}:${language}`}
                 id={active.id}
                 language={language}
+                path={active.path}
                 compileDiagnostics={compileDiagnostics}
                 toolchainVersion={toolchainVersion}
                 source={active.source}

@@ -25,12 +25,12 @@ use tokio::{
         AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines,
     },
     process::{Child, ChildStdout, Command},
-    sync::{mpsc, oneshot, Mutex},
+    sync::{mpsc, oneshot, Mutex, Notify},
     time::timeout,
 };
 use url::Url;
 
-use crate::{find_uv, toolchains, RUNTIME};
+use crate::{find_uv, roslyn, shadow::ShadowProject, toolchains, RUNTIME};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -128,9 +128,10 @@ impl LanguageServers {
                 "The editor session is stale. Reload the tab to restart code intelligence.".into(),
             );
         }
+        let restart_key = dependencies.join("\n");
         let existing = self.servers.lock().await.get(script_id).cloned();
         if let Some(existing) = existing {
-            if existing.dependencies == dependencies && existing.alive() {
+            if existing.restart_key == restart_key && existing.alive() {
                 existing.set_events(events.clone());
                 if existing.did_change(source).await.is_ok() {
                     if self.closed.lock().await.contains(script_id) {
@@ -152,8 +153,21 @@ impl LanguageServers {
             existing.stop().await;
         }
 
-        let workspace = PythonWorkspace::create(source)?;
-        let server = LspServer::start(&self.uv_path(), dependencies, workspace, events).await?;
+        let workspace = Workspace::Python(PythonWorkspace::create(source)?);
+        let mut command = server_command(&self.uv_path(), &dependencies);
+        if let Ok(paths) = std::env::join_paths(workspace.extra_paths()) {
+            command.env("PYTHONPATH", paths);
+        }
+        let server = LspServer::start(
+            command,
+            workspace,
+            "python",
+            "Python",
+            restart_key,
+            "uv was not found. Press Run and choose Install uv and run to enable code intelligence, or install uv on PATH yourself and reopen this tab.".to_owned(),
+            events,
+        )
+        .await?;
         let previous = self
             .servers
             .lock()
@@ -196,6 +210,110 @@ impl LanguageServers {
         Ok(LspStartResult {
             uri: server.document_uri.clone(),
         })
+    }
+
+    /// Start Roslyn for one C# script using a generated shadow project.
+    pub async fn start_csharp(
+        &self,
+        script_id: &str,
+        source: &str,
+        path: Option<&Path>,
+        session: &str,
+        emit: impl Fn(LspEvent) + Send + Sync + 'static,
+    ) -> Result<LspStartResult, String> {
+        if script_id.is_empty() {
+            return Err("A script id is required".into());
+        }
+        let directives = crate::shadow::Directives::parse(source)?;
+        let restart_key = format!(
+            "{}\n{}",
+            directives.key(),
+            path.map(|p| p.display().to_string()).unwrap_or_default()
+        );
+        let events: EventSink = Arc::new(emit);
+
+        let start = {
+            let mut starts = self.starts.lock().await;
+            starts
+                .entry(script_id.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _start = start.lock().await;
+        self.check_session(script_id, session).await?;
+        let existing = self.servers.lock().await.get(script_id).cloned();
+        if let Some(existing) = existing {
+            if existing.restart_key == restart_key && existing.alive() {
+                existing.set_events(events.clone());
+                if existing.did_change(source).await.is_ok() {
+                    self.check_session(script_id, session).await?;
+                    return Ok(LspStartResult {
+                        uri: existing.document_uri.clone(),
+                    });
+                }
+            }
+            self.servers.lock().await.remove(script_id);
+            existing.stop().await;
+        }
+
+        let project_key = format!("{script_id}\n{restart_key}");
+        let workspace = Workspace::Csharp(ShadowProject::create(source, path, &project_key)?);
+        let roslyn = roslyn::find(self.data_dir.as_deref())?;
+        let mut command = roslyn.command();
+        command.current_dir(workspace.root());
+        let server = LspServer::start(
+            command,
+            workspace,
+            "csharp",
+            "C#",
+            restart_key,
+            "The Roslyn language server was not found. Install the C# extension in VS Code, or set CODINGPAD_ROSLYN_LSP to Microsoft.CodeAnalysis.LanguageServer.".to_owned(),
+            events,
+        )
+        .await?;
+        let previous = self
+            .servers
+            .lock()
+            .await
+            .insert(script_id.to_owned(), server.clone());
+        if let Some(previous) = previous {
+            previous.stop().await;
+        }
+
+        if let Err(error) = server.initialize().await {
+            let message = server.failure_message(error).await;
+            if self.remove_if_same(script_id, &server).await {
+                server.stop().await;
+            }
+            return Err(message);
+        }
+        if let Err(error) = server.did_open(source).await {
+            let message = server.failure_message(error).await;
+            if self.remove_if_same(script_id, &server).await {
+                server.stop().await;
+            }
+            return Err(message);
+        }
+        if !self.is_current(script_id, &server).await {
+            server.stop().await;
+            return Err("The language server was stopped".into());
+        }
+        self.check_session(script_id, session).await?;
+        Ok(LspStartResult {
+            uri: server.document_uri.clone(),
+        })
+    }
+
+    async fn check_session(&self, script_id: &str, session: &str) -> Result<(), String> {
+        if self.closed.lock().await.contains(script_id) {
+            return Err("The script was closed".into());
+        }
+        if self.session.lock().await.as_deref() != Some(session) {
+            return Err(
+                "The editor session is stale. Reload the tab to restart code intelligence.".into(),
+            );
+        }
+        Ok(())
     }
 
     /// Synchronize the full document after an edit.
@@ -308,30 +426,79 @@ struct LspServer {
     version: Arc<Mutex<i64>>,
     alive: Arc<AtomicBool>,
     events: Events,
-    dependencies: Vec<String>,
+    restart_key: String,
+    language_id: &'static str,
+    server_name: &'static str,
+    pull_diagnostics: bool,
     document_uri: String,
     workspace_uri: String,
+    extra_paths: Vec<String>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
-    _workspace: PythonWorkspace,
+    diagnostics_notify: Arc<Notify>,
+    diagnostics_last: Arc<StdMutex<Option<Value>>>,
+    _workspace: Workspace,
+}
+
+enum Workspace {
+    Python(PythonWorkspace),
+    Csharp(ShadowProject),
+}
+
+impl Workspace {
+    fn root(&self) -> &Path {
+        match self {
+            Workspace::Python(workspace) => &workspace.root,
+            Workspace::Csharp(workspace) => workspace.root(),
+        }
+    }
+
+    fn document_uri(&self) -> &str {
+        match self {
+            Workspace::Python(workspace) => &workspace.document_uri,
+            Workspace::Csharp(workspace) => workspace.document_uri(),
+        }
+    }
+
+    fn root_uri(&self) -> &str {
+        match self {
+            Workspace::Python(workspace) => &workspace.root_uri,
+            Workspace::Csharp(workspace) => workspace.root_uri(),
+        }
+    }
+
+    fn extra_paths(&self) -> &[String] {
+        match self {
+            Workspace::Python(workspace) => &workspace.extra_paths,
+            Workspace::Csharp(_) => &[],
+        }
+    }
+
+    fn touch(&self) {
+        if let Workspace::Csharp(workspace) = self {
+            workspace.touch();
+        }
+    }
 }
 
 impl LspServer {
     async fn start(
-        uv: &Path,
-        dependencies: Vec<String>,
-        workspace: PythonWorkspace,
+        mut command: Command,
+        workspace: Workspace,
+        language_id: &'static str,
+        server_name: &'static str,
+        restart_key: String,
+        start_error: String,
         events: EventSink,
     ) -> Result<Arc<Self>, String> {
-        let mut command = server_command(uv, &dependencies);
+        let root_uri = workspace.root_uri().to_owned();
+        let document_uri = workspace.document_uri().to_owned();
+        let extra_paths = workspace.extra_paths().to_vec();
         command
-            .current_dir(&workspace.root)
+            .current_dir(workspace.root())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        if let Ok(paths) = std::env::join_paths(&workspace.extra_paths) {
-            command.env("PYTHONPATH", paths);
-        }
         #[cfg(unix)]
         command.process_group(0);
         #[cfg(windows)]
@@ -339,9 +506,9 @@ impl LspServer {
 
         let mut child = command.spawn().map_err(|error| {
             if error.kind() == ErrorKind::NotFound {
-                "uv was not found. Press Run and choose Install uv and run to enable code intelligence, or install uv on PATH yourself and reopen this tab.".to_owned()
+                start_error
             } else {
-                format!("Could not start Python code intelligence: {error}")
+                format!("Could not start {server_name} code intelligence: {error}")
             }
         })?;
         let stdin = child
@@ -379,17 +546,23 @@ impl LspServer {
             version: version.clone(),
             alive: alive.clone(),
             events: events.clone(),
-            dependencies,
-            document_uri: workspace.document_uri.clone(),
-            workspace_uri: workspace.root_uri.clone(),
+            restart_key,
+            language_id,
+            server_name,
+            pull_diagnostics: language_id == "csharp",
+            document_uri,
+            workspace_uri: root_uri,
+            extra_paths,
             stderr_tail: stderr_tail.clone(),
+            diagnostics_notify: Arc::new(Notify::new()),
+            diagnostics_last: Arc::new(StdMutex::new(None)),
             _workspace: workspace,
         });
 
         let response_config = ResponseConfig {
             document_uri: server.document_uri.clone(),
             workspace_uri: server.workspace_uri.clone(),
-            extra_paths: server._workspace.extra_paths.clone(),
+            extra_paths: server.extra_paths.clone(),
             version,
         };
         tokio::spawn(read_loop(
@@ -401,6 +574,58 @@ impl LspServer {
             alive,
         ));
         tokio::spawn(read_stderr(stderr, stderr_tail));
+        if server.pull_diagnostics {
+            // Pull diagnostics on demand and during project loading, then go
+            // idle so background tabs do not poll Roslyn forever.
+            let poll = server.clone();
+            let wake = server.diagnostics_notify.clone();
+            tokio::spawn(async move {
+                let burst = std::time::Instant::now() + Duration::from_secs(30);
+                loop {
+                    if std::time::Instant::now() < burst {
+                        tokio::select! {
+                            _ = wake.notified() => {}
+                            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                        }
+                    } else {
+                        tokio::select! {
+                            _ = wake.notified() => {}
+                            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                                if !poll.alive() {
+                                    return;
+                                }
+                                // Keep the shadow project's liveness marker fresh
+                                // so another script's sweep cannot remove it.
+                                poll._workspace.touch();
+                                continue;
+                            }
+                        }
+                    }
+                    if !poll.alive() {
+                        return;
+                    }
+                    poll._workspace.touch();
+                    let Some((version, diagnostics)) = poll.document_diagnostics().await else {
+                        continue;
+                    };
+                    let changed = poll
+                        .diagnostics_last
+                        .lock()
+                        .map(|mut last| {
+                            if last.as_ref() == Some(&diagnostics) {
+                                false
+                            } else {
+                                *last = Some(diagnostics.clone());
+                                true
+                            }
+                        })
+                        .unwrap_or(true);
+                    if changed {
+                        poll.emit_diagnostics(version, diagnostics);
+                    }
+                }
+            });
+        }
         Ok(server)
     }
 
@@ -408,6 +633,12 @@ impl LspServer {
         if let Ok(mut slot) = self.events.lock() {
             *slot = events;
         }
+        // A remounted editor starts with no markers, so force the next pull to
+        // deliver the unchanged diagnostics to the new sink.
+        if let Ok(mut last) = self.diagnostics_last.lock() {
+            *last = None;
+        }
+        self.diagnostics_notify.notify_one();
     }
 
     fn alive(&self) -> bool {
@@ -445,6 +676,9 @@ impl LspServer {
                 "workspace": {
                     "workspaceFolders": true,
                     "configuration": true
+                },
+                "window": {
+                    "workDoneProgress": true
                 }
             }
         });
@@ -456,31 +690,71 @@ impl LspServer {
     async fn did_open(&self, source: &str) -> Result<(), String> {
         let mut version = self.version.lock().await;
         *version = 1;
-        self.write(json!({
+        let notice = self.write(json!({
             "jsonrpc": "2.0",
             "method": "textDocument/didOpen",
             "params": {
                 "textDocument": {
                     "uri": &self.document_uri,
-                    "languageId": "python",
+                    "languageId": self.language_id,
                     "version": 1,
                     "text": source
                 }
             }
-        }))
+        }));
+        if notice.is_ok() {
+            self.diagnostics_notify.notify_one();
+        }
+        notice
     }
 
     async fn did_change(&self, source: &str) -> Result<(), String> {
         let mut version = self.version.lock().await;
         *version += 1;
-        self.write(json!({
+        let notice = self.write(json!({
             "jsonrpc": "2.0",
             "method": "textDocument/didChange",
             "params": {
                 "textDocument": { "uri": &self.document_uri, "version": *version },
                 "contentChanges": [{ "text": source }]
             }
-        }))
+        }));
+        if notice.is_ok() {
+            self.diagnostics_notify.notify_one();
+        }
+        notice
+    }
+
+    /// Roslyn publishes document diagnostics on request rather than on edit.
+    async fn document_diagnostics(&self) -> Option<(i64, Value)> {
+        let version = *self.version.lock().await;
+        let result = self
+            .request(
+                "textDocument/diagnostic",
+                json!({ "textDocument": { "uri": &self.document_uri } }),
+            )
+            .await
+            .ok()?;
+        let diagnostics = match result {
+            Value::Array(items) => Value::Array(items),
+            Value::Object(report) => report.get("items").cloned().unwrap_or_else(|| json!([])),
+            _ => json!([]),
+        };
+        Some((version, diagnostics))
+    }
+
+    fn emit_diagnostics(&self, version: i64, diagnostics: Value) {
+        let sink = self.events.lock().ok().map(|events| (*events).clone());
+        if let Some(sink) = sink {
+            sink(LspEvent {
+                method: DIAGNOSTICS_METHOD.to_owned(),
+                params: json!({
+                    "uri": &self.document_uri,
+                    "version": version,
+                    "diagnostics": diagnostics
+                }),
+            });
+        }
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -509,14 +783,15 @@ impl LspServer {
         }
         match timeout(wait, receiver).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(
-                "The Python language server stopped before answering. Reopen the tab to restart it."
-                    .into(),
-            ),
+            Ok(Err(_)) => Err(format!(
+                "The {} language server stopped before answering. Reopen the tab to restart it.",
+                self.server_name
+            )),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
                 Err(format!(
-                    "The Python language server did not answer {method} in time. Reopen the tab to retry."
+                    "The {} language server did not answer {method} in time. Reopen the tab to retry.",
+                    self.server_name
                 ))
             }
         }
@@ -532,8 +807,10 @@ impl LspServer {
 
     fn write(&self, message: Value) -> Result<(), String> {
         self.writer.send(message).map_err(|_| {
-            "The Python language server is not accepting messages. Reopen the tab to restart it."
-                .to_owned()
+            format!(
+                "The {} language server is not accepting messages. Reopen the tab to restart it.",
+                self.server_name
+            )
         })
     }
 
@@ -762,7 +1039,7 @@ fn configuration_result(message: &Value, config: &ResponseConfig) -> Value {
                     "basedpyright" => json!({
                         "analysis": analysis_settings(config)
                     }),
-                    _ => json!({}),
+                    _ => Value::Null,
                 }
             })
             .collect(),
@@ -828,7 +1105,7 @@ fn error_message(error: &Value) -> String {
         .to_owned()
 }
 
-fn path_to_uri(path: &Path) -> Result<String, String> {
+pub(crate) fn path_to_uri(path: &Path) -> Result<String, String> {
     Url::from_file_path(path)
         .map(|url| url.to_string())
         .map_err(|()| format!("Could not convert {} to a file URI", path.display()))
@@ -978,7 +1255,7 @@ print("hi")
         );
         assert_eq!(result[0]["analysis"]["extraPaths"][0], "/tmp/runtime");
         assert_eq!(result[1]["extraPaths"][0], "/tmp/runtime");
-        assert_eq!(result[2], json!({}));
+        assert_eq!(result[2], Value::Null);
     }
 
     #[tokio::test]

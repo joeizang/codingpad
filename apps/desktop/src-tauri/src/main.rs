@@ -99,14 +99,34 @@ async fn start_language_server(
     language_servers: State<'_, LanguageServers>,
     script_id: String,
     source: String,
+    language: String,
+    path: Option<String>,
     session: String,
     on_event: Channel<LspEvent>,
 ) -> Result<LspStartResult, String> {
-    language_servers
-        .start_python(&script_id, &source, &session, move |event| {
-            let _ = on_event.send(event);
-        })
-        .await
+    match language.as_str() {
+        "python" => {
+            language_servers
+                .start_python(&script_id, &source, &session, move |event| {
+                    let _ = on_event.send(event);
+                })
+                .await
+        }
+        "csharp" => {
+            language_servers
+                .start_csharp(
+                    &script_id,
+                    &source,
+                    path.as_deref().map(std::path::Path::new),
+                    &session,
+                    move |event| {
+                        let _ = on_event.send(event);
+                    },
+                )
+                .await
+        }
+        _ => Err("Code intelligence is not available for this language".into()),
+    }
 }
 
 #[tauri::command]

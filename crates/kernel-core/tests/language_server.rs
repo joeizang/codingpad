@@ -179,3 +179,105 @@ value: int = "bad"
     assert_ne!(first.uri, third.uri);
     servers.close("reuse").await;
 }
+
+#[tokio::test]
+async fn csharp_code_intelligence_uses_the_shadow_project() {
+    // Roslyn ships with the VS Code C# extension rather than the .NET SDK.
+    // Set CODINGPAD_ROSLYN_LSP to opt in to this end-to-end check.
+    if std::env::var_os("CODINGPAD_ROSLYN_LSP").is_none() {
+        eprintln!("skipping: set CODINGPAD_ROSLYN_LSP to a Roslyn language server");
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let script = directory.path().join("script.cs");
+    let source = "#:property Nullable=disable\n#:property ImplicitUsings=disable\nvar value = 42;\nvalue.Dump();\nCache(\"answer\", () => 42);\nConsole.WriteLine(value);\nmissing();\n";
+    std::fs::write(&script, source).unwrap();
+
+    let servers = LanguageServers::with_data_dir(directory.path().join("data"));
+    servers.begin_session("test").await;
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let started = timeout(
+        Duration::from_secs(120),
+        servers.start_csharp("csharp", source, Some(&script), "test", move |event| {
+            let _ = sender.send(event);
+        }),
+    )
+    .await
+    .expect("language server startup timed out")
+    .expect("language server failed to start");
+
+    let diagnostics = next_diagnostics(&mut receiver, &started.uri).await;
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "CS0103"),
+        "unexpected diagnostics: {diagnostics:?}"
+    );
+
+    let mut labels = Vec::new();
+    for _ in 0..40 {
+        let completions = servers
+            .request(
+                "csharp",
+                "textDocument/completion",
+                json!({
+                    "textDocument": { "uri": started.uri },
+                    "position": { "line": 3, "character": 6 },
+                    "context": { "triggerKind": 2, "triggerCharacter": "." }
+                }),
+            )
+            .await
+            .expect("completion request failed");
+        labels = completions
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|item| item["label"].as_str().map(str::to_owned))
+            .collect();
+        if labels.iter().any(|label| label.starts_with("Dump")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        labels.iter().any(|label| label.starts_with("Dump")),
+        "missing Dump completion: {labels:?}"
+    );
+
+    // A tab switch remounts the editor with a new event sink but reuses the
+    // warm server. Unchanged diagnostics must still reach the new sink.
+    let (second_sender, mut second_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let restarted = servers
+        .start_csharp("csharp", source, Some(&script), "test", move |event| {
+            let _ = second_sender.send(event);
+        })
+        .await
+        .expect("reused language server failed");
+    assert_eq!(restarted.uri, started.uri);
+    let repeated = timeout(Duration::from_secs(10), async {
+        loop {
+            let Some(event) = second_receiver.recv().await else {
+                panic!("language server closed before resending diagnostics");
+            };
+            if event.method == "textDocument/publishDiagnostics" {
+                let diagnostics = event.params["diagnostics"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                if !diagnostics.is_empty() {
+                    return diagnostics;
+                }
+            }
+        }
+    })
+    .await
+    .expect("reused server did not resend diagnostics");
+    assert!(
+        repeated
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "CS0103"),
+        "reused server sent no current diagnostics: {repeated:?}"
+    );
+}

@@ -92,7 +92,10 @@ export function markerSeverity(severity?: number): number {
   }
 }
 
-export function diagnosticMarkers(diagnostics: LspDiagnostic[]) {
+export function diagnosticMarkers(
+  diagnostics: LspDiagnostic[],
+  fallbackSource = "basedpyright",
+) {
   return diagnostics.map((diagnostic) => ({
     startLineNumber: diagnostic.range.start.line + 1,
     startColumn: diagnostic.range.start.character + 1,
@@ -100,7 +103,7 @@ export function diagnosticMarkers(diagnostics: LspDiagnostic[]) {
     endColumn: diagnostic.range.end.character + 1,
     message: diagnostic.message,
     severity: markerSeverity(diagnostic.severity),
-    source: diagnostic.source ?? "basedpyright",
+    source: diagnostic.source ?? fallbackSource,
     code: diagnostic.code === undefined ? undefined : String(diagnostic.code),
   }));
 }
@@ -158,6 +161,31 @@ const COMPLETION_KINDS: Record<number, number> = {
 
 export function completionKind(kind?: number): number {
   return kind === undefined ? 18 : (COMPLETION_KINDS[kind] ?? 18);
+}
+
+// A stable value for the C# file directives. Roslyn restarts only when the
+// shadow project the kernel would compile has changed.
+export function csharpDirectiveKey(source: string): string {
+  const directives: string[] = [];
+  let inBlockComment = false;
+  for (const line of source.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (inBlockComment) {
+      if (trimmed.includes("*/")) inBlockComment = false;
+      continue;
+    }
+    if (trimmed.startsWith("/*")) {
+      inBlockComment = !trimmed.includes("*/");
+      continue;
+    }
+    if (!trimmed || trimmed.startsWith("//")) continue;
+    if (trimmed.startsWith("#:")) {
+      directives.push(trimmed);
+      continue;
+    }
+    break;
+  }
+  return directives.sort().join("\n");
 }
 
 // A stable value for the script's inline dependency set. The editor restarts

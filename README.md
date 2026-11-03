@@ -291,8 +291,13 @@ usings, allowing `WebApplication.CreateBuilder()`, routes and `RunAsync(Cancel)`
 Install the ASP.NET Core runtime matching the selected .NET major version (the
 .NET SDK includes it). A long-running web app stays active until Stop. Project
 references report: "not supported in CodingPad yet; runs with `dotnet run`".
-Roslyn completions and one-click SDK installation follow in later M2 issues.
-Only managed `Console` output is
+C# code intelligence uses Roslyn against a generated hidden shadow project: the
+script's directives become the project's packages, properties and SDK, and the
+built-in `CodingPad` sources provide `.Dump()`, `Cache` and helper completions.
+Diagnostics are pulled from Roslyn after edits and match the kernel's compiler.
+Roslyn ships with the VS Code C# extension; CodingPad finds it there, in its own
+`roslyn` data folder, on `PATH`, or at `CODINGPAD_ROSLYN_LSP`. A one-click SDK
+install follows in a later M2 issue. Only managed `Console` output is
 captured; direct native writes are outside this increment. Scripts run with your
 user privileges.
 

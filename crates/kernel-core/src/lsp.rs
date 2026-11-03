@@ -25,7 +25,7 @@ use tokio::{
         AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines,
     },
     process::{Child, ChildStdout, Command},
-    sync::{mpsc, oneshot, Mutex},
+    sync::{mpsc, oneshot, Mutex, Notify},
     time::timeout,
 };
 use url::Url;
@@ -434,6 +434,8 @@ struct LspServer {
     workspace_uri: String,
     extra_paths: Vec<String>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    diagnostics_notify: Arc<Notify>,
+    diagnostics_last: Arc<StdMutex<Option<Value>>>,
     _workspace: Workspace,
 }
 
@@ -468,6 +470,12 @@ impl Workspace {
         match self {
             Workspace::Python(workspace) => &workspace.extra_paths,
             Workspace::Csharp(_) => &[],
+        }
+    }
+
+    fn touch(&self) {
+        if let Workspace::Csharp(workspace) = self {
+            workspace.touch();
         }
     }
 }
@@ -546,6 +554,8 @@ impl LspServer {
             workspace_uri: root_uri,
             extra_paths,
             stderr_tail: stderr_tail.clone(),
+            diagnostics_notify: Arc::new(Notify::new()),
+            diagnostics_last: Arc::new(StdMutex::new(None)),
             _workspace: workspace,
         });
 
@@ -565,23 +575,53 @@ impl LspServer {
         ));
         tokio::spawn(read_stderr(stderr, stderr_tail));
         if server.pull_diagnostics {
-            // Keep diagnostics fresh without making completion wait for them.
-            // Roslyn also loads the project in the background, so the first
-            // useful report may arrive well after didOpen.
+            // Pull diagnostics on demand and during project loading, then go
+            // idle so background tabs do not poll Roslyn forever.
             let poll = server.clone();
+            let wake = server.diagnostics_notify.clone();
             tokio::spawn(async move {
-                let mut last: Option<Value> = None;
+                let burst = std::time::Instant::now() + Duration::from_secs(30);
                 loop {
-                    tokio::time::sleep(Duration::from_millis(750)).await;
+                    if std::time::Instant::now() < burst {
+                        tokio::select! {
+                            _ = wake.notified() => {}
+                            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                        }
+                    } else {
+                        tokio::select! {
+                            _ = wake.notified() => {}
+                            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                                if !poll.alive() {
+                                    return;
+                                }
+                                // Keep the shadow project's liveness marker fresh
+                                // so another script's sweep cannot remove it.
+                                poll._workspace.touch();
+                                continue;
+                            }
+                        }
+                    }
                     if !poll.alive() {
                         return;
                     }
+                    poll._workspace.touch();
                     let Some((version, diagnostics)) = poll.document_diagnostics().await else {
                         continue;
                     };
-                    if last.as_ref() != Some(&diagnostics) {
-                        poll.emit_diagnostics(version, diagnostics.clone());
-                        last = Some(diagnostics);
+                    let changed = poll
+                        .diagnostics_last
+                        .lock()
+                        .map(|mut last| {
+                            if last.as_ref() == Some(&diagnostics) {
+                                false
+                            } else {
+                                *last = Some(diagnostics.clone());
+                                true
+                            }
+                        })
+                        .unwrap_or(true);
+                    if changed {
+                        poll.emit_diagnostics(version, diagnostics);
                     }
                 }
             });
@@ -593,6 +633,12 @@ impl LspServer {
         if let Ok(mut slot) = self.events.lock() {
             *slot = events;
         }
+        // A remounted editor starts with no markers, so force the next pull to
+        // deliver the unchanged diagnostics to the new sink.
+        if let Ok(mut last) = self.diagnostics_last.lock() {
+            *last = None;
+        }
+        self.diagnostics_notify.notify_one();
     }
 
     fn alive(&self) -> bool {
@@ -644,7 +690,7 @@ impl LspServer {
     async fn did_open(&self, source: &str) -> Result<(), String> {
         let mut version = self.version.lock().await;
         *version = 1;
-        self.write(json!({
+        let notice = self.write(json!({
             "jsonrpc": "2.0",
             "method": "textDocument/didOpen",
             "params": {
@@ -655,20 +701,28 @@ impl LspServer {
                     "text": source
                 }
             }
-        }))
+        }));
+        if notice.is_ok() {
+            self.diagnostics_notify.notify_one();
+        }
+        notice
     }
 
     async fn did_change(&self, source: &str) -> Result<(), String> {
         let mut version = self.version.lock().await;
         *version += 1;
-        self.write(json!({
+        let notice = self.write(json!({
             "jsonrpc": "2.0",
             "method": "textDocument/didChange",
             "params": {
                 "textDocument": { "uri": &self.document_uri, "version": *version },
                 "contentChanges": [{ "text": source }]
             }
-        }))
+        }));
+        if notice.is_ok() {
+            self.diagnostics_notify.notify_one();
+        }
+        notice
     }
 
     /// Roslyn publishes document diagnostics on request rather than on edit.

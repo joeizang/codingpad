@@ -231,9 +231,7 @@ impl Directives {
                     [
                         "System",
                         "System.Collections.Generic",
-                        "System.IO",
                         "System.Linq",
-                        "System.Net.Http",
                         "System.Threading",
                         "System.Threading.Tasks",
                     ]
@@ -321,14 +319,16 @@ impl ShadowProject {
             format!("Could not generate the code-intelligence project: {error}")
         })?;
 
-        Ok(Self {
+        let project = Self {
             persistent,
             parent,
             _temp: temp,
             document_uri: path_to_uri(&program)?,
             root_uri: path_to_uri(&root)?,
             root,
-        })
+        };
+        project.touch();
+        Ok(project)
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -341,6 +341,11 @@ impl ShadowProject {
 
     pub(crate) fn root_uri(&self) -> &str {
         &self.root_uri
+    }
+
+    /// Refresh the liveness timestamp used by stale-project sweeps.
+    pub(crate) fn touch(&self) {
+        let _ = fs::write(self.root.join(".codingpad-alive"), b"1");
     }
 }
 
@@ -366,8 +371,9 @@ fn sweep_stale(directory: &Path, current: &Path) {
         if path == current || !path.is_dir() {
             continue;
         }
-        let stale = entry
-            .metadata()
+        let marker = path.join(".codingpad-alive");
+        let stale = fs::metadata(&marker)
+            .or_else(|_| entry.metadata())
             .and_then(|metadata| metadata.modified())
             .is_ok_and(|modified| modified < cutoff);
         if stale {
@@ -616,6 +622,8 @@ mod tests {
         let usings = directives.usings();
         assert!(usings.contains("global using System;"));
         assert!(usings.contains("global using System.Linq;"));
+        assert!(!usings.contains("global using System.IO;"));
+        assert!(!usings.contains("global using System.Net.Http;"));
         assert!(usings.contains("global using CodingPad;"));
         assert!(usings.contains("global using static CodingPad.ScriptHelpers;"));
     }

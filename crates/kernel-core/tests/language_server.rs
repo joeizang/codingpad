@@ -245,4 +245,39 @@ async fn csharp_code_intelligence_uses_the_shadow_project() {
         labels.iter().any(|label| label.starts_with("Dump")),
         "missing Dump completion: {labels:?}"
     );
+
+    // A tab switch remounts the editor with a new event sink but reuses the
+    // warm server. Unchanged diagnostics must still reach the new sink.
+    let (second_sender, mut second_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let restarted = servers
+        .start_csharp("csharp", source, Some(&script), "test", move |event| {
+            let _ = second_sender.send(event);
+        })
+        .await
+        .expect("reused language server failed");
+    assert_eq!(restarted.uri, started.uri);
+    let repeated = timeout(Duration::from_secs(10), async {
+        loop {
+            let Some(event) = second_receiver.recv().await else {
+                panic!("language server closed before resending diagnostics");
+            };
+            if event.method == "textDocument/publishDiagnostics" {
+                let diagnostics = event.params["diagnostics"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                if !diagnostics.is_empty() {
+                    return diagnostics;
+                }
+            }
+        }
+    })
+    .await
+    .expect("reused server did not resend diagnostics");
+    assert!(
+        repeated
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "CS0103"),
+        "reused server sent no current diagnostics: {repeated:?}"
+    );
 }

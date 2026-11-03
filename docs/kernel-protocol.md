@@ -333,8 +333,16 @@ Directives are parsed before restore/compile, using a shared model intended for
 M2.4's shadow project. Invalid directives send line-based `diagnostics` and an
 error node without executing source. NuGet restore uses the bundled client
 libraries, standard settings/credentials/caches, and cancellation. Restore
-progress/warnings use stderr `stream` events; failures are error nodes with
-`ok: false`. No `dotnet restore` or MSBuild process is launched for a script.
+installs/warnings use stderr `stream` events; failures are error nodes with
+`ok: false` without duplicating restore errors in stderr. Successful restores
+are memoised for the kernel lifetime by packages, Web SDK choice, directory,
+configuration contents, environment credentials, and runtime. Hits validate that
+resolved files still exist and emit no restore progress; failures/cancellation
+are never memoised. Ranges/floating versions stay pinned until invalidation or
+Reset. Unknown distro RIDs use portable platform/architecture (including musl)
+fallbacks from the bundled graph. Dependency load contexts are allocated only
+after successful asset discovery and only for previously unseen resolved graphs.
+No `dotnet restore` or MSBuild process is launched for a script.
 Resolved compile assets become Roslyn references; runtime/native/resource assets
 load in a dependency context shared across unchanged graphs. Script assemblies
 remain collectible. Web SDK scripts load the installed matching ASP.NET Core

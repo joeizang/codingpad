@@ -16,7 +16,7 @@ internal sealed class ScriptDirectives
     {
         var result = new ScriptDirectives();
         var root = CSharpSyntaxTree.ParseText(source, cancellationToken: cancel).GetRoot(cancel);
-        var first = root.GetFirstToken().SpanStart;
+        var first = root.GetFirstToken(includeZeroWidth: true).SpanStart;
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var trivia in root.DescendantTrivia())
         {

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -58,7 +59,7 @@ class DirectiveTests(unittest.TestCase):
                               f'<add key="local" value="{escape(str(cls.feed))}" />'
                               '</packageSources></configuration>', encoding="utf-8")
 
-    def run_kernel(self, sources, *, env=None, path=None, before_reply=None):
+    def run_kernel(self, sources, *, env=None, path=None, before_reply=None, after_reply=None):
         process = subprocess.Popen(["dotnet", str(self.kernel / "CodingPad.Kernel.dll")],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True, env=env or self.env, cwd=ROOT)
@@ -82,6 +83,8 @@ class DirectiveTests(unittest.TestCase):
                     self.assertIsNotNone(event, "Kernel exited before replying")
                     events.append(event)
                     if event.get("id") == run_id:
+                        if after_reply:
+                            after_reply(run_id)
                         break
             return events
         finally:
@@ -120,6 +123,99 @@ Console.WriteLine(new Fixture.Root().Child.Value);
 ''', encoding="utf-8")
         result = self.command(["dotnet", "run", "--file", str(script), "-p:PublishAot=false"], cwd=self.work, env=self.env)
         self.assertEqual(result.stdout.strip(), "restored")
+
+    def test_directives_only_and_trailing_comments_are_valid(self):
+        events = self.run_kernel([
+            '#:package CodingPad.Test.Root@1.0.0\n#:package CodingPad.Test.Leaf@1.0.0\n',
+            '#:property Nullable=enable\n#:property Optimize=true\n// Write code next.\n',
+            '// Leading comment\n#:property Nullable=enable\n#:property Optimize=true\n/* Done */\n',
+        ])
+        self.assert_ok(events, 3)
+        self.assertFalse(any(e.get("method") == "dump" for e in events), events)
+        invalid = self.run_kernel(['Console.WriteLine("must not run");\n#:property Optimize=true\n'])
+        self.assertFalse(invalid[-1]["result"]["ok"])
+        self.assertIn("File directives must appear before C# code", json.dumps(invalid))
+
+    def test_dependency_context_count_stays_constant_on_hits_and_failures(self):
+        count = 'Console.WriteLine(System.Runtime.Loader.AssemblyLoadContext.All.Count(c => c.Name == "CodingPad dependencies"));'
+        package = '#:package CodingPad.Test.Root@1.0.0\n' + count
+        missing = '#:package Missing.CodingPad.Leak@1.0.0\n'
+        events = self.run_kernel([count] * 5 + [missing] * 2 + [count] + [package] * 5 + [count])
+        self.assertEqual(self.stdout(events).splitlines(), ["1"] * 6 + ["2"] * 6)
+        self.assertEqual([e["result"]["ok"] for e in events if "result" in e], [True] * 5 + [False] * 2 + [True] * 7)
+
+    def test_unknown_build_rids_fall_back_to_portable_assets(self):
+        # Exercise the internal selector through reflection; scripts still receive
+        # only framework/helper compiler references, never private NuGet APIs.
+        source = r'''var type = AppDomain.CurrentDomain.GetAssemblies().Single(a => a.GetName().Name == "CodingPad.Kernel").GetType("ScriptDependencies")!;
+var select = type.GetMethod("SelectRuntimeIdentifier", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!;
+var graphType = select.GetParameters()[0].ParameterType;
+var read = graphType.Assembly.GetType("NuGet.RuntimeModel.JsonRuntimeFormat")!.GetMethod("ReadRuntimeGraph", new[] { typeof(string) })!;
+var graph = read.Invoke(null, new object[] { Path.Combine(AppContext.BaseDirectory, "PortableRuntimeIdentifierGraph.json") })!;
+string Pick(string rid, string os, System.Runtime.InteropServices.Architecture arch, bool musl) =>
+    (string)select.Invoke(null, new object[] { graph, rid, os, arch, musl })!;
+Console.WriteLine(Pick("ubuntu.999.0-x64", "linux", System.Runtime.InteropServices.Architecture.X64, false));
+Console.WriteLine(Pick("alpine.999.0-arm64", "linux", System.Runtime.InteropServices.Architecture.Arm64, true));
+Console.WriteLine(Pick("future-windows", "win", System.Runtime.InteropServices.Architecture.X64, false));
+Console.WriteLine(Pick("future-macos", "osx", System.Runtime.InteropServices.Architecture.Arm64, false));
+Console.WriteLine(Pick("linux-x64", "linux", System.Runtime.InteropServices.Architecture.X64, false));
+'''
+        events = self.run_kernel([source])
+        self.assert_ok(events)
+        self.assertEqual(self.stdout(events).splitlines(), ["linux-x64", "linux-musl-arm64", "win-x64", "osx-arm64", "linux-x64"])
+
+    def test_restore_cache_pins_ranges_until_config_changes(self):
+        folder = self.work / "range-cache"
+        folder.mkdir()
+        feed = folder / "feed"
+        feed.mkdir()
+        for package in self.feed.glob("*.nupkg"):
+            (feed / package.name).write_bytes(package.read_bytes())
+        config = folder / "NuGet.Config"
+        config_text = '<configuration><packageSources><clear />' + f'<add key="range" value="{escape(str(feed))}" />' + '</packageSources></configuration>'
+        config.write_text(config_text, encoding="utf-8")
+        (folder / "scripts").mkdir()
+        source = '#:package CodingPad.Test.Root@1.*\nConsole.WriteLine(typeof(Fixture.Root).Assembly.Location);'
+        def update(run_id):
+            if run_id in (1, 3):
+                # Introduce a newer local version after initial resolution.
+                version = "1.1.0" if run_id == 1 else "1.2.0"
+                original = next(feed.glob("CodingPad.Test.Root.1.0.0.nupkg"))
+                with zipfile.ZipFile(original) as old, zipfile.ZipFile(feed / f"CodingPad.Test.Root.{version}.nupkg", "w") as new:
+                    for item in old.infolist():
+                        data = old.read(item.filename)
+                        if item.filename.endswith(".nuspec"):
+                            data = data.replace(b"<version>1.0.0</version>", f"<version>{version}</version>".encode())
+                        new.writestr(item, data)
+            if run_id == 3:
+                (folder / "scripts" / "NuGet.Config").write_text(config_text.replace('key="range"', 'key="child"'), encoding="utf-8")
+            if run_id == 2:
+                # Same-length edit rules out a size/mtime-only fingerprint.
+                config.write_text(config_text.replace('key="range"', 'key="other"'), encoding="utf-8")
+        env = {**self.env, "NUGET_PACKAGES": str(folder / "packages")}
+        events = self.run_kernel([source] * 4, path=folder / "scripts" / "script.cs", env=env, after_reply=update)
+        self.assert_ok(events, 4)
+        locations = [line.replace("\\", "/") for line in self.stdout(events).splitlines()]
+        self.assertIn("/1.0.0/", locations[0])
+        self.assertEqual(locations[0], locations[1])
+        self.assertIn("/1.1.0/", locations[2])
+        self.assertIn("/1.2.0/", locations[3])
+        self.assertFalse(any(e.get("method") == "stream" and e["params"]["runId"] == 2 and e["params"]["stream"] == "stderr" for e in events), events)
+
+    def test_restore_cache_recovers_when_package_files_are_removed(self):
+        folder = self.work / "removed-cache"
+        folder.mkdir()
+        env = {**self.env, "NUGET_PACKAGES": str(folder / "packages")}
+        source = '#:package CodingPad.Test.Root@1.0.0\nConsole.WriteLine("ok");'
+        package = folder / "packages" / "codingpad.test.root" / "1.0.0"
+        def remove(run_id):
+            if run_id == 1:
+                shutil.rmtree(package)
+        events = self.run_kernel([source] * 3, path=folder / "script.cs", env=env, after_reply=remove)
+        self.assert_ok(events, 3)
+        self.assertEqual(self.stdout(events), "ok\nok\nok\n")
+        self.assertTrue((package / "lib/net10.0/Root.dll").is_file())
+        self.assertFalse(any(e.get("method") == "stream" and e["params"]["runId"] == 3 and e["params"]["stream"] == "stderr" for e in events), events)
 
     def test_compiler_properties_and_line_numbers(self):
         source = '''#:property AllowUnsafeBlocks=true
@@ -181,6 +277,7 @@ Console.WriteLine(app.GetType().Name);
         self.assertEqual([e["result"]["ok"] for e in events if "result" in e], [False, True])
         self.assertEqual(self.stdout(events), "recovered\n")
         self.assertIn("NU1101", json.dumps(events))
+        self.assertFalse(any(e.get("method") == "stream" and "NU1101" in e["params"]["text"] for e in events), events)
 
     def test_cancel_interrupts_restore_and_preserves_warm_cache(self):
         requested = threading.Event()

@@ -21,6 +21,16 @@ pub async fn download_verified(
     artifact: &Artifact<'_>,
     directory: &Path,
 ) -> Result<NamedTempFile, String> {
+    download_verified_with_suffix(artifact, directory, "").await
+}
+
+/// Download a verified file that needs a recognizable extension (for example a
+/// PowerShell script passed to `-File`). The suffix never comes from the webview.
+pub async fn download_verified_with_suffix(
+    artifact: &Artifact<'_>,
+    directory: &Path,
+    suffix: &str,
+) -> Result<NamedTempFile, String> {
     if !artifact.url.starts_with("https://") {
         return Err("Tool downloads require HTTPS".into());
     }
@@ -41,6 +51,7 @@ pub async fn download_verified(
         .map_err(|e| format!("Tool download failed. Check your connection and retry: {e}"))?;
     let mut file = tempfile::Builder::new()
         .prefix(".codingpad-install-")
+        .suffix(suffix)
         .tempfile_in(directory)
         .map_err(|e| e.to_string())?;
     let mut hash = Sha256::new();

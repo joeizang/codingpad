@@ -37,7 +37,9 @@ impl Roslyn {
 }
 
 /// Resolve the language server, preferring a path the user chose explicitly.
-pub(crate) fn find(data_dir: Option<&Path>) -> Result<Roslyn, String> {
+/// `dotnet` is the host resolved by the toolchain module so a private SDK can
+/// run framework-dependent servers when no user SDK is installed.
+pub(crate) fn find(data_dir: Option<&Path>, dotnet: &Path) -> Result<Roslyn, String> {
     let mut candidates = Vec::new();
     if let Some(path) = std::env::var_os("CODINGPAD_ROSLYN_LSP") {
         candidates.push(PathBuf::from(path));
@@ -82,7 +84,7 @@ pub(crate) fn find(data_dir: Option<&Path>) -> Result<Roslyn, String> {
         }
     }
     for candidate in candidates {
-        if let Some(server) = resolve(&candidate) {
+        if let Some(server) = resolve(&candidate, dotnet) {
             return Ok(server);
         }
     }
@@ -106,7 +108,7 @@ fn server_files(directory: &Path) -> Vec<PathBuf> {
     ]
 }
 
-fn resolve(candidate: &Path) -> Option<Roslyn> {
+fn resolve(candidate: &Path, dotnet: &Path) -> Option<Roslyn> {
     if !candidate.is_file() {
         return None;
     }
@@ -115,9 +117,9 @@ fn resolve(candidate: &Path) -> Option<Roslyn> {
         .is_some_and(|extension| extension == "dll")
     {
         // A framework-dependent server needs the dotnet host; the runtime it
-        // targets is the same one the installed SDK provides.
+        // targets is the same one the resolved SDK provides.
         return Some(Roslyn {
-            program: PathBuf::from("dotnet"),
+            program: dotnet.to_path_buf(),
             prefix: vec!["exec".into(), candidate.as_os_str().to_owned()],
         });
     }
@@ -136,7 +138,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let dll = directory.path().join(format!("{EXECUTABLE}.dll"));
         std::fs::write(&dll, "").unwrap();
-        let server = resolve(&dll).unwrap();
+        let server = resolve(&dll, Path::new("dotnet")).unwrap();
         assert_eq!(server.program, PathBuf::from("dotnet"));
         assert_eq!(
             server.prefix,
@@ -159,7 +161,7 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let executable = directory.join(EXECUTABLE);
         std::fs::write(&executable, "").unwrap();
-        let server = find(Some(data.path())).unwrap();
+        let server = find(Some(data.path()), Path::new("dotnet")).unwrap();
         assert_eq!(server.program, executable);
     }
 }

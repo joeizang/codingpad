@@ -1,12 +1,38 @@
-//! uv release manifest and app-private toolchain lifecycle.
+//! Toolchain release manifests and app-private installation lifecycle.
 use crate::{
     find_uv,
     installer::{self, Archive, Artifact},
 };
-use std::path::{Path, PathBuf};
-use tokio::sync::Mutex;
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
+    sync::Mutex,
+};
 
 pub const UV_VERSION: &str = "0.13.6";
+
+// Pinned official .NET install script from dotnet/install-scripts tag
+// v2026.07.21. The tag is immutable, so the URLs and digests never change under
+// us. Update the tag, both digests, and README together.
+#[cfg(test)]
+const DOTNET_SCRIPTS_COMMIT: &str = "da3ce11ba63f3dbb0fb835d41bda2665d5c48e84";
+const DOTNET_INSTALL_SH: (&str, &str) = (
+    "https://raw.githubusercontent.com/dotnet/install-scripts/da3ce11ba63f3dbb0fb835d41bda2665d5c48e84/src/dotnet-install.sh",
+    "082f7685e156738a1b2e2ed8381a621870d4ce8e8c59278034556f05c186eb2e",
+);
+const DOTNET_INSTALL_PS1: (&str, &str) = (
+    "https://raw.githubusercontent.com/dotnet/install-scripts/da3ce11ba63f3dbb0fb835d41bda2665d5c48e84/src/dotnet-install.ps1",
+    "3bb07bc8025211836c1e4f9d3f6a044e55b1fb6eec518a6c78851d04e210442b",
+);
+// D50/D58: install the current long-term-support release. The SDK includes the
+// runtime the C# kernel needs.
+const DOTNET_CHANNEL: &str = "LTS";
+const DOTNET_SCRIPT_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const DOTNET_INSTALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 // SHA-256 digests from https://github.com/astral-sh/uv/releases/tag/0.13.6
 // Update UV_VERSION, all asset digests, and README together.
@@ -80,6 +106,169 @@ fn prefer_user(user: PathBuf, private: PathBuf) -> PathBuf {
     }
 }
 
+fn private_dotnet_dir(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join("toolchains")
+        .join("dotnet")
+        .join(DOTNET_CHANNEL.to_lowercase())
+}
+
+pub fn private_dotnet(data_dir: &Path) -> PathBuf {
+    private_dotnet_dir(data_dir).join(dotnet_name())
+}
+
+fn dotnet_name() -> &'static str {
+    if cfg!(windows) {
+        "dotnet.exe"
+    } else {
+        "dotnet"
+    }
+}
+
+/// The user's installations first, then CodingPad's private copy. Scripts run on
+/// the newest supported runtime, not merely the first executable on PATH.
+pub fn dotnet_candidates(data_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates: Vec<_> = std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join(dotnet_name()))
+                .collect()
+        })
+        .unwrap_or_default();
+    for variable in ["DOTNET_ROOT", "DOTNET_ROOT_X64", "DOTNET_ROOT_ARM64"] {
+        if let Some(path) = std::env::var_os(variable) {
+            candidates.push(PathBuf::from(path).join(dotnet_name()));
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".dotnet").join(dotnet_name()));
+    }
+    if cfg!(unix) {
+        candidates.extend(
+            [
+                "/usr/local/share/dotnet",
+                "/usr/share/dotnet",
+                "/usr/lib/dotnet",
+            ]
+            .map(|directory| PathBuf::from(directory).join(dotnet_name())),
+        );
+    }
+    #[cfg(windows)]
+    if let Some(programs) = std::env::var_os("ProgramFiles") {
+        candidates.push(PathBuf::from(programs).join("dotnet").join(dotnet_name()));
+    }
+    if let Some(data_dir) = data_dir {
+        candidates.push(private_dotnet(data_dir));
+    }
+    candidates.push(PathBuf::from(dotnet_name()));
+    let mut seen = HashSet::new();
+    candidates.retain(|candidate| seen.insert(candidate.clone()));
+    candidates
+}
+
+/// A stable .NET 10+ version, preferring the newest installed release.
+fn supported_version(version: &str) -> Option<(Vec<u32>, String)> {
+    if version.contains('-') {
+        return None;
+    }
+    let numbers: Vec<u32> = version
+        .split('.')
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    (numbers.len() == 3 && numbers[0] >= 10).then(|| (numbers, version.to_owned()))
+}
+
+fn newest_version(versions: impl Iterator<Item = String>) -> Option<String> {
+    versions
+        .filter_map(|version| supported_version(&version))
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, version)| version)
+}
+
+/// The newest supported runtime from `dotnet --list-runtimes`.
+pub(crate) fn newest_runtime_version(output: &str) -> Option<String> {
+    newest_version(output.lines().filter_map(|line| {
+        let mut parts = line.split_whitespace();
+        if parts.next()? != "Microsoft.NETCore.App" {
+            return None;
+        }
+        Some(parts.next()?.to_owned())
+    }))
+}
+
+/// The newest supported SDK from `dotnet --list-sdks`, whose lines start with
+/// the version followed by the install root.
+pub(crate) fn newest_sdk_version(output: &str) -> Option<String> {
+    newest_version(
+        output
+            .lines()
+            .filter_map(|line| line.split_whitespace().next().map(str::to_owned)),
+    )
+}
+
+async fn list_dotnet(executable: &Path, argument: &str) -> Result<String, String> {
+    let mut command = tokio::process::Command::new(executable);
+    command.arg(argument).kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    let output = command.output().await.map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+async fn has_supported_runtime(executable: &Path) -> bool {
+    list_dotnet(executable, "--list-runtimes")
+        .await
+        .ok()
+        .and_then(|output| newest_runtime_version(&output))
+        .is_some()
+}
+
+/// Resolve the `dotnet` host to use. CodingPad prefers an installed .NET 10+
+/// runtime and falls back to its private copy; a bare `dotnet` keeps the
+/// existing actionable "not found" message when nothing is installed.
+pub async fn resolve_dotnet(data_dir: Option<&Path>) -> PathBuf {
+    let candidates = dotnet_candidates(data_dir);
+    for candidate in &candidates {
+        if candidate.is_file() && has_supported_runtime(candidate).await {
+            return candidate.clone();
+        }
+    }
+    if let Some(data_dir) = data_dir {
+        let private = private_dotnet(data_dir);
+        if private.is_file() {
+            return private;
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| PathBuf::from(dotnet_name()))
+}
+
+async fn installed_sdk_version(executable: &Path) -> Option<String> {
+    if !executable.is_file() {
+        return None;
+    }
+    list_dotnet(executable, "--list-sdks")
+        .await
+        .ok()
+        .and_then(|output| newest_sdk_version(&output))
+}
+
+async fn find_installed_sdk(data_dir: &Path) -> Option<PathBuf> {
+    let candidates = dotnet_candidates(Some(data_dir));
+    for candidate in candidates {
+        if installed_sdk_version(&candidate).await.is_some() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// One installer per application; simultaneous clicks share its completed result.
 pub struct Toolchains {
     data_dir: PathBuf,
@@ -101,6 +290,17 @@ impl Toolchains {
             return Ok(existing);
         }
         install_private_uv(&self.data_dir, progress).await
+    }
+
+    pub async fn install_dotnet(
+        &self,
+        progress: impl FnMut(&str) + Send,
+    ) -> Result<PathBuf, String> {
+        let _guard = self.install.lock().await;
+        if let Some(installed) = find_installed_sdk(&self.data_dir).await {
+            return Ok(installed);
+        }
+        install_private_dotnet(&self.data_dir, progress).await
     }
 }
 
@@ -126,7 +326,7 @@ fn prepare_install(directory: &Path) -> Result<InstallLock, String> {
         .truncate(false)
         .open(directory.join(".install.lock"))
         .map_err(|e| format!("Could not open the tool installer lock: {e}"))?;
-    lock.try_lock().map_err(|e| format!("Could not lock the tool installer. Another CodingPad instance may be installing uv; retry when it finishes: {e}"))?;
+    lock.try_lock().map_err(|e| format!("Could not lock the tool installer. Another CodingPad instance may be installing a toolchain; retry when it finishes: {e}"))?;
     // Guard immediately so a failed cleanup below still unlocks explicitly.
     let lock = InstallLock(lock);
     for entry in std::fs::read_dir(directory).map_err(|e| e.to_string())? {
@@ -136,7 +336,13 @@ fn prepare_install(directory: &Path) -> Result<InstallLock, String> {
         // Include the original tempfile prefix for interrupted older installs.
         if name.starts_with(".codingpad-install-") || name.starts_with(".tmp") {
             let kind = entry.file_type().map_err(|e| e.to_string())?;
-            if kind.is_file() || kind.is_symlink() {
+            if name.starts_with(".codingpad-install-") && kind.is_dir() {
+                // A staging directory left by a killed .NET install. The lock
+                // proves no live install is using it.
+                std::fs::remove_dir_all(entry.path()).map_err(|e| {
+                    format!("Could not remove an interrupted tool installation: {e}")
+                })?;
+            } else if kind.is_file() || kind.is_symlink() {
                 std::fs::remove_file(entry.path())
                     .map_err(|e| format!("Could not remove an interrupted tool download: {e}"))?;
             }
@@ -183,6 +389,246 @@ async fn install_private_uv(
     Ok(path)
 }
 
+/// Keep learner-facing progress friendly: the script's diagnostic lines include
+/// URLs, staging paths and CI advice that do not belong in Results.
+fn friendly_dotnet_progress(line: &str) -> Option<&'static str> {
+    let line = line.trim().to_ascii_lowercase();
+    if line.contains("attempting to download")
+        || line.contains("downloading")
+        || line.contains("payload url")
+        || line.contains("downloaded file size")
+    {
+        Some("Downloading the .NET SDK…")
+    } else if line.contains("extracting") || line.contains("extraction") {
+        Some("Unpacking the .NET SDK…")
+    } else if line.contains("installed version")
+        || line.contains("installation finished")
+        || line.contains("checking installation")
+    {
+        Some("Finishing the .NET SDK installation…")
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
+struct ProcessGroup(Option<u32>);
+
+#[cfg(unix)]
+impl ProcessGroup {
+    fn new(pid: Option<u32>) -> Self {
+        Self(pid)
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            // Negative pid targets the group made by process_group(0). This
+            // also stops the script's curl/wget child after a timeout or drop.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+    }
+}
+
+async fn promote_dotnet(stage: PathBuf, destination: &Path) -> Result<(), String> {
+    let mut last = None;
+    for attempt in 0..6 {
+        match std::fs::rename(&stage, destination) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last = Some(error);
+                if attempt < 5 {
+                    // Windows antivirus can briefly hold the new executables.
+                    tokio::time::sleep(Duration::from_millis(200 * (1 << attempt))).await;
+                }
+            }
+        }
+    }
+    Err(format!(
+        "Could not finish the .NET installation: {}",
+        last.unwrap()
+    ))
+}
+
+async fn install_private_dotnet(
+    data_dir: &Path,
+    mut progress: impl FnMut(&str) + Send,
+) -> Result<PathBuf, String> {
+    let root = private_dotnet_dir(data_dir)
+        .parent()
+        .ok_or("Missing tool directory")?
+        .to_path_buf();
+    let destination = private_dotnet_dir(data_dir);
+    let executable = destination.join(dotnet_name());
+    let _lock = prepare_install(&root)?;
+    if installed_sdk_version(&executable).await.is_some() {
+        return Ok(executable);
+    }
+    // A killed install can leave version folders without a working host. The
+    // app never silently repairs that in place, so replace the whole folder.
+    if destination.exists() {
+        std::fs::remove_dir_all(&destination)
+            .map_err(|e| format!("Could not remove an interrupted .NET installation: {e}"))?;
+    }
+    let (url, sha256, suffix) = if cfg!(windows) {
+        (DOTNET_INSTALL_PS1.0, DOTNET_INSTALL_PS1.1, ".ps1")
+    } else {
+        (DOTNET_INSTALL_SH.0, DOTNET_INSTALL_SH.1, ".sh")
+    };
+    progress("Downloading and verifying the .NET install script…");
+    let script = installer::download_verified_with_suffix(
+        &Artifact {
+            url,
+            sha256,
+            max_bytes: DOTNET_SCRIPT_MAX_BYTES,
+        },
+        &root,
+        suffix,
+    )
+    .await?
+    // PowerShell must be able to reopen the script on Windows. The TempPath
+    // retains automatic cleanup while closing the download's file handle.
+    .into_temp_path();
+    let stage = tempfile::Builder::new()
+        .prefix(".codingpad-install-dotnet-")
+        .tempdir_in(&root)
+        .map_err(|e| format!("Could not create the .NET staging folder: {e}"))?;
+    progress("Installing the .NET long-term-support SDK…");
+    run_dotnet_install_script(&script, stage.path(), &mut progress).await?;
+    let version = installed_sdk_version(&stage.path().join(dotnet_name()))
+        .await
+        .ok_or("The .NET SDK was installed but could not be started. Retry installation.")?;
+    // Promote only a verified, complete SDK so an interrupted copy is never
+    // mistaken for an installed one on the next attempt.
+    promote_dotnet(stage.keep(), &destination).await?;
+    progress(&format!(".NET SDK {version} installed. Starting script…"));
+    Ok(executable)
+}
+
+async fn run_dotnet_install_script(
+    script: &Path,
+    directory: &Path,
+    mut progress: impl FnMut(&str) + Send,
+) -> Result<(), String> {
+    // The downloaded script is the only executable content: run it through the
+    // platform shell so no archive extraction or PATH changes are involved.
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(script)
+            .arg("-Channel")
+            .arg(DOTNET_CHANNEL)
+            .arg("-InstallDir")
+            .arg(directory)
+            .arg("-NoPath");
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        // dotnet-install.sh is bash, not POSIX sh; Debian and Ubuntu use dash
+        // for /bin/sh, where it fails on `[[` and pipefail.
+        let mut command = tokio::process::Command::new("bash");
+        command
+            .arg(script)
+            .arg("--channel")
+            .arg(DOTNET_CHANNEL)
+            .arg("--install-dir")
+            .arg(directory)
+            .arg("--no-path");
+        command
+    };
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            if cfg!(windows) {
+                "The .NET installer needs PowerShell, which was not found.".to_owned()
+            } else {
+                "The .NET installer needs bash, which was not found. Install bash and retry."
+                    .to_owned()
+            }
+        } else {
+            format!("Could not start the .NET install script: {error}")
+        }
+    })?;
+    #[cfg(unix)]
+    let mut process_group = ProcessGroup::new(child.id());
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("Could not read the .NET installer output")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("Could not read the .NET installer errors")?;
+    let errors = tokio::spawn(async move {
+        let mut text = String::new();
+        let _ = BufReader::new(stderr).read_to_string(&mut text).await;
+        text
+    });
+    let install = async {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|e| format!("Could not read the .NET installer output: {e}"))?
+        {
+            let line = line.trim();
+            if let Some(message) = friendly_dotnet_progress(line) {
+                progress(message);
+            }
+        }
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| format!("Could not wait for the .NET installer: {e}"))?;
+        #[cfg(unix)]
+        process_group.disarm();
+        let errors = errors.await.unwrap_or_default();
+        Ok::<_, String>((status, errors))
+    };
+    let (status, errors) = tokio::time::timeout(DOTNET_INSTALL_TIMEOUT, install)
+        .await
+        .map_err(|_| {
+            "The .NET installation timed out. Check your connection and retry.".to_owned()
+        })??;
+    if status.success() {
+        return Ok(());
+    }
+    let message = errors.trim();
+    Err(format!(
+        "The .NET install script failed. {}",
+        if message.is_empty() {
+            "Check your connection and retry."
+        } else {
+            message
+        }
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +665,127 @@ mod tests {
     }
 
     #[test]
+    fn dotnet_scripts_are_pinned_official_https_assets() {
+        for (url, hash) in [DOTNET_INSTALL_SH, DOTNET_INSTALL_PS1] {
+            assert!(url.starts_with("https://raw.githubusercontent.com/dotnet/install-scripts/"));
+            assert!(url.contains(DOTNET_SCRIPTS_COMMIT));
+            assert_eq!(hash.len(), 64);
+            assert!(hash.bytes().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn private_dotnet_lives_under_the_app_data_folder() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = private_dotnet(directory.path());
+        assert!(path.starts_with(directory.path().join("toolchains").join("dotnet")));
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            if cfg!(windows) {
+                "dotnet.exe"
+            } else {
+                "dotnet"
+            }
+        );
+    }
+
+    #[test]
+    fn windows_installer_extraction_message_shows_unpacking() {
+        assert_eq!(
+            friendly_dotnet_progress("dotnet-install: Extracting the archive."),
+            Some("Unpacking the .NET SDK…")
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn promotion_retries_while_a_file_is_locked() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let stage = directory.path().join("stage");
+        let destination = directory.path().join("sdk");
+        std::fs::create_dir(&stage).unwrap();
+        let file = stage.join("dotnet.exe");
+        std::fs::write(&file, "sdk").unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&file)
+            .unwrap();
+        assert!(std::fs::rename(&stage, &destination).is_err());
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            drop(lock);
+        });
+        promote_dotnet(stage, &destination).await.unwrap();
+        release.await.unwrap();
+        assert_eq!(
+            std::fs::read(destination.join("dotnet.exe")).unwrap(),
+            b"sdk"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dotnet_install_script_streams_progress_and_reports_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("install.sh");
+        std::fs::write(
+            &script,
+            "#!/usr/bin/env bash\necho 'dotnet-install: Attempting to download using aka.ms link'\necho 'dotnet-install: noise that learners should not see'\necho 'dotnet-install: Extracting archive from /tmp/sdk.tar.gz'\n",
+        )
+        .unwrap();
+        let mut progress = Vec::new();
+        super::run_dotnet_install_script(&script, directory.path(), |line| {
+            progress.push(line.to_owned())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            progress,
+            ["Downloading the .NET SDK…", "Unpacking the .NET SDK…"]
+        );
+
+        std::fs::write(
+            &script,
+            "#!/usr/bin/env bash\necho 'partial output'\necho 'connection failed' >&2\nexit 3\n",
+        )
+        .unwrap();
+        let error = super::run_dotnet_install_script(&script, directory.path(), |_| {})
+            .await
+            .unwrap_err();
+        assert!(error.contains("connection failed"), "{error}");
+    }
+
+    #[test]
+    fn selects_the_newest_supported_sdk_and_runtime() {
+        let sdks = "10.0.100 [/usr/share/dotnet/sdk]\n10.0.402 [/usr/share/dotnet/sdk]\n9.0.201 [/usr/share/dotnet/sdk]\n12.0.100-preview.1 [/usr/share/dotnet/sdk]\n";
+        assert_eq!(newest_sdk_version(sdks), Some("10.0.402".into()));
+        let runtimes = "Microsoft.NETCore.App 9.0.9 [/a]\nMicrosoft.NETCore.App 10.0.9 [/b]\nMicrosoft.NETCore.App 10.0.14 [/b]\nMicrosoft.AspNetCore.App 12.0.0 [/b]\n";
+        assert_eq!(newest_runtime_version(runtimes), Some("10.0.14".into()));
+        assert_eq!(newest_sdk_version("Microsoft.NET.Sdk 9.0.201 [/a]"), None);
+        assert_eq!(newest_runtime_version("not dotnet output"), None);
+    }
+
+    #[test]
+    fn dotnet_candidates_prefer_user_locations_and_end_with_a_private_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let candidates = dotnet_candidates(Some(directory.path()));
+        let private = private_dotnet(directory.path());
+        assert!(candidates.contains(&private));
+        assert_eq!(candidates.last(), Some(&PathBuf::from(dotnet_name())));
+        assert!(
+            candidates
+                .iter()
+                .position(|candidate| candidate == &private)
+                < candidates
+                    .iter()
+                    .position(|candidate| candidate == &PathBuf::from(dotnet_name()))
+        );
+    }
+
+    #[test]
     fn cleans_interrupted_installs_without_touching_active_or_unrelated_files() {
         let data = tempfile::tempdir().unwrap();
         let directory = data.path();
@@ -226,9 +793,11 @@ mod tests {
             std::fs::write(directory.join(name), name).unwrap();
         }
         std::fs::create_dir(directory.join(".tmp-directory")).unwrap();
+        std::fs::create_dir(directory.join(".codingpad-install-dotnet-stale")).unwrap();
         let lock = prepare_install(directory).unwrap();
         assert!(!directory.join(".tmp-old").exists());
         assert!(!directory.join(".codingpad-install-old").exists());
+        assert!(!directory.join(".codingpad-install-dotnet-stale").exists());
         assert!(directory.join("uv").exists());
         assert!(directory.join("notes").exists());
         assert!(directory.join(".tmp-directory").is_dir());
@@ -299,5 +868,35 @@ mod tests {
                 .count(),
             2 // Installed executable plus the persistent process lock.
         );
+    }
+
+    /// Network acceptance test for the one-click .NET SDK install.
+    #[tokio::test]
+    #[ignore = "downloads the official .NET LTS SDK; run explicitly when validating the installer"]
+    async fn official_dotnet_script_installs_lts_sdk_privately() {
+        let data = tempfile::tempdir().unwrap();
+        let installed = install_private_dotnet(data.path(), |_| {}).await.unwrap();
+        assert_eq!(installed, private_dotnet(data.path()));
+        let sdks = list_dotnet(&installed, "--list-sdks").await.unwrap();
+        newest_sdk_version(&sdks).expect("a supported SDK is installed");
+        let runtimes = list_dotnet(&installed, "--list-runtimes").await.unwrap();
+        assert!(newest_runtime_version(&runtimes).is_some());
+        // The private host runs the bundled C# kernel without the user's SDK.
+        let supervisor = crate::Supervisor::with_dotnet(installed.clone());
+        let mut events = Vec::new();
+        let result = supervisor
+            .run_language(
+                "dotnet",
+                "Console.WriteLine(6 * 7);",
+                crate::Language::Csharp,
+                |event| events.push(event),
+            )
+            .await
+            .unwrap();
+        assert!(result.ok, "{events:?}");
+        assert!(events
+            .iter()
+            .any(|event| event.params.to_string().contains("42")));
+        supervisor.shutdown().await;
     }
 }

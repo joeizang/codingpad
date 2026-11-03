@@ -70,17 +70,29 @@ by `uv python find`; a missing Python produces an actionable message in Results.
 The uv install action installs only `uv`. Scripts with inline dependencies install
 their packages through `uv` when Run is pressed.
 
+If no .NET 10+ runtime is installed, Results offers **Install .NET and run**. One
+click downloads the official `dotnet-install` script pinned to the
+`dotnet/install-scripts` tag `v2026.07.21`, verifies its SHA-256, and runs it to
+install the current long-term-support SDK privately under the app data folder
+(`toolchains/dotnet/lts`). The script needs bash with `curl` or `wget` on Linux
+and macOS, or PowerShell on Windows, plus an internet connection. It installs
+into a staging folder and is promoted only after `dotnet --list-sdks` succeeds,
+so an interrupted download is cleaned up and retried safely. CodingPad never
+changes your shell profiles or `PATH`, and it prefers a supported .NET you
+installed yourself. Code intelligence restarts with the installed SDK.
+
 The default test suite runs offline installer checks. To also download the real
 release into a temporary folder and run Python through it:
 
 ```sh
 cargo test -p codingpad-kernel-core --lib toolchains::tests::official_release -- --ignored
+cargo test -p codingpad-kernel-core --lib toolchains::tests::official_dotnet -- --ignored
 ```
 
-This needs network access and an installed Python 3.10+. It leaves user toolchains
-unchanged. Release URLs and SHA-256 digests are pinned in
+This needs network access (and Python 3.10+ for the uv test). It leaves user
+toolchains unchanged. Release URLs and SHA-256 digests are pinned in
 `crates/kernel-core/src/toolchains.rs`; update that manifest and the documented
-version together when upgrading the private `uv` release.
+versions together when upgrading private toolchains.
 
 Try the initial script, or paste:
 
@@ -130,12 +142,13 @@ types remain editable and saveable.
 
 ## C# scripts (M2.3)
 
-Click **+ C#** or open a `.cs` file. Install .NET 10 or later first; CodingPad
-finds `dotnet` on `PATH`, in `DOTNET_ROOT`, or in standard install locations and
+Click **+ C#** or open a `.cs` file. CodingPad finds `dotnet` on `PATH`, in
+`DOTNET_ROOT`, or in standard install locations, then in its private copy, and
 selects the newest installed stable `Microsoft.NETCore.App` runtime, 10 or later.
+If none is available, Results offers **Install .NET and run** (see above).
 The first successful C# startup caches runtime discovery and extracts the bundled
 assets once for the app session; tabs and kernel restarts reuse them. Restart the
-app after installing a newer runtime to select it.
+app after installing a newer runtime outside CodingPad to select it.
 The application bundles its compiler and helper library. Building CodingPad
 requires the SDK and restores the locked compiler and NuGet client dependencies; running the
 installed app does not restore or build a project per script.

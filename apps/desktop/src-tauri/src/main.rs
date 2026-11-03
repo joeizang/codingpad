@@ -40,6 +40,19 @@ async fn install_uv(
 }
 
 #[tauri::command]
+async fn install_dotnet(
+    tools: State<'_, Toolchains>,
+    on_progress: Channel<String>,
+) -> Result<(), String> {
+    tools
+        .install_dotnet(|message| {
+            let _ = on_progress.send(message.to_owned());
+        })
+        .await?;
+    Ok(())
+}
+
+#[tauri::command]
 async fn run_script(
     supervisor: State<'_, Supervisor>,
     script_id: String,
@@ -218,6 +231,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             ui_ready,
             install_uv,
+            install_dotnet,
             run_script,
             stop_script,
             reset_script,

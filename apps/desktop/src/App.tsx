@@ -70,7 +70,7 @@ type Script = {
   updates: Record<string, DumpNode>;
   controlling?: boolean;
   error?: string;
-  missingUv?: boolean;
+  missingToolchain?: "uv" | "dotnet";
   compilation?: { source: string; diagnostics: CompileDiagnostic[] };
 };
 function intelligenceLabel(summary: DiagnosticsSummary): string {
@@ -115,7 +115,7 @@ export default function App() {
   const opening = useRef(new Set<string>());
   const [closing, setClosing] = useState(false);
   const [installProgress, setInstallProgress] = useState<string | null>(null);
-  const installingUv = useRef(false);
+  const installingToolchain = useRef(false);
   const [toolchainVersion, setToolchainVersion] = useState(0);
   const generation = useRef(new Map<string, number>());
   const running = useRef(new Set<string>());
@@ -162,7 +162,7 @@ export default function App() {
 
   async function runScript(script: Script) {
     if (
-      installingUv.current ||
+      installingToolchain.current ||
       running.current.has(script.id) ||
       script.controlling
     )
@@ -184,7 +184,7 @@ export default function App() {
       output: [],
       running: true,
       status: "Running…",
-      missingUv: false,
+      missingToolchain: undefined,
       version,
       updates: {},
       compilation: undefined,
@@ -246,11 +246,16 @@ export default function App() {
               : "Script error",
       }));
     } catch (error) {
+      const message = String(error);
       update(script.id, (item) => ({
         ...item,
         status: "Could not run",
-        error: String(error),
-        missingUv: String(error).startsWith("uv was not found."),
+        error: message,
+        missingToolchain: message.startsWith("uv was not found.")
+          ? "uv"
+          : message.startsWith(".NET was not found.")
+            ? "dotnet"
+            : undefined,
       }));
     } finally {
       flush();
@@ -259,28 +264,37 @@ export default function App() {
     }
   }
 
-  async function installUvAndRun(script: Script) {
-    if (installingUv.current) return;
-    installingUv.current = true;
-    setInstallProgress("Downloading and verifying uv…");
+  async function installToolchainAndRun(
+    script: Script,
+    toolchain: "uv" | "dotnet",
+  ) {
+    if (installingToolchain.current) return;
+    installingToolchain.current = true;
+    setInstallProgress(
+      toolchain === "uv"
+        ? "Downloading and verifying uv…"
+        : "Downloading and verifying the .NET install script…",
+    );
     update(script.id, (item) => ({ ...item, error: undefined }));
     const onProgress = new Channel<string>();
     onProgress.onmessage = (message) => {
-      if (installingUv.current) setInstallProgress(message);
+      if (installingToolchain.current) setInstallProgress(message);
     };
     let installed = false;
     try {
-      await invoke("install_uv", { onProgress });
+      await invoke(toolchain === "uv" ? "install_uv" : "install_dotnet", {
+        onProgress,
+      });
       installed = true;
       setToolchainVersion((version) => version + 1);
     } catch (error) {
       update(script.id, (item) => ({
         ...item,
         error: String(error),
-        missingUv: true,
+        missingToolchain: toolchain,
       }));
     } finally {
-      installingUv.current = false;
+      installingToolchain.current = false;
       setInstallProgress(null);
     }
     const current = scriptsRef.current.find((item) => item.id === script.id);
@@ -762,18 +776,30 @@ export default function App() {
             </div>
             <div className="results" aria-busy={active.running || installProgress !== null}>
               {installProgress && <p role="status">{installProgress}</p>}
-              {active.missingUv && (
+              {active.missingToolchain && (
                 <div className="tool-install">
                   <p>
-                    Install uv privately for CodingPad to run Python scripts.
-                    This needs an internet connection.
+                    {active.missingToolchain === "dotnet"
+                      ? "Install the .NET SDK privately for CodingPad to run C# scripts. This needs an internet connection."
+                      : "Install uv privately for CodingPad to run Python scripts. This needs an internet connection."}
                   </p>
                   <button
                     className="control-button"
                     disabled={installProgress !== null || active.running}
-                    onClick={() => void installUvAndRun(active)}
+                    onClick={() =>
+                      void installToolchainAndRun(
+                        active,
+                        active.missingToolchain!,
+                      )
+                    }
                   >
-                    {installProgress ? "Installing uv…" : "Install uv and run"}
+                    {installProgress
+                      ? active.missingToolchain === "dotnet"
+                        ? "Installing .NET…"
+                        : "Installing uv…"
+                      : active.missingToolchain === "dotnet"
+                        ? "Install .NET and run"
+                        : "Install uv and run"}
                   </button>
                 </div>
               )}

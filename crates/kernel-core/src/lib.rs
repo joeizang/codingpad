@@ -75,6 +75,7 @@ type SharedSlot = Arc<Slot>;
 
 pub struct Supervisor {
     uv: PathBuf,
+    dotnet: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     kernels: Mutex<HashMap<String, SharedSlot>>,
     csharp: OnceCell<csharp::Installation>,
@@ -124,6 +125,19 @@ impl Supervisor {
     pub fn with_uv(uv: PathBuf) -> Self {
         Self {
             uv,
+            dotnet: None,
+            data_dir: None,
+            kernels: Mutex::new(HashMap::new()),
+            csharp: OnceCell::new(),
+        }
+    }
+
+    /// Pin C# execution to one `dotnet` host, as the installer acceptance test
+    /// does when the user's own SDK must not be used.
+    pub fn with_dotnet(dotnet: PathBuf) -> Self {
+        Self {
+            uv: find_uv(),
+            dotnet: Some(dotnet),
             data_dir: None,
             kernels: Mutex::new(HashMap::new()),
             csharp: OnceCell::new(),
@@ -212,7 +226,14 @@ impl Supervisor {
             let uv = self.uv_path();
             let startup = tokio::select! {
                 result = async {
-                    if language == Language::Csharp { Kernel::start_csharp(&self.csharp).await }
+                    if language == Language::Csharp {
+                        Kernel::start_csharp(
+                            &self.csharp,
+                            self.data_dir.as_deref(),
+                            self.dotnet.as_deref(),
+                        )
+                        .await
+                    }
                     else { Kernel::start(&uv, packages, &mut emit).await }
                 } => result,
                 _ = closed.changed() => return Err("Script was closed".into()),
@@ -360,8 +381,12 @@ struct Kernel {
 }
 
 impl Kernel {
-    async fn start_csharp(cache: &OnceCell<csharp::Installation>) -> Result<Self, String> {
-        let (mut command, files) = csharp::command(cache).await?;
+    async fn start_csharp(
+        cache: &OnceCell<csharp::Installation>,
+        data_dir: Option<&std::path::Path>,
+        dotnet: Option<&std::path::Path>,
+    ) -> Result<Self, String> {
+        let (mut command, files) = csharp::command(cache, data_dir, dotnet).await?;
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

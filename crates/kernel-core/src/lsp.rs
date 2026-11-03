@@ -258,7 +258,8 @@ impl LanguageServers {
 
         let project_key = format!("{script_id}\n{restart_key}");
         let workspace = Workspace::Csharp(ShadowProject::create(source, path, &project_key)?);
-        let roslyn = roslyn::find(self.data_dir.as_deref())?;
+        let dotnet = toolchains::resolve_dotnet(self.data_dir.as_deref()).await;
+        let roslyn = roslyn::find(self.data_dir.as_deref(), &dotnet)?;
         let mut command = roslyn.command();
         command.current_dir(workspace.root());
         let server = LspServer::start(

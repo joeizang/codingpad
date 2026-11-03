@@ -399,7 +399,7 @@ fn friendly_dotnet_progress(line: &str) -> Option<&'static str> {
         || line.contains("downloaded file size")
     {
         Some("Downloading the .NET SDK…")
-    } else if line.contains("extracting archive") || line.contains("extraction") {
+    } else if line.contains("extracting") || line.contains("extraction") {
         Some("Unpacking the .NET SDK…")
     } else if line.contains("installed version")
         || line.contains("installation finished")
@@ -440,14 +440,14 @@ impl Drop for ProcessGroup {
 
 async fn promote_dotnet(stage: PathBuf, destination: &Path) -> Result<(), String> {
     let mut last = None;
-    for attempt in 0..5 {
+    for attempt in 0..6 {
         match std::fs::rename(&stage, destination) {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last = Some(error);
-                if attempt < 4 {
+                if attempt < 5 {
                     // Windows antivirus can briefly hold the new executables.
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    tokio::time::sleep(Duration::from_millis(200 * (1 << attempt))).await;
                 }
             }
         }
@@ -493,13 +493,16 @@ async fn install_private_dotnet(
         &root,
         suffix,
     )
-    .await?;
+    .await?
+    // PowerShell must be able to reopen the script on Windows. The TempPath
+    // retains automatic cleanup while closing the download's file handle.
+    .into_temp_path();
     let stage = tempfile::Builder::new()
         .prefix(".codingpad-install-dotnet-")
         .tempdir_in(&root)
         .map_err(|e| format!("Could not create the .NET staging folder: {e}"))?;
     progress("Installing the .NET long-term-support SDK…");
-    run_dotnet_install_script(script.path(), stage.path(), &mut progress).await?;
+    run_dotnet_install_script(&script, stage.path(), &mut progress).await?;
     let version = installed_sdk_version(&stage.path().join(dotnet_name()))
         .await
         .ok_or("The .NET SDK was installed but could not be started. Retry installation.")?;
@@ -683,6 +686,43 @@ mod tests {
             } else {
                 "dotnet"
             }
+        );
+    }
+
+    #[test]
+    fn windows_installer_extraction_message_shows_unpacking() {
+        assert_eq!(
+            friendly_dotnet_progress("dotnet-install: Extracting the archive."),
+            Some("Unpacking the .NET SDK…")
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn promotion_retries_while_a_file_is_locked() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let stage = directory.path().join("stage");
+        let destination = directory.path().join("sdk");
+        std::fs::create_dir(&stage).unwrap();
+        let file = stage.join("dotnet.exe");
+        std::fs::write(&file, "sdk").unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&file)
+            .unwrap();
+        assert!(std::fs::rename(&stage, &destination).is_err());
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            drop(lock);
+        });
+        promote_dotnet(stage, &destination).await.unwrap();
+        release.await.unwrap();
+        assert_eq!(
+            std::fs::read(destination.join("dotnet.exe")).unwrap(),
+            b"sdk"
         );
     }
 

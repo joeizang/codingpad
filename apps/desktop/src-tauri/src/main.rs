@@ -45,12 +45,19 @@ async fn run_script(
     script_id: String,
     source: String,
     language: Option<Language>,
+    path: Option<String>,
     on_event: Channel<KernelEvent>,
 ) -> Result<RunResult, String> {
     supervisor
-        .run_language(&script_id, &source, language.unwrap_or_default(), |event| {
-            let _ = on_event.send(event);
-        })
+        .run_language_at(
+            &script_id,
+            &source,
+            language.unwrap_or_default(),
+            path.as_deref(),
+            |event| {
+                let _ = on_event.send(event);
+            },
+        )
         .await
 }
 

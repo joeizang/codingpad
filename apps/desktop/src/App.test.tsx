@@ -485,6 +485,7 @@ test("opens a library script and preserves its header when saving", async () => 
         name: "hello.py",
         source: args.source,
       };
+    if (command === "run_script") return { ok: true };
     return undefined;
   });
   render(<App />);
@@ -509,6 +510,11 @@ test("opens a library script and preserves its header when saving", async () => 
     }),
   );
   expect(screen.getByText("/library/hello.py")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith(
+    "run_script", expect.objectContaining({ path: "/library/hello.py", source: edited }),
+  ));
+  await screen.findByText("Finished");
 });
 
 test("a scratch script saves through the dialog, then saves in place", async () => {

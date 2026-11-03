@@ -24,16 +24,6 @@ internal static class Program
             OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
         .Append(typeof(DumpExtensions).Assembly.Location)
         .Distinct().Select(path => MetadataReference.CreateFromFile(path)).ToArray();
-    private static readonly SyntaxTree Usings = CSharpSyntaxTree.ParseText("""
-        global using System;
-        global using System.Collections.Generic;
-        global using System.Linq;
-        global using System.Threading;
-        global using System.Threading.Tasks;
-        global using CodingPad;
-        global using static CodingPad.ScriptHelpers;
-        """);
-
     private sealed class RunContext(long id)
     {
         public long Id { get; } = id;
@@ -69,11 +59,17 @@ internal static class Program
     private static void Error(RunContext context, string type, string message, object[] frames) =>
         Notify(context, "dump", new { runId = context.Id, node = new { kind = "error", type, message, traceback = frames } });
 
-    private static CSharpCompilation Compile(SyntaxTree tree) => CSharpCompilation.Create(
-        "CodingPadScript_" + Guid.NewGuid().ToString("N"), [Usings, tree], References,
-        new CSharpCompilationOptions(OutputKind.ConsoleApplication, optimizationLevel: OptimizationLevel.Debug));
+    private static CSharpCompilation Compile(SyntaxTree tree, ScriptDirectives directives, ScriptDependencies dependencies)
+    {
+        var paths = dependencies.CompilePaths.ToArray();
+        var names = paths.Select(Path.GetFileNameWithoutExtension).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var references = References.Where(reference => !names.Contains(Path.GetFileNameWithoutExtension(reference.Display)))
+            .Concat(paths.Select(path => MetadataReference.CreateFromFile(path)));
+        return CSharpCompilation.Create("CodingPadScript_" + Guid.NewGuid().ToString("N"),
+            [directives.Usings, tree], references, directives.CompilationOptions);
+    }
 
-    private static async Task Run(long id, string source, RunCancellation cancellation)
+    private static async Task Run(long id, string source, string? scriptPath, RunCancellation cancellation)
     {
         var cancel = cancellation.Token;
         Session?.Dispose();
@@ -99,8 +95,12 @@ internal static class Program
         try
         {
             cancel.ThrowIfCancellationRequested();
-            var tree = CSharpSyntaxTree.ParseText(source, path: "script.cs", encoding: Encoding.UTF8, cancellationToken: cancel);
-            var compilation = Compile(tree);
+            var directives = ScriptDirectives.Parse(source, cancel);
+            var directory = scriptPath is null ? Environment.CurrentDirectory : Path.GetDirectoryName(Path.GetFullPath(scriptPath))!;
+            var dependencies = await ScriptDependencies.Restore(directives, directory,
+                text => Notify(context, "stream", new { runId = id, stream = "stderr", text }), cancel);
+            var tree = CSharpSyntaxTree.ParseText(source, directives.ParseOptions, path: "script.cs", encoding: Encoding.UTF8, cancellationToken: cancel);
+            var compilation = Compile(tree, directives, dependencies);
             var last = tree.GetRoot(cancel).ChildNodes().OfType<GlobalStatementSyntax>().LastOrDefault();
             // Empty/comment/type-only scripts are useful no-ops. Keep every
             // other diagnostic, and preserve explicit Main programs when present.
@@ -172,8 +172,14 @@ internal static class Program
             helpers = ScriptHelpers.BeginRun(cancel, text =>
                 Notify(context, "stream", new { runId = id, stream = "stdout", text }));
             cancel.ThrowIfCancellationRequested();
-            await Execute(pe, pdb);
+            await Execute(pe, pdb, dependencies);
             ok = true;
+        }
+        catch (ScriptDirectives.Invalid exception)
+        {
+            Notify(context, "diagnostics", new { runId = id, diagnostics = new[] { new {
+                message = exception.Message, line = exception.Line, column = 1, endLine = exception.Line, endColumn = 2 } } });
+            Error(context, "Directive error", exception.Message, [new { file = "script.cs", line = exception.Line, column = 1, function = "<directive>", text = "", script = true }]);
         }
         catch (Exception exception)
         {
@@ -197,9 +203,9 @@ internal static class Program
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private static async Task Execute(Stream pe, Stream pdb)
+    private static async Task Execute(Stream pe, Stream pdb, ScriptDependencies dependencies)
     {
-        var load = new AssemblyLoadContext("script", isCollectible: true);
+        var load = dependencies.CreateScriptContext();
         try
         {
             var assembly = load.LoadFromStream(pe, pdb);
@@ -364,7 +370,8 @@ internal static class Program
                 id = value.GetInt64();
                 if (root.GetProperty("jsonrpc").GetString() != "2.0") throw new JsonException("Expected JSON-RPC 2.0");
                 if (root.GetProperty("method").GetString() == "run")
-                    Run(id.Value, root.GetProperty("params").GetProperty("source").GetString()!, cancel ?? new RunCancellation()).GetAwaiter().GetResult();
+                    Run(id.Value, root.GetProperty("params").GetProperty("source").GetString()!,
+                        root.GetProperty("params").TryGetProperty("path", out var path) ? path.GetString() : null, cancel ?? new RunCancellation()).GetAwaiter().GetResult();
                 else if (root.GetProperty("method").GetString() == "expand")
                 {
                     var parameters = root.GetProperty("params");

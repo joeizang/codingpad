@@ -4,6 +4,8 @@ fn main() {
     for path in [
         "kernels/csharp/Program.cs",
         "kernels/csharp/DumpSession.cs",
+        "kernels/csharp/ScriptDirectives.cs",
+        "kernels/csharp/ScriptDependencies.cs",
         "kernels/csharp/CodingPad.Kernel.csproj",
         "kernels/csharp/packages.lock.json",
         "runtimes/dotnet/CodingPad/CodingPad.csproj",

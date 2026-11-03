@@ -1775,3 +1775,41 @@ finally { Volatile.Write(ref flags[0], 1); }
     assert_eq!(dumps(&next)[0]["v"], 42);
     supervisor.shutdown().await;
 }
+
+#[tokio::test]
+async fn csharp_saved_script_uses_parent_nuget_config_and_recovers_after_restore_failure() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::create_dir(workspace.path().join("feed")).unwrap();
+    std::fs::create_dir(workspace.path().join("scripts")).unwrap();
+    std::fs::write(
+        workspace.path().join("NuGet.Config"),
+        r#"<configuration><packageSources><clear /><add key="local" value="feed" /></packageSources></configuration>"#,
+    )
+    .unwrap();
+    let path = workspace.path().join("scripts/example.cs");
+    let supervisor = Supervisor::default();
+    let mut events = Vec::new();
+    let result = timeout(
+        Duration::from_secs(30),
+        supervisor.run_language_at(
+            "saved",
+            "#:package Missing.CodingPad.Package@1.0.0\nConsole.WriteLine(\"must not run\");",
+            Language::Csharp,
+            path.to_str(),
+            |event| events.push(event),
+        ),
+    )
+    .await
+    .expect("Local restore timed out")
+    .unwrap();
+    assert!(!result.ok, "{events:?}");
+    assert!(dumps(&events).iter().any(|node| node["message"]
+        .as_str()
+        .is_some_and(|text| text.contains("NU1101"))));
+    assert!(!events
+        .iter()
+        .any(|event| event.params["stream"] == "stdout"));
+    let events = run(&supervisor, "saved", "42.Dump();", true).await;
+    assert_eq!(dumps(&events)[0]["v"], 42);
+    supervisor.shutdown().await;
+}

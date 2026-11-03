@@ -236,7 +236,7 @@ scrolled to the end in one webview; split or filter larger data. Cancellation
 arrives in #3.
 
 
-## C# kernel (M2.0–M2.2)
+## C# kernel (M2.0–M2.3)
 
 C# reuses `run`, `stream`, `dump`, `run_finished` and the final response. The host
 selects the language explicitly and replaces the kernel when a tab changes
@@ -326,7 +326,29 @@ nested live values. Only the latest view can be expanded. Sibling values and
 independent dumps retain their own handles and iterators. Iterator cleanup may
 itself trigger an update; only the newest replacement is emitted. Remaining
 subscriptions and views are released with the session. Background writes/updates are discarded after run completion.
-C# package directives follow in M2.3.
+C# `run.params.path` is an optional absolute saved-file path. The host forwards
+it on each run, including after Save As; the kernel uses its parent for standard
+NuGet configuration discovery. An absent/null path uses the host working directory.
+Directives are parsed before restore/compile, using a shared model intended for
+M2.4's shadow project. Invalid directives send line-based `diagnostics` and an
+error node without executing source. NuGet restore uses the bundled client
+libraries, standard settings/credentials/caches, and cancellation. Cache misses
+immediately emit “Restoring C# packages…” in a stderr `stream` event, before
+resolution or downloads. Installs/warnings also use stderr `stream` events;
+failures are error nodes with
+`ok: false` without duplicating restore errors in stderr. Successful restores
+are memoised for the kernel lifetime by packages, Web SDK choice, directory,
+configuration contents, environment credentials, and runtime. Hits validate that
+resolved files still exist and emit no restore progress; failures/cancellation
+are never memoised. Ranges/floating versions stay pinned until invalidation or
+Reset. Unknown distro RIDs use portable platform/architecture (including musl)
+fallbacks from the bundled graph. Dependency load contexts are allocated only
+after successful asset discovery and only for previously unseen resolved graphs.
+No `dotnet restore` or MSBuild process is launched for a script.
+Resolved compile assets become Roslyn references; runtime/native/resource assets
+load in a dependency context shared across unchanged graphs. Script assemblies
+remain collectible. Web SDK scripts load the installed matching ASP.NET Core
+shared framework without making it a prerequisite for ordinary C# scripts.
 
 C# uses a synchronous stdin reader on the main thread and a serial dispatcher on
 a dedicated worker thread, independent of the thread pool. Parsed JSON documents

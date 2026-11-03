@@ -414,7 +414,7 @@ stop **Run**; Python executes regardless.
 
 ## Performance checks
 
-`just bench` builds the release app and measures the M1 targets from D38 on
+`just bench` builds the release app and measures the M1 and M2 targets from D38 on
 macOS and Linux:
 
 | Metric | Target |
@@ -425,8 +425,15 @@ macOS and Linux:
 | Warm Python rerun | < 200 ms |
 | 100k-row dump, first page to host | < 1 s |
 | Python completion | < 300 ms |
+| First C# kernel start | < 3 s |
+| Warm C# rerun after an edit | < 500 ms |
+| 100k-item C# sequence, first page to host | < 1 s |
+| C# completion | < 300 ms |
 
 The first completion run may download basedpyright; later runs reuse the cache.
+The C# completion measurement requires the Roslyn server described above and
+warms the language server before timing. C# runs use no NuGet packages, so the
+measurements do not include package downloads.
 Idle memory is sampled five seconds after the window is ready, so first-paint
 buffers have been released; on macOS it is the sum of physical footprints, and
 elsewhere it is resident memory. The dump metric ends when the first page reaches

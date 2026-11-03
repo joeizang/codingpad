@@ -104,7 +104,7 @@ class DirectiveTests(unittest.TestCase):
 
     @staticmethod
     def stdout(events):
-        return "".join(e["params"]["text"] for e in events if e.get("method") == "stream" and e["params"]["stream"] == "stdout")
+        return "".join(e["params"]["text"] for e in events if e.get("method") == "stream" and e["params"]["stream"] == "stdout").replace("\r\n", "\n")
 
     def test_transitive_local_feed_parent_config_cache_and_package_identity(self):
         # Parent config must be found from the saved script, not the host cwd.

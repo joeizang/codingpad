@@ -1,6 +1,6 @@
-//! Local M1 performance checks (D38, D48). Run with `just bench`.
+//! Local M1 and M2 performance checks (D38, D48, D55). Run with `just bench`.
 
-use codingpad_kernel_core::{lsp::LanguageServers, KernelEvent, Supervisor};
+use codingpad_kernel_core::{lsp::LanguageServers, KernelEvent, Language, Supervisor};
 use serde_json::json;
 use std::time::{Duration, Instant};
 #[cfg(unix)]
@@ -13,6 +13,7 @@ use std::{
 const TARGET_APP_READY: Duration = Duration::from_millis(1_000);
 const TARGET_FIRST_KERNEL: Duration = Duration::from_millis(3_000);
 const TARGET_WARM_RERUN: Duration = Duration::from_millis(200);
+const TARGET_CSHARP_WARM: Duration = Duration::from_millis(500);
 const TARGET_DUMP_FIRST_PAGE: Duration = Duration::from_millis(1_000);
 const TARGET_COMPLETION: Duration = Duration::from_millis(300);
 const TARGET_IDLE_MEMORY: u64 = 300 * 1024 * 1024;
@@ -173,12 +174,46 @@ async fn main() {
         }
     }
 
+    for (name, target, result) in [
+        (
+            "first C# kernel start",
+            TARGET_FIRST_KERNEL,
+            csharp_first_run(&supervisor).await,
+        ),
+        (
+            "warm C# rerun after edit",
+            TARGET_CSHARP_WARM,
+            csharp_warm_run(&supervisor).await,
+        ),
+        (
+            "100k-item C# sequence, first page",
+            TARGET_DUMP_FIRST_PAGE,
+            csharp_dump_first_page(&supervisor).await,
+        ),
+        (
+            "C# completion",
+            TARGET_COMPLETION,
+            csharp_completion_latency().await,
+        ),
+    ] {
+        match result {
+            Ok(measured) => rows.push(Row::time(name, measured, target)),
+            Err(error) => {
+                rows.push(Row::failed(
+                    name,
+                    format!("< {} ms", target.as_millis()),
+                    &error,
+                ));
+                failures.push(error);
+            }
+        }
+    }
     supervisor.shutdown().await;
     report(&rows);
     if failures.is_empty() && rows.iter().all(|row| row.status != Status::Fail) {
-        println!("\nAll measured M1 targets pass.");
+        println!("\nAll measured M1 and M2 targets pass.");
     } else {
-        eprintln!("\nSome M1 targets did not pass or could not be measured.");
+        eprintln!("\nSome M1 or M2 targets did not pass or could not be measured.");
         std::process::exit(1);
     }
 }
@@ -278,6 +313,124 @@ async fn completion_latency() -> Result<Duration, String> {
     measured
 }
 
+async fn csharp_first_run(supervisor: &Supervisor) -> Result<Duration, String> {
+    let started = Instant::now();
+    let result = supervisor
+        .run_language(
+            "bench-csharp",
+            "Console.WriteLine(1);",
+            Language::Csharp,
+            |_| {},
+        )
+        .await?;
+    if !result.ok {
+        return Err("the first C# kernel run failed".into());
+    }
+    Ok(started.elapsed())
+}
+
+async fn csharp_warm_run(supervisor: &Supervisor) -> Result<Duration, String> {
+    let started = Instant::now();
+    let result = supervisor
+        .run_language(
+            "bench-csharp",
+            "Console.WriteLine(2);",
+            Language::Csharp,
+            |_| {},
+        )
+        .await?;
+    if !result.ok {
+        return Err("the warm C# kernel run failed".into());
+    }
+    Ok(started.elapsed())
+}
+
+async fn csharp_dump_first_page(supervisor: &Supervisor) -> Result<Duration, String> {
+    let mut ready = None;
+    let mut page = None;
+    let source = "Console.WriteLine(\"__codingpad_bench_ready__\"); Enumerable.Range(0, 100_000).Select(i => i).Dump();";
+    let result = supervisor
+        .run_language("bench-csharp", source, Language::Csharp, |event| {
+            if ready.is_none()
+                && event.method == "stream"
+                && event.params["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("__codingpad_bench_ready__")
+            {
+                ready = Some(Instant::now());
+            }
+            if page.is_none()
+                && event.method == "dump"
+                && event.params["node"]["kind"] == "table"
+                && event.params["node"]["rows"]
+                    .as_array()
+                    .is_some_and(|rows| !rows.is_empty())
+            {
+                page = ready.map(|start| start.elapsed());
+            }
+        })
+        .await?;
+    if !result.ok {
+        return Err("the C# sequence dump failed".into());
+    }
+    page.ok_or_else(|| "no C# sequence page arrived".into())
+}
+
+async fn csharp_completion_latency() -> Result<Duration, String> {
+    eprintln!("Warming the C# language server...");
+    let servers = LanguageServers::default();
+    let measured = async {
+        servers.begin_session("bench-csharp").await;
+        let source = "var value = 42;\nvalue.";
+        let start = servers
+            .start_csharp("bench-csharp-lsp", source, None, "bench-csharp", |_| {})
+            .await?;
+        let params = completion_params(&start.uri, 6);
+        let mut ready = false;
+        for _ in 0..40 {
+            let result = servers
+                .request(
+                    "bench-csharp-lsp",
+                    "textDocument/completion",
+                    params.clone(),
+                )
+                .await?;
+            if result
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|items| !items.is_empty())
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        if !ready {
+            return Err("C# completions did not become ready".into());
+        }
+        servers
+            .did_change("bench-csharp-lsp", "var value = 43;\nvalue.")
+            .await?;
+        let started = Instant::now();
+        let result = servers
+            .request("bench-csharp-lsp", "textDocument/completion", params)
+            .await?;
+        let elapsed = started.elapsed();
+        if !result
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+        {
+            return Err("C# completion returned no items".into());
+        }
+        Ok(elapsed)
+    }
+    .await;
+    servers.shutdown().await;
+    measured
+}
+
 fn report(rows: &[Row]) {
     let metric_width = rows
         .iter()
@@ -299,7 +452,7 @@ fn report(rows: &[Row]) {
         .max("target".len());
 
     println!(
-        "CodingPad M1 performance ({}, {} build)\n",
+        "CodingPad M1 and M2 performance ({}, {} build)\n",
         std::env::consts::OS,
         if cfg!(debug_assertions) {
             "debug"

@@ -352,8 +352,8 @@ static class Sequence {
         .filter(|event| event.method == "stream")
         .filter_map(|event| event.params["text"].as_str())
         .collect();
-    assert!(output.contains("read 99\n"));
-    assert!(!output.contains("read 100\n"));
+    assert!(output.lines().any(|line| line == "read 99"));
+    assert!(!output.lines().any(|line| line == "read 100"));
     let page = supervisor
         .expand("seq", handle, Some("100"), None)
         .await

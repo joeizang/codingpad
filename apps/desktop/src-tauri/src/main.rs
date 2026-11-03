@@ -8,6 +8,7 @@ use codingpad_kernel_core::{
 };
 use std::{
     fs,
+    io::Write,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -15,7 +16,8 @@ use tauri::{ipc::Channel, Manager, State};
 
 /// Record when the interface is ready for `just bench`. A no-op in normal use.
 #[tauri::command]
-fn ui_ready() {
+fn ui_ready(frontend: serde_json::Value) {
+    bench_phase("editor_interactive", frontend);
     let Some(path) = std::env::var_os("CODINGPAD_BENCH_MARKER") else {
         return;
     };
@@ -24,6 +26,28 @@ fn ui_ready() {
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or_default();
     let _ = fs::write(path, nanos.to_string());
+}
+
+/// Sidecar JSON lines preserve startup phases without changing the ready marker.
+fn bench_phase(phase: &str, detail: serde_json::Value) {
+    let Some(path) = std::env::var_os("CODINGPAD_BENCH_MARKER") else {
+        return;
+    };
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(format!("{}.trace", PathBuf::from(path).display()))
+    {
+        let _ = writeln!(
+            file,
+            "{}",
+            serde_json::json!({"phase": phase, "unix_ns": nanos as u64, "detail": detail})
+        );
+    }
 }
 
 #[tauri::command]
@@ -219,13 +243,25 @@ fn write_script(path: String, source: String) -> Result<ScriptFile, String> {
 }
 
 fn main() {
+    bench_phase("process_entry", serde_json::Value::Null);
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .on_page_load(|_, payload| {
+            bench_phase(
+                match payload.event() {
+                    tauri::webview::PageLoadEvent::Started => "webview_load_started",
+                    tauri::webview::PageLoadEvent::Finished => "webview_load_finished",
+                },
+                serde_json::Value::Null,
+            );
+        })
         .setup(|app| {
+            bench_phase("setup_started", serde_json::Value::Null);
             let data_dir = app.path().app_data_dir()?;
             app.manage(Supervisor::with_data_dir(data_dir.clone()));
             app.manage(Toolchains::new(data_dir.clone()));
             app.manage(LanguageServers::with_data_dir(data_dir));
+            bench_phase("setup_finished", serde_json::Value::Null);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
-import Editor, { loader } from "@monaco-editor/react";
+import Editor from "./MonacoEditor";
 import * as monaco from "monaco-editor/editor/editor.api.js";
 import "monaco-editor/languages/definitions/python/register.js";
 import "monaco-editor/languages/definitions/csharp/register.js";
@@ -28,7 +28,6 @@ import {
 
 // Bundle Monaco and its worker locally; no CDN or runtime network dependency.
 self.MonacoEnvironment = { getWorker: () => new EditorWorker() };
-loader.config({ monaco });
 
 export type EditorHandle = {
   revealLineInCenter: (line: number) => void;
@@ -79,6 +78,7 @@ function toCompletionItem(
   const documentation = completionDocumentation(item);
   return {
     label: completionLabel(item),
+    tags: item.tags?.includes(1) ? [monaco.languages.CompletionItemTag.Deprecated] : undefined,
     data: item,
     kind: completionKind(item.kind) as monaco.languages.CompletionItemKind,
     detail: item.detail,
@@ -119,6 +119,7 @@ export default function CodeEditor({
   onDiagnostics,
 }: Props) {
   const generation = useRef(0);
+  const [interactive, setInteractive] = useState(false);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const lsp = useRef<{ id: string; uri: string; ready: boolean } | null>(null);
   const pendingDiagnostics = useRef<LspDiagnostic[] | null>(null);
@@ -203,6 +204,8 @@ export default function CodeEditor({
   }, [language, compileDiagnostics]);
 
   useEffect(() => {
+    // Let the editor paint before starting the background language server.
+    if (!interactive) return;
     if (!supportsCodeIntelligence(language)) {
       onDiagnosticsRef.current?.({
         errors: 0,
@@ -279,7 +282,7 @@ export default function CodeEditor({
       const model = editorRef.current?.getModel();
       if (model) monaco.editor.setModelMarkers(model, "codingpad-lsp", []);
     };
-  }, [id, dependencyKey, toolchainVersion, language, path]);
+  }, [id, dependencyKey, toolchainVersion, language, path, interactive]);
 
   useEffect(
     () => () => {
@@ -299,9 +302,28 @@ export default function CodeEditor({
       onChange={(value) => onChange(value ?? "")}
       onMount={(editor) => {
         editorRef.current = editor;
+        const reportReady = () => {
+          // Readiness means the mounted editor can receive input, with its run
+          // command and completion/hover providers installed, after a paint.
+          const mounted = performance.now();
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            if (editorRef.current !== editor || !editor.getModel() ||
+                !editor.getDomNode()?.isConnected ||
+                editor.getOption(monaco.editor.EditorOption.readOnly)) return;
+            setInteractive(true);
+            void invoke("ui_ready", { frontend: {
+              timeOrigin: performance.timeOrigin,
+              evaluated: performance.getEntriesByName("frontend-evaluated")[0]?.startTime,
+              createStarted: performance.getEntriesByName("editor-create-started").at(-1)?.startTime,
+              editorMounted: mounted,
+              interactive: performance.now(),
+            } }).catch(() => {});
+          }));
+        };
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, onRun);
         if (!supportsCodeIntelligence(language)) {
           onMount?.(editor);
+          reportReady();
           return;
         }
         if (language === "csharp") applyCompileDiagnostics();
@@ -384,6 +406,8 @@ export default function CodeEditor({
               const documentation = completionDocumentation(resolved);
               if (documentation) item.documentation = { value: documentation };
               if (resolved.detail) item.detail = resolved.detail;
+              if (resolved.tags) item.tags = resolved.tags.includes(1)
+                ? [monaco.languages.CompletionItemTag.Deprecated] : [];
               if (resolved.additionalTextEdits) {
                 item.additionalTextEdits = resolved.additionalTextEdits.map(
                   (additional) => ({
@@ -429,6 +453,7 @@ export default function CodeEditor({
           hover.dispose();
         };
         onMount?.(editor);
+        reportReady();
       }}
       options={{
         fontSize: 14,
@@ -442,7 +467,6 @@ export default function CodeEditor({
         wordBasedSuggestions: "off",
         suggestOnTriggerCharacters: true,
       }}
-      loading={<p className="empty">Loading editor…</p>}
     />
   );
 }

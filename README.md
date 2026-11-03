@@ -420,7 +420,7 @@ macOS and Linux:
 | Metric | Target |
 |---|---|
 | App usable | < 1 s |
-| Idle memory | < 300 MB |
+| Idle physical footprint | < 300 MiB |
 | First Python kernel start | < 3 s |
 | Warm Python rerun | < 200 ms |
 | 100k-row dump, first page to host | < 1 s |
@@ -434,12 +434,40 @@ The first completion run may download basedpyright; later runs reuse the cache.
 The C# completion measurement requires the Roslyn server described above and
 warms the language server before timing. C# runs use no NuGet packages, so the
 measurements do not include package downloads.
-Idle memory is sampled five seconds after the window is ready, so first-paint
-buffers have been released; on macOS it is the sum of physical footprints, and
-elsewhere it is resident memory. The dump metric ends when the first page reaches
-the Rust host, before the webview renders it. The app metrics need a desktop session and are
-skipped on Windows, where a Windows VM only confirms that `just check` passes
-(D42, D48). Set `CODINGPAD_DESKTOP` to benchmark a different app binary.
+App readiness requires a mounted, writable Monaco model and registered editor
+commands/providers after a paint. Process entry, Tauri setup, WebView loading,
+frontend evaluation and editor creation/mount timestamps are printed separately.
+Code intelligence starts after the editor paints and remains resident during the
+idle sample. The public CodingPad helper stub keeps basedpyright from analyzing
+the dump renderer implementation just to understand `dump`.
+
+Idle memory is sampled five seconds after readiness. The 300 MiB gate uses
+summed Linux PSS or macOS `phys_footprint`, per D61. The app, WebKit helpers, and
+language-server descendants (including separate process groups) are included.
+Summed RSS and Linux private memory are printed alongside the gate. Missing
+physical-memory data fails the measurement; it never falls back to RSS. On
+macOS, close other WebKit apps before testing: XPC helpers are attributed by
+comparing their PIDs before and after launch.
+
+Python completion warms `os.path.` and times typing `j` followed immediately by
+a completion request, including the document-change call. Both responses must
+contain `join`. No diagnostic barrier or delay precedes the measured request.
+Set `CODINGPAD_LSP_TRACE=1` to log request IDs, document versions and timestamps
+at bridge queueing, pipe writes, response receipt and caller delivery. The pipe
+write-to-receive interval includes server work and OS scheduling; it is not an
+internal server CPU timer. Trace output excludes document and result payloads.
+
+`just bench` runs three sequential repetitions and fails if any measured target
+fails in any repetition; `CODINGPAD_BENCH_RUNS` overrides the count for profiling.
+Use a release build, a quiet desktop, fixed power/display settings, cached tools
+and packages, and no concurrent builds/tests for qualification. These are warm
+OS-cache launches, not a disk-cache-flushed cold-start test. Save the full output
+and environment with each run; retain earlier failures when recording new results.
+The dump metric ends when the first page reaches the Rust host, before rendering.
+The app metrics need a desktop session and are skipped on Windows, where a
+Windows VM confirms that `just check` passes (D42, D48). Set `CODINGPAD_DESKTOP`
+to benchmark a different app binary. M1 stays open until repeated `just bench`
+runs pass on both Ubuntu and macOS.
 
 Dual-licensed MIT OR Apache-2.0.
 

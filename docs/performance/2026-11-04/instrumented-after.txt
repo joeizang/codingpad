@@ -1,0 +1,440 @@
+
+Benchmark repetition 1/3 (sequential, warm OS caches)
+Memory pid=2660910: RSS=164.9 MiB physical=60.8 MiB private=43.7 MiB
+Memory pid=2660927: RSS=2.2 MiB physical=0.1 MiB private=0.1 MiB
+Memory pid=2660928: RSS=1.5 MiB physical=0.3 MiB private=0.2 MiB
+Memory pid=2660929: RSS=17.1 MiB physical=7.7 MiB private=7.5 MiB
+Memory pid=2661145: RSS=50.8 MiB physical=15.4 MiB private=8.6 MiB
+Memory pid=2661167: RSS=259.8 MiB physical=163.9 MiB private=146.6 MiB
+Memory pid=2661248: RSS=30.5 MiB physical=28.0 MiB private=28.0 MiB
+Memory pid=2661257: RSS=14.7 MiB physical=12.2 MiB private=12.1 MiB
+Memory pid=2661260: RSS=167.1 MiB physical=162.9 MiB private=162.6 MiB
+Startup phases (launch unix_ns=1793747275825537331):
+{"detail":null,"phase":"process_entry","unix_ns":1793747275846649017}
+{"detail":null,"phase":"setup_started","unix_ns":1793747276030660931}
+{"detail":null,"phase":"setup_finished","unix_ns":1793747276030722514}
+{"detail":null,"phase":"webview_load_started","unix_ns":1793747276105155413}
+{"detail":null,"phase":"webview_load_finished","unix_ns":1793747276149281507}
+{"detail":{"createStarted":185,"editorMounted":500,"evaluated":143.00000000000003,"interactive":665,"timeOrigin":1793747276101},"phase":"editor_interactive","unix_ns":1793747276767362011}
+
+Idle summed RSS (informational): 708.6 MiB
+Warming the Python language server (the first run may download basedpyright)...
+lsp_trace {"id":1,"method":"initialize","phase":"queued","unix_us":1793747281938699,"version":null}
+lsp_trace {"id":1,"method":"initialize","phase":"write_started","unix_us":1793747281938756,"version":null}
+lsp_trace {"id":1,"method":"initialize","phase":"write_finished","unix_us":1793747281938821,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747282118699,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747282118766,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747282121995,"version":null}
+lsp_trace {"id":1,"method":null,"phase":"received","unix_us":1793747282122086,"version":null}
+lsp_trace {"id":1,"method":"initialize","phase":"request_delivered","unix_us":1793747282122244,"version":null}
+lsp_trace {"id":null,"method":"initialized","phase":"queued","unix_us":1793747282122316,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didOpen","phase":"queued","unix_us":1793747282122359,"version":1}
+lsp_trace {"id":null,"method":"initialized","phase":"write_started","unix_us":1793747282122363,"version":null}
+lsp_trace {"id":null,"method":"initialized","phase":"write_finished","unix_us":1793747282122426,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didOpen","phase":"write_started","unix_us":1793747282122452,"version":1}
+lsp_trace {"id":null,"method":"textDocument/didOpen","phase":"write_finished","unix_us":1793747282122479,"version":1}
+lsp_trace {"id":2,"method":"textDocument/completion","phase":"queued","unix_us":1793747282122403,"version":null}
+lsp_trace {"id":2,"method":"textDocument/completion","phase":"write_started","unix_us":1793747282122700,"version":null}
+lsp_trace {"id":2,"method":"textDocument/completion","phase":"write_finished","unix_us":1793747282122727,"version":null}
+lsp_trace {"id":0,"method":"workspace/configuration","phase":"received","unix_us":1793747282123476,"version":null}
+lsp_trace {"id":0,"method":null,"phase":"write_started","unix_us":1793747282123536,"version":null}
+lsp_trace {"id":0,"method":null,"phase":"write_finished","unix_us":1793747282123574,"version":null}
+lsp_trace {"id":1,"method":"workspace/configuration","phase":"received","unix_us":1793747282124177,"version":null}
+lsp_trace {"id":1,"method":null,"phase":"write_started","unix_us":1793747282124224,"version":null}
+lsp_trace {"id":1,"method":null,"phase":"write_finished","unix_us":1793747282124249,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747282733886,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747282733930,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747282733960,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747282733981,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747282734003,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747282734023,"version":null}
+lsp_trace {"id":2,"method":null,"phase":"received","unix_us":1793747282734164,"version":null}
+lsp_trace {"id":2,"method":"textDocument/completion","phase":"request_delivered","unix_us":1793747282734277,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747282734286,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didChange","phase":"queued","unix_us":1793747282734340,"version":2}
+lsp_trace {"id":null,"method":"textDocument/publishDiagnostics","phase":"received","unix_us":1793747282734358,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didChange","phase":"write_started","unix_us":1793747282734391,"version":2}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"queued","unix_us":1793747282734383,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didChange","phase":"write_finished","unix_us":1793747282734452,"version":2}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"write_started","unix_us":1793747282734485,"version":null}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"write_finished","unix_us":1793747282734503,"version":null}
+lsp_trace {"id":3,"method":null,"phase":"received","unix_us":1793747282996431,"version":null}
+lsp_trace {"id":null,"method":"textDocument/publishDiagnostics","phase":"received","unix_us":1793747282996569,"version":null}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"request_delivered","unix_us":1793747282996671,"version":null}
+Python completion: change queued 0.043 ms, request/response 262.449 ms, 2 items including join
+lsp_trace {"id":4,"method":"shutdown","phase":"queued","unix_us":1793747282996946,"version":null}
+lsp_trace {"id":4,"method":"shutdown","phase":"write_started","unix_us":1793747282997093,"version":null}
+lsp_trace {"id":4,"method":"shutdown","phase":"write_finished","unix_us":1793747282997162,"version":null}
+lsp_trace {"id":4,"method":null,"phase":"received","unix_us":1793747282997938,"version":null}
+lsp_trace {"id":4,"method":"shutdown","phase":"request_delivered","unix_us":1793747282998074,"version":null}
+lsp_trace {"id":null,"method":"exit","phase":"queued","unix_us":1793747282998127,"version":null}
+lsp_trace {"id":null,"method":"exit","phase":"write_started","unix_us":1793747282998279,"version":null}
+lsp_trace {"id":null,"method":"exit","phase":"write_finished","unix_us":1793747282998330,"version":null}
+Warming the C# language server...
+lsp_trace {"id":1,"method":"initialize","phase":"queued","unix_us":1793747284316106,"version":null}
+lsp_trace {"id":1,"method":"initialize","phase":"write_started","unix_us":1793747284316192,"version":null}
+lsp_trace {"id":1,"method":"initialize","phase":"write_finished","unix_us":1793747284316255,"version":null}
+lsp_trace {"id":2,"method":"textDocument/diagnostic","phase":"queued","unix_us":1793747284817142,"version":null}
+lsp_trace {"id":2,"method":"textDocument/diagnostic","phase":"write_started","unix_us":1793747284817219,"version":null}
+lsp_trace {"id":2,"method":"textDocument/diagnostic","phase":"write_finished","unix_us":1793747284817268,"version":null}
+lsp_trace {"id":1,"method":null,"phase":"received","unix_us":1793747284850477,"version":null}
+lsp_trace {"id":1,"method":"initialize","phase":"request_delivered","unix_us":1793747284850668,"version":null}
+lsp_trace {"id":null,"method":"initialized","phase":"queued","unix_us":1793747284850743,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didOpen","phase":"queued","unix_us":1793747284850787,"version":1}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"queued","unix_us":1793747284850843,"version":null}
+lsp_trace {"id":null,"method":"initialized","phase":"write_started","unix_us":1793747284850869,"version":null}
+lsp_trace {"id":null,"method":"initialized","phase":"write_finished","unix_us":1793747284850947,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didOpen","phase":"write_started","unix_us":1793747284850984,"version":1}
+lsp_trace {"id":null,"method":"textDocument/didOpen","phase":"write_finished","unix_us":1793747284851022,"version":1}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"write_started","unix_us":1793747284851058,"version":null}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"write_finished","unix_us":1793747284851094,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747284938232,"version":null}
+lsp_trace {"id":2,"method":null,"phase":"received","unix_us":1793747284942355,"version":null}
+lsp_trace {"id":2,"method":"textDocument/diagnostic","phase":"request_delivered","unix_us":1793747284942404,"version":null}
+lsp_trace {"id":4,"method":"textDocument/diagnostic","phase":"queued","unix_us":1793747284942482,"version":null}
+lsp_trace {"id":4,"method":"textDocument/diagnostic","phase":"write_started","unix_us":1793747284942523,"version":null}
+lsp_trace {"id":4,"method":"textDocument/diagnostic","phase":"write_finished","unix_us":1793747284942565,"version":null}
+lsp_trace {"id":2,"method":"workspace/configuration","phase":"received","unix_us":1793747284962915,"version":null}
+lsp_trace {"id":2,"method":null,"phase":"write_started","unix_us":1793747284963033,"version":null}
+lsp_trace {"id":2,"method":null,"phase":"write_finished","unix_us":1793747284963073,"version":null}
+lsp_trace {"id":3,"method":"window/workDoneProgress/create","phase":"received","unix_us":1793747284977407,"version":null}
+lsp_trace {"id":3,"method":null,"phase":"write_started","unix_us":1793747284977470,"version":null}
+lsp_trace {"id":3,"method":null,"phase":"write_finished","unix_us":1793747284977509,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747284978303,"version":null}
+lsp_trace {"id":null,"method":"$/progress","phase":"received","unix_us":1793747284987672,"version":null}
+lsp_trace {"id":null,"method":"$/progress","phase":"received","unix_us":1793747284990187,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747284999286,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747285000096,"version":null}
+lsp_trace {"id":4,"method":"workspace/configuration","phase":"received","unix_us":1793747285000141,"version":null}
+lsp_trace {"id":4,"method":null,"phase":"write_started","unix_us":1793747285000183,"version":null}
+lsp_trace {"id":4,"method":null,"phase":"write_finished","unix_us":1793747285000221,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747285007517,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747285017197,"version":null}
+lsp_trace {"id":5,"method":"client/registerCapability","phase":"received","unix_us":1793747285019053,"version":null}
+lsp_trace {"id":5,"method":null,"phase":"write_started","unix_us":1793747285019107,"version":null}
+lsp_trace {"id":5,"method":null,"phase":"write_finished","unix_us":1793747285019148,"version":null}
+lsp_trace {"id":3,"method":null,"phase":"received","unix_us":1793747285388391,"version":null}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"request_delivered","unix_us":1793747285388479,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didChange","phase":"queued","unix_us":1793747285388547,"version":2}
+lsp_trace {"id":5,"method":"textDocument/completion","phase":"queued","unix_us":1793747285388597,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didChange","phase":"write_started","unix_us":1793747285388700,"version":2}
+lsp_trace {"id":null,"method":"textDocument/didChange","phase":"write_finished","unix_us":1793747285388758,"version":2}
+lsp_trace {"id":5,"method":"textDocument/completion","phase":"write_started","unix_us":1793747285388815,"version":null}
+lsp_trace {"id":5,"method":"textDocument/completion","phase":"write_finished","unix_us":1793747285388853,"version":null}
+lsp_trace {"id":5,"method":null,"phase":"received","unix_us":1793747285419569,"version":null}
+lsp_trace {"id":5,"method":"textDocument/completion","phase":"request_delivered","unix_us":1793747285419674,"version":null}
+lsp_trace {"id":6,"method":"shutdown","phase":"queued","unix_us":1793747285419732,"version":null}
+lsp_trace {"id":6,"method":"shutdown","phase":"write_started","unix_us":1793747285419766,"version":null}
+lsp_trace {"id":6,"method":"shutdown","phase":"write_finished","unix_us":1793747285419802,"version":null}
+lsp_trace {"id":null,"method":"exit","phase":"queued","unix_us":1793747285921789,"version":null}
+lsp_trace {"id":null,"method":"exit","phase":"write_started","unix_us":1793747285922043,"version":null}
+lsp_trace {"id":null,"method":"exit","phase":"write_finished","unix_us":1793747285922125,"version":null}
+CodingPad M1 and M2 performance (linux, release build)
+
+metric                             measured   target     status
+app usable                         941.9 ms   < 1000 ms  pass
+idle physical footprint            451.4 MiB  < 300 MiB  FAIL
+first Python kernel start          42.3 ms    < 3000 ms  pass
+warm Python rerun                  1.0 ms     < 200 ms   pass
+100k-row dump, first page to host  1.1 ms     < 1000 ms  pass
+Python completion                  262.5 ms   < 300 ms   pass
+first C# kernel start              1055.9 ms  < 3000 ms  pass
+warm C# rerun after edit           17.9 ms    < 500 ms   pass
+100k-item C# sequence, first page  10.3 ms    < 1000 ms  pass
+C# completion                      31.1 ms    < 300 ms   pass
+
+Some M1 or M2 targets did not pass or could not be measured.
+
+Benchmark repetition 2/3 (sequential, warm OS caches)
+lsp_trace {"id":4,"method":"textDocument/diagnostic","phase":"request_delivered","unix_us":1793747286444893,"version":null}
+Memory pid=2661662: RSS=165.1 MiB physical=61.1 MiB private=43.9 MiB
+Memory pid=2661679: RSS=2.3 MiB physical=0.1 MiB private=0.1 MiB
+Memory pid=2661680: RSS=1.5 MiB physical=0.3 MiB private=0.2 MiB
+Memory pid=2661681: RSS=16.9 MiB physical=7.7 MiB private=7.5 MiB
+Memory pid=2661895: RSS=50.9 MiB physical=15.4 MiB private=8.6 MiB
+Memory pid=2661914: RSS=259.8 MiB physical=163.8 MiB private=146.4 MiB
+Memory pid=2661993: RSS=30.1 MiB physical=27.6 MiB private=27.6 MiB
+Memory pid=2662002: RSS=14.6 MiB physical=12.1 MiB private=12.1 MiB
+Memory pid=2662005: RSS=167.3 MiB physical=163.0 MiB private=162.8 MiB
+Startup phases (launch unix_ns=1793747286423977133):
+{"detail":null,"phase":"process_entry","unix_ns":1793747286454681742}
+{"detail":null,"phase":"setup_started","unix_ns":1793747286641892270}
+{"detail":null,"phase":"setup_finished","unix_ns":1793747286641949700}
+{"detail":null,"phase":"webview_load_started","unix_ns":1793747286723838118}
+{"detail":null,"phase":"webview_load_finished","unix_ns":1793747286762581421}
+{"detail":{"createStarted":184,"editorMounted":507,"evaluated":143.00000000000003,"interactive":673,"timeOrigin":1793747286719},"phase":"editor_interactive","unix_ns":1793747287393703258}
+
+Idle summed RSS (informational): 708.5 MiB
+Warming the Python language server (the first run may download basedpyright)...
+lsp_trace {"id":1,"method":"initialize","phase":"queued","unix_us":1793747292576162,"version":null}
+lsp_trace {"id":1,"method":"initialize","phase":"write_started","unix_us":1793747292576212,"version":null}
+lsp_trace {"id":1,"method":"initialize","phase":"write_finished","unix_us":1793747292576276,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747292768655,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747292768726,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747292772026,"version":null}
+lsp_trace {"id":1,"method":null,"phase":"received","unix_us":1793747292772120,"version":null}
+lsp_trace {"id":1,"method":"initialize","phase":"request_delivered","unix_us":1793747292772188,"version":null}
+lsp_trace {"id":null,"method":"initialized","phase":"queued","unix_us":1793747292772262,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didOpen","phase":"queued","unix_us":1793747292772307,"version":1}
+lsp_trace {"id":null,"method":"initialized","phase":"write_started","unix_us":1793747292772311,"version":null}
+lsp_trace {"id":2,"method":"textDocument/completion","phase":"queued","unix_us":1793747292772352,"version":null}
+lsp_trace {"id":null,"method":"initialized","phase":"write_finished","unix_us":1793747292772378,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didOpen","phase":"write_started","unix_us":1793747292772449,"version":1}
+lsp_trace {"id":null,"method":"textDocument/didOpen","phase":"write_finished","unix_us":1793747292772487,"version":1}
+lsp_trace {"id":2,"method":"textDocument/completion","phase":"write_started","unix_us":1793747292772523,"version":null}
+lsp_trace {"id":2,"method":"textDocument/completion","phase":"write_finished","unix_us":1793747292772559,"version":null}
+lsp_trace {"id":0,"method":"workspace/configuration","phase":"received","unix_us":1793747292773423,"version":null}
+lsp_trace {"id":0,"method":null,"phase":"write_started","unix_us":1793747292773470,"version":null}
+lsp_trace {"id":0,"method":null,"phase":"write_finished","unix_us":1793747292773505,"version":null}
+lsp_trace {"id":1,"method":"workspace/configuration","phase":"received","unix_us":1793747292774151,"version":null}
+lsp_trace {"id":1,"method":null,"phase":"write_started","unix_us":1793747292774198,"version":null}
+lsp_trace {"id":1,"method":null,"phase":"write_finished","unix_us":1793747292774233,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747293431673,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747293431724,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747293431749,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747293431773,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747293431801,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747293431821,"version":null}
+lsp_trace {"id":2,"method":null,"phase":"received","unix_us":1793747293431951,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747293432066,"version":null}
+lsp_trace {"id":null,"method":"textDocument/publishDiagnostics","phase":"received","unix_us":1793747293432089,"version":null}
+lsp_trace {"id":2,"method":"textDocument/completion","phase":"request_delivered","unix_us":1793747293432144,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didChange","phase":"queued","unix_us":1793747293432205,"version":2}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"queued","unix_us":1793747293432255,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didChange","phase":"write_started","unix_us":1793747293432257,"version":2}
+lsp_trace {"id":null,"method":"textDocument/didChange","phase":"write_finished","unix_us":1793747293432321,"version":2}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"write_started","unix_us":1793747293432340,"version":null}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"write_finished","unix_us":1793747293432360,"version":null}
+lsp_trace {"id":3,"method":null,"phase":"received","unix_us":1793747293695084,"version":null}
+lsp_trace {"id":null,"method":"textDocument/publishDiagnostics","phase":"received","unix_us":1793747293695173,"version":null}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"request_delivered","unix_us":1793747293695171,"version":null}
+Python completion: change queued 0.047 ms, request/response 263.029 ms, 2 items including join
+lsp_trace {"id":4,"method":"shutdown","phase":"queued","unix_us":1793747293695364,"version":null}
+lsp_trace {"id":4,"method":"shutdown","phase":"write_started","unix_us":1793747293695428,"version":null}
+lsp_trace {"id":4,"method":"shutdown","phase":"write_finished","unix_us":1793747293695481,"version":null}
+lsp_trace {"id":4,"method":null,"phase":"received","unix_us":1793747293696173,"version":null}
+lsp_trace {"id":4,"method":"shutdown","phase":"request_delivered","unix_us":1793747293696259,"version":null}
+lsp_trace {"id":null,"method":"exit","phase":"queued","unix_us":1793747293696305,"version":null}
+lsp_trace {"id":null,"method":"exit","phase":"write_started","unix_us":1793747293696353,"version":null}
+lsp_trace {"id":null,"method":"exit","phase":"write_finished","unix_us":1793747293696412,"version":null}
+Warming the C# language server...
+lsp_trace {"id":1,"method":"initialize","phase":"queued","unix_us":1793747295026307,"version":null}
+lsp_trace {"id":1,"method":"initialize","phase":"write_started","unix_us":1793747295026413,"version":null}
+lsp_trace {"id":1,"method":"initialize","phase":"write_finished","unix_us":1793747295026480,"version":null}
+lsp_trace {"id":2,"method":"textDocument/diagnostic","phase":"queued","unix_us":1793747295526963,"version":null}
+lsp_trace {"id":2,"method":"textDocument/diagnostic","phase":"write_started","unix_us":1793747295527027,"version":null}
+lsp_trace {"id":2,"method":"textDocument/diagnostic","phase":"write_finished","unix_us":1793747295527074,"version":null}
+lsp_trace {"id":1,"method":null,"phase":"received","unix_us":1793747295557169,"version":null}
+lsp_trace {"id":1,"method":"initialize","phase":"request_delivered","unix_us":1793747295557354,"version":null}
+lsp_trace {"id":null,"method":"initialized","phase":"queued","unix_us":1793747295557436,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didOpen","phase":"queued","unix_us":1793747295557481,"version":1}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"queued","unix_us":1793747295557527,"version":null}
+lsp_trace {"id":null,"method":"initialized","phase":"write_started","unix_us":1793747295557569,"version":null}
+lsp_trace {"id":null,"method":"initialized","phase":"write_finished","unix_us":1793747295557630,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didOpen","phase":"write_started","unix_us":1793747295557671,"version":1}
+lsp_trace {"id":null,"method":"textDocument/didOpen","phase":"write_finished","unix_us":1793747295557713,"version":1}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"write_started","unix_us":1793747295557753,"version":null}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"write_finished","unix_us":1793747295557802,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747295643083,"version":null}
+lsp_trace {"id":2,"method":null,"phase":"received","unix_us":1793747295647258,"version":null}
+lsp_trace {"id":2,"method":"textDocument/diagnostic","phase":"request_delivered","unix_us":1793747295647315,"version":null}
+lsp_trace {"id":4,"method":"textDocument/diagnostic","phase":"queued","unix_us":1793747295647402,"version":null}
+lsp_trace {"id":4,"method":"textDocument/diagnostic","phase":"write_started","unix_us":1793747295647445,"version":null}
+lsp_trace {"id":4,"method":"textDocument/diagnostic","phase":"write_finished","unix_us":1793747295647491,"version":null}
+lsp_trace {"id":2,"method":"workspace/configuration","phase":"received","unix_us":1793747295667325,"version":null}
+lsp_trace {"id":2,"method":null,"phase":"write_started","unix_us":1793747295667418,"version":null}
+lsp_trace {"id":2,"method":null,"phase":"write_finished","unix_us":1793747295667462,"version":null}
+lsp_trace {"id":3,"method":"window/workDoneProgress/create","phase":"received","unix_us":1793747295682492,"version":null}
+lsp_trace {"id":3,"method":null,"phase":"write_started","unix_us":1793747295682546,"version":null}
+lsp_trace {"id":3,"method":null,"phase":"write_finished","unix_us":1793747295682586,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747295684887,"version":null}
+lsp_trace {"id":null,"method":"$/progress","phase":"received","unix_us":1793747295692927,"version":null}
+lsp_trace {"id":null,"method":"$/progress","phase":"received","unix_us":1793747295695079,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747295705177,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747295705990,"version":null}
+lsp_trace {"id":4,"method":"workspace/configuration","phase":"received","unix_us":1793747295706043,"version":null}
+lsp_trace {"id":4,"method":null,"phase":"write_started","unix_us":1793747295706086,"version":null}
+lsp_trace {"id":4,"method":null,"phase":"write_finished","unix_us":1793747295706125,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747295713094,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747295719327,"version":null}
+lsp_trace {"id":5,"method":"client/registerCapability","phase":"received","unix_us":1793747295721178,"version":null}
+lsp_trace {"id":5,"method":null,"phase":"write_started","unix_us":1793747295721233,"version":null}
+lsp_trace {"id":5,"method":null,"phase":"write_finished","unix_us":1793747295721277,"version":null}
+lsp_trace {"id":3,"method":null,"phase":"received","unix_us":1793747296109831,"version":null}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"request_delivered","unix_us":1793747296109927,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didChange","phase":"queued","unix_us":1793747296109971,"version":2}
+lsp_trace {"id":5,"method":"textDocument/completion","phase":"queued","unix_us":1793747296109997,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didChange","phase":"write_started","unix_us":1793747296110103,"version":2}
+lsp_trace {"id":null,"method":"textDocument/didChange","phase":"write_finished","unix_us":1793747296110158,"version":2}
+lsp_trace {"id":5,"method":"textDocument/completion","phase":"write_started","unix_us":1793747296110195,"version":null}
+lsp_trace {"id":5,"method":"textDocument/completion","phase":"write_finished","unix_us":1793747296110233,"version":null}
+lsp_trace {"id":5,"method":null,"phase":"received","unix_us":1793747296141003,"version":null}
+lsp_trace {"id":5,"method":"textDocument/completion","phase":"request_delivered","unix_us":1793747296141065,"version":null}
+lsp_trace {"id":6,"method":"shutdown","phase":"queued","unix_us":1793747296141124,"version":null}
+lsp_trace {"id":6,"method":"shutdown","phase":"write_started","unix_us":1793747296141150,"version":null}
+lsp_trace {"id":6,"method":"shutdown","phase":"write_finished","unix_us":1793747296141171,"version":null}
+lsp_trace {"id":null,"method":"exit","phase":"queued","unix_us":1793747296642873,"version":null}
+lsp_trace {"id":null,"method":"exit","phase":"write_started","unix_us":1793747296643043,"version":null}
+lsp_trace {"id":null,"method":"exit","phase":"write_finished","unix_us":1793747296643105,"version":null}
+CodingPad M1 and M2 performance (linux, release build)
+
+metric                             measured   target     status
+app usable                         969.9 ms   < 1000 ms  pass
+idle physical footprint            451.2 MiB  < 300 MiB  FAIL
+first Python kernel start          42.1 ms    < 3000 ms  pass
+warm Python rerun                  1.2 ms     < 200 ms   pass
+100k-row dump, first page to host  1.0 ms     < 1000 ms  pass
+Python completion                  263.1 ms   < 300 ms   pass
+first C# kernel start              1065.4 ms  < 3000 ms  pass
+warm C# rerun after edit           17.0 ms    < 500 ms   pass
+100k-item C# sequence, first page  10.4 ms    < 1000 ms  pass
+C# completion                      31.1 ms    < 300 ms   pass
+
+Some M1 or M2 targets did not pass or could not be measured.
+
+Benchmark repetition 3/3 (sequential, warm OS caches)
+lsp_trace {"id":4,"method":"textDocument/diagnostic","phase":"request_delivered","unix_us":1793747297170018,"version":null}
+Memory pid=2662373: RSS=165.2 MiB physical=61.1 MiB private=44.0 MiB
+Memory pid=2662390: RSS=2.3 MiB physical=0.1 MiB private=0.1 MiB
+Memory pid=2662391: RSS=1.5 MiB physical=0.3 MiB private=0.2 MiB
+Memory pid=2662392: RSS=16.9 MiB physical=7.8 MiB private=7.5 MiB
+Memory pid=2662606: RSS=50.8 MiB physical=15.4 MiB private=8.6 MiB
+Memory pid=2662625: RSS=259.7 MiB physical=163.8 MiB private=146.3 MiB
+Memory pid=2662719: RSS=30.5 MiB physical=28.1 MiB private=28.1 MiB
+Memory pid=2662728: RSS=14.6 MiB physical=12.1 MiB private=12.1 MiB
+Memory pid=2662731: RSS=168.3 MiB physical=164.0 MiB private=163.8 MiB
+Startup phases (launch unix_ns=1793747297145635282):
+{"detail":null,"phase":"process_entry","unix_ns":1793747297176790980}
+{"detail":null,"phase":"setup_started","unix_ns":1793747297363778631}
+{"detail":null,"phase":"setup_finished","unix_ns":1793747297363844543}
+{"detail":null,"phase":"webview_load_started","unix_ns":1793747297434168417}
+{"detail":null,"phase":"webview_load_finished","unix_ns":1793747297468747939}
+{"detail":{"createStarted":178,"editorMounted":494,"evaluated":137,"interactive":661,"timeOrigin":1793747297430},"phase":"editor_interactive","unix_ns":1793747298092997281}
+
+Idle summed RSS (informational): 709.8 MiB
+Warming the Python language server (the first run may download basedpyright)...
+lsp_trace {"id":1,"method":"initialize","phase":"queued","unix_us":1793747303260547,"version":null}
+lsp_trace {"id":1,"method":"initialize","phase":"write_started","unix_us":1793747303260590,"version":null}
+lsp_trace {"id":1,"method":"initialize","phase":"write_finished","unix_us":1793747303260662,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747303457016,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747303457092,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747303460634,"version":null}
+lsp_trace {"id":1,"method":null,"phase":"received","unix_us":1793747303460731,"version":null}
+lsp_trace {"id":1,"method":"initialize","phase":"request_delivered","unix_us":1793747303460781,"version":null}
+lsp_trace {"id":null,"method":"initialized","phase":"queued","unix_us":1793747303460848,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didOpen","phase":"queued","unix_us":1793747303460871,"version":1}
+lsp_trace {"id":null,"method":"initialized","phase":"write_started","unix_us":1793747303460877,"version":null}
+lsp_trace {"id":2,"method":"textDocument/completion","phase":"queued","unix_us":1793747303460894,"version":null}
+lsp_trace {"id":null,"method":"initialized","phase":"write_finished","unix_us":1793747303460919,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didOpen","phase":"write_started","unix_us":1793747303460955,"version":1}
+lsp_trace {"id":null,"method":"textDocument/didOpen","phase":"write_finished","unix_us":1793747303460979,"version":1}
+lsp_trace {"id":2,"method":"textDocument/completion","phase":"write_started","unix_us":1793747303461001,"version":null}
+lsp_trace {"id":2,"method":"textDocument/completion","phase":"write_finished","unix_us":1793747303461025,"version":null}
+lsp_trace {"id":0,"method":"workspace/configuration","phase":"received","unix_us":1793747303462134,"version":null}
+lsp_trace {"id":0,"method":null,"phase":"write_started","unix_us":1793747303462169,"version":null}
+lsp_trace {"id":0,"method":null,"phase":"write_finished","unix_us":1793747303462189,"version":null}
+lsp_trace {"id":1,"method":"workspace/configuration","phase":"received","unix_us":1793747303462852,"version":null}
+lsp_trace {"id":1,"method":null,"phase":"write_started","unix_us":1793747303462884,"version":null}
+lsp_trace {"id":1,"method":null,"phase":"write_finished","unix_us":1793747303462906,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747304175791,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747304175831,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747304175853,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747304175876,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747304175894,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747304175912,"version":null}
+lsp_trace {"id":2,"method":null,"phase":"received","unix_us":1793747304176040,"version":null}
+lsp_trace {"id":2,"method":"textDocument/completion","phase":"request_delivered","unix_us":1793747304176117,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747304176124,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didChange","phase":"queued","unix_us":1793747304176152,"version":2}
+lsp_trace {"id":null,"method":"textDocument/publishDiagnostics","phase":"received","unix_us":1793747304176166,"version":null}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"queued","unix_us":1793747304176190,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didChange","phase":"write_started","unix_us":1793747304176199,"version":2}
+lsp_trace {"id":null,"method":"textDocument/didChange","phase":"write_finished","unix_us":1793747304176279,"version":2}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"write_started","unix_us":1793747304176319,"version":null}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"write_finished","unix_us":1793747304176359,"version":null}
+lsp_trace {"id":3,"method":null,"phase":"received","unix_us":1793747304453383,"version":null}
+lsp_trace {"id":null,"method":"textDocument/publishDiagnostics","phase":"received","unix_us":1793747304453477,"version":null}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"request_delivered","unix_us":1793747304453474,"version":null}
+Python completion: change queued 0.034 ms, request/response 277.365 ms, 2 items including join
+lsp_trace {"id":4,"method":"shutdown","phase":"queued","unix_us":1793747304453597,"version":null}
+lsp_trace {"id":4,"method":"shutdown","phase":"write_started","unix_us":1793747304453632,"version":null}
+lsp_trace {"id":4,"method":"shutdown","phase":"write_finished","unix_us":1793747304453674,"version":null}
+lsp_trace {"id":4,"method":null,"phase":"received","unix_us":1793747304454396,"version":null}
+lsp_trace {"id":4,"method":"shutdown","phase":"request_delivered","unix_us":1793747304454460,"version":null}
+lsp_trace {"id":null,"method":"exit","phase":"queued","unix_us":1793747304454486,"version":null}
+lsp_trace {"id":null,"method":"exit","phase":"write_started","unix_us":1793747304454639,"version":null}
+lsp_trace {"id":null,"method":"exit","phase":"write_finished","unix_us":1793747304454697,"version":null}
+Warming the C# language server...
+lsp_trace {"id":1,"method":"initialize","phase":"queued","unix_us":1793747305818266,"version":null}
+lsp_trace {"id":1,"method":"initialize","phase":"write_started","unix_us":1793747305818301,"version":null}
+lsp_trace {"id":1,"method":"initialize","phase":"write_finished","unix_us":1793747305818356,"version":null}
+lsp_trace {"id":2,"method":"textDocument/diagnostic","phase":"queued","unix_us":1793747306318874,"version":null}
+lsp_trace {"id":2,"method":"textDocument/diagnostic","phase":"write_started","unix_us":1793747306318937,"version":null}
+lsp_trace {"id":2,"method":"textDocument/diagnostic","phase":"write_finished","unix_us":1793747306318983,"version":null}
+lsp_trace {"id":1,"method":null,"phase":"received","unix_us":1793747306383849,"version":null}
+lsp_trace {"id":1,"method":"initialize","phase":"request_delivered","unix_us":1793747306384055,"version":null}
+lsp_trace {"id":null,"method":"initialized","phase":"queued","unix_us":1793747306384131,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didOpen","phase":"queued","unix_us":1793747306384164,"version":1}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"queued","unix_us":1793747306384196,"version":null}
+lsp_trace {"id":null,"method":"initialized","phase":"write_started","unix_us":1793747306384295,"version":null}
+lsp_trace {"id":null,"method":"initialized","phase":"write_finished","unix_us":1793747306384350,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didOpen","phase":"write_started","unix_us":1793747306384387,"version":1}
+lsp_trace {"id":null,"method":"textDocument/didOpen","phase":"write_finished","unix_us":1793747306384424,"version":1}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"write_started","unix_us":1793747306384460,"version":null}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"write_finished","unix_us":1793747306384497,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747306476690,"version":null}
+lsp_trace {"id":2,"method":null,"phase":"received","unix_us":1793747306481150,"version":null}
+lsp_trace {"id":2,"method":"textDocument/diagnostic","phase":"request_delivered","unix_us":1793747306481214,"version":null}
+lsp_trace {"id":4,"method":"textDocument/diagnostic","phase":"queued","unix_us":1793747306481297,"version":null}
+lsp_trace {"id":4,"method":"textDocument/diagnostic","phase":"write_started","unix_us":1793747306481335,"version":null}
+lsp_trace {"id":4,"method":"textDocument/diagnostic","phase":"write_finished","unix_us":1793747306481375,"version":null}
+lsp_trace {"id":2,"method":"workspace/configuration","phase":"received","unix_us":1793747306501679,"version":null}
+lsp_trace {"id":2,"method":null,"phase":"write_started","unix_us":1793747306501810,"version":null}
+lsp_trace {"id":2,"method":null,"phase":"write_finished","unix_us":1793747306501857,"version":null}
+lsp_trace {"id":3,"method":"window/workDoneProgress/create","phase":"received","unix_us":1793747306518265,"version":null}
+lsp_trace {"id":3,"method":null,"phase":"write_started","unix_us":1793747306518315,"version":null}
+lsp_trace {"id":3,"method":null,"phase":"write_finished","unix_us":1793747306518348,"version":null}
+lsp_trace {"id":null,"method":"$/progress","phase":"received","unix_us":1793747306531498,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747306532094,"version":null}
+lsp_trace {"id":null,"method":"$/progress","phase":"received","unix_us":1793747306533713,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747306548255,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747306549038,"version":null}
+lsp_trace {"id":4,"method":"workspace/configuration","phase":"received","unix_us":1793747306549089,"version":null}
+lsp_trace {"id":4,"method":null,"phase":"write_started","unix_us":1793747306549126,"version":null}
+lsp_trace {"id":4,"method":null,"phase":"write_finished","unix_us":1793747306549158,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747306558343,"version":null}
+lsp_trace {"id":null,"method":"window/logMessage","phase":"received","unix_us":1793747306562961,"version":null}
+lsp_trace {"id":5,"method":"client/registerCapability","phase":"received","unix_us":1793747306565125,"version":null}
+lsp_trace {"id":5,"method":null,"phase":"write_started","unix_us":1793747306565170,"version":null}
+lsp_trace {"id":5,"method":null,"phase":"write_finished","unix_us":1793747306565204,"version":null}
+lsp_trace {"id":3,"method":null,"phase":"received","unix_us":1793747307010591,"version":null}
+lsp_trace {"id":3,"method":"textDocument/completion","phase":"request_delivered","unix_us":1793747307010644,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didChange","phase":"queued","unix_us":1793747307010685,"version":2}
+lsp_trace {"id":5,"method":"textDocument/completion","phase":"queued","unix_us":1793747307010710,"version":null}
+lsp_trace {"id":null,"method":"textDocument/didChange","phase":"write_started","unix_us":1793747307010712,"version":2}
+lsp_trace {"id":null,"method":"textDocument/didChange","phase":"write_finished","unix_us":1793747307010750,"version":2}
+lsp_trace {"id":5,"method":"textDocument/completion","phase":"write_started","unix_us":1793747307010770,"version":null}
+lsp_trace {"id":5,"method":"textDocument/completion","phase":"write_finished","unix_us":1793747307010787,"version":null}
+lsp_trace {"id":5,"method":null,"phase":"received","unix_us":1793747307048412,"version":null}
+lsp_trace {"id":5,"method":"textDocument/completion","phase":"request_delivered","unix_us":1793747307048471,"version":null}
+lsp_trace {"id":6,"method":"shutdown","phase":"queued","unix_us":1793747307048561,"version":null}
+lsp_trace {"id":6,"method":"shutdown","phase":"write_started","unix_us":1793747307048622,"version":null}
+lsp_trace {"id":6,"method":"shutdown","phase":"write_finished","unix_us":1793747307048644,"version":null}
+lsp_trace {"id":null,"method":"exit","phase":"queued","unix_us":1793747307549324,"version":null}
+lsp_trace {"id":null,"method":"exit","phase":"write_started","unix_us":1793747307549504,"version":null}
+lsp_trace {"id":null,"method":"exit","phase":"write_finished","unix_us":1793747307549566,"version":null}
+CodingPad M1 and M2 performance (linux, release build)
+
+metric                             measured   target     status
+app usable                         947.5 ms   < 1000 ms  pass
+idle physical footprint            452.8 MiB  < 300 MiB  FAIL
+first Python kernel start          52.9 ms    < 3000 ms  pass
+warm Python rerun                  0.7 ms     < 200 ms   pass
+100k-row dump, first page to host  1.1 ms     < 1000 ms  pass
+Python completion                  277.4 ms   < 300 ms   pass
+first C# kernel start              1082.4 ms  < 3000 ms  pass
+warm C# rerun after edit           16.2 ms    < 500 ms   pass
+100k-item C# sequence, first page  12.4 ms    < 1000 ms  pass
+C# completion                      37.8 ms    < 300 ms   pass
+
+Some M1 or M2 targets did not pass or could not be measured.

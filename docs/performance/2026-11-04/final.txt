@@ -1,0 +1,117 @@
+
+Benchmark repetition 1/3 (sequential, warm OS caches)
+Desktop binary: /tmp/codingpad-milestones/target/release/codingpad-desktop
+Memory pid=2686992 (codingpad-deskt): RSS=165.3 MiB physical=61.2 MiB private=44.1 MiB
+Memory pid=2687009 (bwrap): RSS=2.3 MiB physical=0.1 MiB private=0.1 MiB
+Memory pid=2687010 (bwrap): RSS=1.5 MiB physical=0.3 MiB private=0.2 MiB
+Memory pid=2687011 (glycin-svg): RSS=16.8 MiB physical=7.7 MiB private=7.5 MiB
+Memory pid=2687227 (WebKitNetworkPr): RSS=50.8 MiB physical=15.4 MiB private=8.6 MiB
+Memory pid=2687250 (WebKitWebProces): RSS=259.9 MiB physical=163.7 MiB private=146.3 MiB
+Memory pid=2687329 (uv): RSS=30.8 MiB physical=28.3 MiB private=28.3 MiB
+Memory pid=2687338 (python): RSS=14.6 MiB physical=12.1 MiB private=12.1 MiB
+Memory pid=2687341 (MainThread): RSS=165.5 MiB physical=161.2 MiB private=161.0 MiB
+Startup phases (launch unix_ns=1793747745731586755):
+{"detail":null,"phase":"process_entry","unix_ns":1793747745763441567}
+{"detail":null,"phase":"setup_started","unix_ns":1793747745943435962}
+{"detail":null,"phase":"setup_finished","unix_ns":1793747745943496368}
+{"detail":null,"phase":"webview_load_started","unix_ns":1793747746019768328}
+{"detail":null,"phase":"webview_load_finished","unix_ns":1793747746050841791}
+{"detail":{"createStarted":174.00000000000003,"editorMounted":490,"evaluated":133,"interactive":654,"timeOrigin":1793747746016},"phase":"editor_interactive","unix_ns":1793747746671601595}
+
+Idle summed RSS (informational): 707.5 MiB
+Warming the Python language server (the first run may download basedpyright)...
+Python completion: change queued 0.012 ms, request/response 255.351 ms, 2 items including join
+Warming the C# language server...
+CodingPad M1 and M2 performance (linux, release build)
+
+metric                             measured   target     status
+app usable                         940.1 ms   < 1000 ms  pass
+idle physical footprint            450.2 MiB  < 300 MiB  FAIL
+first Python kernel start          44.2 ms    < 3000 ms  pass
+warm Python rerun                  0.8 ms     < 200 ms   pass
+100k-row dump, first page to host  1.4 ms     < 1000 ms  pass
+Python completion                  255.4 ms   < 300 ms   pass
+first C# kernel start              1066.5 ms  < 3000 ms  pass
+warm C# rerun after edit           17.8 ms    < 500 ms   pass
+100k-item C# sequence, first page  11.0 ms    < 1000 ms  pass
+C# completion                      25.5 ms    < 300 ms   pass
+
+Some M1 or M2 targets did not pass or could not be measured.
+
+Benchmark repetition 2/3 (sequential, warm OS caches)
+Desktop binary: /tmp/codingpad-milestones/target/release/codingpad-desktop
+Memory pid=2687691 (codingpad-deskt): RSS=165.1 MiB physical=61.2 MiB private=44.0 MiB
+Memory pid=2687708 (bwrap): RSS=2.3 MiB physical=0.1 MiB private=0.1 MiB
+Memory pid=2687709 (bwrap): RSS=1.5 MiB physical=0.3 MiB private=0.2 MiB
+Memory pid=2687710 (glycin-svg): RSS=16.9 MiB physical=7.7 MiB private=7.5 MiB
+Memory pid=2687924 (WebKitNetworkPr): RSS=50.8 MiB physical=15.4 MiB private=8.6 MiB
+Memory pid=2687944 (WebKitWebProces): RSS=259.6 MiB physical=163.6 MiB private=146.2 MiB
+Memory pid=2688069 (uv): RSS=31.0 MiB physical=28.4 MiB private=28.4 MiB
+Memory pid=2688078 (python): RSS=14.6 MiB physical=12.1 MiB private=12.1 MiB
+Memory pid=2688081 (MainThread): RSS=165.0 MiB physical=160.8 MiB private=160.5 MiB
+Startup phases (launch unix_ns=1793747756351968545):
+{"detail":null,"phase":"process_entry","unix_ns":1793747756370690424}
+{"detail":null,"phase":"setup_started","unix_ns":1793747756551908659}
+{"detail":null,"phase":"setup_finished","unix_ns":1793747756551968395}
+{"detail":null,"phase":"webview_load_started","unix_ns":1793747756625375681}
+{"detail":null,"phase":"webview_load_finished","unix_ns":1793747756669116404}
+{"detail":{"createStarted":195,"editorMounted":517,"evaluated":152,"interactive":689,"timeOrigin":1793747756622},"phase":"editor_interactive","unix_ns":1793747757312893934}
+
+Idle summed RSS (informational): 706.9 MiB
+Warming the Python language server (the first run may download basedpyright)...
+Python completion: change queued 0.012 ms, request/response 257.495 ms, 2 items including join
+Warming the C# language server...
+CodingPad M1 and M2 performance (linux, release build)
+
+metric                             measured   target     status
+app usable                         961.0 ms   < 1000 ms  pass
+idle physical footprint            449.8 MiB  < 300 MiB  FAIL
+first Python kernel start          46.1 ms    < 3000 ms  pass
+warm Python rerun                  0.7 ms     < 200 ms   pass
+100k-row dump, first page to host  1.1 ms     < 1000 ms  pass
+Python completion                  257.5 ms   < 300 ms   pass
+first C# kernel start              1081.0 ms  < 3000 ms  pass
+warm C# rerun after edit           17.2 ms    < 500 ms   pass
+100k-item C# sequence, first page  10.6 ms    < 1000 ms  pass
+C# completion                      26.0 ms    < 300 ms   pass
+
+Some M1 or M2 targets did not pass or could not be measured.
+
+Benchmark repetition 3/3 (sequential, warm OS caches)
+Desktop binary: /tmp/codingpad-milestones/target/release/codingpad-desktop
+Memory pid=2688399 (codingpad-deskt): RSS=165.0 MiB physical=61.0 MiB private=43.9 MiB
+Memory pid=2688416 (bwrap): RSS=2.3 MiB physical=0.1 MiB private=0.1 MiB
+Memory pid=2688417 (bwrap): RSS=1.5 MiB physical=0.3 MiB private=0.2 MiB
+Memory pid=2688418 (glycin-svg): RSS=16.8 MiB physical=7.8 MiB private=7.5 MiB
+Memory pid=2688632 (WebKitNetworkPr): RSS=50.6 MiB physical=15.4 MiB private=8.6 MiB
+Memory pid=2688657 (WebKitWebProces): RSS=259.9 MiB physical=163.9 MiB private=146.5 MiB
+Memory pid=2688745 (uv): RSS=30.5 MiB physical=28.1 MiB private=28.1 MiB
+Memory pid=2688754 (python): RSS=14.7 MiB physical=12.1 MiB private=12.1 MiB
+Memory pid=2688757 (MainThread): RSS=168.6 MiB physical=164.3 MiB private=164.0 MiB
+Startup phases (launch unix_ns=1793747767005041554):
+{"detail":null,"phase":"process_entry","unix_ns":1793747767027602677}
+{"detail":null,"phase":"setup_started","unix_ns":1793747767218651269}
+{"detail":null,"phase":"setup_finished","unix_ns":1793747767218722497}
+{"detail":null,"phase":"webview_load_started","unix_ns":1793747767288966092}
+{"detail":null,"phase":"webview_load_finished","unix_ns":1793747767324909916}
+{"detail":{"createStarted":178,"editorMounted":503,"evaluated":136,"interactive":671,"timeOrigin":1793747767285},"phase":"editor_interactive","unix_ns":1793747767957431059}
+
+Idle summed RSS (informational): 709.9 MiB
+Warming the Python language server (the first run may download basedpyright)...
+Python completion: change queued 0.006 ms, request/response 262.333 ms, 2 items including join
+Warming the C# language server...
+CodingPad M1 and M2 performance (linux, release build)
+
+metric                             measured   target     status
+app usable                         952.5 ms   < 1000 ms  pass
+idle physical footprint            453.1 MiB  < 300 MiB  FAIL
+first Python kernel start          44.1 ms    < 3000 ms  pass
+warm Python rerun                  1.0 ms     < 200 ms   pass
+100k-row dump, first page to host  0.9 ms     < 1000 ms  pass
+Python completion                  262.3 ms   < 300 ms   pass
+first C# kernel start              1076.8 ms  < 3000 ms  pass
+warm C# rerun after edit           16.4 ms    < 500 ms   pass
+100k-item C# sequence, first page  10.6 ms    < 1000 ms  pass
+C# completion                      29.8 ms    < 300 ms   pass
+
+Some M1 or M2 targets did not pass or could not be measured.

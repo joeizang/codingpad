@@ -1,0 +1,6 @@
+Error serving connection: hyper::Error(User(Service), client error (Connect)
+
+Caused by:
+    0: tcp connect error
+    1: Connection refused (os error 111))
+Desktop smoke passed: ready marker, typing, local Monaco, print, nested dump, final expression, rerun, independent tab.

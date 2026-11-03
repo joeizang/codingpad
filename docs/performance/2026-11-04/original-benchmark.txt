@@ -1,0 +1,17 @@
+Warming the Python language server (the first run may download basedpyright)...
+Warming the C# language server...
+CodingPad M1 and M2 performance (linux, release build)
+
+metric                             measured   target     status
+app usable                         709.6 ms   < 1000 ms  pass
+idle memory                        498.0 MB   < 300 MB   FAIL
+first Python kernel start          42.5 ms    < 3000 ms  pass
+warm Python rerun                  0.7 ms     < 200 ms   pass
+100k-row dump, first page to host  0.8 ms     < 1000 ms  pass
+Python completion                  320.2 ms   < 300 ms   FAIL
+first C# kernel start              1079.0 ms  < 3000 ms  pass
+warm C# rerun after edit           18.0 ms    < 500 ms   pass
+100k-item C# sequence, first page  11.5 ms    < 1000 ms  pass
+C# completion                      33.9 ms    < 300 ms   pass
+
+Some M1 or M2 targets did not pass or could not be measured.

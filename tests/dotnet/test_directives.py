@@ -200,6 +200,7 @@ Console.WriteLine(Pick("linux-x64", "linux", System.Runtime.InteropServices.Arch
         self.assertEqual(locations[0], locations[1])
         self.assertIn("/1.1.0/", locations[2])
         self.assertIn("/1.2.0/", locations[3])
+        self.assertEqual([e["params"]["runId"] for e in events if e.get("method") == "stream" and e["params"]["text"] == "Restoring C# packages…\n"], [1, 3, 4])
         self.assertFalse(any(e.get("method") == "stream" and e["params"]["runId"] == 2 and e["params"]["stream"] == "stderr" for e in events), events)
 
     def test_restore_cache_recovers_when_package_files_are_removed(self):
@@ -215,6 +216,7 @@ Console.WriteLine(Pick("linux-x64", "linux", System.Runtime.InteropServices.Arch
         self.assert_ok(events, 3)
         self.assertEqual(self.stdout(events), "ok\nok\nok\n")
         self.assertTrue((package / "lib/net10.0/Root.dll").is_file())
+        self.assertEqual([e["params"]["runId"] for e in events if e.get("method") == "stream" and e["params"]["text"] == "Restoring C# packages…\n"], [1, 2])
         self.assertFalse(any(e.get("method") == "stream" and e["params"]["runId"] == 3 and e["params"]["stream"] == "stderr" for e in events), events)
 
     def test_compiler_properties_and_line_numbers(self):
@@ -314,6 +316,7 @@ Console.WriteLine(app.GetType().Name);
             ], path=folder / "script.cs", before_reply=cancel)
             self.assertEqual([e["result"]["ok"] for e in events if "result" in e], [True, False, True])
             self.assertEqual(self.stdout(events), "7\n")
+            self.assertEqual([e["params"]["runId"] for e in events if e.get("method") == "stream" and e["params"]["text"] == "Restoring C# packages…\n"], [2])
             self.assertLess(time.monotonic() - cancelled_at[0], 5, "Restore did not cancel promptly")
         finally:
             release.set()

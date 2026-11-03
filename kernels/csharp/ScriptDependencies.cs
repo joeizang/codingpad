@@ -112,6 +112,7 @@ internal sealed class ScriptDependencies : AssemblyLoadContext
                 cancel.ThrowIfCancellationRequested();
                 return cached;
             }
+            progress("Restoring C# packages…\n");
             var temporary = Path.Combine(Path.GetTempPath(), "codingpad-restore-" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(temporary);
             try

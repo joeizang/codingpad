@@ -332,8 +332,10 @@ NuGet configuration discovery. An absent/null path uses the host working directo
 Directives are parsed before restore/compile, using a shared model intended for
 M2.4's shadow project. Invalid directives send line-based `diagnostics` and an
 error node without executing source. NuGet restore uses the bundled client
-libraries, standard settings/credentials/caches, and cancellation. Restore
-installs/warnings use stderr `stream` events; failures are error nodes with
+libraries, standard settings/credentials/caches, and cancellation. Cache misses
+immediately emit “Restoring C# packages…” in a stderr `stream` event, before
+resolution or downloads. Installs/warnings also use stderr `stream` events;
+failures are error nodes with
 `ok: false` without duplicating restore errors in stderr. Successful restores
 are memoised for the kernel lifetime by packages, Web SDK choice, directory,
 configuration contents, environment credentials, and runtime. Hits validate that

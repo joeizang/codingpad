@@ -265,8 +265,10 @@ not supported yet. Restore failures appear in Results and prevent execution;
 Stop cancels restore too. Successful restores are reused silently while package
 directives, Web SDK choice, configuration contents/environment credentials and
 resolved files remain unchanged. Floating versions and ranges stay pinned in a
-warm kernel until those inputs change or Reset is used. Only actual installs
-and restore warnings produce progress output; restore errors appear once.
+warm kernel until those inputs change or Reset is used. A restore-cache miss
+immediately shows “Restoring C# packages…” while resolution or downloads are
+pending; cache hits stay silent. Actual installs and restore warnings also
+produce progress output; restore errors appear once.
 Package assembly identities are reused for unchanged resolved graphs, so `Cache`
 can retain package values. Reset clears these loaded assemblies along with the
 process. Unknown distro runtime identifiers fall back to the matching portable

@@ -23,7 +23,9 @@ class DirectiveTests(unittest.TestCase):
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory(prefix="codingpad-directives-")
         cls.addClassCleanup(cls.temp.cleanup)
-        cls.work = Path(cls.temp.name)
+        # macOS temp folders sit behind a symlink (/var -> /private/var). `dotnet pack`
+        # drops ProjectReference dependencies when given a path through one.
+        cls.work = Path(cls.temp.name).resolve()
         cls.feed = cls.work / "feed"
         cls.feed.mkdir()
         cls.kernel = cls.work / "kernel"

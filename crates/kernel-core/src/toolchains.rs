@@ -389,6 +389,75 @@ async fn install_private_uv(
     Ok(path)
 }
 
+/// Keep learner-facing progress friendly: the script's diagnostic lines include
+/// URLs, staging paths and CI advice that do not belong in Results.
+fn friendly_dotnet_progress(line: &str) -> Option<&'static str> {
+    let line = line.trim().to_ascii_lowercase();
+    if line.contains("attempting to download")
+        || line.contains("downloading")
+        || line.contains("payload url")
+        || line.contains("downloaded file size")
+    {
+        Some("Downloading the .NET SDK…")
+    } else if line.contains("extracting archive") || line.contains("extraction") {
+        Some("Unpacking the .NET SDK…")
+    } else if line.contains("installed version")
+        || line.contains("installation finished")
+        || line.contains("checking installation")
+    {
+        Some("Finishing the .NET SDK installation…")
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
+struct ProcessGroup(Option<u32>);
+
+#[cfg(unix)]
+impl ProcessGroup {
+    fn new(pid: Option<u32>) -> Self {
+        Self(pid)
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            // Negative pid targets the group made by process_group(0). This
+            // also stops the script's curl/wget child after a timeout or drop.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+    }
+}
+
+async fn promote_dotnet(stage: PathBuf, destination: &Path) -> Result<(), String> {
+    let mut last = None;
+    for attempt in 0..5 {
+        match std::fs::rename(&stage, destination) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last = Some(error);
+                if attempt < 4 {
+                    // Windows antivirus can briefly hold the new executables.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+    }
+    Err(format!(
+        "Could not finish the .NET installation: {}",
+        last.unwrap()
+    ))
+}
+
 async fn install_private_dotnet(
     data_dir: &Path,
     mut progress: impl FnMut(&str) + Send,
@@ -436,8 +505,7 @@ async fn install_private_dotnet(
         .ok_or("The .NET SDK was installed but could not be started. Retry installation.")?;
     // Promote only a verified, complete SDK so an interrupted copy is never
     // mistaken for an installed one on the next attempt.
-    std::fs::rename(stage.keep(), &destination)
-        .map_err(|e| format!("Could not finish the .NET installation: {e}"))?;
+    promote_dotnet(stage.keep(), &destination).await?;
     progress(&format!(".NET SDK {version} installed. Starting script…"));
     Ok(executable)
 }
@@ -489,6 +557,8 @@ async fn run_dotnet_install_script(
         .kill_on_drop(true);
     #[cfg(windows)]
     command.creation_flags(0x08000000);
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = command.spawn().map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             if cfg!(windows) {
@@ -501,6 +571,8 @@ async fn run_dotnet_install_script(
             format!("Could not start the .NET install script: {error}")
         }
     })?;
+    #[cfg(unix)]
+    let mut process_group = ProcessGroup::new(child.id());
     let stdout = child
         .stdout
         .take()
@@ -522,14 +594,16 @@ async fn run_dotnet_install_script(
             .map_err(|e| format!("Could not read the .NET installer output: {e}"))?
         {
             let line = line.trim();
-            if !line.is_empty() {
-                progress(line);
+            if let Some(message) = friendly_dotnet_progress(line) {
+                progress(message);
             }
         }
         let status = child
             .wait()
             .await
             .map_err(|e| format!("Could not wait for the .NET installer: {e}"))?;
+        #[cfg(unix)]
+        process_group.disarm();
         let errors = errors.await.unwrap_or_default();
         Ok::<_, String>((status, errors))
     };
@@ -619,7 +693,7 @@ mod tests {
         let script = directory.path().join("install.sh");
         std::fs::write(
             &script,
-            "#!/usr/bin/env bash\necho 'dotnet-install: step one'\n",
+            "#!/usr/bin/env bash\necho 'dotnet-install: Attempting to download using aka.ms link'\necho 'dotnet-install: noise that learners should not see'\necho 'dotnet-install: Extracting archive from /tmp/sdk.tar.gz'\n",
         )
         .unwrap();
         let mut progress = Vec::new();
@@ -628,7 +702,10 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(progress, ["dotnet-install: step one"]);
+        assert_eq!(
+            progress,
+            ["Downloading the .NET SDK…", "Unpacking the .NET SDK…"]
+        );
 
         std::fs::write(
             &script,

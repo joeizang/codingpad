@@ -826,6 +826,34 @@ test("missing uv offers one-click installation and reruns the latest source", as
   expect(screen.queryByRole("button", { name: "Install uv and run" })).not.toBeInTheDocument();
 });
 
+test("missing .NET offers one-click SDK installation and reruns the latest source", async () => {
+  let installed = false;
+  let finish!: () => void;
+  invoke.mockImplementation(async (command, args) => {
+    if (command === "run_script") {
+      if (!installed) throw ".NET was not found. Install the .NET SDK and run again.";
+      return { ok: true };
+    }
+    if (command === "install_dotnet") {
+      args.onProgress.onmessage("Downloading and verifying the .NET install script…");
+      await new Promise<void>((resolve) => { finish = resolve; });
+      installed = true;
+    }
+  });
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "New C# scratch script" }));
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Install .NET and run" }));
+  expect(screen.getByRole("button", { name: "Installing .NET…" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "▶ Run" })).toBeDisabled();
+  fireEvent.change(screen.getByLabelText("Code"), { target: { value: "42.Dump();" } });
+  await act(async () => finish());
+  await screen.findByText("Finished");
+  expect(screen.getByLabelText("Code")).toHaveAttribute("data-toolchain-version", "1");
+  expect(invoke).toHaveBeenLastCalledWith("run_script", expect.objectContaining({ source: "42.Dump();" }));
+  expect(screen.queryByRole("button", { name: "Install .NET and run" })).not.toBeInTheDocument();
+});
+
 test("failed uv installation can be retried without rerunning prematurely", async () => {
   invoke.mockImplementation(async (command) => {
     if (command === "run_script") throw "uv was not found. Install a private copy.";
@@ -848,6 +876,7 @@ test("ordinary script errors never offer a uv installation", async () => {
   fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
   await screen.findByRole("alert");
   expect(screen.queryByRole("button", { name: "Install uv and run" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Install .NET and run" })).not.toBeInTheDocument();
 });
 
 

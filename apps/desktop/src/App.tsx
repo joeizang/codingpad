@@ -232,6 +232,7 @@ export default function App() {
         scriptId: script.id,
         source: script.source,
         language: scriptLanguage(script),
+        path: script.path ?? null,
         onEvent,
       });
       update(script.id, (item) => ({

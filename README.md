@@ -128,7 +128,7 @@ folders and dialog choices); there is no filesystem sandbox between the UI and
 your user account. Python (`.py`) and C# (`.cs`) files can run; other file
 types remain editable and saveable.
 
-## C# scripts (M2.2)
+## C# scripts (M2.3)
 
 Click **+ C#** or open a `.cs` file. Install .NET 10 or later first; CodingPad
 finds `dotnet` on `PATH`, in `DOTNET_ROOT`, or in standard install locations and
@@ -137,7 +137,7 @@ The first successful C# startup caches runtime discovery and extracts the bundle
 assets once for the app session; tabs and kernel restarts reuse them. Restart the
 app after installing a newer runtime to select it.
 The application bundles its compiler and helper library. Building CodingPad
-requires the SDK and restores the locked Roslyn NuGet dependency; running the
+requires the SDK and restores the locked compiler and NuGet client dependencies; running the
 installed app does not restore or build a project per script.
 
 ```csharp
@@ -245,8 +245,46 @@ Set `<CodingPadImplicitUsings>false</CodingPadImplicitUsings>` in a project, or
 explicitly. The updated package must be published or supplied through a local
 NuGet feed; the existing registry reservation is not this implementation. Run
 `dotnet pack runtimes/dotnet/CodingPad -o /path/to/feed` to build it locally.
-Package directives inside the app, Roslyn completions and SDK installation follow
-in later M2 issues. Only managed `Console` output is
+C# file directives are supported inside the app:
+
+```csharp
+#:package Newtonsoft.Json@13.0.3
+#:property Nullable=enable
+#:property DefineConstants=MY_FEATURE
+Newtonsoft.Json.JsonConvert.SerializeObject(new { Answer = 42 }).Dump();
+```
+
+Use `#:package Name@Version` with an explicit NuGet version, range or floating
+version. The kernel restores transitive dependencies using the bundled NuGet
+client, with the standard global packages/HTTP caches. Restore uses user-wide
+`NuGet.config` and configurations in the saved script's folder and its ancestors,
+including source mapping, disabled feeds, fallback folders and configured
+username/password or token credentials (tokens go in the password field).
+Unsaved tabs use the app's working directory. Credential-provider plugins are
+not supported yet. Restore failures appear in Results and prevent execution;
+Stop cancels restore too. Package assembly identities are reused for unchanged
+resolved graphs, so `Cache` can retain package values. Reset clears these loaded
+assemblies along with the process. A declared `CodingPad` package uses the app's
+built-in helper rather than downloading another copy.
+
+Common `#:property Name=Value` compiler options are `AllowUnsafeBlocks`,
+`CheckForOverflowUnderflow`, `Optimize`, `Nullable`, `DefineConstants` (semicolon
+or comma separated), `LangVersion`, `ImplicitUsings`, `TreatWarningsAsErrors`,
+`WarningLevel`, `NoWarn`, `WarningsAsErrors`, and `WarningsNotAsErrors`.
+`CodingPadImplicitUsings` controls the helper imports. `TargetFramework` must
+match the selected runtime (`net10.0` for .NET 10). `PublishAot` and `PackAsTool`
+are accepted deployment switches with no effect on in-memory execution.
+Other properties receive an explicit unsupported-property error; arbitrary
+MSBuild targets, package build targets, analyzers and source generators are not
+executed by this kernel. Put directives before code; duplicates are errors.
+
+`#:sdk Microsoft.NET.Sdk.Web` adds ASP.NET Core references and Web SDK implicit
+usings, allowing `WebApplication.CreateBuilder()`, routes and `RunAsync(Cancel)`.
+Install the ASP.NET Core runtime matching the selected .NET major version (the
+.NET SDK includes it). A long-running web app stays active until Stop. Project
+references report: "not supported in CodingPad yet; runs with `dotnet run`".
+Roslyn completions and one-click SDK installation follow in later M2 issues.
+Only managed `Console` output is
 captured; direct native writes are outside this increment. Scripts run with your
 user privileges.
 

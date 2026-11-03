@@ -160,6 +160,19 @@ impl Supervisor {
         language: Language,
         mut emit: impl FnMut(KernelEvent) + Send,
     ) -> Result<RunResult, String> {
+        self.run_language_at(script_id, source, language, None, &mut emit)
+            .await
+    }
+
+    /// Run a saved script with file-relative NuGet configuration discovery.
+    pub async fn run_language_at(
+        &self,
+        script_id: &str,
+        source: &str,
+        language: Language,
+        path: Option<&str>,
+        mut emit: impl FnMut(KernelEvent) + Send,
+    ) -> Result<RunResult, String> {
         if script_id.is_empty() {
             return Err("A script id is required".into());
         }
@@ -206,7 +219,7 @@ impl Supervisor {
             *guard = Some(startup?);
         }
         let result = tokio::select! {
-            result = guard.as_mut().unwrap().run(source, &mut emit, &mut stop) => result,
+            result = guard.as_mut().unwrap().run(source, path, &mut emit, &mut stop) => result,
             _ = closed.changed() => Err("Script was closed".into()),
         };
         if result.as_ref().is_ok_and(|result| result.cache_cleared) {
@@ -468,13 +481,14 @@ impl Kernel {
     async fn run(
         &mut self,
         source: &str,
+        path: Option<&str>,
         emit: &mut (impl FnMut(KernelEvent) + Send),
         stop: &mut watch::Receiver<u64>,
     ) -> Result<RunResult, String> {
         self.next_id += 1;
         let id = self.next_id;
         let mut request = serde_json::to_vec(
-            &json!({"jsonrpc": "2.0", "id": id, "method": "run", "params": {"source": source}}),
+            &json!({"jsonrpc": "2.0", "id": id, "method": "run", "params": {"source": source, "path": path}}),
         )
         .map_err(|e| e.to_string())?;
         request.push(b'\n');

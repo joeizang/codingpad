@@ -221,6 +221,12 @@ internal static class Program
         // may occupy the pool while waiting for its cancellation token.
         var worker = Task.Factory.StartNew(ProcessRequests, CancellationToken.None,
             TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        // A failed dispatcher cannot leave stdin blocked and an undrained queue.
+        _ = worker.ContinueWith(failed =>
+        {
+            _ = failed.Exception;
+            Environment.Exit(1);
+        }, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         try
         {
             while (Input.ReadLine() is { } line)
@@ -235,7 +241,7 @@ internal static class Program
                     if (root.GetProperty("jsonrpc").GetString() == "2.0")
                     {
                         var method = root.GetProperty("method").GetString();
-                        if (method == "cancel")
+                        if (method == "cancel" && !root.TryGetProperty("id", out _))
                         {
                             var runId = root.GetProperty("params").GetProperty("runId").GetInt64();
                             if (Cancellations.TryGetValue(runId, out var active)) active.Request();
@@ -260,7 +266,14 @@ internal static class Program
                 Requests.Add(new(document, parseError, cancel));
             }
         }
-        finally { Requests.CompleteAdding(); }
+        finally
+        {
+            foreach (var cancellation in Cancellations.Values) cancellation.Request();
+            Requests.CompleteAdding();
+        }
+        // EOF means the host is gone. Cooperative scripts finish first; an
+        // uncooperative script must not keep its orphaned kernel alive forever.
+        if (!worker.Wait(TimeSpan.FromSeconds(2))) Environment.Exit(1);
         worker.GetAwaiter().GetResult();
     }
 
@@ -272,23 +285,66 @@ internal static class Program
 
         internal void Request()
         {
-            if (Interlocked.Exchange(ref requested, 1) == 0)
-            {
-                // Callbacks run away from stdin and the pool, and may block or
-                // throw without holding up completion of the protocol response.
-                new Thread(() =>
-                {
-                    try { source.Cancel(); }
-                    catch (Exception) { /* User cancellation callbacks may throw. */ }
-                }) { IsBackground = true, Name = "CodingPad cancellation" }.Start();
-            }
+            if (Interlocked.Exchange(ref requested, 1) == 0) CancellationDispatcher.Enqueue(this);
             // Wait only for the cancellation flag, which is set before callbacks.
             // This makes the token cancelled before run_finished is observable.
             SpinWait.SpinUntil(() => source.IsCancellationRequested);
         }
 
+        internal void CancelCallbacks()
+        {
+            try { source.Cancel(); }
+            catch (Exception) { /* User cancellation callbacks may throw. */ }
+        }
+
         // Do not dispose the source: scripts may retain the token or WaitHandle
         // after completion. Once they release it, GC reclaims its managed handle.
+    }
+
+    // Workers are reused across runs. If a user callback blocks, another worker
+    // can still signal later runs; excess workers retire once they become idle.
+    private static class CancellationDispatcher
+    {
+        private static readonly object Gate = new();
+        private static readonly Queue<RunCancellation> Queue = new();
+        private static int workers, busy;
+        internal static void Enqueue(RunCancellation cancellation)
+        {
+            lock (Gate)
+            {
+                Queue.Enqueue(cancellation);
+                if (Queue.Count > workers - busy)
+                {
+                    workers++;
+                    var thread = new Thread(Work) { IsBackground = true, Name = "CodingPad cancellation" };
+                    // Persistent workers must not retain a run's AsyncLocals.
+                    if (ExecutionContext.IsFlowSuppressed()) thread.Start();
+                    else { using var flow = ExecutionContext.SuppressFlow(); thread.Start(); }
+                }
+                Monitor.PulseAll(Gate);
+            }
+        }
+        private static void Work()
+        {
+            while (true)
+            {
+                RunCancellation? item;
+                lock (Gate)
+                {
+                    while (Queue.Count == 0)
+                        if (!Monitor.Wait(Gate, TimeSpan.FromSeconds(30)) && Queue.Count == 0 && workers > 1)
+                        { workers--; return; }
+                    item = Queue.Dequeue();
+                    busy++;
+                }
+                try { item.CancelCallbacks(); }
+                finally
+                {
+                    item = null;
+                    lock (Gate) busy--;
+                }
+            }
+        }
     }
 
     private static void ProcessRequests()

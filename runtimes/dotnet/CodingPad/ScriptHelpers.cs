@@ -6,12 +6,17 @@ namespace CodingPad;
 /// <summary>Helpers shared by hosted scripts and ordinary .NET programs.</summary>
 public static class ScriptHelpers
 {
-    private sealed record Entry(object? Value);
+    private sealed class Entry(object? value, long generation)
+    {
+        internal readonly object? Value = value;
+        internal long Generation = generation;
+    }
     private static readonly object Gate = new();
     private static readonly Dictionary<string, Entry> Values = new();
+    private static readonly Dictionary<string, Entry> ScriptRoots = new();
     private static readonly AsyncLocal<RunScope?> Current = new();
+    private static long generation;
     private static bool hosted;
-    private static readonly MethodInfo AsyncCache = typeof(ScriptHelpers).GetMethod(nameof(CacheTask), BindingFlags.Static | BindingFlags.NonPublic)!;
 
     public static CancellationToken Cancel => Current.Value?.Token ?? CancellationToken.None;
 
@@ -25,59 +30,98 @@ public static class ScriptHelpers
         ArgumentNullException.ThrowIfNull(key);
         ArgumentNullException.ThrowIfNull(factory);
         var scope = Current.Value;
-        // An overload with Func<Task<T>> makes existing null/throw-only factories
-        // ambiguous. Dispatch Task<T> factories here, preserving the public API.
-        if (typeof(T).IsGenericType && typeof(T).GetGenericTypeDefinition() == typeof(Task<>))
-            return (T)AsyncCache.MakeGenericMethod(typeof(T).GetGenericArguments()[0]).Invoke(null, [key, factory, scope])!;
+        if (AsyncFactory<T>.Invoke is { } invoke) return invoke(key, factory, scope);
         if (TryCached<T>(key, scope, out var cached)) return cached;
-        return Store(key, scope, factory()); // Failed factories are never stored.
+        return Store(key, scope, factory());
     }
 
-    private static async Task<T> CacheTask<T>(string key, Func<Task<T>> factory, RunScope? scope)
+    // One strongly typed adapter per factory return type. No per-call reflection
+    // or process-wide Type dictionary retaining collectible generic arguments.
+    private static class AsyncFactory<T>
     {
-        if (TryCached<T>(key, scope, out var cached)) return cached;
-        var value = await factory().ConfigureAwait(false);
-        return Store(key, scope, value);
+        internal static readonly Func<string, Func<T>, RunScope?, T>? Invoke = Create();
+        private static Func<string, Func<T>, RunScope?, T>? Create()
+        {
+            if (!typeof(T).IsGenericType) return null;
+            var definition = typeof(T).GetGenericTypeDefinition();
+            var method = definition == typeof(Task<>) ? nameof(CacheTask) :
+                definition == typeof(ValueTask<>) ? nameof(CacheValueTask) : null;
+            return method is null ? null : typeof(ScriptHelpers).GetMethod(method, BindingFlags.Static | BindingFlags.NonPublic)!
+                .MakeGenericMethod(typeof(T).GetGenericArguments()[0])
+                .CreateDelegate<Func<string, Func<T>, RunScope?, T>>();
+        }
     }
+
+    // Validation and factory invocation happen synchronously, even if the caller
+    // ignores the returned awaitable. Only awaiting and storing are asynchronous.
+    private static Task<T> CacheTask<T>(string key, Func<Task<T>> factory, RunScope? scope) =>
+        TryCached<T>(key, scope, out var cached) ? Task.FromResult(cached) : CompleteTask(key, scope, factory());
+
+    private static async Task<T> CompleteTask<T>(string key, RunScope? scope, Task<T> task) =>
+        Store(key, scope, await task.ConfigureAwait(false));
+
+    private static ValueTask<T> CacheValueTask<T>(string key, Func<ValueTask<T>> factory, RunScope? scope) =>
+        TryCached<T>(key, scope, out var cached) ? new(cached) : CompleteValueTask(key, scope, factory());
+
+    private static async ValueTask<T> CompleteValueTask<T>(string key, RunScope? scope, ValueTask<T> task) =>
+        Store(key, scope, await task.ConfigureAwait(false));
 
     private static bool TryCached<T>(string key, RunScope? scope, out T value)
     {
-        lock (Gate)
+        while (true)
         {
-            EnsureActive(scope);
-            if (Values.TryGetValue(key, out var entry))
+            Entry entry;
+            lock (Gate)
             {
+                EnsureActive(scope);
+                if (!Values.TryGetValue(key, out entry!)) { value = default!; return false; }
+                if (scope is null || entry.Generation == scope.Generation)
+                { value = Cached<T>(key, entry); return true; }
+            }
+            // Inspect just this key, once per run, outside the cache lock. A
+            // racing lookup/store may supersede the snapshot while it is checked.
+            var reason = scope.Inspect(entry.Value);
+            lock (Gate)
+            {
+                EnsureActive(scope);
+                if (!Values.TryGetValue(key, out var current) || !ReferenceEquals(current, entry) ||
+                    entry.Generation == scope.Generation) continue;
+                if (reason is not null)
+                {
+                    Values.Remove(key);
+                    ScriptRoots.Remove(key);
+                    scope.Refreshed[key] = reason.Value;
+                    value = default!;
+                    return false;
+                }
+                entry.Generation = scope.Generation;
                 value = Cached<T>(key, entry);
                 return true;
             }
         }
-        value = default!;
-        return false;
     }
 
     private static T Store<T>(string key, RunScope? scope, T value)
     {
         RefreshReason? reason = null;
+        var scriptRoot = value is not null && IsScriptType(value.GetType());
         lock (Gate)
         {
             EnsureActive(scope);
             if (Values.TryGetValue(key, out var winner)) return Cached<T>(key, winner);
-            Values[key] = new(value);
-            // A failed factory leaves its note pending. Only the first successful
-            // store consumes it; a concurrent winner emits the note exactly once.
+            var entry = Values[key] = new(value, scope?.Generation ?? 0);
+            if (scriptRoot) ScriptRoots[key] = entry;
             if (scope is not null && scope.Refreshed.Remove(key, out var refreshed)) reason = refreshed;
         }
         if (reason is not null) scope?.Note(RefreshMessage(reason.Value));
         return value;
     }
 
-    internal enum RefreshReason { ScriptTypes, OpaqueStorage, Budget, InspectionFailure }
-
+    internal enum RefreshReason { ScriptTypes, OpaqueStorage, InspectionFailure }
     private static string RefreshMessage(RefreshReason reason) => reason switch
     {
         RefreshReason.ScriptTypes => "cache refreshed: script types changed\n",
         RefreshReason.OpaqueStorage => "cache refreshed: value contains opaque handles or callbacks\n",
-        RefreshReason.Budget => "cache refreshed: inspection budget exceeded\n",
         _ => "cache refreshed: value could not be inspected safely\n"
     };
 
@@ -94,26 +138,24 @@ public static class ScriptHelpers
             throw new InvalidOperationException("Cache is only available during an active script run.");
     }
 
+    private static bool IsScriptType(Type type) =>
+        type.Assembly.IsCollectible ||
+        (type.HasElementType && IsScriptType(type.GetElementType()!)) ||
+        (type.IsGenericType && type.GetGenericArguments().Any(IsScriptType));
+
     private static bool IsScalar(Type type) =>
         type != typeof(IntPtr) && type != typeof(UIntPtr) &&
         (type.IsPrimitive || type.IsEnum || type == typeof(string) || type == typeof(decimal) ||
          type == typeof(DateTime) || type == typeof(DateTimeOffset) || type == typeof(TimeSpan) || type == typeof(Guid));
 
-    // Metadata is shared across entries for this inspection only. A process-wide
-    // Type dictionary would keep collectible script assemblies alive forever.
+    // Per-run metadata is released with the scope, including collectible types.
     private sealed class CacheInspection(CancellationToken cancel)
     {
         private readonly Dictionary<Type, bool> scriptTypes = new();
         private readonly Dictionary<Type, bool> safeTypes = new();
         private readonly Dictionary<Type, FieldInfo[]> fields = new();
-
-        private bool ScriptType(Type type)
-        {
-            if (scriptTypes.TryGetValue(type, out var result)) return result;
-            return scriptTypes[type] = AssemblyLoadContext.GetLoadContext(type.Assembly)?.IsCollectible == true ||
-                (type.HasElementType && ScriptType(type.GetElementType()!)) ||
-                (type.IsGenericType && type.GetGenericArguments().Any(ScriptType));
-        }
+        private bool ScriptType(Type type) => scriptTypes.TryGetValue(type, out var result) ? result :
+            scriptTypes[type] = IsScriptType(type);
 
         private FieldInfo[] Fields(Type type)
         {
@@ -129,57 +171,88 @@ public static class ScriptHelpers
             typeof(Delegate).IsAssignableFrom(type) || typeof(MemberInfo).IsAssignableFrom(type) ||
             typeof(Assembly).IsAssignableFrom(type) || typeof(AssemblyLoadContext).IsAssignableFrom(type);
 
-        // Prove safety from storage types when possible. Sealed reference types
-        // cannot conceal a script subclass; object/interface fields need a walk.
-        // Mark recursive shapes uncertain while computing their verdict.
-        private bool AlwaysSafe(Type type)
+        private bool AlwaysSafe(Type root)
         {
-            cancel.ThrowIfCancellationRequested();
-            if (safeTypes.TryGetValue(type, out var result)) return result;
-            safeTypes[type] = false;
-            if (ScriptType(type) || Opaque(type)) return false;
-            if (IsScalar(type)) return safeTypes[type] = true;
-            if (type.IsArray) return safeTypes[type] = AlwaysSafe(type.GetElementType()!);
-            if (!type.IsValueType && !type.IsSealed) return false;
-            return safeTypes[type] = Fields(type).All(field => AlwaysSafe(field.FieldType));
+            if (safeTypes.TryGetValue(root, out var result)) return result;
+            // Greatest fixpoint: cycles with no unsafe storage are safe. Propagate
+            // every unsafe leaf back through all parents before publishing any
+            // verdict, so an optimistic recursive dependency cannot escape early.
+            var graph = new Dictionary<Type, Type[]>();
+            var bad = new HashSet<Type>();
+            var pending = new Stack<Type>();
+            pending.Push(root);
+            while (pending.TryPop(out var type))
+            {
+                cancel.ThrowIfCancellationRequested();
+                if (graph.ContainsKey(type)) continue;
+                graph[type] = [];
+                if (safeTypes.TryGetValue(type, out var known))
+                { if (!known) bad.Add(type); continue; }
+                if (graph.Count > 1024 || ScriptType(type) || Opaque(type)) { bad.Add(type); continue; }
+                if (IsScalar(type)) continue;
+                if (!type.IsArray && !type.IsValueType && !type.IsSealed) { bad.Add(type); continue; }
+                var children = type.IsArray ? new[] { type.GetElementType()! } : Fields(type).Select(field => field.FieldType).ToArray();
+                graph[type] = children;
+                foreach (var child in children) pending.Push(child);
+            }
+            var parents = new Dictionary<Type, List<Type>>();
+            foreach (var (type, children) in graph)
+                foreach (var child in children)
+                {
+                    if (!parents.TryGetValue(child, out var list)) parents[child] = list = [];
+                    list.Add(type);
+                }
+            var unsafeTypes = new Queue<Type>(bad);
+            while (unsafeTypes.TryDequeue(out var type))
+                if (parents.TryGetValue(type, out var list))
+                    foreach (var parent in list)
+                        if (bad.Add(parent)) unsafeTypes.Enqueue(parent);
+            foreach (var type in graph.Keys) safeTypes[type] = !bad.Contains(type);
+            return safeTypes[root];
         }
 
-        // Inspect storage, not properties or IEnumerable: those can execute user code.
+        private sealed record ArrayFrame(System.Collections.IEnumerator Items, bool CopiesValues);
+
         internal RefreshReason? ReasonToRefresh(object? root)
         {
             var pending = new Stack<object>();
             var seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
-            if (root is not null) pending.Push(root);
-            var budget = 100_000;
+            RefreshReason? Visit(object? value, bool copiedValue = false)
+            {
+                cancel.ThrowIfCancellationRequested();
+                if (value is null) return null;
+                var type = value.GetType();
+                if (ScriptType(type)) return RefreshReason.ScriptTypes;
+                if (value is Type reflected) return ScriptType(reflected) ? RefreshReason.ScriptTypes : null;
+                if (Opaque(type)) return RefreshReason.OpaqueStorage;
+                if (!AlwaysSafe(type) && (copiedValue || seen.Add(value))) pending.Push(value);
+                return null;
+            }
             try
             {
+                if (Visit(root) is { } initial) return initial;
                 while (pending.TryPop(out var value))
                 {
-                    cancel.ThrowIfCancellationRequested();
-                    if (--budget < 0) return RefreshReason.Budget;
-                    if (!seen.Add(value)) continue;
-                    var type = value.GetType();
-                    if (ScriptType(type)) return RefreshReason.ScriptTypes;
-                    if (value is Type reflected)
+                    if (value is ArrayFrame frame)
                     {
-                        if (ScriptType(reflected)) return RefreshReason.ScriptTypes;
-                        continue;
+                        if (frame.Items.MoveNext())
+                        {
+                            pending.Push(frame);
+                            if (Visit(frame.Items.Current, frame.CopiesValues) is { } reason) return reason;
+                        }
                     }
-                    // Native and reflection handles can hide managed/code targets.
-                    if (Opaque(type)) return RefreshReason.OpaqueStorage;
-                    if (AlwaysSafe(type)) continue;
-                    if (value is Array array)
+                    else if (value is Array array)
                     {
-                        if (array.Length > budget) return RefreshReason.Budget;
-                        foreach (var item in array)
-                            if (item is not null) pending.Push(item);
-                        continue;
+                        // Walk storage incrementally, without retaining temporary
+                        // boxes for every struct in a large array. No user iterator.
+                        pending.Push(new ArrayFrame(array.GetEnumerator(), value.GetType().GetElementType()!.IsValueType));
                     }
-                    foreach (var field in Fields(type))
+                    else foreach (var field in Fields(value.GetType()))
                     {
+                        cancel.ThrowIfCancellationRequested();
                         if (AlwaysSafe(field.FieldType)) continue;
                         if (field.FieldType.IsPointer || field.FieldType.IsFunctionPointer) return RefreshReason.OpaqueStorage;
-                        if (field.GetValue(value) is { } child) pending.Push(child);
+                        if (Visit(field.GetValue(value), field.FieldType.IsValueType) is { } reason) return reason;
                     }
                 }
                 return null;
@@ -190,48 +263,46 @@ public static class ScriptHelpers
     }
 
     internal static void InitializeHost() => hosted = true;
-
-    /// <summary>Host integration: install a fresh run context without clearing safe cached values.</summary>
     internal static RunScope BeginRun(CancellationToken token, Action<string> note)
     {
-        var scope = new RunScope(token, note);
-        var inspection = new CacheInspection(token);
-        KeyValuePair<string, Entry>[] snapshot;
-        lock (Gate) snapshot = Values.ToArray();
-        var stale = new List<(string Key, Entry Entry, RefreshReason Reason)>();
-        // Reflection runs outside the cache lock. Metadata is reused across this
-        // snapshot, and only unchanged entries are removed when applying results.
-        foreach (var (key, entry) in snapshot)
-            if (inspection.ReasonToRefresh(entry.Value) is { } reason) stale.Add((key, entry, reason));
-        token.ThrowIfCancellationRequested();
+        var scope = new RunScope(Interlocked.Increment(ref generation), token, note);
         lock (Gate)
         {
-            foreach (var (key, entry, reason) in stale)
+            // Only known script roots need an eager sweep. Mutable nested graphs
+            // are inspected lazily when requested; unused keys pay no graph walk.
+            foreach (var (key, entry) in ScriptRoots)
                 if (Values.TryGetValue(key, out var current) && ReferenceEquals(current, entry))
                 {
                     Values.Remove(key);
-                    scope.Refreshed.Add(key, reason);
+                    scope.Refreshed.Add(key, RefreshReason.ScriptTypes);
                 }
+            ScriptRoots.Clear();
         }
         Current.Value = scope;
         return scope;
     }
 
-    internal sealed class RunScope : IDisposable
+    internal sealed class RunScope(long generation, CancellationToken token, Action<string> note) : IDisposable
     {
-        internal RunScope(CancellationToken token, Action<string> note)
-        { Token = token; Note = note; }
-        internal CancellationToken Token { get; }
-        internal Action<string> Note { get; }
+        internal long Generation { get; } = generation;
+        internal CancellationToken Token { get; } = token;
+        internal Action<string> Note { get; } = note;
         internal readonly Dictionary<string, RefreshReason> Refreshed = new();
-        internal bool Active = true;
+        internal volatile bool Active = true;
+        private readonly object inspectionGate = new();
+        private CacheInspection? inspection;
+        internal RefreshReason? Inspect(object? value)
+        {
+            lock (inspectionGate)
+            {
+                try { return (inspection ??= new(Token)).ReasonToRefresh(value); }
+                finally { if (!Active) inspection = null; }
+            }
+        }
         public void Dispose()
         {
-            lock (Gate)
-            {
-                Active = false;
-                Refreshed.Clear(); // Unused notes live only for this run.
-            }
+            lock (Gate) { Active = false; Refreshed.Clear(); }
+            inspection = null;
             Current.Value = null;
         }
     }

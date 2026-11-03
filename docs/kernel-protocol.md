@@ -330,55 +330,60 @@ C# package directives follow in M2.3.
 
 C# uses a synchronous stdin reader on the main thread and a serial dispatcher on
 a dedicated worker thread, independent of the thread pool. Parsed JSON documents
-are transferred to the worker and disposed after dispatch, without parsing the
-source a second time. The reader registers a cancellation source as soon as a
-`run` request arrives, so `cancel` notifications can be handled during
-compilation or execution. Wrong and expired run IDs are ignored. Cancellation
-callbacks run on a separate dedicated thread so a blocking user callback cannot
-block protocol input or depend on a free pool thread. Scripts receive the token
-as `Cancel`; Roslyn parsing, diagnostics, semantic queries and emit receive the
-same token; entry checks also honor cancellation arriving before execution. No
-loop rewriting or thread abort is used. The supervisor retains its two-second
-forced-stop path for scripts that do not cooperate.
+are transferred to the worker and disposed after dispatch. The reader registers
+a cancellation source as each run arrives. Notifications without an `id` are
+handled immediately; wrong/expired run IDs are ignored. A `cancel` request with
+an `id` goes through normal dispatch and receives error `-32601`. Roslyn parsing,
+diagnostics, semantic queries and emit receive the same token as scripts' `Cancel`.
+The supervisor retains its two-second forced-stop fallback.
 
-At run completion, including compile/runtime failures, the helper scope closes
-and the run token is cancelled before `run_finished` and its response. One
-cancellation worker per run sets the flag before invoking user callbacks; the
-request worker waits only for that flag, never for callbacks. Completed token
-sources are not explicitly disposed because scripts may still retain their
-tokens or wait handles; GC reclaims those resources once references are released.
-Idle Stop and expired IDs cannot cancel a subsequent run's independent token.
+Cancellation uses reusable dedicated workers, outside stdin and the thread pool.
+A blocked callback can occupy one worker while another signals a later run;
+excess workers retire after 30 seconds idle. New workers suppress execution-context
+flow so they cannot retain the originating run's AsyncLocals. At completion,
+including failures, the helper scope closes and the token cancels before
+`run_finished` and its response. The request worker waits only for the cancellation
+flag, never for callback completion. Sources are not explicitly disposed while
+scripts may retain tokens or wait handles; GC reclaims released resources.
+On stdin EOF all queued/active tokens cancel, dispatch drains for up to two seconds,
+and an uncooperative dispatcher causes process exit. Dispatcher faults are observed
+and terminate the process even when stdin is still open.
 
-`Cache(key, factory)` lives in the shared CodingPad assembly, outside collectible
-script assemblies. Inspection starts only after compilation and emit succeed;
-compile failures leave cached entries untouched. A snapshot of entries is checked
-outside the cache lock, then entries still matching that snapshot are removed
-under the lock. Actual field graphs (including generic arguments, arrays and
-mutable containers) are checked without invoking properties or user iterators.
-Arrays with provably safe element storage, including structs composed of safe
-fields, bypass element traversal. Scalar checks, field lists and type verdicts
-are memoized for that inspection only, so metadata cannot retain old assemblies.
-Other graphs have a 100,000-step budget per entry.
+`Cache(key, factory)` lives in the shared CodingPad assembly. After compilation
+succeeds, a small index of known collectible root types is purged; failed compiles
+leave entries untouched. All other entries are inspected on first lookup in the
+new run, never merely because an unrelated script executes. A generation marker
+avoids repeated checks within that run. Inspection runs outside the cache lock;
+results are applied only if the entry still matches. Previously unused nested
+script values can keep their old assembly alive until lookup, Reset or close.
 
-Each evicted key records its reason in the new run scope: script-defined types,
-opaque handles/callbacks, exceeded budget, or inspection failure. A successful
-store emits the corresponding `cache refreshed: ...` note; only actual script
-types use `script types changed`. Failed/cancelled factories keep the note pending
-for another attempt in that run. Consuming a note is atomic with storing its
-value; concurrent winners emit it once. Scope disposal clears unused notes, so
-keys never requested again leave no process-wide refresh history.
+Storage is inspected without invoking properties or user iterators. Type proofs
+propagate unsafe leaves through all parents before publishing their verdicts;
+recursive sealed storage with no unsafe leaf is safe. This prevents an optimistic
+cycle verdict from hiding an unsafe mutually recursive dependency. Type proofs
+that grow beyond 1,024 nodes fall back to examining actual values. Per-run metadata
+is released with the scope. There is no object-count cutoff: arrays are walked
+incrementally, scalar/proven-safe values need no traversal, copies of struct
+storage do not fill the identity registry, and reference cycles are tracked.
+Every traversal honors cancellation. Collectible assemblies, including emitted
+collectible assemblies, are recognized as script types.
 
-Factories execute outside the cache lock, null is a hit, and the first successful
-store wins. A factory returning `Task<T>` is dispatched internally to await the
-factory and store only its successful `T` result. This preserves the original
-`Cache<T>(string, Func<T>)` signature and avoids the null/throw-only factory
-ambiguities of an additional async overload. Neither failed nor cancelled tasks
-are cached. Awaited script-defined values still undergo the usual inspection.
-Incompatible types requested under a key fail explicitly without evicting its
-value, including concurrent races. In hosted mode a missing or completed scope
-rejects cache calls, including idle previews and late async factory completion;
-standalone consumers may cache without a scope. Reset or forced Stop discards the
-process and all cached entries.
+Evicted keys record their reason in the active scope: script types, opaque
+handles/callbacks or inspection failure. A successful store consumes and emits
+its note exactly once. Failed factories leave it pending for a retry; scope
+disposal clears unused notes. Concurrent misses run factories outside the lock,
+with the first store winning; incompatible types never evict that winner.
+
+`Task<T>` and `ValueTask<T>` factories use a strongly typed adapter cached per
+factory return type. Reflection builds that delegate once, with no per-call
+argument array or invocation. Scope and type checks run synchronously before an
+awaitable is returned. Only a successful awaited payload is stored; a pooled
+ValueTask source is consumed once, and hits wrap its retained result afresh.
+Keeping the original `Cache<T>(string, Func<T>)` signature avoids ambiguous null
+or throw-only factories. Pending completions must still pass the originating
+scope's active check before storing. Hosted calls without an active scope fail,
+including idle previews and late callbacks; standalone consumers need no scope.
+Reset and forced Stop discard all cached values.
 
 The package's `build/CodingPad.targets` adds global namespace/static imports for
 direct consumers by default. Setting `CodingPadImplicitUsings=false` opts out,

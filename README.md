@@ -220,22 +220,22 @@ Reset discards that tab's process, cache and previews; other tabs are unaffected
 
 `Cache("key", () => ...)` retains successful values across runs, including null.
 Async factories work with the same call: `await Cache("data", () => LoadAsync())`
-caches the awaited result, rather than retaining the script's task/state machine.
-Failed or cancelled factories are not cached. Concurrent misses may compute more
-than once; the first successful stored result wins. An incompatible type requested
-for an existing key throws a clear error and preserves its value.
+caches the awaited result for both `Task<T>` and `ValueTask<T>`, consuming pooled
+sources only once. Failed or cancelled factories are not cached. Concurrent
+misses may compute more than once; the first successful stored result wins.
+Incompatible types and inactive-scope access throw immediately, including when
+the caller ignores the returned awaitable.
 
-After compilation succeeds, cached object graphs are checked without calling
-properties or enumerating user sequences. Inspection takes place outside the
-cache lock; only unchanged entries are removed when applying its results. Values
-containing script-defined types are discarded before execution. A successful
-recompute shows `cache refreshed: script types changed` for those values; opaque
-handles/callbacks, budget limits and inspection failures each have their own reason.
-A failed recompute keeps its note pending for a retry in that run. Unused notes
-expire at run completion. Arrays whose element storage types prove safe,
-including scalar tuples and dictionary entries, have no size limit for this
-check. Inspection metadata is reused within that boundary. Late cache calls and
-cache calls from idle previews fail.
+After compilation succeeds, known script-defined roots are discarded. Other
+cached graphs are checked lazily on their first lookup in a run, outside the
+cache lock, without calling properties or user iterators. Recursive safe storage
+can bypass traversal; large ordinary collections are not evicted just for their
+size. Stop can interrupt an inspection. Unused nested graphs can retain old
+script objects until their next lookup or Reset. A successful recompute reports
+`cache refreshed: script types changed` for script values; opaque handles or
+callbacks and inspection failures have their own reasons. A failed factory keeps
+its note pending for a retry in that run. Unused notes expire at completion.
+Late cache calls and cache calls from idle previews fail.
 `Secret("name")` throws an explanation that vault support is planned for M3.
 
 The runtime is packable as `CodingPad`; its direct-consumer `build` imports make

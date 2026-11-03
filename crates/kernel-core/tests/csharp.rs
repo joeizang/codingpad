@@ -1457,7 +1457,7 @@ try { Cache<int>("opaque", () => throw new Exception("retry")); } catch {}
 try { await Cache("script", () => Task.FromException<int>(new Exception("retry"))); } catch {}
 Console.WriteLine("factories failed; no refresh succeeded yet");
 Cache("opaque", () => 1); Cache("opaque", () => 2);
-Cache("budget", () => 2); Cache("script", () => 3);
+Cache<List<object>>("budget", () => throw new Exception("Large scalar graph must be reused")).Count.Dump(); Cache("script", () => 3);
 "#,
         true,
     )
@@ -1474,7 +1474,7 @@ Cache("budget", () => 2); Cache("script", () => 3);
             .iter()
             .filter(|text| **text == "cache refreshed: inspection budget exceeded\n")
             .count(),
-        1
+        0
     );
     assert_eq!(
         notes
@@ -1599,5 +1599,179 @@ Cache("late", () => -1).Dump();
 "#, true).await;
     assert_eq!(dumps(&next)[0]["v"], 1);
     assert_eq!(dumps(&next)[1]["v"], -1);
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_large_recursive_and_object_collections_are_reused() {
+    let supervisor = Supervisor::default();
+    run(
+        &supervisor,
+        "large-graphs",
+        r#"
+Cache("concurrent", () => new System.Collections.Concurrent.ConcurrentDictionary<string, int>(
+    Enumerable.Range(0, 150_000).Select(i => new KeyValuePair<string, int>(i.ToString(), i))));
+Cache("linked", () => new LinkedList<int>(Enumerable.Range(0, 150_000)));
+Cache("list", () => Enumerable.Range(0, 200_000).Cast<object>().ToList());
+Cache("dict", () => Enumerable.Range(0, 150_000).ToDictionary(i => i.ToString(), i => (object)i));
+Cache("array", () => Enumerable.Range(0, 200_000).Cast<object>().ToArray());
+"#,
+        true,
+    )
+    .await;
+    let next = run(&supervisor, "large-graphs", r#"
+Cache<System.Collections.Concurrent.ConcurrentDictionary<string, int>>("concurrent", () => throw new Exception("concurrent recomputed")).Count.Dump();
+Cache<LinkedList<int>>("linked", () => throw new Exception("linked recomputed")).Count.Dump();
+Cache<List<object>>("list", () => throw new Exception("list recomputed")).Count.Dump();
+Cache<Dictionary<string, object>>("dict", () => throw new Exception("dict recomputed"))["149999"].Dump();
+Cache<object[]>("array", () => throw new Exception("array recomputed"))[199999].Dump();
+"#, true).await;
+    let nodes = dumps(&next);
+    assert_eq!(nodes[0]["v"], 150_000);
+    assert_eq!(nodes[1]["v"], 150_000);
+    assert_eq!(nodes[2]["v"], 200_000);
+    assert_eq!(nodes[3]["v"], 149_999);
+    assert_eq!(nodes[4]["v"], 199_999);
+    assert!(!next.iter().any(|event| event.method == "stream"));
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_unused_cache_graphs_are_inspected_only_when_requested() {
+    let supervisor = Supervisor::default();
+    run(
+        &supervisor,
+        "lazy-cache",
+        "Cache(\"opaque\", () => (Func<int>)(() => 1));",
+        true,
+    )
+    .await;
+    run(&supervisor, "lazy-cache", "42.Dump();", true).await;
+    let used = run(
+        &supervisor,
+        "lazy-cache",
+        "Cache(\"opaque\", () => 42).Dump();",
+        true,
+    )
+    .await;
+    assert_eq!(dumps(&used)[0]["v"], 42);
+    assert!(
+        used.iter().any(|event| event.params["text"]
+            == "cache refreshed: value contains opaque handles or callbacks\n"),
+        "An unused graph must not have been inspected and evicted by the intervening run"
+    );
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_value_task_cache_consumes_single_use_sources_once() {
+    let supervisor = Supervisor::default();
+    let first = run(&supervisor, "value-task", r#"
+var source = new SingleUse();
+(await Cache("pooled", () => new ValueTask<int>(source, 0))).Dump();
+(await Cache("pooled", () => new ValueTask<int>(source, 0))).Dump();
+source.Reads.Dump();
+try { await Cache("failed", () => new ValueTask<int>(Task.FromException<int>(new Exception("failed")))); } catch {}
+(await Cache("failed", () => new ValueTask<int>(7))).Dump();
+try { await Cache("cancelled", () => new ValueTask<int>(Task.FromCanceled<int>(new CancellationToken(true)))); } catch (OperationCanceledException) {}
+(await Cache("cancelled", () => new ValueTask<int>(9))).Dump();
+class SingleUse : System.Threading.Tasks.Sources.IValueTaskSource<int> {
+    public int Reads;
+    public int GetResult(short token) {
+        if (++Reads != 1) throw new InvalidOperationException("Consumed a pooled source twice");
+        return 42;
+    }
+    public System.Threading.Tasks.Sources.ValueTaskSourceStatus GetStatus(short token) => System.Threading.Tasks.Sources.ValueTaskSourceStatus.Succeeded;
+    public void OnCompleted(Action<object?> continuation, object? state, short token, System.Threading.Tasks.Sources.ValueTaskSourceOnCompletedFlags flags) => throw new Exception("Already complete");
+}
+"#, true).await;
+    let nodes = dumps(&first);
+    assert_eq!(nodes[0]["v"], 42);
+    assert_eq!(nodes[1]["v"], 42);
+    assert_eq!(nodes[2]["v"], 1);
+    assert_eq!(nodes[3]["v"], 7);
+    assert_eq!(nodes[4]["v"], 9);
+    let next = run(&supervisor, "value-task", r#"
+(await Cache("pooled", () => new ValueTask<int>(Task.FromException<int>(new Exception("must reuse"))))).Dump();
+"#, true).await;
+    assert_eq!(dumps(&next)[0]["v"], 42);
+    assert!(!next.iter().any(|event| event.method == "stream"));
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_async_cache_validates_synchronously_before_returning_awaitables() {
+    let supervisor = Supervisor::default();
+    let events = run(&supervisor, "async-validation", r#"
+Cache("number", () => 42);
+bool taskError = false, valueTaskError = false;
+try { _ = Cache("number", () => Task.FromResult("wrong type")); } catch (InvalidOperationException) { taskError = true; }
+try { _ = Cache("number", () => new ValueTask<string>("wrong type")); } catch (InvalidOperationException) { valueTaskError = true; }
+taskError.Dump(); valueTaskError.Dump();
+IEnumerable<bool> Items() {
+    for (int i = 0; i < 100; i++) yield return true;
+    bool taskRejected = false, valueTaskRejected = false;
+    try { _ = Cache("idle-task", () => Task.FromResult(1)); } catch (InvalidOperationException) { taskRejected = true; }
+    try { _ = Cache("idle-value-task", () => new ValueTask<int>(1)); } catch (InvalidOperationException) { valueTaskRejected = true; }
+    yield return taskRejected; yield return valueTaskRejected;
+}
+Items().Dump();
+"#, true).await;
+    let nodes = dumps(&events);
+    assert_eq!(nodes[0]["v"], true);
+    assert_eq!(nodes[1]["v"], true);
+    let page = supervisor
+        .expand(
+            "async-validation",
+            nodes[2]["handle"].as_str().unwrap(),
+            Some("100"),
+            None,
+        )
+        .await
+        .unwrap()
+        .node;
+    assert_eq!(page["rows"][0][0]["v"], true);
+    assert_eq!(page["rows"][1][0]["v"], true);
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn csharp_blocked_completion_callback_does_not_block_later_stop() {
+    let supervisor = std::sync::Arc::new(Supervisor::default());
+    run(
+        &supervisor,
+        "control",
+        r#"
+var flags = Cache("flags", () => new int[2]);
+Cache("saved", () => 42);
+Cancel.Register(() => {
+    Volatile.Write(ref flags[1], 1);
+    while (Volatile.Read(ref flags[0]) == 0) Thread.Sleep(1);
+});
+"#,
+        true,
+    )
+    .await;
+    let task = csharp_start_until_ready(supervisor.clone(), r#"
+var flags = Cache("flags", () => new int[2]);
+if (!SpinWait.SpinUntil(() => Volatile.Read(ref flags[1]) == 1, 5000)) throw new Exception("Old callback did not start");
+Console.WriteLine("ready");
+try { Cancel.WaitHandle.WaitOne(); Cancel.ThrowIfCancellationRequested(); }
+finally { Volatile.Write(ref flags[0], 1); }
+"#).await;
+    supervisor.stop("control").await;
+    let result = timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.stopped && !result.ok && !result.cache_cleared);
+    let next = run(
+        &supervisor,
+        "control",
+        "Cache(\"saved\", () => -1).Dump();",
+        true,
+    )
+    .await;
+    assert_eq!(dumps(&next)[0]["v"], 42);
     supervisor.shutdown().await;
 }

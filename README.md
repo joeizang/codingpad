@@ -128,7 +128,7 @@ folders and dialog choices); there is no filesystem sandbox between the UI and
 your user account. Python (`.py`) and C# (`.cs`) files can run; other file
 types remain editable and saveable.
 
-## C# scripts (M2.1)
+## C# scripts (M2.2)
 
 Click **+ C#** or open a `.cs` file. Install .NET 10 or later first; CodingPad
 finds `dotnet` on `PATH`, in `DOTNET_ROOT`, or in standard install locations and
@@ -201,9 +201,52 @@ out a preview discards the kernel and its cache; Run then starts a fresh process
 Stop also cancels pending previews. Mutating a collection may invalidate an older
 dump's retained iterator; the next dump creates a new iterator.
 
-Cooperative cancellation and `Cache` are M2.2; NuGet directives, Roslyn completions,
-and SDK installation follow in later M2 issues. Stop currently uses the existing
-two-second forced restart fallback for C#. Only managed `Console` output is
+C# scripts have `Cancel`, `Cache` and `Secret` available without `using` lines:
+
+```csharp
+var rows = Cache("rows", () => Enumerable.Range(1, 1000).ToArray());
+rows.Dump();
+await Task.Delay(60_000, Cancel); // Stop cancels this delay without losing the cache
+```
+
+Stop cancels the current run's token first. Pass `Cancel` to async operations, or
+call `Cancel.ThrowIfCancellationRequested()` in long loops. If the script ignores
+cancellation, the supervisor kills its kernel after about two seconds and reports
+that the cache was cleared. Cooperative Stop keeps the process and cached values.
+The token is also cancelled when a run ends, including after failures, so
+cooperative background work can exit. Captured tokens and their wait handles stay
+usable after completion; cancellation callbacks run separately and are not awaited.
+Reset discards that tab's process, cache and previews; other tabs are unaffected.
+
+`Cache("key", () => ...)` retains successful values across runs, including null.
+Async factories work with the same call: `await Cache("data", () => LoadAsync())`
+caches the awaited result for both `Task<T>` and `ValueTask<T>`, consuming pooled
+sources only once. Failed or cancelled factories are not cached. Concurrent
+misses may compute more than once; the first successful stored result wins.
+Incompatible types and inactive-scope access throw immediately, including when
+the caller ignores the returned awaitable.
+
+After compilation succeeds, known script-defined roots are discarded. Other
+cached graphs are checked lazily on their first lookup in a run, outside the
+cache lock, without calling properties or user iterators. Recursive safe storage
+can bypass traversal; large ordinary collections are not evicted just for their
+size. Stop can interrupt an inspection. Unused nested graphs can retain old
+script objects until their next lookup or Reset. A successful recompute reports
+`cache refreshed: script types changed` for script values; opaque handles or
+callbacks and inspection failures have their own reasons. A failed factory keeps
+its note pending for a retry in that run. Unused notes expire at completion.
+Late cache calls and cache calls from idle previews fail.
+`Secret("name")` throws an explanation that vault support is planned for M3.
+
+The runtime is packable as `CodingPad`; its direct-consumer `build` imports make
+helper names available in .NET 10 file scripts with `#:package CodingPad@0.1.0`.
+Set `<CodingPadImplicitUsings>false</CodingPadImplicitUsings>` in a project, or
+`#:property CodingPadImplicitUsings=false` in a file script, to choose imports
+explicitly. The updated package must be published or supplied through a local
+NuGet feed; the existing registry reservation is not this implementation. Run
+`dotnet pack runtimes/dotnet/CodingPad -o /path/to/feed` to build it locally.
+Package directives inside the app, Roslyn completions and SDK installation follow
+in later M2 issues. Only managed `Console` output is
 captured; direct native writes are outside this increment. Scripts run with your
 user privileges.
 
@@ -215,7 +258,8 @@ user privileges.
 - `kernels/csharp`: C# stdio kernel and pinned Roslyn dependency
 - `runtimes/dotnet/CodingPad`: bundled C# `.Dump()` extension library
 - `runtimes/python/codingpad`: bundled `dump()` helper (no registry download)
-- `tests/python`: kernel protocol and execution tests
+- `tests/python`: Python kernel protocol and execution tests
+- `tests/dotnet`: C# cancellation protocol and standalone package checks
 - `docs`: design decisions and [kernel protocol](docs/kernel-protocol.md)
 - `packaging/placeholders`: registry name reservations, separate from the runtime
 

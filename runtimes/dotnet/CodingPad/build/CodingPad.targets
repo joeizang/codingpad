@@ -1,0 +1,11 @@
+<Project>
+  <ItemGroup Condition="'$(CodingPadImplicitUsings)' != 'false'">
+    <Using Include="System" />
+    <Using Include="System.Collections.Generic" />
+    <Using Include="System.Linq" />
+    <Using Include="System.Threading" />
+    <Using Include="System.Threading.Tasks" />
+    <Using Include="CodingPad" />
+    <Using Include="CodingPad.ScriptHelpers" Static="true" />
+  </ItemGroup>
+</Project>

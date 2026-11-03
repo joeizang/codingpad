@@ -2,6 +2,14 @@
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
+    <PackageId>CodingPad</PackageId>
+    <Version>0.1.0</Version>
+    <Description>CodingPad script helpers for hosted and standalone C# scripts.</Description>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- API organization only: this unsigned friend name does not authenticate callers. -->
+    <InternalsVisibleTo Include="CodingPad.Kernel" />
+    <None Include="build/CodingPad.targets" Pack="true" PackagePath="build/" />
+  </ItemGroup>
 </Project>

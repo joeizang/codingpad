@@ -9,6 +9,7 @@ fn main() {
         "runtimes/dotnet/CodingPad/CodingPad.csproj",
         "runtimes/dotnet/CodingPad/DumpExtensions.cs",
         "runtimes/dotnet/CodingPad/RichValues.cs",
+        "runtimes/dotnet/CodingPad/ScriptHelpers.cs",
     ] {
         println!("cargo:rerun-if-changed=../../{path}");
     }

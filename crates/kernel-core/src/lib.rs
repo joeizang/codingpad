@@ -159,13 +159,6 @@ impl Supervisor {
             .unwrap_or_else(|| self.uv.clone())
     }
 
-    async fn dotnet_path(&self) -> PathBuf {
-        match &self.dotnet {
-            Some(dotnet) => dotnet.clone(),
-            None => toolchains::resolve_dotnet(self.data_dir.as_deref()).await,
-        }
-    }
-
     pub async fn run(
         &self,
         script_id: &str,
@@ -234,8 +227,12 @@ impl Supervisor {
             let startup = tokio::select! {
                 result = async {
                     if language == Language::Csharp {
-                        let dotnet = self.dotnet_path().await;
-                        Kernel::start_csharp(&self.csharp, &dotnet).await
+                        Kernel::start_csharp(
+                            &self.csharp,
+                            self.data_dir.as_deref(),
+                            self.dotnet.as_deref(),
+                        )
+                        .await
                     }
                     else { Kernel::start(&uv, packages, &mut emit).await }
                 } => result,
@@ -386,9 +383,10 @@ struct Kernel {
 impl Kernel {
     async fn start_csharp(
         cache: &OnceCell<csharp::Installation>,
-        dotnet: &std::path::Path,
+        data_dir: Option<&std::path::Path>,
+        dotnet: Option<&std::path::Path>,
     ) -> Result<Self, String> {
-        let (mut command, files) = csharp::command(cache, dotnet).await?;
+        let (mut command, files) = csharp::command(cache, data_dir, dotnet).await?;
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

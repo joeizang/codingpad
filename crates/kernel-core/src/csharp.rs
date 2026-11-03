@@ -2,7 +2,7 @@
 use std::{path::PathBuf, sync::Arc};
 use tokio::{process::Command, sync::OnceCell};
 
-use crate::toolchains::newest_runtime_version;
+use crate::toolchains::{newest_runtime_version, resolve_dotnet};
 
 include!(concat!(env!("OUT_DIR"), "/csharp_assets.rs"));
 
@@ -18,10 +18,17 @@ pub(super) struct Installation {
 // Failed or cancelled preparation remains retryable, including missing .NET.
 pub(super) async fn command(
     cache: &OnceCell<Installation>,
-    dotnet: &std::path::Path,
+    data_dir: Option<&std::path::Path>,
+    dotnet: Option<&std::path::Path>,
 ) -> Result<(Command, Arc<tempfile::TempDir>), String> {
     let installation = cache
-        .get_or_try_init(|| prepare(dotnet.to_path_buf()))
+        .get_or_try_init(|| async {
+            let executable = match dotnet {
+                Some(dotnet) => dotnet.to_path_buf(),
+                None => resolve_dotnet(data_dir).await,
+            };
+            prepare(executable).await
+        })
         .await?;
     let mut command = Command::new(&installation.executable);
     command
@@ -58,10 +65,9 @@ mod tests {
     #[tokio::test]
     async fn concurrent_launches_share_one_preparation_and_keep_assets_alive() {
         let cache = tokio::sync::OnceCell::new();
-        let dotnet = crate::toolchains::resolve_dotnet(None).await;
         let (first, second) = tokio::join!(
-            super::command(&cache, &dotnet),
-            super::command(&cache, &dotnet)
+            super::command(&cache, None, None),
+            super::command(&cache, None, None)
         );
         let (first_command, first_files) = first.unwrap();
         let (second_command, second_files) = second.unwrap();

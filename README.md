@@ -74,10 +74,12 @@ If no .NET 10+ runtime is installed, Results offers **Install .NET and run**. On
 click downloads the official `dotnet-install` script pinned to the
 `dotnet/install-scripts` tag `v2026.07.21`, verifies its SHA-256, and runs it to
 install the current long-term-support SDK privately under the app data folder
-(`toolchains/dotnet/lts`). The script needs `curl` or `wget` on Linux and macOS and
-PowerShell on Windows, plus an internet connection. CodingPad never changes your
-shell profiles or `PATH`, and it prefers a supported .NET you installed yourself.
-Code intelligence restarts with the installed SDK.
+(`toolchains/dotnet/lts`). The script needs bash with `curl` or `wget` on Linux
+and macOS, or PowerShell on Windows, plus an internet connection. It installs
+into a staging folder and is promoted only after `dotnet --list-sdks` succeeds,
+so an interrupted download is cleaned up and retried safely. CodingPad never
+changes your shell profiles or `PATH`, and it prefers a supported .NET you
+installed yourself. Code intelligence restarts with the installed SDK.
 
 The default test suite runs offline installer checks. To also download the real
 release into a temporary folder and run Python through it:

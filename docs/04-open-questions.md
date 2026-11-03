@@ -65,6 +65,7 @@
 | D58 | C# scripts run on the **newest installed .NET, 10 or later**; the one-click install uses the current long-term-support release. The **C# compiler is built into CodingPad** and updated with each release; a too-new C# feature gives a "needs a newer CodingPad" message | 2026-10-31 |
 | D59 | C# helpers are **short global names needing no `using` line**: `x.Dump()`, `Cache("key", () => ...)`, `Secret("name")`, and the `Cancel` token. Inside CodingPad they are always available; under `dotnet run`, the `CodingPad` NuGet package adds the global usings itself, so the same script compiles in both | 2026-10-31 |
 | D60 | C# package restore **respects the standard `NuGet.config` files** (user-wide and in the script's folder or above), like `dotnet run`. Feeds with username/password or token auth work in M2; credential-provider plugins come later | 2026-10-31 |
+| D61 | **Idle-memory acceptance uses physical footprint**: sum Linux PSS or macOS `phys_footprint` across the app, WebKit helpers and language-server descendants, with a 300 MiB limit. Report summed RSS and Linux private memory alongside it; unavailable physical data fails rather than falling back to RSS. Explicit owner decision during the M1 performance investigation | 2026-11-04 |
 
 ## Open
 

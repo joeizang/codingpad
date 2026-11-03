@@ -39,6 +39,7 @@ def greet(name: str) -> str:
 
 value: int = "not an int"
 dump(greet("Ada"))
+typed_dump: str = dump(42)
 "#;
     servers.begin_session("test").await;
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -59,6 +60,13 @@ dump(greet("Ada"))
             .as_str()
             .is_some_and(|message| message.contains("int") || message.contains("assign"))),
         "unexpected diagnostics: {diagnostics:?}"
+    );
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["range"]["start"]["line"] == 7),
+        "dump should preserve its argument type via the bundled stub: {diagnostics:?}"
     );
 
     let completions = servers

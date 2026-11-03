@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import time
+import tempfile
 from http.client import HTTPException
 from pathlib import Path
 from urllib.error import URLError
@@ -19,7 +20,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("application", type=Path)
     args = parser.parse_args()
-    process = subprocess.Popen(["tauri-driver", "--port", "4444"])
+    marker_home = tempfile.TemporaryDirectory(prefix="codingpad-smoke-")
+    ready_marker = Path(marker_home.name) / "ready"
+    process = subprocess.Popen(
+        ["tauri-driver", "--port", "4444"],
+        env={**os.environ, "CODINGPAD_BENCH_MARKER": str(ready_marker)},
+    )
     session = None
 
     def request(method, path, data=None):
@@ -74,12 +80,25 @@ def main():
                 }
             },
         )["sessionId"]
+        wait_for(ready_marker.is_file, "interactive editor ready marker")
+        assert int(ready_marker.read_text()) > 0
         wait_for(
             lambda: execute(
                 "return !!document.querySelector('.monaco-editor .view-line')"
             ),
             "Monaco editor",
         )
+        input_element = request("POST", f"/session/{session}/element", {
+            "using": "css selector",
+            "value": ".monaco-editor textarea, .monaco-editor [contenteditable=true]",
+        })
+        element_id = input_element.get("element-6066-11e4-a52e-4f735466cecf", input_element.get("ELEMENT"))
+        request("POST", f"/session/{session}/element/{element_id}/value", {
+            "text": "# readiness_input\n",
+        })
+        wait_for(lambda: execute(
+            "return document.querySelector('.monaco-editor').textContent.includes('readiness_input')"
+        ), "typed editor content")
         for _ in range(2):
             execute("document.querySelector('.run-button').click()")
             wait_for(
@@ -101,7 +120,7 @@ def main():
             "second script kernel",
         )
         print(
-            "Desktop smoke passed: local Monaco, print, nested dump, final expression, rerun, independent tab."
+            "Desktop smoke passed: ready marker, typing, local Monaco, print, nested dump, final expression, rerun, independent tab."
         )
     finally:
         try:
@@ -123,6 +142,7 @@ def main():
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
+            marker_home.cleanup()
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ export type LspEvent =
   | { method: string; params: unknown };
 
 export type LspCompletionItem = {
+  tags?: number[];
   label: string | { label: string; detail?: string; description?: string };
   data?: unknown;
   kind?: number;

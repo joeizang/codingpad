@@ -36,6 +36,25 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
 const DIAGNOSTICS_METHOD: &str = "textDocument/publishDiagnostics";
 
+/// Opt-in transport timeline, without document text or completion payloads.
+fn trace_lsp(transport: u32, phase: &str, message: &Value) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("CODINGPAD_LSP_TRACE").is_some()) {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    eprintln!(
+        "lsp_trace {}",
+        json!({
+            "unix_us": now.as_micros() as u64, "transport_pid": transport, "phase": phase,
+            "id": message.get("id"), "method": message.get("method"),
+            "version": message.pointer("/params/textDocument/version"),
+        })
+    );
+}
+
 /// A notification forwarded from a language server to the window.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -420,6 +439,7 @@ impl LanguageServers {
 }
 
 struct LspServer {
+    transport_pid: u32,
     child: Mutex<Child>,
     writer: mpsc::UnboundedSender<Value>,
     pending: Pending,
@@ -524,13 +544,16 @@ impl LspServer {
             .stderr
             .take()
             .ok_or_else(|| "Could not open the language server error stream".to_owned())?;
+        let transport_pid = child.id().unwrap_or_default();
         let (writer, mut writer_rx) = mpsc::unbounded_channel::<Value>();
         tokio::spawn(async move {
             let mut stdin = stdin;
             while let Some(message) = writer_rx.recv().await {
+                trace_lsp(transport_pid, "write_started", &message);
                 if write_message(&mut stdin, &message).await.is_err() {
                     break;
                 }
+                trace_lsp(transport_pid, "write_finished", &message);
             }
         });
         let pending = Arc::new(Mutex::new(HashMap::new()));
@@ -540,6 +563,7 @@ impl LspServer {
         let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
 
         let server = Arc::new(Self {
+            transport_pid,
             child: Mutex::new(child),
             writer: writer.clone(),
             pending: pending.clone(),
@@ -561,6 +585,7 @@ impl LspServer {
         });
 
         let response_config = ResponseConfig {
+            transport_pid,
             document_uri: server.document_uri.clone(),
             workspace_uri: server.workspace_uri.clone(),
             extra_paths: server.extra_paths.clone(),
@@ -664,7 +689,9 @@ impl LspServer {
                             "documentationFormat": ["markdown", "plaintext"],
                             "insertReplaceSupport": true,
                             "resolveSupport": {
-                                "properties": ["documentation", "detail", "additionalTextEdits"]
+                                // basedpyright can defer expensive deprecated-type checks
+                                // until an item is selected when tags can be resolved.
+                                "properties": ["documentation", "detail", "additionalTextEdits", "tags"]
                             }
                         }
                     },
@@ -783,7 +810,14 @@ impl LspServer {
             return Err(error);
         }
         match timeout(wait, receiver).await {
-            Ok(Ok(result)) => result,
+            Ok(Ok(result)) => {
+                trace_lsp(
+                    self.transport_pid,
+                    "request_delivered",
+                    &json!({"id": id, "method": method}),
+                );
+                result
+            }
             Ok(Err(_)) => Err(format!(
                 "The {} language server stopped before answering. Reopen the tab to restart it.",
                 self.server_name
@@ -807,6 +841,7 @@ impl LspServer {
     }
 
     fn write(&self, message: Value) -> Result<(), String> {
+        trace_lsp(self.transport_pid, "queued", &message);
         self.writer.send(message).map_err(|_| {
             format!(
                 "The {} language server is not accepting messages. Reopen the tab to restart it.",
@@ -877,6 +912,14 @@ impl PythonWorkspace {
         fs::write(runtime.join("codingpad/__init__.py"), RUNTIME)
             .map_err(|error| format!("Could not create the code-intelligence runtime: {error}"))?;
 
+        // The public stub avoids loading the dump renderer's implementation
+        // and its transitive standard-library imports just to type dump(value).
+        fs::write(
+            runtime.join("codingpad/__init__.pyi"),
+            include_str!("../../../runtimes/python/codingpad/__init__.pyi"),
+        )
+        .map_err(|error| format!("Could not stage CodingPad helper types: {error}"))?;
+
         let script = root.join("script.py");
         fs::write(&script, source).map_err(|error| {
             format!("Could not stage the script for code intelligence: {error}")
@@ -911,6 +954,7 @@ impl PythonWorkspace {
 }
 
 struct ResponseConfig {
+    transport_pid: u32,
     document_uri: String,
     workspace_uri: String,
     extra_paths: Vec<String>,
@@ -930,6 +974,7 @@ async fn read_loop(
             Ok(Some(message)) => message,
             Ok(None) | Err(_) => break,
         };
+        trace_lsp(config.transport_pid, "received", &message);
         let method = message.get("method").and_then(Value::as_str);
         let id = message.get("id");
         match (method, id) {
@@ -1245,6 +1290,7 @@ print("hi")
     #[test]
     fn answers_configuration_for_python_sections() {
         let config = ResponseConfig {
+            transport_pid: 0,
             document_uri: "file:///tmp/workspace/script.py".into(),
             workspace_uri: "file:///tmp/workspace".into(),
             extra_paths: vec!["/tmp/runtime".into()],

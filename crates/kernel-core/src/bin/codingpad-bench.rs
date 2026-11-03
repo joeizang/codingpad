@@ -66,7 +66,7 @@ impl Row {
             metric,
             value: format!("{:.1} ms", measured.as_secs_f64() * 1000.0),
             target: format!("< {} ms", target.as_millis()),
-            status: if measured <= target {
+            status: if measured < target {
                 Status::Pass
             } else {
                 Status::Fail
@@ -77,9 +77,9 @@ impl Row {
     fn memory(metric: &'static str, measured: u64, target: u64) -> Self {
         Self {
             metric,
-            value: format!("{:.1} MB", measured as f64 / (1024.0 * 1024.0)),
-            target: format!("< {} MB", target / (1024 * 1024)),
-            status: if measured <= target {
+            value: format!("{:.1} MiB", measured as f64 / (1024.0 * 1024.0)),
+            target: format!("< {} MiB", target / (1024 * 1024)),
+            status: if measured < target {
                 Status::Pass
             } else {
                 Status::Fail
@@ -109,18 +109,39 @@ impl Row {
 struct AppMeasurement {
     ready: Duration,
     idle_memory: u64,
+    rss: u64,
 }
 
 #[tokio::main]
 async fn main() {
+    let runs = std::env::var("CODINGPAD_BENCH_RUNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(3);
+    let mut passed = true;
+    for run in 1..=runs {
+        println!("\nBenchmark repetition {run}/{runs} (sequential, warm OS caches)");
+        passed &= run_once().await;
+    }
+    if !passed {
+        std::process::exit(1);
+    }
+}
+
+async fn run_once() -> bool {
     let mut rows = Vec::new();
     let mut failures = Vec::new();
 
     match app_measurement() {
         Ok(Some(measurement)) => {
             rows.push(Row::time("app usable", measurement.ready, TARGET_APP_READY));
+            eprintln!(
+                "Idle summed RSS (informational): {:.1} MiB",
+                measurement.rss as f64 / 1048576.0
+            );
             rows.push(Row::memory(
-                "idle memory",
+                "idle physical footprint",
                 measurement.idle_memory,
                 TARGET_IDLE_MEMORY,
             ));
@@ -132,14 +153,14 @@ async fn main() {
                 "not measured on this platform",
             ));
             rows.push(Row::skipped(
-                "idle memory",
-                "< 300 MB",
+                "idle physical footprint",
+                "< 300 MiB",
                 "not measured on this platform",
             ));
         }
         Err(error) => {
             rows.push(Row::failed("app usable", "< 1000 ms", error.clone()));
-            rows.push(Row::failed("idle memory", "< 300 MB", error));
+            rows.push(Row::failed("idle physical footprint", "< 300 MiB", error));
         }
     }
 
@@ -207,9 +228,10 @@ async fn main() {
     report(&rows);
     if failures.is_empty() && rows.iter().all(|row| row.status != Status::Fail) {
         println!("\nAll measured M1 and M2 targets pass.");
+        true
     } else {
         eprintln!("\nSome M1 or M2 targets did not pass or could not be measured.");
-        std::process::exit(1);
+        false
     }
 }
 
@@ -269,41 +291,44 @@ fn completion_params(uri: &str, character: u32) -> serde_json::Value {
     })
 }
 
+fn useful_completion(result: &serde_json::Value, expected: &str) -> Result<usize, String> {
+    let items = result
+        .as_array()
+        .or_else(|| result["items"].as_array())
+        .ok_or("completion result has no items array")?;
+    if !items.iter().any(|item| {
+        item["label"].as_str() == Some(expected)
+            || item["label"]["label"].as_str() == Some(expected)
+    }) {
+        return Err(format!(
+            "completion did not include {expected:?} ({} items)",
+            items.len()
+        ));
+    }
+    Ok(items.len())
+}
+
 async fn completion_latency() -> Result<Duration, String> {
     eprintln!("Warming the Python language server (the first run may download basedpyright)...");
     let servers = LanguageServers::default();
     let measured = async {
         servers.begin_session("bench").await;
-        let start = servers
-            .start_python("bench-lsp", "import os\nos.path.join", "bench", |_| {})
-            .await?;
-        let _ = servers
-            .request(
-                "bench-lsp",
-                "textDocument/completion",
-                completion_params(&start.uri, 12),
-            )
-            .await?;
-        servers
-            .did_change("bench-lsp", "import os\nos.path.join(")
-            .await?;
+        // Warm the same imported module and member list that the user will edit.
+        let start = servers.start_python("bench-lsp", "import os\nos.path.", "bench", |_| {}).await?;
+        let warm = servers.request("bench-lsp", "textDocument/completion", completion_params(&start.uri, 8)).await?;
+        useful_completion(&warm, "join")?;
+        // Typing 'j' requests real member completion, not call-argument completion.
+        // Include didChange/bridge queueing; do not wait for diagnostics or sleep.
         let started = Instant::now();
-        let result = servers
-            .request(
-                "bench-lsp",
-                "textDocument/completion",
-                completion_params(&start.uri, 13),
-            )
-            .await?;
+        servers.did_change("bench-lsp", "import os\nos.path.j").await?;
+        let changed = started.elapsed();
+        let result = servers.request("bench-lsp", "textDocument/completion", completion_params(&start.uri, 9)).await?;
         let elapsed = started.elapsed();
-        if result.is_null() {
-            return Err::<Duration, String>(
-                "the language server returned no completion result".into(),
-            );
-        }
+        let count = useful_completion(&result, "join")?;
+        eprintln!("Python completion: change queued {:.3} ms, request/response {:.3} ms, {count} items including join",
+            changed.as_secs_f64() * 1000.0, (elapsed - changed).as_secs_f64() * 1000.0);
         Ok(elapsed)
-    }
-    .await;
+    }.await;
     servers.shutdown().await;
     measured
 }
@@ -544,6 +569,7 @@ fn measure_app_unix() -> Result<AppMeasurement, String> {
     use std::{os::unix::process::CommandExt, thread};
 
     let desktop = desktop_binary()?;
+    eprintln!("Desktop binary: {}", desktop.display());
     let marker = std::env::temp_dir().join(format!(
         "codingpad-bench-ready-{}-{}",
         std::process::id(),
@@ -580,36 +606,62 @@ fn measure_app_unix() -> Result<AppMeasurement, String> {
         Err(error) => {
             let _ = std::fs::remove_file(&marker);
             stop_app(&mut child, pid);
+            report_startup_trace(&marker, launched);
             return Err(error);
         }
     };
     thread::sleep(IDLE_SETTLE);
 
-    #[cfg(target_os = "macos")]
-    let idle_memory = {
-        let current = webkit_pids();
-        let helpers: Vec<_> = current.difference(&baseline_helpers).copied().collect();
-        std::iter::once(pid)
-            .chain(helpers)
-            .map(process_memory)
-            .sum()
-    };
-    #[cfg(not(target_os = "macos"))]
-    let idle_memory = process_group_rss(pid).unwrap_or(0);
+    let memory = measure_memory(pid, {
+        #[cfg(target_os = "macos")]
+        {
+            webkit_pids()
+                .difference(&baseline_helpers)
+                .copied()
+                .collect()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Vec::new()
+        }
+    });
+    report_startup_trace(&marker, launched);
     let _ = std::fs::remove_file(&marker);
     stop_app(&mut child, pid);
-
-    if idle_memory == 0 {
-        return Err("could not read the app's memory use".into());
-    }
+    let (rss, footprint) = memory?;
     Ok(AppMeasurement {
         ready: Duration::from_nanos(ready),
-        idle_memory,
+        idle_memory: footprint,
+        rss,
     })
 }
 
 #[cfg(unix)]
+fn report_startup_trace(marker: &Path, launched: u64) {
+    let path = format!("{}.trace", marker.display());
+    if let Ok(trace) = std::fs::read_to_string(&path) {
+        eprintln!("Startup phases (launch unix_ns={launched}):\n{trace}");
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(unix)]
 fn stop_app(child: &mut std::process::Child, pid: u32) {
+    // LSPs use separate process groups; killing only the app group leaks them
+    // into subsequent repetitions and invalidates both memory and timing.
+    if let Ok(output) = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,pgid=,rss="])
+        .output()
+    {
+        let table = parse_process_table(&String::from_utf8_lossy(&output.stdout));
+        for descendant in app_processes(pid, &table) {
+            if descendant != pid {
+                unsafe {
+                    libc::kill(descendant as i32, libc::SIGKILL);
+                }
+            }
+        }
+    }
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
     }
@@ -640,14 +692,105 @@ fn wait_for_marker(
     Err("the app did not report that it was ready".into())
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
-fn process_group_rss(pgid: u32) -> Option<u64> {
+/// Include descendants even if a language server creates its own process group.
+#[cfg(any(unix, test))]
+fn app_processes(pid: u32, table: &[(u32, u32, u32, u64)]) -> std::collections::HashSet<u32> {
+    let mut pids = std::collections::HashSet::from([pid]);
+    loop {
+        let before = pids.len();
+        for (child, parent, group, _) in table {
+            if *group == pid || pids.contains(parent) {
+                pids.insert(*child);
+            }
+        }
+        if pids.len() == before {
+            return pids;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn measure_memory(pid: u32, helpers: Vec<u32>) -> Result<(u64, u64), String> {
     let output = Command::new("ps")
         .args(["-axo", "pid=,ppid=,pgid=,rss="])
         .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    Some(group_rss(pgid, &parse_process_table(&text)))
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err("could not enumerate app processes".into());
+    }
+    let table = parse_process_table(&String::from_utf8_lossy(&output.stdout));
+    let mut pids = app_processes(pid, &table);
+    pids.extend(helpers);
+    let mut rss = 0;
+    let mut physical = 0;
+    let mut pids: Vec<_> = pids.into_iter().collect();
+    pids.sort_unstable();
+    for pid in pids {
+        let resident = table
+            .iter()
+            .find(|row| row.0 == pid)
+            .ok_or_else(|| format!("process {pid} disappeared during memory sampling"))?
+            .3
+            * 1024;
+        #[cfg(target_os = "linux")]
+        let (footprint, private) = {
+            let smaps = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
+                .map_err(|e| format!("cannot read PSS for process {pid}: {e}"))?;
+            parse_smaps(&smaps)
+                .ok_or_else(|| format!("missing PSS/private fields for process {pid}"))?
+        };
+        #[cfg(target_os = "macos")]
+        let (footprint, private) = (process_memory(pid)?, 0);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        return Err("physical footprint measurement is unsupported on this platform".into());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            #[cfg(target_os = "linux")]
+            let name = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .unwrap_or_else(|_| "unknown".into())
+                .trim()
+                .to_owned();
+            #[cfg(not(target_os = "linux"))]
+            let name = "process";
+            eprintln!(
+                "Memory pid={pid} ({name}): RSS={:.1} MiB physical={:.1} MiB private={} MiB",
+                resident as f64 / 1048576.0,
+                footprint as f64 / 1048576.0,
+                if cfg!(target_os = "linux") {
+                    format!("{:.1}", private as f64 / 1048576.0)
+                } else {
+                    "unavailable".into()
+                }
+            );
+            rss += resident;
+            physical += footprint;
+        }
+    }
+    if rss == 0 || physical == 0 {
+        return Err("could not read the app's memory use".into());
+    }
+    Ok((rss, physical))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_smaps(text: &str) -> Option<(u64, u64)> {
+    let field = |key: &str| -> Option<u64> {
+        text.lines().find_map(|line| {
+            let value = line.strip_prefix(key)?;
+            value
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()?
+                .checked_mul(1024)
+        })
+    };
+    Some((
+        field("Pss:")?,
+        field("Private_Clean:")?
+            + field("Private_Dirty:")?
+            + field("Private_Hugetlb:").unwrap_or(0),
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -672,28 +815,21 @@ fn webkit_pids() -> std::collections::HashSet<u32> {
         .unwrap_or_default()
 }
 
-/// Activity Monitor-style footprint, falling back to RSS.
+/// Activity Monitor-style footprint. Never silently substitute RSS for it.
 #[cfg(target_os = "macos")]
-fn process_memory(pid: u32) -> u64 {
-    Command::new("footprint")
+fn process_memory(pid: u32) -> Result<u64, String> {
+    let output = Command::new("footprint")
         .arg(pid.to_string())
         .output()
-        .ok()
-        .and_then(|output| parse_footprint(&String::from_utf8_lossy(&output.stdout)))
-        .or_else(|| {
-            Command::new("ps")
-                .args(["-o", "rss=", "-p", &pid.to_string()])
-                .output()
-                .ok()
-                .and_then(|output| {
-                    String::from_utf8_lossy(&output.stdout)
-                        .trim()
-                        .parse::<u64>()
-                        .ok()
-                        .map(|kilobytes| kilobytes * 1024)
-                })
-        })
-        .unwrap_or(0)
+        .map_err(|e| format!("could not run footprint for {pid}: {e}"))?;
+    if output.status.success() {
+        if let Some(bytes) = parse_footprint(&String::from_utf8_lossy(&output.stdout)) {
+            return Ok(bytes);
+        }
+    }
+    Err(format!(
+        "could not measure phys_footprint for {pid}; RSS is not a substitute"
+    ))
 }
 
 #[allow(dead_code)]
@@ -707,9 +843,9 @@ fn parse_footprint(output: &str) -> Option<u64> {
     let unit = fields.next()?.to_ascii_lowercase();
     let factor = match unit.as_str() {
         "b" | "bytes" => 1.0,
-        "kb" => 1024.0,
-        "mb" => 1024.0 * 1024.0,
-        "gb" => 1024.0 * 1024.0 * 1024.0,
+        "kb" | "kib" => 1024.0,
+        "mb" | "mib" => 1024.0 * 1024.0,
+        "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
         _ => return None,
     };
     Some((amount * factor) as u64)
@@ -732,15 +868,6 @@ fn parse_process_table(output: &str) -> Vec<(u32, u32, u32, u64)> {
             ))
         })
         .collect()
-}
-
-#[allow(dead_code)]
-fn group_rss(pgid: u32, table: &[(u32, u32, u32, u64)]) -> u64 {
-    table
-        .iter()
-        .filter(|(_, _, group, _)| *group == pgid)
-        .map(|(_, _, _, rss)| rss.saturating_mul(1024))
-        .sum()
 }
 
 #[cfg(unix)]
@@ -780,18 +907,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_and_sums_a_process_group() {
+    fn includes_language_servers_in_separate_groups() {
+        let table =
+            parse_process_table("10 1 10 1024\n11 10 11 2048\n12 11 11 4096\n99 1 99 4096\n");
+        assert_eq!(
+            app_processes(10, &table),
+            std::collections::HashSet::from([10, 11, 12])
+        );
+    }
+
+    #[test]
+    fn requires_physical_and_private_memory_fields() {
+        assert_eq!(
+            parse_smaps(
+                "Pss: 42 kB\nPrivate_Clean: 2 kB\nPrivate_Dirty: 3 kB\nPrivate_Hugetlb: 4 kB\n"
+            ),
+            Some((42 * 1024, 9 * 1024))
+        );
+        assert_eq!(parse_smaps("Rss: 100 kB\n"), None);
+    }
+
+    #[test]
+    fn completion_must_contain_the_expected_member() {
+        assert!(useful_completion(&json!(null), "join").is_err());
+        assert!(useful_completion(&json!({"items": []}), "join").is_err());
+        assert!(useful_completion(&json!([{"label": "other"}]), "join").is_err());
+        assert_eq!(
+            useful_completion(&json!({"items": [{"label": "join"}]}), "join").unwrap(),
+            1
+        );
+        assert_eq!(
+            useful_completion(&json!([{"label": {"label": "join"}}]), "join").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn parses_process_table() {
         let table =
             parse_process_table("10 1 10 1024\n11 10 10 2048\n12 11 12 4096\n\nbogus line\n");
         assert_eq!(table.len(), 3);
-        assert_eq!(group_rss(10, &table), 3 * 1024 * 1024);
-        assert_eq!(group_rss(99, &table), 0);
+        assert_eq!(table[1], (11, 10, 10, 2048));
     }
 
     #[test]
     fn parses_footprint_units() {
         assert_eq!(
-            parse_footprint("Auxiliary data:\n    phys_footprint: 118 MB\n"),
+            parse_footprint("Auxiliary data:\n    phys_footprint: 118 MiB\n"),
             Some(118 * 1024 * 1024)
         );
         assert_eq!(
@@ -799,6 +961,12 @@ mod tests {
             Some(5904 * 1024)
         );
         assert_eq!(parse_footprint("nothing"), None);
+    }
+
+    #[test]
+    fn target_boundaries_are_strict() {
+        assert!(Row::time("ready", TARGET_APP_READY, TARGET_APP_READY).status == Status::Fail);
+        assert!(Row::memory("idle", TARGET_IDLE_MEMORY, TARGET_IDLE_MEMORY).status == Status::Fail);
     }
 
     #[test]

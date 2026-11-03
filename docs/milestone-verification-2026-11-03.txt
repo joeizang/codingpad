@@ -1,0 +1,24 @@
+CodingPad milestone verification, 2026-11-03
+
+Base commit: 64d9de8fce14fe383f372d255ba66c5305d39f07
+Linux: Ubuntu desktop, native execution of release binaries built in the codingpad-check-csharp Linux container (desktop development headers unavailable on host); X11 desktop session. Windows VM was running checks concurrently. The Linux run therefore provides measurements, not an isolated performance qualification.
+
+Metric                                  Measured  Target
+App usable                              848.6 ms  < 1000 ms
+Idle memory                             492.2 MB  < 300 MB (FAIL)
+First Python kernel start                62.4 ms  < 3000 ms
+Warm Python rerun                         0.9 ms  < 200 ms
+100k-row Python dump, first page          4.1 ms  < 1000 ms
+Python completion                      1026.1 ms  < 300 ms (FAIL)
+First C# kernel start                  2205.1 ms  < 3000 ms
+Warm C# rerun after edit                 26.7 ms  < 500 ms
+100k-item C# sequence, first page        21.5 ms  < 1000 ms
+C# completion                            40.5 ms  < 300 ms
+
+Earlier container execution also failed idle memory (504.4 MB) and Python completion (558.5 ms). macOS M2 benchmarks remain outstanding. M1 and M2 must remain open until their acceptance criteria pass on all required platforms.
+
+Windows: Windows 11 Pro 24H2 QEMU VM, 4 vCPUs and 8 GiB RAM. On the milestone changes in this PR, `just check` passed after filtering native ASP.NET DLLs from managed compiler references and making output assertions accept Windows newlines. This included 58 frontend tests, 49 Python tests (one Unix-only skip), 22 .NET tests, workspace formatting and Clippy, Rust workspace tests (including 41 C# integration tests), and a native Tauri debug build. The optional Roslyn integration test was not configured. Prior attempts had test timeouts when the VM suspended; the passing run completed with sleep temporarily disabled.
+
+A repeat after the Windows check completed used a freshly host-built release benchmark binary and the same container-built release desktop. The VM remained running but was no longer running tests:
+
+App usable: 1742.1 ms (FAIL); idle memory: 500.0 MB (FAIL); first Python kernel: 66.0 ms; warm Python rerun: 0.7 ms; Python first page: 1.4 ms; Python completion: 1060.8 ms (FAIL); first C# kernel: 2201.3 ms; warm C# rerun: 20.0 ms; C# first page: 20.6 ms; C# completion: 58.0 ms. Times and memory targets are the same as above. The macOS and Linux milestone gates remain open; these measurements do not establish a passing M1.

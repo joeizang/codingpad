@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using System.Reflection;
+using System.Reflection.PortableExecutable;
 using System.Runtime.InteropServices;
 using System.Runtime.Loader;
 using System.Security.Cryptography;
@@ -94,7 +95,13 @@ internal sealed class ScriptDependencies : AssemblyLoadContext
                 .Where(p => Version.TryParse(Path.GetFileName(p), out var v) && v.Major == Environment.Version.Major)
                 .OrderByDescending(p => Version.Parse(Path.GetFileName(p))).FirstOrDefault() : null;
             if (version is null) throw new InvalidOperationException("Microsoft.NET.Sdk.Web requires the ASP.NET Core " + Environment.Version.Major + " runtime. Install the matching .NET SDK or ASP.NET Core runtime.");
-            foreach (var path in Directory.GetFiles(version, "*.dll")) dependencies.AddManaged(path, compile: true);
+            foreach (var path in Directory.GetFiles(version, "*.dll"))
+            {
+                // The Windows ASP.NET shared framework also contains native DLLs.
+                using var file = File.OpenRead(path);
+                using var pe = new PEReader(file);
+                if (pe.HasMetadata) dependencies.AddManaged(path, compile: true);
+            }
         }
         if (directives.Packages.Count > 0)
         {

@@ -299,18 +299,6 @@ impl LanguageServers {
             return Err("The language server was stopped".into());
         }
         self.check_session(script_id, session).await?;
-        // The project loads in the background after didOpen. Pull once the
-        // workspace settles so the editor gets package and CodingPad errors.
-        let poll = server.clone();
-        tokio::spawn(async move {
-            for delay in [300, 700, 1500, 3000, 6000] {
-                tokio::time::sleep(Duration::from_millis(delay)).await;
-                if !poll.alive() {
-                    return;
-                }
-                poll.refresh_diagnostics().await;
-            }
-        });
         Ok(LspStartResult {
             uri: server.document_uri.clone(),
         })
@@ -576,6 +564,28 @@ impl LspServer {
             alive,
         ));
         tokio::spawn(read_stderr(stderr, stderr_tail));
+        if server.pull_diagnostics {
+            // Keep diagnostics fresh without making completion wait for them.
+            // Roslyn also loads the project in the background, so the first
+            // useful report may arrive well after didOpen.
+            let poll = server.clone();
+            tokio::spawn(async move {
+                let mut last: Option<Value> = None;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(750)).await;
+                    if !poll.alive() {
+                        return;
+                    }
+                    let Some((version, diagnostics)) = poll.document_diagnostics().await else {
+                        continue;
+                    };
+                    if last.as_ref() != Some(&diagnostics) {
+                        poll.emit_diagnostics(version, diagnostics.clone());
+                        last = Some(diagnostics);
+                    }
+                }
+            });
+        }
         Ok(server)
     }
 
@@ -651,38 +661,35 @@ impl LspServer {
     async fn did_change(&self, source: &str) -> Result<(), String> {
         let mut version = self.version.lock().await;
         *version += 1;
-        let notice = self.write(json!({
+        self.write(json!({
             "jsonrpc": "2.0",
             "method": "textDocument/didChange",
             "params": {
                 "textDocument": { "uri": &self.document_uri, "version": *version },
                 "contentChanges": [{ "text": source }]
             }
-        }));
-        drop(version);
-        if notice.is_ok() && self.pull_diagnostics {
-            self.refresh_diagnostics().await;
-        }
-        notice
+        }))
     }
 
     /// Roslyn publishes document diagnostics on request rather than on edit.
-    async fn refresh_diagnostics(&self) {
+    async fn document_diagnostics(&self) -> Option<(i64, Value)> {
         let version = *self.version.lock().await;
-        let Ok(result) = self
+        let result = self
             .request(
                 "textDocument/diagnostic",
                 json!({ "textDocument": { "uri": &self.document_uri } }),
             )
             .await
-        else {
-            return;
-        };
+            .ok()?;
         let diagnostics = match result {
             Value::Array(items) => Value::Array(items),
             Value::Object(report) => report.get("items").cloned().unwrap_or_else(|| json!([])),
             _ => json!([]),
         };
+        Some((version, diagnostics))
+    }
+
+    fn emit_diagnostics(&self, version: i64, diagnostics: Value) {
         let sink = self.events.lock().ok().map(|events| (*events).clone());
         if let Some(sink) = sink {
             sink(LspEvent {

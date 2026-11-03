@@ -190,7 +190,7 @@ async fn csharp_code_intelligence_uses_the_shadow_project() {
     }
     let directory = tempfile::tempdir().unwrap();
     let script = directory.path().join("script.cs");
-    let source = "var value = 42;\nvalue.Dump();\nCache(\"answer\", () => 42);\nmissing();\n";
+    let source = "#:property Nullable=disable\n#:property ImplicitUsings=disable\nvar value = 42;\nvalue.Dump();\nCache(\"answer\", () => 42);\nConsole.WriteLine(value);\nmissing();\n";
     std::fs::write(&script, source).unwrap();
 
     let servers = LanguageServers::with_data_dir(directory.path().join("data"));
@@ -222,7 +222,7 @@ async fn csharp_code_intelligence_uses_the_shadow_project() {
                 "textDocument/completion",
                 json!({
                     "textDocument": { "uri": started.uri },
-                    "position": { "line": 1, "character": 6 },
+                    "position": { "line": 3, "character": 6 },
                     "context": { "triggerKind": 2, "triggerCharacter": "." }
                 }),
             )

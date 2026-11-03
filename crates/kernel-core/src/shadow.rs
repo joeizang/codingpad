@@ -123,6 +123,7 @@ impl Directives {
                     }
                     let value = unquote(raw.trim()).map_err(|message| fail(&message))?;
                     validate_property(name, &value).map_err(|message| fail(&message))?;
+                    let name = canonical_property(name).unwrap_or(name);
                     result.properties.insert(name.to_owned(), value);
                 }
                 other => return Err(fail(&format!("Unsupported file directive: #:{other}"))),
@@ -177,6 +178,10 @@ impl Directives {
             format!("CS5001;{no_warn}")
         };
         properties.insert("NoWarn".to_owned(), no_warn);
+        properties.insert(
+            "Features".to_owned(),
+            "$(Features);FileBasedProgram".to_owned(),
+        );
         for (name, value) in &self.properties {
             match name.as_str() {
                 "TargetFramework" | "Nullable" | "ImplicitUsings" | "WarningLevel" | "NoWarn" => {}
@@ -219,10 +224,33 @@ impl Directives {
     fn usings(&self) -> String {
         let mut usings = Vec::new();
         if self.flag("CodingPadImplicitUsings", true) {
+            // Without SDK implicit usings the kernel still imports the common
+            // namespaces through its helper block.
+            if !self.implicit_usings_enabled() {
+                usings.extend(
+                    [
+                        "System",
+                        "System.Collections.Generic",
+                        "System.IO",
+                        "System.Linq",
+                        "System.Net.Http",
+                        "System.Threading",
+                        "System.Threading.Tasks",
+                    ]
+                    .map(|name| format!("global using {name};")),
+                );
+            }
             usings.push("global using CodingPad;".to_owned());
             usings.push("global using static CodingPad.ScriptHelpers;".to_owned());
         }
         usings.join("\n")
+    }
+
+    fn implicit_usings_enabled(&self) -> bool {
+        matches!(
+            self.value("ImplicitUsings", "enable").as_str(),
+            "enable" | "true"
+        )
     }
 }
 
@@ -230,6 +258,7 @@ impl Directives {
 pub(crate) struct ShadowProject {
     _temp: TempDir,
     root: PathBuf,
+    parent: Option<PathBuf>,
     persistent: bool,
     document_uri: String,
     root_uri: String,
@@ -250,7 +279,12 @@ impl ShadowProject {
             .filter(|parent| parent.is_dir())
             .map(|parent| parent.join(".codingpad").join(short_hash(key)));
         let (root, persistent) = match neighbour {
-            Some(root) if prepare(&root).is_ok() => (root, true),
+            Some(root) if prepare(&root).is_ok() => {
+                if let Some(parent) = root.parent() {
+                    sweep_stale(parent, &root);
+                }
+                (root, true)
+            }
             _ => {
                 prepare(&temporary).map_err(|error| {
                     format!("Could not create a code-intelligence workspace: {error}")
@@ -258,6 +292,7 @@ impl ShadowProject {
                 (temporary, false)
             }
         };
+        let parent = persistent.then(|| root.parent().unwrap().to_path_buf());
 
         let program = root.join("Program.cs");
         fs::write(&program, strip_directives(source)).map_err(|error| {
@@ -288,6 +323,7 @@ impl ShadowProject {
 
         Ok(Self {
             persistent,
+            parent,
             _temp: temp,
             document_uri: path_to_uri(&program)?,
             root_uri: path_to_uri(&root)?,
@@ -312,8 +348,54 @@ impl Drop for ShadowProject {
     fn drop(&mut self) {
         if self.persistent {
             let _ = fs::remove_dir_all(&self.root);
+            if let Some(parent) = &self.parent {
+                // Fails harmlessly while another script in the folder is open.
+                let _ = fs::remove_dir(parent);
+            }
         }
     }
+}
+
+fn sweep_stale(directory: &Path, current: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 24 * 60 * 60);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == current || !path.is_dir() {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| modified < cutoff);
+        if stale {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn canonical_property(name: &str) -> Option<&'static str> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "allowunsafeblocks" => "AllowUnsafeBlocks",
+        "checkforoverflowunderflow" => "CheckForOverflowUnderflow",
+        "optimize" => "Optimize",
+        "treatwarningsaserrors" => "TreatWarningsAsErrors",
+        "publishaot" => "PublishAot",
+        "packastool" => "PackAsTool",
+        "codingpadimplicitusings" => "CodingPadImplicitUsings",
+        "nullable" => "Nullable",
+        "implicitusings" => "ImplicitUsings",
+        "langversion" => "LangVersion",
+        "defineconstants" => "DefineConstants",
+        "nowarn" => "NoWarn",
+        "warningsaserrors" => "WarningsAsErrors",
+        "warningsnotaserrors" => "WarningsNotAsErrors",
+        "warninglevel" => "WarningLevel",
+        "targetframework" => "TargetFramework",
+        _ => return None,
+    })
 }
 
 fn prepare(root: &Path) -> std::io::Result<()> {
@@ -529,6 +611,35 @@ mod tests {
     }
 
     #[test]
+    fn keeps_the_kernel_usings_when_sdk_implicit_usings_are_disabled() {
+        let directives = Directives::parse("#:property ImplicitUsings=disable").unwrap();
+        let usings = directives.usings();
+        assert!(usings.contains("global using System;"));
+        assert!(usings.contains("global using System.Linq;"));
+        assert!(usings.contains("global using CodingPad;"));
+        assert!(usings.contains("global using static CodingPad.ScriptHelpers;"));
+    }
+
+    #[test]
+    fn treats_property_names_case_insensitively() {
+        let directives = Directives::parse(
+            "#:property codingpadimplicitusings=false\n#:property nullable=disable",
+        )
+        .unwrap();
+        assert_eq!(directives.usings(), "");
+        let manifest = directives.property_manifest();
+        assert!(manifest.contains("<Nullable>disable</Nullable>"));
+        assert!(!manifest.contains("codingpadimplicitusings"));
+        assert!(!manifest.contains("CodingPadImplicitUsings"));
+    }
+
+    #[test]
+    fn hidden_projects_use_file_based_program_parsing() {
+        let directives = Directives::default();
+        assert!(directives.property_manifest().contains("FileBasedProgram"));
+    }
+
+    #[test]
     fn saved_scripts_get_a_hidden_neighbour_project() {
         let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("script.cs");
@@ -538,7 +649,9 @@ mod tests {
             directory.path().join(".codingpad").join(short_hash("key"))
         );
         let root = project.root().to_path_buf();
+        let hidden = directory.path().join(".codingpad");
         drop(project);
         assert!(!root.exists());
+        assert!(!hidden.exists());
     }
 }

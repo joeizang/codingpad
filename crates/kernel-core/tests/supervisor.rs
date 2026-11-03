@@ -647,7 +647,7 @@ async fn empty_metadata_uses_an_isolated_environment() {
 async fn requests_first_run_and_cached_environment_after_restart() {
     let source = package_source(
         "requests>=2,<3",
-        "import requests, sys\nassert requests.__version__.startswith('2.')\nsys.executable",
+        "import requests, sys\nassert requests.__version__.startswith('2.')\nsys.prefix",
     );
     let supervisor = Supervisor::default();
     let first = run(&supervisor, "requests", &source).await;

@@ -47,6 +47,8 @@ platforms.
 
 [Windows verification results](docs/windows-verification.md) record the native
 build, tests, and desktop smoke check with Python 3.14.7 and Node.js 26.
+[macOS verification results](docs/macos-verification.md) record the milestone
+acceptance runs on Apple silicon, including their open findings.
 
 CodingPad checks `PATH`, then the usual `~/.local/bin` and `~/.cargo/bin`
 locations for `uv`, plus `/opt/homebrew/bin` and `/usr/local/bin` on macOS.

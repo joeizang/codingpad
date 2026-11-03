@@ -6,6 +6,7 @@ import {
   diagnosticMarkers,
   diagnosticsFor,
   hoverMarkdown,
+  csharpDirectiveKey,
   inlineDependencyKey,
   markerSeverity,
   uniqueId,
@@ -108,6 +109,26 @@ describe("language-server presentation", () => {
         '# /// script\n# dependencies = [\n#   "requests", # a ] comment\n# ]\n# ///',
       ),
     ).toBe("requests");
+  });
+
+  test("restarts Roslyn only when C# directives change", () => {
+    expect(csharpDirectiveKey("Console.WriteLine(1);")).toBe("");
+    expect(
+      csharpDirectiveKey("#:package Newtonsoft.Json@13.0.3\nvar x = 1;"),
+    ).toBe("#:package Newtonsoft.Json@13.0.3");
+    expect(
+      csharpDirectiveKey(
+        "#:property Nullable=disable\n#:package A@1\n// comment\nclass C {}",
+      ),
+    ).toBe("#:package A@1\n#:property Nullable=disable");
+    expect(
+      csharpDirectiveKey(
+        '#:sdk Microsoft.NET.Sdk.Web\n#:property LangVersion="preview"',
+      ),
+    ).toBe('#:property LangVersion="preview"\n#:sdk Microsoft.NET.Sdk.Web');
+    expect(
+      csharpDirectiveKey('var s = """\n#:package Nope@1\n""";'),
+    ).toBe("");
   });
 
   test("maps completion labels, documentation and kinds", () => {

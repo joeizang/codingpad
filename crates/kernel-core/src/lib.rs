@@ -3,6 +3,8 @@ mod csharp;
 pub mod installer;
 pub mod lsp;
 mod packages;
+mod roslyn;
+mod shadow;
 pub mod store;
 pub mod toolchains;
 

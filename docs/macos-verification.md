@@ -1,8 +1,8 @@
 # macOS verification — 3 November 2026
 
-Acceptance run for the M1 close gate (#8), on an Apple M4 Max with 48 GB RAM,
-macOS 27.0.1 (26A434). The machine was in normal use, not quiesced. Linux and
-Windows are not covered here.
+Acceptance runs for the M1 (#8) and M2 (#15) close gates, on an Apple M4 Max with
+48 GB RAM, macOS 27.0.1 (26A434). The machine was in normal use, not quiesced.
+Linux and Windows are not covered here.
 
 ## Environment
 
@@ -20,6 +20,9 @@ Windows are not covered here.
 **M1 does not cleanly pass on macOS.** Four metrics and every functional check
 pass. App usable and idle memory each miss their target intermittently.
 
+**M2's C# targets pass on macOS** in every run, by a wide margin. `just bench`
+reports M1 and M2 together, so its exit status can still fail on the M1 findings.
+
 ## Functional results
 
 | Check | Result |
@@ -31,6 +34,7 @@ pass. App usable and idle memory each miss their target intermittently.
 | Rust tests | 58 + 3 + 41 + 1 + 24 passed; 6 network tests ignored by default |
 | Rust format, Clippy with warnings denied, Tauri debug build | Passed |
 | Network acceptance: official uv and .NET installs, Python language server, PyPI package | 6 passed |
+| Roslyn end-to-end C# code intelligence, with `CODINGPAD_ROSLYN_LSP` set | Passed |
 | Terminal `dump()` fallback, run from plain `python3` outside CodingPad | Pretty-printed a dict, a list of dicts and a string |
 
 ## Speed results
@@ -45,9 +49,19 @@ Ten consecutive bench runs against one already-launched binary:
 | Warm Python rerun | < 200 ms | 0.4 | 0.4 | 0.6 | 0/10 |
 | 100k-row dump, first page to host | < 1000 ms | 0.5 | 0.5 | 0.5 | 0/10 |
 | Python completion | < 300 ms | 178.4 | 183.2 | 190.8 | 0/10 |
+| First C# kernel start | < 3000 ms | 552.0 | 555.0 | 583.9 | 0/10 |
+| Warm C# rerun after an edit | < 500 ms | 26.4 | 27.6 | 29.0 | 0/10 |
+| 100k-item `IEnumerable`, first page to host | < 1000 ms | 148.1 | 150.2 | 157.6 | 0/10 |
+| C# completion | < 300 ms | 17.4 | 18.4 | 21.0 | 0/10 |
 
 These runs start from warm caches. The first Python kernel start in particular
-does not include resolving or downloading anything.
+does not include resolving or downloading anything. The C# metrics also passed
+in both `just bench` runs that included them, which came straight after a build.
+
+The bench's C# scripts declare no packages. D55 times reruns with packages
+cached, so that was measured once separately: a script using a local-feed package
+took 724.5 ms on its first run including restore, then 21.9 ms and 5.8 ms on two
+edited reruns.
 
 ## Open findings
 

@@ -1,6 +1,6 @@
-//! Local M1 performance checks (D38, D48). Run with `just bench`.
+//! Local M1 and M2 performance checks (D38, D48, D55). Run with `just bench`.
 
-use codingpad_kernel_core::{lsp::LanguageServers, KernelEvent, Supervisor};
+use codingpad_kernel_core::{lsp::LanguageServers, KernelEvent, Language, Supervisor};
 use serde_json::json;
 use std::time::{Duration, Instant};
 #[cfg(unix)]
@@ -16,6 +16,13 @@ const TARGET_WARM_RERUN: Duration = Duration::from_millis(200);
 const TARGET_DUMP_FIRST_PAGE: Duration = Duration::from_millis(1_000);
 const TARGET_COMPLETION: Duration = Duration::from_millis(300);
 const TARGET_IDLE_MEMORY: u64 = 300 * 1024 * 1024;
+const TARGET_CSHARP_FIRST_KERNEL: Duration = Duration::from_millis(3_000);
+const TARGET_CSHARP_RERUN: Duration = Duration::from_millis(500);
+const TARGET_CSHARP_SEQUENCE: Duration = Duration::from_millis(1_000);
+const TARGET_CSHARP_COMPLETION: Duration = Duration::from_millis(300);
+
+/// Roslyn loads the shadow project in the background after it starts.
+const ROSLYN_WARM_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[cfg(unix)]
 const APP_READY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -25,6 +32,18 @@ const IDLE_SETTLE: Duration = Duration::from_secs(5);
 const DUMP_SCRIPT: &str = r#"rows = [{"name": f"row {index}", "score": index} for index in range(100_000)]
 print("__codingpad_bench_ready__", flush=True)
 dump(rows)
+"#;
+
+const CSHARP_SCRIPT: &str = "var numbers = Enumerable.Range(1, 10).ToList();\nnumbers.Sum();";
+const CSHARP_EDITED_SCRIPT: &str =
+    "var numbers = Enumerable.Range(1, 11).ToList();\nnumbers.Sum();";
+const CSHARP_EDITED_RESULT: i64 = 66;
+const CSHARP_SEQUENCE_SCRIPT: &str = r#"IEnumerable<object> Rows()
+{
+    for (var index = 0; index < 100_000; index++)
+        yield return new { Name = $"row {index}", Score = index };
+}
+Rows().Dump();
 "#;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -174,11 +193,22 @@ async fn main() {
     }
 
     supervisor.shutdown().await;
+
+    csharp_kernel_rows(&mut rows).await;
+    match csharp_completion_latency().await {
+        Ok(measured) => rows.push(Row::time(
+            "C# completion",
+            measured,
+            TARGET_CSHARP_COMPLETION,
+        )),
+        Err(error) => rows.push(Row::failed("C# completion", "< 300 ms", error)),
+    }
+
     report(&rows);
     if failures.is_empty() && rows.iter().all(|row| row.status != Status::Fail) {
-        println!("\nAll measured M1 targets pass.");
+        println!("\nAll measured M1 and M2 targets pass.");
     } else {
-        eprintln!("\nSome M1 targets did not pass or could not be measured.");
+        eprintln!("\nSome M1 or M2 targets did not pass or could not be measured.");
         std::process::exit(1);
     }
 }
@@ -278,6 +308,180 @@ async fn completion_latency() -> Result<Duration, String> {
     measured
 }
 
+/// Measure the C# kernel in order: a cold start, the first rerun after an edit,
+/// then a dump. Each later metric depends on the kernel the first one started.
+async fn csharp_kernel_rows(rows: &mut Vec<Row>) {
+    let supervisor = Supervisor::default();
+    match csharp_first_run(&supervisor).await {
+        Ok(measured) => rows.push(Row::time(
+            "first C# kernel start",
+            measured,
+            TARGET_CSHARP_FIRST_KERNEL,
+        )),
+        Err(error) => rows.push(Row::failed("first C# kernel start", "< 3000 ms", error)),
+    }
+    match csharp_edited_rerun(&supervisor).await {
+        Ok(measured) => rows.push(Row::time(
+            "warm C# rerun after an edit",
+            measured,
+            TARGET_CSHARP_RERUN,
+        )),
+        Err(error) => rows.push(Row::failed(
+            "warm C# rerun after an edit",
+            "< 500 ms",
+            error,
+        )),
+    }
+    match csharp_sequence_first_page(&supervisor).await {
+        Ok(measured) => rows.push(Row::time(
+            "100k-item IEnumerable, first page to host",
+            measured,
+            TARGET_CSHARP_SEQUENCE,
+        )),
+        Err(error) => rows.push(Row::failed(
+            "100k-item IEnumerable, first page to host",
+            "< 1000 ms",
+            error,
+        )),
+    }
+    supervisor.shutdown().await;
+}
+
+async fn csharp_first_run(supervisor: &Supervisor) -> Result<Duration, String> {
+    let started = Instant::now();
+    let result = supervisor
+        .run_language("bench-csharp", CSHARP_SCRIPT, Language::Csharp, |_| {})
+        .await?;
+    if !result.ok {
+        return Err("the first C# run failed".into());
+    }
+    Ok(started.elapsed())
+}
+
+/// Changed source forces a new compilation, and the result proves it ran.
+async fn csharp_edited_rerun(supervisor: &Supervisor) -> Result<Duration, String> {
+    let mut value = None;
+    let started = Instant::now();
+    let result = supervisor
+        .run_language(
+            "bench-csharp",
+            CSHARP_EDITED_SCRIPT,
+            Language::Csharp,
+            |event: KernelEvent| {
+                if event.method == "dump" {
+                    value = event.params["node"]["v"].as_i64();
+                }
+            },
+        )
+        .await?;
+    let elapsed = started.elapsed();
+    if !result.ok {
+        return Err("the edited C# run failed".into());
+    }
+    if value != Some(CSHARP_EDITED_RESULT) {
+        return Err("the edited C# run did not return the edited result".into());
+    }
+    Ok(elapsed)
+}
+
+/// Timed from pressing Run: a lazy sequence costs nothing to create, so unlike
+/// the Python dump the compile is the work a user waits for.
+async fn csharp_sequence_first_page(supervisor: &Supervisor) -> Result<Duration, String> {
+    let mut first_page = None;
+    let started = Instant::now();
+    let result = supervisor
+        .run_language(
+            "bench-csharp",
+            CSHARP_SEQUENCE_SCRIPT,
+            Language::Csharp,
+            |event: KernelEvent| {
+                let node = &event.params["node"];
+                if first_page.is_none()
+                    && event.method == "dump"
+                    && node["kind"] == "table"
+                    && node["rows"].as_array().is_some_and(|rows| !rows.is_empty())
+                {
+                    first_page = Some(started.elapsed());
+                }
+            },
+        )
+        .await?;
+    if !result.ok {
+        return Err("the 100k-item C# dump failed".into());
+    }
+    first_page.ok_or_else(|| "no table dump arrived".into())
+}
+
+fn csharp_completion_params(uri: &str, line: u32, character: u32) -> serde_json::Value {
+    json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": line, "character": character },
+        "context": { "triggerKind": 2, "triggerCharacter": "." },
+    })
+}
+
+fn has_completion(result: &serde_json::Value, prefix: &str) -> bool {
+    result["items"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["label"]
+                .as_str()
+                .is_some_and(|label| label.starts_with(prefix))
+        })
+    })
+}
+
+async fn csharp_completion_latency() -> Result<Duration, String> {
+    eprintln!("Warming the Roslyn language server...");
+    let servers = LanguageServers::default();
+    let measured = async {
+        servers.begin_session("bench").await;
+        let source = "var value = 42;\nvalue.";
+        let start = servers
+            .start_csharp("bench-csharp-lsp", source, None, "bench", |_| {})
+            .await?;
+        let warm = Instant::now();
+        loop {
+            let result = servers
+                .request(
+                    "bench-csharp-lsp",
+                    "textDocument/completion",
+                    csharp_completion_params(&start.uri, 1, 6),
+                )
+                .await?;
+            if has_completion(&result, "Dump") {
+                break;
+            }
+            if warm.elapsed() > ROSLYN_WARM_TIMEOUT {
+                return Err("Roslyn did not load the shadow project in time".to_owned());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        // Time the first completion after an edit, as a user would see it.
+        servers
+            .did_change(
+                "bench-csharp-lsp",
+                "var other = 42;\nvar total = other + 1;\ntotal.",
+            )
+            .await?;
+        let started = Instant::now();
+        let result = servers
+            .request(
+                "bench-csharp-lsp",
+                "textDocument/completion",
+                csharp_completion_params(&start.uri, 2, 6),
+            )
+            .await?;
+        let elapsed = started.elapsed();
+        if !has_completion(&result, "Dump") {
+            return Err("Roslyn returned no completions for the edited script".to_owned());
+        }
+        Ok(elapsed)
+    }
+    .await;
+    servers.shutdown().await;
+    measured
+}
+
 fn report(rows: &[Row]) {
     let metric_width = rows
         .iter()
@@ -299,7 +503,7 @@ fn report(rows: &[Row]) {
         .max("target".len());
 
     println!(
-        "CodingPad M1 performance ({}, {} build)\n",
+        "CodingPad M1 and M2 performance ({}, {} build)\n",
         std::env::consts::OS,
         if cfg!(debug_assertions) {
             "debug"
@@ -602,5 +806,13 @@ mod tests {
         let row = Row::time("warm", Duration::from_millis(250), TARGET_WARM_RERUN);
         assert!(row.status == Status::Fail);
         assert_eq!(row.target, "< 200 ms");
+    }
+
+    #[test]
+    fn finds_a_completion_by_label_prefix() {
+        let result = json!({ "items": [{ "label": "ToString" }, { "label": "Dump<>" }] });
+        assert!(has_completion(&result, "Dump"));
+        assert!(!has_completion(&result, "Missing"));
+        assert!(!has_completion(&serde_json::Value::Null, "Dump"));
     }
 }

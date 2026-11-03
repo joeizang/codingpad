@@ -416,8 +416,8 @@ stop **Run**; Python executes regardless.
 
 ## Performance checks
 
-`just bench` builds the release app and measures the M1 targets from D38 on
-macOS and Linux:
+`just bench` builds the release app and measures the M1 and M2 targets from D38
+on macOS and Linux:
 
 | Metric | Target |
 |---|---|
@@ -427,8 +427,16 @@ macOS and Linux:
 | Warm Python rerun | < 200 ms |
 | 100k-row dump, first page to host | < 1 s |
 | Python completion | < 300 ms |
+| First C# kernel start | < 3 s |
+| Warm C# rerun after an edit | < 500 ms |
+| 100k-item `IEnumerable`, first page to host | < 1 s |
+| C# completion | < 300 ms |
 
 The first completion run may download basedpyright; later runs reuse the cache.
+The C# completion metric needs Roslyn, from the VS Code C# extension or
+`CODINGPAD_ROSLYN_LSP`. It waits for Roslyn to load the script, then times the
+first completion after an edit. The `IEnumerable` metric runs in a warm kernel
+and is timed from the start of the run, so it includes compilation.
 Idle memory is sampled five seconds after the window is ready, so first-paint
 buffers have been released; on macOS it is the sum of physical footprints, and
 elsewhere it is resident memory. The dump metric ends when the first page reaches

@@ -316,6 +316,22 @@ install follows in a later M2 issue. Only managed `Console` output is
 captured; direct native writes are outside this increment. Scripts run with your
 user privileges.
 
+## SQL scripts (M3.0)
+
+Click **Connections…** to add a SQLite database, then **+ SQL** or open a `.sql`
+file. The first line names the connection; the rest is plain SQL:
+
+```sql
+# codingpad: connection=northwind
+
+SELECT CustomerId, CompanyName FROM Customers LIMIT 100;
+```
+
+Results appear as a paged table in Results. Statement failures and missing
+connections show a clear error. **Stop** interrupts a running SQLite query.
+Connections live in the app settings; passwords for server databases are held
+only in the vault (see below), never in connection settings or scripts.
+
 ## Secrets
 
 Click **Secrets…** to add, update or remove named secrets. Values are stored in

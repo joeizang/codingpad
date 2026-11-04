@@ -295,7 +295,7 @@ export default function CodeEditor({
 
   return (
     <Editor
-      path={`${id}.${language === "csharp" ? "cs" : language === "python" ? "py" : "txt"}`}
+      path={`${id}.${language === "csharp" ? "cs" : language === "python" ? "py" : language === "sql" ? "sql" : "txt"}`}
       language={language}
       theme="vs-dark"
       value={source}

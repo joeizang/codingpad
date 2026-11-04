@@ -68,8 +68,24 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
     }
   }
 
+  function validate(): string | undefined {
+    if (!draft.name.trim()) return "A connection name cannot be empty";
+    if (/\s/.test(draft.name.trim())) {
+      return "A connection name cannot contain spaces; use letters, digits, dashes or underscores.";
+    }
+    if (draft.kind === "sqlite" && !draft.path?.trim()) {
+      return "A SQLite connection needs a database file";
+    }
+    return undefined;
+  }
+
   async function save() {
     if (busy) return;
+    const invalid = validate();
+    if (invalid) {
+      setError(invalid);
+      return;
+    }
     setBusy(true);
     setError(undefined);
     setStatus(undefined);

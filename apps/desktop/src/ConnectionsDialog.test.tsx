@@ -60,3 +60,22 @@ test("lists, adds, tests and removes SQLite connections", async () => {
     expect(invoke).toHaveBeenCalledWith("delete_connection", { id: "one" }),
   );
 });
+
+test("rejects connection names with spaces before saving", async () => {
+  invoke.mockImplementation(async (command: string) => {
+    if (command === "list_connections") return [];
+    return undefined;
+  });
+  render(<ConnectionsDialog open onClose={() => {}} />);
+  fireEvent.change(screen.getByLabelText("Name"), {
+    target: { value: "my db" },
+  });
+  fireEvent.change(screen.getByLabelText("Database file"), {
+    target: { value: "/tmp/my.db" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Add connection" }));
+  await waitFor(() =>
+    expect(screen.getByRole("alert")).toHaveTextContent("cannot contain spaces"),
+  );
+  expect(invoke).not.toHaveBeenCalledWith("save_connection", expect.anything());
+});

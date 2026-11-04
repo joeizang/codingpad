@@ -11,7 +11,7 @@ use rusqlite::{types::ValueRef, Connection as SqliteConnection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -217,7 +217,6 @@ pub struct SqlManager {
     script_results: Mutex<HashMap<String, Vec<String>>>,
     interrupts: Mutex<HashMap<String, Interrupt>>,
     cancel_flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
-    pending_stops: Mutex<HashSet<String>>,
     next_handle: AtomicU64,
 }
 
@@ -230,7 +229,6 @@ impl SqlManager {
             script_results: Mutex::new(HashMap::new()),
             interrupts: Mutex::new(HashMap::new()),
             cancel_flags: Mutex::new(HashMap::new()),
-            pending_stops: Mutex::new(HashSet::new()),
             next_handle: AtomicU64::new(1),
         }
     }
@@ -271,15 +269,16 @@ impl SqlManager {
         if script_id.is_empty() {
             return Err("A script id is required".into());
         }
-        // Register before any work so a Stop racing the connection open is kept.
-        let cancelled = Arc::new(AtomicBool::new(false));
-        self.cancel_flags
-            .lock()
-            .unwrap()
-            .insert(script_id.to_owned(), cancelled.clone());
-        if self.pending_stops.lock().unwrap().remove(script_id) {
-            cancelled.store(true, Ordering::Relaxed);
-        }
+        // The UI calls begin_run before Run, so a Stop that arrives before this
+        // future is polled still targets this run. Without begin_run, register
+        // here for direct callers.
+        let cancelled = {
+            let mut flags = self.cancel_flags.lock().unwrap();
+            flags
+                .entry(script_id.to_owned())
+                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                .clone()
+        };
         let result = self
             .run_registered(script_id, source, path, &cancelled)
             .await;
@@ -380,16 +379,22 @@ impl SqlManager {
         }
     }
 
+    /// Register a run before invoking `run`, so a fast Stop cannot miss it.
+    /// Calling this for an idle tab does not affect the next Run; only a Stop
+    /// between this call and the matching run does.
+    pub fn begin_run(&self, script_id: &str) {
+        self.cancel_flags
+            .lock()
+            .unwrap()
+            .entry(script_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)));
+    }
+
     pub fn stop(&self, script_id: &str) {
-        let flag = self.cancel_flags.lock().unwrap().get(script_id).cloned();
-        match flag {
-            Some(cancelled) => cancelled.store(true, Ordering::Relaxed),
-            None => {
-                self.pending_stops
-                    .lock()
-                    .unwrap()
-                    .insert(script_id.to_owned());
-            }
+        // Stop only affects a run that has begun. A Stop on an idle tab is a
+        // no-op, so it cannot cancel the next Run.
+        if let Some(cancelled) = self.cancel_flags.lock().unwrap().get(script_id).cloned() {
+            cancelled.store(true, Ordering::Relaxed);
         }
         if let Some(interrupt) = self.interrupts.lock().unwrap().get(script_id) {
             if let Some(handle) = interrupt.lock().unwrap().as_ref() {
@@ -404,12 +409,11 @@ impl SqlManager {
         self.script_results.lock().unwrap().clear();
         self.interrupts.lock().unwrap().clear();
         self.cancel_flags.lock().unwrap().clear();
-        self.pending_stops.lock().unwrap().clear();
     }
 
     pub fn reset(&self, script_id: &str) {
         self.stop(script_id);
-        self.pending_stops.lock().unwrap().remove(script_id);
+        self.cancel_flags.lock().unwrap().remove(script_id);
         self.clear_results(script_id);
     }
 
@@ -589,12 +593,9 @@ fn cell_node(value: ValueRef<'_>, row: usize, column: usize) -> Value {
     let id = format!("sql:r{row}c{column}");
     match value {
         ValueRef::Null => json!({"id": id, "kind": "null"}),
-        ValueRef::Integer(value) if value.abs() > MAX_SAFE_INTEGER => string_node(
-            id,
-            value.to_string(),
-            Some("int"),
-            Some(value.to_string().chars().count()),
-        ),
+        ValueRef::Integer(value) if value.unsigned_abs() > MAX_SAFE_INTEGER as u64 => {
+            string_node(id, value.to_string(), Some("int"), None)
+        }
         ValueRef::Integer(value) => json!({"id": id, "kind": "primitive", "v": value}),
         ValueRef::Real(value) if value.is_finite() => {
             json!({"id": id, "kind": "primitive", "v": value})
@@ -862,7 +863,7 @@ mod tests {
         let result = manager
             .run(
                 "sql",
-                "-- codingpad: connection=sample\nSELECT 9007199254740993 AS id, replace(printf('%0*d', 2000, 0), '0', 'x') AS big",
+                "-- codingpad: connection=sample\nSELECT 9007199254740993 AS id, replace(printf('%0*d', 2000, 0), '0', 'x') AS big, -9223372036854775807 - 1 AS minimum",
                 None,
             )
             .await
@@ -870,9 +871,40 @@ mod tests {
         let cells = &result.tables[0]["rows"][0];
         assert_eq!(cells[0]["kind"], "string");
         assert_eq!(cells[0]["v"], "9007199254740993");
+        assert!(cells[0].get("truncated").is_none());
+        assert_eq!(cells[2]["v"], "-9223372036854775808");
         assert_eq!(cells[1]["truncated"], true);
         assert_eq!(cells[1]["total"], 2000);
         assert_eq!(cells[1]["v"].as_str().unwrap().chars().count(), 1000);
+    }
+
+    #[tokio::test]
+    async fn an_idle_stop_does_not_cancel_the_next_run() {
+        let (_directory, _connections, _secrets, manager, _database) = setup();
+        manager
+            .run("sql", "-- codingpad: connection=sample\nSELECT 1", None)
+            .await
+            .unwrap();
+        manager.stop("sql");
+        let result = manager
+            .run(
+                "sql",
+                "-- codingpad: connection=sample\nINSERT INTO people VALUES ('Idle', 1)",
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(result.ok, "an idle Stop must not affect the next Run");
+        assert!(!result.stopped);
+        let count = manager
+            .run(
+                "sql",
+                "-- codingpad: connection=sample\nSELECT count(*) FROM people WHERE name = 'Idle'",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(count.tables[0]["rows"][0][0]["v"], 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -881,6 +913,7 @@ mod tests {
         let (_directory, _connections, _secrets, manager, _database) = setup();
         let manager = Arc::new(manager);
         let endless = "-- codingpad: connection=sample\nWITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c";
+        manager.begin_run("sql");
         let run = {
             let manager = manager.clone();
             tokio::spawn(async move { manager.run("sql", endless, None).await })
@@ -895,6 +928,7 @@ mod tests {
         assert!(result.stopped);
         assert!(!result.ok);
 
+        manager.begin_run("sql");
         let run = {
             let manager = manager.clone();
             tokio::spawn(async move { manager.run("sql", endless, None).await })

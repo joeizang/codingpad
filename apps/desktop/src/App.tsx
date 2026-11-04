@@ -300,6 +300,7 @@ export default function App() {
       error: undefined,
     }));
     try {
+      await invoke("begin_sql_run", { scriptId: script.id });
       const result = await invoke<{
         ok: boolean;
         stopped?: boolean;

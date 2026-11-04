@@ -80,6 +80,11 @@ async fn test_connection(sql: State<'_, Arc<SqlManager>>, id: String) -> Result<
 }
 
 #[tauri::command]
+fn begin_sql_run(sql: State<'_, Arc<SqlManager>>, script_id: String) {
+    sql.begin_run(&script_id);
+}
+
+#[tauri::command]
 async fn run_sql(
     sql: State<'_, Arc<SqlManager>>,
     script_id: String,
@@ -385,6 +390,7 @@ fn main() {
             save_connection,
             delete_connection,
             test_connection,
+            begin_sql_run,
             run_sql,
             expand_sql,
             save_secret,

@@ -670,6 +670,11 @@ impl SqlManager {
             })?
             .unwrap_or_default();
         config.authentication(tiberius::AuthMethod::sql_server(user, password));
+        config.encryption(match connection.tls {
+            TlsMode::Prefer => tiberius::EncryptionLevel::On,
+            TlsMode::Require => tiberius::EncryptionLevel::Required,
+            TlsMode::Disable => tiberius::EncryptionLevel::NotSupported,
+        });
         if connection.trust_server_certificate {
             config.trust_cert();
         }
@@ -712,12 +717,34 @@ impl SqlManager {
                 tables: Vec::new(),
             });
         }
+        let mut client = tokio::select! {
+            result = self.connect_sqlserver(connection) => match result {
+                Ok(client) => client,
+                Err(error) => {
+                    self.stops.lock().unwrap().remove(script_id);
+                    return Err(error);
+                }
+            },
+            _ = stop.changed() => {
+                self.stops.lock().unwrap().remove(script_id);
+                return Ok(SqlRunResult { ok: false, stopped: true, tables: Vec::new() });
+            }
+        };
+        let mut query = Box::pin(sqlserver_tables(&mut client, source));
         let outcome = tokio::select! {
-            result = async {
-                let mut client = self.connect_sqlserver(connection).await?;
-                sqlserver_tables(&mut client, source).await
-            } => result,
-            _ = stop.changed() => return Ok(SqlRunResult { ok: false, stopped: true, tables: Vec::new() }),
+            result = &mut query => result,
+            _ = stop.changed() => {
+                drop(query);
+                // Closing resets the TDS connection; an open transaction is
+                // rolled back instead of committing after we reported Stop.
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    client.close(),
+                )
+                .await;
+                self.stops.lock().unwrap().remove(script_id);
+                return Ok(SqlRunResult { ok: false, stopped: true, tables: Vec::new() });
+            }
         };
         self.stops.lock().unwrap().remove(script_id);
         let tables = outcome?;
@@ -1079,42 +1106,88 @@ fn sqlserver_table(rows: Vec<tiberius::Row>) -> TableData {
 fn sqlserver_cell(value: &tiberius::ColumnData<'_>, row: usize, column: usize) -> Value {
     use tiberius::ColumnData;
     let id = format!("sql:r{row}c{column}");
-    let null = || json!({"id": id, "kind": "null"});
-    let primitive = |value: Value| json!({"id": id, "kind": "primitive", "v": value});
-    let text = |value: String| json!({"id": id, "kind": "string", "v": value});
     match value {
-        ColumnData::U8(value) => value.map_or_else(null, |value| primitive(json!(value))),
-        ColumnData::I16(value) => value.map_or_else(null, |value| primitive(json!(value))),
-        ColumnData::I32(value) => value.map_or_else(null, |value| primitive(json!(value))),
-        ColumnData::I64(value) => value.map_or_else(null, |value| primitive(json!(value))),
-        ColumnData::F32(value) => value
-            .filter(|value| value.is_finite())
-            .map_or_else(null, |value| primitive(json!(value))),
-        ColumnData::F64(value) => value
-            .filter(|value| value.is_finite())
-            .map_or_else(null, |value| primitive(json!(value))),
-        ColumnData::Bit(value) => value.map_or_else(null, |value| primitive(json!(value))),
-        ColumnData::String(value) => value
-            .as_ref()
-            .map_or_else(null, |value| text(value.to_string())),
-        ColumnData::Guid(value) => value.map_or_else(null, |value| text(value.to_string())),
-        ColumnData::Binary(value) => value.as_ref().map_or_else(null, |value| text(hex(value))),
-        ColumnData::Numeric(value) => value
-            .as_ref()
-            .map_or_else(null, |value| text(value.to_string())),
-        ColumnData::Xml(value) => value
-            .as_ref()
-            .map_or_else(null, |value| text(format!("{value:?}"))),
-        ColumnData::DateTime(value) => value.map_or_else(null, |value| text(format!("{value:?}"))),
-        ColumnData::SmallDateTime(value) => {
-            value.map_or_else(null, |value| text(format!("{value:?}")))
+        ColumnData::U8(value) => {
+            value.map_or_else(|| null_node(&id), |value| integer_node(&id, value as i64))
         }
-        ColumnData::Time(value) => value.map_or_else(null, |value| text(format!("{value:?}"))),
-        ColumnData::Date(value) => value.map_or_else(null, |value| text(format!("{value:?}"))),
-        ColumnData::DateTime2(value) => value.map_or_else(null, |value| text(format!("{value:?}"))),
-        ColumnData::DateTimeOffset(value) => {
-            value.map_or_else(null, |value| text(format!("{value:?}")))
+        ColumnData::I16(value) => {
+            value.map_or_else(|| null_node(&id), |value| integer_node(&id, value as i64))
         }
+        ColumnData::I32(value) => {
+            value.map_or_else(|| null_node(&id), |value| integer_node(&id, value as i64))
+        }
+        ColumnData::I64(value) => {
+            value.map_or_else(|| null_node(&id), |value| integer_node(&id, value))
+        }
+        ColumnData::F32(value) => match value {
+            None => null_node(&id),
+            Some(value) if !value.is_finite() => bounded_text(&id, value.to_string(), None),
+            Some(value) => primitive_node(
+                &id,
+                json!(value.to_string().parse::<f64>().unwrap_or(*value as f64)),
+            ),
+        },
+        ColumnData::F64(value) => match value {
+            None => null_node(&id),
+            Some(value) if value.is_nan() => bounded_text(&id, "NaN".into(), None),
+            Some(value) if value.is_infinite() => bounded_text(
+                &id,
+                if value.is_sign_negative() {
+                    "-Infinity".into()
+                } else {
+                    "Infinity".into()
+                },
+                None,
+            ),
+            Some(value) => primitive_node(&id, json!(value)),
+        },
+        ColumnData::Bit(value) => {
+            value.map_or_else(|| null_node(&id), |value| primitive_node(&id, json!(value)))
+        }
+        ColumnData::String(value) => value.as_ref().map_or_else(
+            || null_node(&id),
+            |value| bounded_text(&id, value.to_string(), Some("nvarchar")),
+        ),
+        ColumnData::Guid(value) => value.map_or_else(
+            || null_node(&id),
+            |value| bounded_text(&id, value.to_string(), Some("uniqueidentifier")),
+        ),
+        ColumnData::Binary(value) => value.as_ref().map_or_else(
+            || null_node(&id),
+            |value| bounded_text(&id, hex(value), Some("varbinary")),
+        ),
+        ColumnData::Numeric(value) => value.as_ref().map_or_else(
+            || null_node(&id),
+            |value| bounded_text(&id, value.to_string(), Some("numeric")),
+        ),
+        ColumnData::Xml(value) => value.as_ref().map_or_else(
+            || null_node(&id),
+            |value| bounded_text(&id, format!("{value:?}"), Some("xml")),
+        ),
+        ColumnData::DateTime(value) => value.map_or_else(
+            || null_node(&id),
+            |value| bounded_text(&id, format!("{value:?}"), Some("datetime")),
+        ),
+        ColumnData::SmallDateTime(value) => value.map_or_else(
+            || null_node(&id),
+            |value| bounded_text(&id, format!("{value:?}"), Some("smalldatetime")),
+        ),
+        ColumnData::Time(value) => value.map_or_else(
+            || null_node(&id),
+            |value| bounded_text(&id, format!("{value:?}"), Some("time")),
+        ),
+        ColumnData::Date(value) => value.map_or_else(
+            || null_node(&id),
+            |value| bounded_text(&id, format!("{value:?}"), Some("date")),
+        ),
+        ColumnData::DateTime2(value) => value.map_or_else(
+            || null_node(&id),
+            |value| bounded_text(&id, format!("{value:?}"), Some("datetime2")),
+        ),
+        ColumnData::DateTimeOffset(value) => value.map_or_else(
+            || null_node(&id),
+            |value| bounded_text(&id, format!("{value:?}"), Some("datetimeoffset")),
+        ),
     }
 }
 
@@ -1644,7 +1717,6 @@ mod tests {
                 database: None,
                 user: None,
                 secret: None,
-                trust_server_certificate: false,
             })
             .unwrap();
         let secrets = Arc::new(SecretStore::with_vault(
@@ -1678,7 +1750,6 @@ mod tests {
                 database: None,
                 user: None,
                 secret: Some("connection:sample".into()),
-                trust_server_certificate: false,
             })
             .unwrap();
         assert_eq!(store.by_name("sample").unwrap().secret, None);
@@ -1712,7 +1783,6 @@ mod tests {
                 database: None,
                 user: None,
                 secret: None,
-                trust_server_certificate: false,
             })
             .is_err());
         let text = fs::read_to_string(directory.path().join(CONNECTIONS_FILE)).unwrap();
@@ -1926,7 +1996,6 @@ mod tests {
                 database: None,
                 user: None,
                 secret: None,
-                trust_server_certificate: false,
             })
             .unwrap();
         assert!(manager
@@ -1968,7 +2037,6 @@ mod tests {
             database: Some("northwind".into()),
             user: Some("reader".into()),
             secret: None,
-            trust_server_certificate: false,
         };
         assert!(store.save(connection).unwrap_err().contains("host"));
         let saved = store
@@ -1984,7 +2052,6 @@ mod tests {
                 database: Some("northwind".into()),
                 user: Some("reader".into()),
                 secret: Some("connection:pg".into()),
-                trust_server_certificate: false,
             })
             .unwrap();
         assert_eq!(saved.port, Some(5433));
@@ -2104,6 +2171,7 @@ mod tests {
             id: String::new(),
             name: "mssql".into(),
             kind: DatabaseKind::SqlServer,
+            tls: TlsMode::Prefer,
             path: None,
             host: Some("db.example.com".into()),
             port: None,
@@ -2122,6 +2190,7 @@ mod tests {
             id: String::new(),
             name: "broken".into(),
             kind: DatabaseKind::SqlServer,
+            tls: TlsMode::Prefer,
             path: None,
             host: Some("db.example.com".into()),
             port: None,
@@ -2131,6 +2200,117 @@ mod tests {
             trust_server_certificate: false,
         };
         assert!(store.save(missing).unwrap_err().contains("database"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODINGPAD_TEST_SQLSERVER_HOST/PORT/DATABASE/USER/PASSWORD"]
+    async fn sqlserver_integration_round_trip_and_cancel() {
+        use std::time::Duration;
+
+        let (Ok(host), Ok(port), Ok(database), Ok(user), Ok(password)) = (
+            std::env::var("CODINGPAD_TEST_SQLSERVER_HOST"),
+            std::env::var("CODINGPAD_TEST_SQLSERVER_PORT"),
+            std::env::var("CODINGPAD_TEST_SQLSERVER_DATABASE"),
+            std::env::var("CODINGPAD_TEST_SQLSERVER_USER"),
+            std::env::var("CODINGPAD_TEST_SQLSERVER_PASSWORD"),
+        ) else {
+            eprintln!("Set the CODINGPAD_TEST_SQLSERVER_* variables to run this test.");
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(SecretStore::with_vault(
+            directory.path(),
+            Arc::new(MemoryVault(Mutex::new(BTreeMap::new()))),
+        ));
+        secrets.set_session("connection:mssql", &password).unwrap();
+        let connections = Arc::new(ConnectionStore::new(directory.path()));
+        connections
+            .save(Connection {
+                id: String::new(),
+                name: "mssql".into(),
+                kind: DatabaseKind::SqlServer,
+                tls: TlsMode::Prefer,
+                path: None,
+                host: Some(host),
+                port: Some(port.parse().unwrap()),
+                database: Some(database),
+                user: Some(user),
+                secret: Some("connection:mssql".into()),
+                trust_server_certificate: std::env::var("CODINGPAD_TEST_SQLSERVER_TRUST")
+                    .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+            })
+            .unwrap();
+        let manager = Arc::new(SqlManager::new(connections, secrets));
+        let header = "-- codingpad: connection=mssql\n";
+        let table = format!("codingpad_m3_3_{}", std::process::id());
+
+        manager
+            .run(
+                "mssql",
+                &format!(
+                    "{header}IF OBJECT_ID('{table}', 'U') IS NOT NULL DROP TABLE {table}; \
+                     CREATE TABLE {table} (n int)"
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let typed = manager
+            .run(
+                "mssql",
+                &format!(
+                    "{header}SELECT CAST(1 AS bigint) AS n, CAST(12.5 AS decimal(10,2)) AS amount, \
+                     CAST('2020-01-02' AS date) AS day, NEWID() AS id, N'hello' AS name, \
+                     CAST(0x0102 AS varbinary(2)) AS bin, CAST(1 AS bit) AS flag, \
+                     CAST(9007199254740993 AS bigint) AS big"
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let cells = &typed.tables[0]["rows"][0];
+        assert_eq!(cells[0]["v"], 1);
+        assert!(cells[1]["v"].as_str().unwrap().contains("12.5"));
+        assert!(cells[2]["v"].as_str().unwrap().contains("2020"));
+        assert!(cells[3]["v"].as_str().unwrap().contains('-'));
+        assert_eq!(cells[4]["v"], "hello");
+        assert!(cells[5]["v"].as_str().unwrap().starts_with("0x"));
+        assert_eq!(cells[6]["v"], true);
+        assert_eq!(cells[7]["v"], "9007199254740993");
+
+        let stop = {
+            let manager = manager.clone();
+            let source = format!(
+                "{header}BEGIN TRAN; INSERT INTO {table} VALUES (1); \
+                 WAITFOR DELAY '00:00:05'; COMMIT;"
+            );
+            tokio::spawn(async move { manager.run("mssql-stop", &source, None).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        manager.stop("mssql-stop");
+        let stopped = tokio::time::timeout(Duration::from_secs(5), stop)
+            .await
+            .expect("SQL Server stop must return")
+            .unwrap()
+            .unwrap();
+        assert!(stopped.stopped);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let check = manager
+            .run(
+                "mssql-check",
+                &format!("{header}SELECT count(*) AS n FROM {table}"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            check.tables[0]["rows"][0][0]["v"], 0,
+            "a stopped transaction must roll back"
+        );
+        manager
+            .run("mssql", &format!("{header}DROP TABLE {table}"), None)
+            .await
+            .unwrap();
     }
 
     #[test]

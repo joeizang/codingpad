@@ -11,6 +11,69 @@ pub mod toolchains;
 
 use packages::Packages;
 use secrets::{SecretSnapshot, SecretStore};
+
+/// Names the script lexically passes to `secret(...)`/`Secret(...)`.
+/// `Some(names)` means read only those; `None` means a dynamic call so every
+/// non-connection secret must be available.
+fn referenced_secret_names(source: &str) -> Option<Vec<String>> {
+    let lower = source.to_ascii_lowercase();
+    if !lower.contains("secret") {
+        return Some(Vec::new());
+    }
+    let bytes = source.as_bytes();
+    let mut names = Vec::new();
+    let mut index = 0;
+    while index + 6 <= bytes.len() {
+        if !bytes[index..index + 6].eq_ignore_ascii_case(b"secret") {
+            index += 1;
+            continue;
+        }
+        index += 6;
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if bytes.get(index) != Some(&b'(') {
+            continue;
+        }
+        index += 1;
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let quote = bytes
+            .get(index)
+            .copied()
+            .filter(|byte| *byte == b'"' || *byte == b'\'')?;
+        index += 1;
+        let mut value = String::new();
+        let mut closed = false;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if byte == b'\\' && index + 1 < bytes.len() {
+                value.push(bytes[index + 1] as char);
+                index += 2;
+                continue;
+            }
+            if byte == quote {
+                closed = true;
+                index += 1;
+                break;
+            }
+            value.push(byte as char);
+            index += 1;
+        }
+        if !closed {
+            return None;
+        }
+        if !value.is_empty() && !names.contains(&value) {
+            names.push(value);
+        }
+    }
+    if names.is_empty() {
+        None
+    } else {
+        Some(names)
+    }
+}
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
@@ -216,10 +279,12 @@ impl Supervisor {
         let mut stop = slot.stop.subscribe();
         // Vault prompts block. Resolve values off the async thread and let Stop
         // or Close cancel the wait before the kernel slot lock is taken.
+        let names = referenced_secret_names(source);
         let secrets = match self.secrets.clone() {
             None => SecretSnapshot::default(),
             Some(store) => {
-                let snapshot = tokio::task::spawn_blocking(move || store.snapshot());
+                let snapshot =
+                    tokio::task::spawn_blocking(move || store.snapshot_named(names.as_deref()));
                 tokio::select! {
                     result = snapshot => result
                         .map_err(|error| format!("Could not read secrets from the vault: {error}"))?,
@@ -758,6 +823,25 @@ impl Drop for Kernel {
 mod tests {
     use super::*;
 
+    #[test]
+    fn secret_names_are_read_lexically_or_not_at_all() {
+        assert_eq!(referenced_secret_names("print(1)"), Some(vec![]));
+        assert_eq!(
+            referenced_secret_names("from codingpad import secret\nsecret('token')"),
+            Some(vec!["token".into()])
+        );
+        assert_eq!(
+            referenced_secret_names("Secret(\"a\"); Secret( 'b' ); Secret(\"a\")"),
+            Some(vec!["a".into(), "b".into()])
+        );
+        assert_eq!(referenced_secret_names("secret(name)"), None);
+        assert_eq!(
+            referenced_secret_names("from codingpad import secret as s\ns('token')"),
+            None,
+            "alias calls fall back to reading every name"
+        );
+    }
+
     #[tokio::test]
     async fn stop_during_a_vault_read_does_not_claim_the_cache_was_cleared() {
         use crate::secrets::Vault;
@@ -785,7 +869,7 @@ mod tests {
         ));
         let supervisor =
             Supervisor::with_data_dir_and_secrets(directory.path().to_path_buf(), store);
-        let mut run = std::pin::pin!(supervisor.run("slow-secret", "1 + 1", |_| {}));
+        let mut run = std::pin::pin!(supervisor.run("slow-secret", "secret('token')", |_| {}));
         let result = tokio::select! {
             result = &mut run => result,
             _ = tokio::time::sleep(Duration::from_millis(50)) => {

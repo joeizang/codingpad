@@ -271,12 +271,30 @@ impl SecretStore {
     /// Database connection passwords (`connection:`) stay in the Rust host and
     /// are never sent to script kernels.
     pub fn snapshot(&self) -> SecretSnapshot {
+        self.snapshot_named(None)
+    }
+
+    /// Read only `names` when the script names them, or every stored name when
+    /// `names` is `None` (a dynamic call). Connection passwords never go to a
+    /// script kernel.
+    pub fn snapshot_named(&self, names: Option<&[String]>) -> SecretSnapshot {
         let mut snapshot = SecretSnapshot::default();
-        for entry in self
-            .entries()
-            .into_iter()
-            .filter(|entry| !entry.name.starts_with("connection:"))
-        {
+        let entries: Vec<SecretEntry> = match names {
+            Some(names) => names
+                .iter()
+                .filter(|name| !name.starts_with("connection:"))
+                .map(|name| SecretEntry {
+                    name: name.clone(),
+                    origin: SecretOrigin::Vault,
+                })
+                .collect(),
+            None => self
+                .entries()
+                .into_iter()
+                .filter(|entry| !entry.name.starts_with("connection:"))
+                .collect(),
+        };
+        for entry in entries {
             match self.resolve(&entry.name) {
                 Ok(Some(value)) => {
                     snapshot.values.insert(entry.name, value);
@@ -485,6 +503,42 @@ mod tests {
         assert_eq!(store.get("token").unwrap(), "value");
         store.delete("token", true).unwrap();
         assert!(store.entries().is_empty());
+    }
+
+    #[test]
+    fn snapshot_named_reads_only_the_requested_secrets() {
+        let directory = tempfile::tempdir().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        struct RecordingVault {
+            values: BTreeMap<String, String>,
+            calls: Arc<Mutex<Vec<String>>>,
+        }
+        impl Vault for RecordingVault {
+            fn get(&self, name: &str) -> Result<Option<String>, String> {
+                self.calls.lock().unwrap().push(name.to_owned());
+                Ok(self.values.get(name).cloned())
+            }
+            fn set(&self, _: &str, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn delete(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let store = SecretStore::with_vault(
+            directory.path(),
+            Arc::new(RecordingVault {
+                values: BTreeMap::from([("one".into(), "1".into()), ("two".into(), "2".into())]),
+                calls: calls.clone(),
+            }),
+        );
+        fs::write(directory.path().join(NAMES_FILE), "[\"one\", \"two\"]").unwrap();
+        let snapshot = store.snapshot_named(Some(&["one".to_owned()]));
+        assert_eq!(snapshot.values.get("one").map(String::as_str), Some("1"));
+        assert!(!snapshot.values.contains_key("two"));
+        assert_eq!(*calls.lock().unwrap(), vec!["one".to_owned()]);
+        store.snapshot_named(Some(&[]));
+        assert_eq!(*calls.lock().unwrap(), vec!["one".to_owned()]);
     }
 
     #[test]

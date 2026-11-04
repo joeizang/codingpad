@@ -268,9 +268,15 @@ impl SecretStore {
 
     /// Values handed to kernels before a run. Missing or unreadable entries are
     /// omitted; the script gets the same clear error from `secret()` instead.
+    /// Database connection passwords (`connection:`) stay in the Rust host and
+    /// are never sent to script kernels.
     pub fn snapshot(&self) -> SecretSnapshot {
         let mut snapshot = SecretSnapshot::default();
-        for entry in self.entries() {
+        for entry in self
+            .entries()
+            .into_iter()
+            .filter(|entry| !entry.name.starts_with("connection:"))
+        {
             match self.resolve(&entry.name) {
                 Ok(Some(value)) => {
                     snapshot.values.insert(entry.name, value);
@@ -479,6 +485,20 @@ mod tests {
         assert_eq!(store.get("token").unwrap(), "value");
         store.delete("token", true).unwrap();
         assert!(store.entries().is_empty());
+    }
+
+    #[test]
+    fn snapshot_never_sends_connection_passwords_to_scripts() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SecretStore::with_vault(directory.path(), Arc::new(MemoryVault::default()));
+        store.set("api-key", "public").unwrap();
+        store.set("connection:pg", "database-password").unwrap();
+        let snapshot = store.snapshot();
+        assert_eq!(
+            snapshot.values.get("api-key").map(String::as_str),
+            Some("public")
+        );
+        assert!(!snapshot.values.contains_key("connection:pg"));
     }
 
     #[test]

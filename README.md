@@ -319,8 +319,8 @@ user privileges.
 
 ## SQL scripts (M3.0)
 
-Click **Connections…** to add a SQLite database, then **+ SQL** or open a `.sql`
-file. The first line names the connection; the rest is plain SQL:
+Click **Connections…** to add a SQLite or PostgreSQL database, then **+ SQL** or
+open a `.sql` file. The first line names the connection; the rest is plain SQL:
 
 ```sql
 -- codingpad: connection=northwind
@@ -330,8 +330,10 @@ SELECT CustomerId, CompanyName FROM Customers LIMIT 100;
 
 Results appear as a paged table in Results. Statement failures and missing
 connections show a clear error. **Stop** interrupts a running SQLite query.
-Connections live in the app settings; passwords for server databases are held
-only in the vault (see below), never in connection settings or scripts.
+Connections live in the app settings. A PostgreSQL connection uses host, port
+(default 5432), database and user; its password is written only to the OS
+password vault and is referenced by name, never stored in connection settings or
+scripts.
 
 ## Secrets
 

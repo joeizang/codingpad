@@ -30,6 +30,8 @@ const STOPPED: &str = "\u{0}stopped";
 #[serde(rename_all = "lowercase")]
 pub enum DatabaseKind {
     Sqlite,
+    #[serde(alias = "postgresql")]
+    Postgres,
 }
 
 /// A saved connection. Values are never stored here; `secret` names the vault
@@ -76,6 +78,21 @@ impl Connection {
                     .is_none()
                 {
                     return Err("A SQLite connection needs a database file".into());
+                }
+            }
+            DatabaseKind::Postgres => {
+                for (field, value) in [
+                    ("host", self.host.as_deref()),
+                    ("database", self.database.as_deref()),
+                    ("user", self.user.as_deref()),
+                ] {
+                    if value
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .is_none()
+                    {
+                        return Err(format!("A PostgreSQL connection needs a {field}"));
+                    }
                 }
             }
         }
@@ -212,11 +229,12 @@ type Interrupt = Arc<Mutex<Option<rusqlite::InterruptHandle>>>;
 
 pub struct SqlManager {
     connections: Arc<ConnectionStore>,
-    _secrets: Arc<SecretStore>,
+    secrets: Arc<SecretStore>,
     results: Mutex<HashMap<String, Arc<TableData>>>,
     script_results: Mutex<HashMap<String, Vec<String>>>,
     interrupts: Mutex<HashMap<String, Interrupt>>,
     cancel_flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    stops: Mutex<HashMap<String, tokio::sync::watch::Sender<u64>>>,
     next_handle: AtomicU64,
 }
 
@@ -224,11 +242,12 @@ impl SqlManager {
     pub fn new(connections: Arc<ConnectionStore>, secrets: Arc<SecretStore>) -> Self {
         Self {
             connections,
-            _secrets: secrets,
+            secrets,
             results: Mutex::new(HashMap::new()),
             script_results: Mutex::new(HashMap::new()),
             interrupts: Mutex::new(HashMap::new()),
             cancel_flags: Mutex::new(HashMap::new()),
+            stops: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
         }
     }
@@ -256,6 +275,19 @@ impl SqlManager {
                 })
                 .await
                 .map_err(|error| format!("The connection test failed: {error}"))?
+            }
+            DatabaseKind::Postgres => {
+                let client = self.connect_postgres(&connection).await?;
+                client
+                    .simple_query("SELECT 1")
+                    .await
+                    .map_err(|error| format!("PostgreSQL rejected the connection test: {error}"))?;
+                Ok(format!(
+                    "Connected to PostgreSQL at {}:{}/{}.",
+                    postgres_host(&connection),
+                    postgres_port(&connection),
+                    connection.database.as_deref().unwrap_or("")
+                ))
             }
         }
     }
@@ -310,6 +342,10 @@ impl SqlManager {
         match connection.kind {
             DatabaseKind::Sqlite => {
                 self.run_sqlite(script_id, &connection, body, cancelled)
+                    .await
+            }
+            DatabaseKind::Postgres => {
+                self.run_postgres(script_id, &connection, body, cancelled)
                     .await
             }
         }
@@ -390,6 +426,104 @@ impl SqlManager {
             .or_insert_with(|| Arc::new(AtomicBool::new(false)));
     }
 
+    fn begin_stop(&self, script_id: &str) -> tokio::sync::watch::Receiver<u64> {
+        self.stops
+            .lock()
+            .unwrap()
+            .entry(script_id.to_owned())
+            .or_insert_with(|| tokio::sync::watch::channel(0).0)
+            .subscribe()
+    }
+
+    async fn connect_postgres(
+        &self,
+        connection: &Connection,
+    ) -> Result<tokio_postgres::Client, String> {
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host(postgres_host(connection))
+            .port(postgres_port(connection))
+            .dbname(connection.database.as_deref().unwrap_or(""))
+            .user(connection.user.as_deref().unwrap_or(""));
+        if let Some(secret) = connection
+            .secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|secret| !secret.is_empty())
+        {
+            let password = self.secrets.get(secret).map_err(|error| {
+                format!("Could not read the PostgreSQL password from the vault: {error}")
+            })?;
+            config.password(password);
+        }
+        config.application_name("CodingPad");
+        config.connect_timeout(std::time::Duration::from_secs(10));
+        let (client, connection) =
+            config
+                .connect(tokio_postgres::NoTls)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Could not connect to PostgreSQL at {}:{}/{}: {error}",
+                        postgres_host(connection),
+                        postgres_port(connection),
+                        connection.database.as_deref().unwrap_or("")
+                    )
+                })?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok(client)
+    }
+
+    async fn run_postgres(
+        &self,
+        script_id: &str,
+        connection: &Connection,
+        source: &str,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<SqlRunResult, String> {
+        let mut stop = self.begin_stop(script_id);
+        if cancelled.load(Ordering::Relaxed) {
+            self.stops.lock().unwrap().remove(script_id);
+            return Ok(SqlRunResult {
+                ok: false,
+                stopped: true,
+                tables: Vec::new(),
+            });
+        }
+        let outcome = tokio::select! {
+            result = async {
+                let client = self.connect_postgres(connection).await?;
+                postgres_tables(&client, source).await
+            } => result,
+            _ = stop.changed() => return Ok(SqlRunResult { ok: false, stopped: true, tables: Vec::new() }),
+        };
+        self.stops.lock().unwrap().remove(script_id);
+        let tables = outcome?;
+        let mut nodes = Vec::with_capacity(tables.len());
+        for table in tables {
+            let handle = format!("sql-{}", self.next_handle.fetch_add(1, Ordering::Relaxed));
+            let table = Arc::new(table);
+            self.results
+                .lock()
+                .unwrap()
+                .insert(handle.clone(), table.clone());
+            self.script_results
+                .lock()
+                .unwrap()
+                .entry(script_id.to_owned())
+                .or_default()
+                .push(handle.clone());
+            nodes.push(table_node(&table, &handle, 0, DEFAULT_PAGE));
+        }
+        Ok(SqlRunResult {
+            ok: true,
+            stopped: false,
+            tables: nodes,
+        })
+    }
+
     pub fn stop(&self, script_id: &str) {
         // Stop only affects a run that has begun. A Stop on an idle tab is a
         // no-op, so it cannot cancel the next Run.
@@ -401,6 +535,9 @@ impl SqlManager {
                 handle.interrupt();
             }
         }
+        if let Some(stop) = self.stops.lock().unwrap().get(script_id) {
+            stop.send_modify(|version| *version += 1);
+        }
     }
 
     /// Release every query and buffered result when the app exits.
@@ -409,6 +546,7 @@ impl SqlManager {
         self.script_results.lock().unwrap().clear();
         self.interrupts.lock().unwrap().clear();
         self.cancel_flags.lock().unwrap().clear();
+        self.stops.lock().unwrap().clear();
     }
 
     pub fn reset(&self, script_id: &str) {
@@ -575,6 +713,216 @@ fn sqlite_error(error: &rusqlite::Error) -> String {
         STOPPED.into()
     } else {
         format!("SQLite could not run the statement: {error}")
+    }
+}
+fn postgres_host(connection: &Connection) -> &str {
+    connection
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .unwrap_or("localhost")
+}
+
+fn postgres_port(connection: &Connection) -> u16 {
+    connection.port.unwrap_or(5432)
+}
+
+async fn postgres_tables(
+    client: &tokio_postgres::Client,
+    source: &str,
+) -> Result<Vec<TableData>, String> {
+    match client.prepare(source).await {
+        Ok(statement) if !statement.columns().is_empty() => {
+            let columns: Vec<Column> = statement
+                .columns()
+                .iter()
+                .map(|column| Column {
+                    name: column.name().to_owned(),
+                })
+                .collect();
+            let rows = client
+                .query(&statement, &[])
+                .await
+                .map_err(|error| format!("PostgreSQL could not run the query: {error}"))?;
+            let mut values = Vec::with_capacity(rows.len().min(MAX_ROWS));
+            for (index, row) in rows.iter().take(MAX_ROWS).enumerate() {
+                let mut cells = Vec::with_capacity(statement.columns().len());
+                for (column_index, column) in statement.columns().iter().enumerate() {
+                    cells.push(pg_cell(row, column_index, column.type_(), index));
+                }
+                values.push(cells);
+            }
+            Ok(vec![TableData {
+                columns,
+                rows: values,
+                truncated: rows.len() > MAX_ROWS,
+            }])
+        }
+        Ok(statement) => {
+            let changed = client
+                .execute(&statement, &[])
+                .await
+                .map_err(|error| format!("PostgreSQL could not run the statement: {error}"))?;
+            Ok(vec![affected_table(changed)])
+        }
+        Err(_) => {
+            // Multiple statements cannot be prepared together. Run them with
+            // simple query so setup scripts still work.
+            let messages = client
+                .simple_query(source)
+                .await
+                .map_err(|error| format!("PostgreSQL could not run the query: {error}"))?;
+            Ok(postgres_simple_tables(messages))
+        }
+    }
+}
+
+fn postgres_simple_tables(messages: Vec<tokio_postgres::SimpleQueryMessage>) -> Vec<TableData> {
+    let mut tables: Vec<TableData> = Vec::new();
+    let mut current: Option<(Vec<Column>, Vec<Vec<Value>>)> = None;
+    let mut last_tag: Option<String> = None;
+    for message in messages {
+        match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                let columns: Vec<Column> = row
+                    .columns()
+                    .iter()
+                    .map(|column| Column {
+                        name: column.name().to_owned(),
+                    })
+                    .collect();
+                let same = current.as_ref().is_some_and(|(existing, _)| {
+                    existing.len() == columns.len()
+                        && existing
+                            .iter()
+                            .zip(&columns)
+                            .all(|(left, right)| left.name == right.name)
+                });
+                if !same {
+                    if let Some((columns, rows)) = current.take() {
+                        let truncated = rows.len() >= MAX_ROWS;
+                        tables.push(TableData {
+                            columns,
+                            rows,
+                            truncated,
+                        });
+                    }
+                    current = Some((columns, Vec::new()));
+                }
+                let (_, rows) = current.as_mut().unwrap();
+                if rows.len() < MAX_ROWS {
+                    let mut cells = Vec::with_capacity(row.columns().len());
+                    for (index, _) in row.columns().iter().enumerate() {
+                        cells.push(pg_text_cell(row.get(index), rows.len(), index));
+                    }
+                    rows.push(cells);
+                }
+            }
+            tokio_postgres::SimpleQueryMessage::CommandComplete(count) => {
+                last_tag = Some(format!("{count} rows affected"));
+            }
+            _ => {}
+        }
+    }
+    if let Some((columns, rows)) = current {
+        let truncated = rows.len() >= MAX_ROWS;
+        tables.push(TableData {
+            columns,
+            rows,
+            truncated,
+        });
+    }
+    if tables.is_empty() {
+        tables.push(affected_table_text(
+            last_tag.unwrap_or_else(|| "Statement completed.".into()),
+        ));
+    }
+    tables
+}
+
+fn affected_table(changed: u64) -> TableData {
+    TableData {
+        columns: vec![Column {
+            name: "rows affected".into(),
+        }],
+        rows: vec![vec![
+            json!({"id": "sql:affected", "kind": "primitive", "v": changed}),
+        ]],
+        truncated: false,
+    }
+}
+
+fn affected_table_text(text: String) -> TableData {
+    TableData {
+        columns: vec![Column {
+            name: "result".into(),
+        }],
+        rows: vec![vec![
+            json!({"id": "sql:result", "kind": "string", "v": text}),
+        ]],
+        truncated: false,
+    }
+}
+
+fn pg_cell(
+    row: &tokio_postgres::Row,
+    column: usize,
+    kind: &tokio_postgres::types::Type,
+    row_index: usize,
+) -> Value {
+    let id = format!("sql:r{row_index}c{column}");
+    let string = |text: Option<String>| match text {
+        Some(text) => json!({"id": id, "kind": "string", "v": text}),
+        None => json!({"id": id, "kind": "null"}),
+    };
+    match kind.name() {
+        "bool" => match row.try_get::<_, Option<bool>>(column) {
+            Ok(Some(value)) => json!({"id": id, "kind": "primitive", "v": value}),
+            Ok(None) => json!({"id": id, "kind": "null"}),
+            Err(_) => string(Some(kind.name().to_owned())),
+        },
+        "int2" => match row.try_get::<_, Option<i16>>(column) {
+            Ok(Some(value)) => json!({"id": id, "kind": "primitive", "v": value}),
+            Ok(None) => json!({"id": id, "kind": "null"}),
+            Err(_) => string(Some(kind.name().to_owned())),
+        },
+        "int4" | "oid" => match row.try_get::<_, Option<i32>>(column) {
+            Ok(Some(value)) => json!({"id": id, "kind": "primitive", "v": value}),
+            Ok(None) => json!({"id": id, "kind": "null"}),
+            Err(_) => string(Some(kind.name().to_owned())),
+        },
+        "int8" => match row.try_get::<_, Option<i64>>(column) {
+            Ok(Some(value)) => json!({"id": id, "kind": "primitive", "v": value}),
+            Ok(None) => json!({"id": id, "kind": "null"}),
+            Err(_) => string(Some(kind.name().to_owned())),
+        },
+        "float4" => match row.try_get::<_, Option<f32>>(column) {
+            Ok(Some(value)) if value.is_finite() => {
+                json!({"id": id, "kind": "primitive", "v": value})
+            }
+            Ok(None) => json!({"id": id, "kind": "null"}),
+            _ => string(Some(kind.name().to_owned())),
+        },
+        "float8" => match row.try_get::<_, Option<f64>>(column) {
+            Ok(Some(value)) if value.is_finite() => {
+                json!({"id": id, "kind": "primitive", "v": value})
+            }
+            Ok(None) => json!({"id": id, "kind": "null"}),
+            _ => string(Some(kind.name().to_owned())),
+        },
+        _ => match row.try_get::<_, Option<String>>(column) {
+            Ok(text) => string(text),
+            Err(_) => string(Some(format!("<{}>", kind.name()))),
+        },
+    }
+}
+
+fn pg_text_cell(text: Option<&str>, row: usize, column: usize) -> Value {
+    let id = format!("sql:r{row}c{column}");
+    match text {
+        Some(text) => json!({"id": id, "kind": "string", "v": text}),
+        None => json!({"id": id, "kind": "null"}),
     }
 }
 
@@ -1006,6 +1354,41 @@ mod tests {
             .await
             .unwrap();
         assert!(result.ok);
+    }
+
+    #[test]
+    fn postgres_connections_require_server_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConnectionStore::new(directory.path());
+        let connection = Connection {
+            id: String::new(),
+            name: "pg".into(),
+            kind: DatabaseKind::Postgres,
+            path: None,
+            host: None,
+            port: None,
+            database: Some("northwind".into()),
+            user: Some("reader".into()),
+            secret: None,
+        };
+        assert!(store.save(connection).unwrap_err().contains("host"));
+        let saved = store
+            .save(Connection {
+                id: String::new(),
+                name: "pg".into(),
+                kind: DatabaseKind::Postgres,
+                path: None,
+                host: Some("db.example.com".into()),
+                port: Some(5433),
+                database: Some("northwind".into()),
+                user: Some("reader".into()),
+                secret: Some("connection:pg".into()),
+            })
+            .unwrap();
+        assert_eq!(saved.port, Some(5433));
+        let text = fs::read_to_string(directory.path().join(CONNECTIONS_FILE)).unwrap();
+        assert!(text.contains("connection:pg"));
+        assert!(!text.contains("password"));
     }
 
     #[test]

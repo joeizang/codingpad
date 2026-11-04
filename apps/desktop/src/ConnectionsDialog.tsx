@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
-export type DatabaseKind = "sqlite";
+export type DatabaseKind = "sqlite" | "postgres";
 
 export type Connection = {
   id: string;
@@ -26,6 +26,7 @@ const EMPTY: Connection = { id: "", name: "", kind: "sqlite", path: "" };
 export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
   const [connections, setConnections] = useState<Connection[]>([]);
   const [draft, setDraft] = useState<Connection>(EMPTY);
+  const [password, setPassword] = useState("");
   const [status, setStatus] = useState<string | undefined>();
   const [error, setError] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
@@ -34,6 +35,7 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
   useEffect(() => {
     if (!open) return;
     setDraft(EMPTY);
+    setPassword("");
     setStatus(undefined);
     setError(undefined);
     void refresh();
@@ -50,6 +52,7 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
 
   function edit(connection: Connection) {
     setDraft({ ...connection });
+    setPassword("");
     setStatus(undefined);
     setError(undefined);
   }
@@ -90,10 +93,19 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
     setError(undefined);
     setStatus(undefined);
     try {
+      const connection = { ...draft };
+      if (connection.kind !== "sqlite" && password) {
+        connection.secret = connection.secret || `connection:${connection.name.trim()}`;
+        await invoke("save_secret", {
+          name: connection.secret,
+          value: password,
+        });
+      }
       const saved = await invoke<Connection>("save_connection", {
-        connection: draft,
+        connection,
       });
       setDraft({ ...saved });
+      setPassword("");
       setStatus(`Saved "${saved.name}".`);
       await refresh();
     } catch (failure) {
@@ -225,23 +237,87 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
               }
             >
               <option value="sqlite">SQLite</option>
+              <option value="postgres">PostgreSQL</option>
             </select>
           </label>
-          <label>
-            Database file
-            <span className="field-row">
-              <input
-                value={draft.path ?? ""}
-                placeholder="/path/to/northwind.db"
-                onChange={(event) =>
-                  setDraft((current) => ({ ...current, path: event.target.value }))
-                }
-              />
-              <button className="control-button" type="button" onClick={() => void browse()}>
-                Browse…
-              </button>
-            </span>
-          </label>
+          {draft.kind === "sqlite" ? (
+            <label>
+              Database file
+              <span className="field-row">
+                <input
+                  value={draft.path ?? ""}
+                  placeholder="/path/to/northwind.db"
+                  onChange={(event) =>
+                    setDraft((current) => ({ ...current, path: event.target.value }))
+                  }
+                />
+                <button className="control-button" type="button" onClick={() => void browse()}>
+                  Browse…
+                </button>
+              </span>
+            </label>
+          ) : (
+            <>
+              <label>
+                Host
+                <input
+                  value={draft.host ?? ""}
+                  placeholder="localhost"
+                  onChange={(event) =>
+                    setDraft((current) => ({ ...current, host: event.target.value }))
+                  }
+                />
+              </label>
+              <label>
+                Port
+                <input
+                  type="number"
+                  min={1}
+                  max={65535}
+                  value={draft.port ?? 5432}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      port: event.target.value ? Number(event.target.value) : null,
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                Database
+                <input
+                  value={draft.database ?? ""}
+                  placeholder="northwind"
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      database: event.target.value,
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                User
+                <input
+                  value={draft.user ?? ""}
+                  placeholder="postgres"
+                  onChange={(event) =>
+                    setDraft((current) => ({ ...current, user: event.target.value }))
+                  }
+                />
+              </label>
+              <label>
+                Password
+                <input
+                  type="password"
+                  autoComplete="off"
+                  value={password}
+                  placeholder={draft.secret ? "Leave blank to keep the saved password" : "Stored in the OS vault"}
+                  onChange={(event) => setPassword(event.target.value)}
+                />
+              </label>
+            </>
+          )}
           <div className="modal-actions">
             <button
               className="run-button"

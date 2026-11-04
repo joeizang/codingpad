@@ -79,3 +79,48 @@ test("rejects connection names with spaces before saving", async () => {
   );
   expect(invoke).not.toHaveBeenCalledWith("save_connection", expect.anything());
 });
+
+test("keeps PostgreSQL passwords in the vault and out of connection settings", async () => {
+  invoke.mockImplementation(async (command: string, args?: any) => {
+    if (command === "list_connections") return [];
+    if (command === "save_secret") return "vault";
+    if (command === "save_connection") return { ...args.connection, id: "pg" };
+    return undefined;
+  });
+  render(<ConnectionsDialog open onClose={() => {}} />);
+  fireEvent.change(screen.getByLabelText("Name"), {
+    target: { value: "northwind" },
+  });
+  fireEvent.change(screen.getByLabelText("Kind"), {
+    target: { value: "postgres" },
+  });
+  fireEvent.change(screen.getByLabelText("Host"), {
+    target: { value: "db.example.com" },
+  });
+  fireEvent.change(screen.getByLabelText("Database"), {
+    target: { value: "northwind" },
+  });
+  fireEvent.change(screen.getByLabelText("User"), {
+    target: { value: "reader" },
+  });
+  fireEvent.change(screen.getByLabelText("Password"), {
+    target: { value: "hunter2" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Add connection" }));
+  await waitFor(() =>
+    expect(invoke).toHaveBeenCalledWith("save_secret", {
+      name: "connection:northwind",
+      value: "hunter2",
+    }),
+  );
+  const call = invoke.mock.calls.find(([command]) => command === "save_connection")!;
+  expect(call[1].connection).toMatchObject({
+    name: "northwind",
+    kind: "postgres",
+    host: "db.example.com",
+    database: "northwind",
+    user: "reader",
+    secret: "connection:northwind",
+  });
+  expect(JSON.stringify(call[1].connection)).not.toContain("hunter2");
+});

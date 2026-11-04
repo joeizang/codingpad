@@ -126,7 +126,8 @@ prompts for its location the first time and can use **Save as…** afterwards.
 CodingPad settings live in the app config folder, never in your scripts.
 
 A script's optional single-line header stays at the top of the file and is shown
-in the footer. For Python it is a `#` comment; C#, Rust and TypeScript use `//`:
+in the footer. For Python it is a `#` comment; C#, Rust and TypeScript use `//`;
+SQL uses `--`:
 
 ```python
 # codingpad: connection=northwind
@@ -322,7 +323,7 @@ Click **Connections…** to add a SQLite database, then **+ SQL** or open a `.sq
 file. The first line names the connection; the rest is plain SQL:
 
 ```sql
-# codingpad: connection=northwind
+-- codingpad: connection=northwind
 
 SELECT CustomerId, CompanyName FROM Customers LIMIT 100;
 ```

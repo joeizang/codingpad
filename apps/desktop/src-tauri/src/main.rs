@@ -101,6 +101,7 @@ fn expand_sql(
         .map(|node| ExpandResult { node })
 }
 
+#[tauri::command]
 async fn save_secret(
     secrets: State<'_, Arc<SecretStore>>,
     name: String,
@@ -293,10 +294,12 @@ async fn request_language_server(
 async fn close_script(
     supervisor: State<'_, Supervisor>,
     language_servers: State<'_, LanguageServers>,
+    sql: State<'_, Arc<SqlManager>>,
     script_id: String,
 ) -> Result<(), String> {
     supervisor.close(&script_id).await;
     language_servers.close(&script_id).await;
+    sql.reset(&script_id);
     Ok(())
 }
 
@@ -409,6 +412,7 @@ fn main() {
         .expect("Could not start CodingPad")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
+                app.state::<Arc<SqlManager>>().shutdown();
                 tauri::async_runtime::block_on(async {
                     app.state::<Supervisor>().shutdown().await;
                     app.state::<LanguageServers>().shutdown().await;

@@ -28,9 +28,11 @@ export function parseHeader(source: string): ScriptHeader | null {
   const trimmed = line.trimStart();
   const rest = trimmed.startsWith("//")
     ? trimmed.slice(2)
-    : trimmed.startsWith("#")
-      ? trimmed.slice(1)
-      : null;
+    : trimmed.startsWith("--")
+      ? trimmed.slice(2)
+      : trimmed.startsWith("#")
+        ? trimmed.slice(1)
+        : null;
   if (rest === null) return null;
   const text = rest.trimStart();
   if (!text.startsWith("codingpad:")) return null;

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
@@ -29,6 +29,7 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
   const [status, setStatus] = useState<string | undefined>();
   const [error, setError] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
+  const dialog = useRef<HTMLElement>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -36,6 +37,7 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
     setStatus(undefined);
     setError(undefined);
     void refresh();
+    dialog.current?.focus();
   }, [open]);
 
   async function refresh() {
@@ -126,10 +128,12 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
       }}
     >
       <section
+        ref={dialog}
         className="modal connections-dialog"
         role="dialog"
         aria-modal="true"
         aria-label="Connections"
+        tabIndex={-1}
         onKeyDown={(event) => {
           if (event.key === "Escape") onClose();
         }}
@@ -142,7 +146,7 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
         </header>
         <p className="modal-note">
           A SQL script names its connection in its first line, for example{" "}
-          <code># codingpad: connection=sample</code>.
+          <code>-- codingpad: connection=sample</code>.
         </p>
         <div className="secret-list" aria-label="Saved connections">
           {connections.length === 0 ? (

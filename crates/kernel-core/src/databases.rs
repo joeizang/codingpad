@@ -11,12 +11,12 @@ use rusqlite::{types::ValueRef, Connection as SqliteConnection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
@@ -59,6 +59,12 @@ impl Connection {
     fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
             return Err("A connection name cannot be empty".into());
+        }
+        if self.name.chars().any(char::is_whitespace) {
+            return Err(
+                "A connection name cannot contain spaces; use letters, digits, dashes or underscores."
+                    .into(),
+            );
         }
         match self.kind {
             DatabaseKind::Sqlite => {
@@ -210,6 +216,8 @@ pub struct SqlManager {
     results: Mutex<HashMap<String, Arc<TableData>>>,
     script_results: Mutex<HashMap<String, Vec<String>>>,
     interrupts: Mutex<HashMap<String, Interrupt>>,
+    cancel_flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    pending_stops: Mutex<HashSet<String>>,
     next_handle: AtomicU64,
 }
 
@@ -221,6 +229,8 @@ impl SqlManager {
             results: Mutex::new(HashMap::new()),
             script_results: Mutex::new(HashMap::new()),
             interrupts: Mutex::new(HashMap::new()),
+            cancel_flags: Mutex::new(HashMap::new()),
+            pending_stops: Mutex::new(HashSet::new()),
             next_handle: AtomicU64::new(1),
         }
     }
@@ -256,20 +266,53 @@ impl SqlManager {
         &self,
         script_id: &str,
         source: &str,
-        _path: Option<&str>,
+        path: Option<&str>,
     ) -> Result<SqlRunResult, String> {
         if script_id.is_empty() {
             return Err("A script id is required".into());
         }
+        // Register before any work so a Stop racing the connection open is kept.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.cancel_flags
+            .lock()
+            .unwrap()
+            .insert(script_id.to_owned(), cancelled.clone());
+        if self.pending_stops.lock().unwrap().remove(script_id) {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+        let result = self
+            .run_registered(script_id, source, path, &cancelled)
+            .await;
+        self.cancel_flags.lock().unwrap().remove(script_id);
+        result
+    }
+
+    async fn run_registered(
+        &self,
+        script_id: &str,
+        source: &str,
+        _path: Option<&str>,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<SqlRunResult, String> {
         let header = parse_header(source).ok_or_else(missing_header)?;
         let name = connection_name(&header)?;
         let connection = self.connections.by_name(&name).ok_or_else(|| {
             format!("Connection \"{name}\" was not found. Add it in Connections…")
         })?;
         self.clear_results(script_id);
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(SqlRunResult {
+                ok: false,
+                stopped: true,
+                tables: Vec::new(),
+            });
+        }
         let body = source.split_once('\n').map(|(_, body)| body).unwrap_or("");
         match connection.kind {
-            DatabaseKind::Sqlite => self.run_sqlite(script_id, &connection, body).await,
+            DatabaseKind::Sqlite => {
+                self.run_sqlite(script_id, &connection, body, cancelled)
+                    .await
+            }
         }
     }
 
@@ -278,10 +321,12 @@ impl SqlManager {
         script_id: &str,
         connection: &Connection,
         source: &str,
+        cancelled: &Arc<AtomicBool>,
     ) -> Result<SqlRunResult, String> {
         let path = sqlite_path(connection)?;
         let source = source.to_owned();
         let interrupt: Interrupt = Arc::new(Mutex::new(None));
+        let cancelled = cancelled.clone();
         self.interrupts
             .lock()
             .unwrap()
@@ -289,9 +334,14 @@ impl SqlManager {
         let outcome = tokio::task::spawn_blocking(move || {
             let database = SqliteConnection::open(&path)
                 .map_err(|error| format!("Could not open the SQLite database: {error}"))?;
-            // Show the vault password in no code path: SQLite needs no password.
+            // SQLite needs no password; the vault is only used by server
+            // connections on later layers.
             *interrupt.lock().unwrap() = Some(database.get_interrupt_handle());
-            execute_sqlite(&database, &source)
+            // A Stop that arrived before the file opened must not be lost.
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(STOPPED.to_string());
+            }
+            execute_sqlite(&database, &source, &cancelled)
         })
         .await
         .map_err(|error| format!("The query failed: {error}"))?;
@@ -302,10 +352,11 @@ impl SqlManager {
                 for table in tables {
                     let handle =
                         format!("sql-{}", self.next_handle.fetch_add(1, Ordering::Relaxed));
+                    let table = Arc::new(table);
                     self.results
                         .lock()
                         .unwrap()
-                        .insert(handle.clone(), Arc::new(table.clone()));
+                        .insert(handle.clone(), table.clone());
                     self.script_results
                         .lock()
                         .unwrap()
@@ -330,6 +381,16 @@ impl SqlManager {
     }
 
     pub fn stop(&self, script_id: &str) {
+        let flag = self.cancel_flags.lock().unwrap().get(script_id).cloned();
+        match flag {
+            Some(cancelled) => cancelled.store(true, Ordering::Relaxed),
+            None => {
+                self.pending_stops
+                    .lock()
+                    .unwrap()
+                    .insert(script_id.to_owned());
+            }
+        }
         if let Some(interrupt) = self.interrupts.lock().unwrap().get(script_id) {
             if let Some(handle) = interrupt.lock().unwrap().as_ref() {
                 handle.interrupt();
@@ -337,8 +398,18 @@ impl SqlManager {
         }
     }
 
+    /// Release every query and buffered result when the app exits.
+    pub fn shutdown(&self) {
+        self.results.lock().unwrap().clear();
+        self.script_results.lock().unwrap().clear();
+        self.interrupts.lock().unwrap().clear();
+        self.cancel_flags.lock().unwrap().clear();
+        self.pending_stops.lock().unwrap().clear();
+    }
+
     pub fn reset(&self, script_id: &str) {
         self.stop(script_id);
+        self.pending_stops.lock().unwrap().remove(script_id);
         self.clear_results(script_id);
     }
 
@@ -390,7 +461,7 @@ impl SqlManager {
 }
 
 fn missing_header() -> String {
-    "Add a \"# codingpad: connection=<name>\" header naming a connection.".into()
+    "Add a \"-- codingpad: connection=<name>\" header naming a connection.".into()
 }
 
 fn connection_name(header: &ScriptHeader) -> Result<String, String> {
@@ -401,7 +472,7 @@ fn connection_name(header: &ScriptHeader) -> Result<String, String> {
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| {
-            "The script header needs connection=<name>, for example \"# codingpad: connection=northwind\"."
+            "The script header needs connection=<name>, for example \"-- codingpad: connection=northwind\"."
                 .into()
         })
 }
@@ -416,84 +487,91 @@ fn sqlite_path(connection: &Connection) -> Result<String, String> {
         .ok_or_else(|| "This SQLite connection has no database file".into())
 }
 
-fn execute_sqlite(database: &SqliteConnection, source: &str) -> Result<Vec<TableData>, String> {
-    if is_query(source) {
-        let mut statement = database
-            .prepare(source)
-            .map_err(|error| format!("SQLite could not prepare the query: {error}"))?;
-        let columns: Vec<Column> = statement
-            .column_names()
-            .map(|name| Column {
-                name: name.to_owned(),
-            })
-            .collect();
-        let mut rows = statement
-            .query([])
-            .map_err(|error| format!("SQLite could not run the query: {error}"))?;
-        let mut values = Vec::new();
-        let mut truncated = false;
-        loop {
-            let row = match rows.next() {
-                Ok(Some(row)) => row,
-                Ok(None) => break,
-                Err(error) => {
-                    if is_interrupted(&error) {
-                        return Err(STOPPED.into());
-                    }
-                    return Err(format!("SQLite could not read the results: {error}"));
-                }
-            };
-            if values.len() >= MAX_ROWS {
-                truncated = true;
-                break;
-            }
-            let mut cells = Vec::with_capacity(columns.len());
-            for index in 0..columns.len() {
-                let value = row
-                    .get_ref(index)
-                    .map_err(|error| format!("SQLite could not read a column: {error}"))?;
-                cells.push(cell_node(value, values.len(), index));
-            }
-            values.push(cells);
+fn execute_sqlite(
+    database: &SqliteConnection,
+    source: &str,
+    cancelled: &AtomicBool,
+) -> Result<Vec<TableData>, String> {
+    use rusqlite::fallible_iterator::FallibleIterator;
+
+    let mut batch = rusqlite::Batch::new(database, source);
+    let mut tables = Vec::new();
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(STOPPED.into());
         }
-        Ok(vec![TableData {
-            columns,
-            rows: values,
-            truncated,
-        }])
-    } else {
-        let before = database.total_changes();
-        database.execute_batch(source).map_err(|error| {
-            if is_interrupted(&error) {
-                STOPPED.into()
-            } else {
-                format!("SQLite could not run the statement: {error}")
+        let statement = batch.next().map_err(|error| sqlite_error(&error))?;
+        let Some(mut statement) = statement else {
+            break;
+        };
+        if statement.column_count() > 0 {
+            let columns: Vec<Column> = statement
+                .column_names()
+                .map(|name| Column {
+                    name: name.to_owned(),
+                })
+                .collect();
+            let mut rows = statement.query([]).map_err(|error| sqlite_error(&error))?;
+            let mut values = Vec::new();
+            let mut truncated = false;
+            loop {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(STOPPED.into());
+                }
+                let row = match rows.next() {
+                    Ok(Some(row)) => row,
+                    Ok(None) => break,
+                    Err(error) => return Err(sqlite_error(&error)),
+                };
+                if values.len() >= MAX_ROWS {
+                    truncated = true;
+                    break;
+                }
+                let mut cells = Vec::with_capacity(columns.len());
+                for index in 0..columns.len() {
+                    let value = row.get_ref(index).map_err(|error| sqlite_error(&error))?;
+                    cells.push(cell_node(value, values.len(), index));
+                }
+                values.push(cells);
             }
-        })?;
-        let changed = database.total_changes().saturating_sub(before);
-        Ok(vec![TableData {
-            columns: vec![Column {
-                name: "rows affected".into(),
-            }],
-            rows: vec![vec![
-                json!({"id": "sql:affected", "kind": "primitive", "v": changed}),
-            ]],
-            truncated: false,
-        }])
+            tables.push(TableData {
+                columns,
+                rows: values,
+                truncated,
+            });
+        } else {
+            let before = database.total_changes();
+            statement
+                .execute([])
+                .map_err(|error| sqlite_error(&error))?;
+            let changed = database.total_changes().saturating_sub(before);
+            tables.push(affected_rows_table(changed));
+        }
+    }
+    if tables.is_empty() {
+        tables.push(affected_rows_table(0));
+    }
+    Ok(tables)
+}
+
+fn affected_rows_table(changed: u64) -> TableData {
+    TableData {
+        columns: vec![Column {
+            name: "rows affected".into(),
+        }],
+        rows: vec![vec![
+            json!({"id": "sql:affected", "kind": "primitive", "v": changed}),
+        ]],
+        truncated: false,
     }
 }
 
-fn is_query(source: &str) -> bool {
-    let keyword: String = source
-        .trim_start_matches(|character: char| character.is_whitespace() || character == '(')
-        .chars()
-        .take_while(|character| character.is_ascii_alphabetic())
-        .collect::<String>()
-        .to_ascii_uppercase();
-    matches!(
-        keyword.as_str(),
-        "SELECT" | "WITH" | "VALUES" | "PRAGMA" | "EXPLAIN"
-    )
+fn sqlite_error(error: &rusqlite::Error) -> String {
+    if is_interrupted(error) {
+        STOPPED.into()
+    } else {
+        format!("SQLite could not run the statement: {error}")
+    }
 }
 
 fn is_interrupted(error: &rusqlite::Error) -> bool {
@@ -504,20 +582,65 @@ fn is_interrupted(error: &rusqlite::Error) -> bool {
     )
 }
 
+const MAX_SAFE_INTEGER: i64 = 2_i64.pow(53) - 1;
+const MAX_CELL_TEXT: usize = 1_000;
+
 fn cell_node(value: ValueRef<'_>, row: usize, column: usize) -> Value {
     let id = format!("sql:r{row}c{column}");
     match value {
         ValueRef::Null => json!({"id": id, "kind": "null"}),
+        ValueRef::Integer(value) if value.abs() > MAX_SAFE_INTEGER => string_node(
+            id,
+            value.to_string(),
+            Some("int"),
+            Some(value.to_string().chars().count()),
+        ),
         ValueRef::Integer(value) => json!({"id": id, "kind": "primitive", "v": value}),
         ValueRef::Real(value) if value.is_finite() => {
             json!({"id": id, "kind": "primitive", "v": value})
         }
-        ValueRef::Real(value) => json!({"id": id, "kind": "string", "v": value.to_string()}),
+        ValueRef::Real(value) => string_node(id, value.to_string(), None, None),
         ValueRef::Text(value) => {
-            json!({"id": id, "kind": "string", "v": String::from_utf8_lossy(value)})
+            let text = String::from_utf8_lossy(value);
+            let total = text.chars().count();
+            if total > MAX_CELL_TEXT {
+                string_node(
+                    id,
+                    text.chars().take(MAX_CELL_TEXT).collect(),
+                    None,
+                    Some(total),
+                )
+            } else {
+                string_node(id, text.into_owned(), None, None)
+            }
         }
-        ValueRef::Blob(value) => json!({"id": id, "kind": "string", "v": hex(value)}),
+        ValueRef::Blob(value) => {
+            let total = 2 + value.len() * 2;
+            let text = hex(value);
+            if text.chars().count() > MAX_CELL_TEXT {
+                string_node(
+                    id,
+                    text.chars().take(MAX_CELL_TEXT).collect(),
+                    Some("blob"),
+                    Some(total),
+                )
+            } else {
+                string_node(id, text, Some("blob"), None)
+            }
+        }
     }
+}
+
+fn string_node(id: String, value: String, kind: Option<&str>, total: Option<usize>) -> Value {
+    let mut node = json!({"id": id, "kind": "string", "v": value});
+    if let Some(kind) = kind {
+        node["type"] = Value::String(kind.into());
+    }
+    if let Some(total) = total {
+        node["truncated"] = Value::Bool(true);
+        node["total"] = Value::Number(total.into());
+    }
+    node
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -665,7 +788,7 @@ mod tests {
         let result = manager
             .run(
                 "sql",
-                "# codingpad: connection=sample\nSELECT name, score FROM people ORDER BY name",
+                "-- codingpad: connection=sample\nSELECT name, score FROM people ORDER BY name",
                 None,
             )
             .await
@@ -684,12 +807,106 @@ mod tests {
         let changed = manager
             .run(
                 "sql",
-                "# codingpad: connection=sample\nINSERT INTO people VALUES ('Barbara', 30)",
+                "-- codingpad: connection=sample\nINSERT INTO people VALUES ('Barbara', 30)",
                 None,
             )
             .await
             .unwrap();
         assert_eq!(changed.tables[0]["rows"][0][0]["v"], 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_handles_comments_multiple_statements_and_returning() {
+        let (_directory, _connections, _secrets, manager, _database) = setup();
+        let run = |sql: &'static str| {
+            let manager = &manager;
+            async move {
+                manager
+                    .run(
+                        "sql",
+                        &format!("-- codingpad: connection=sample\n{sql}"),
+                        None,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let comment = run("-- top rows\nSELECT name FROM people ORDER BY name").await;
+        assert_eq!(comment.tables.len(), 1);
+        assert_eq!(comment.tables[0]["rows"].as_array().unwrap().len(), 2);
+
+        let block = run("/* c */ SELECT name FROM people ORDER BY name").await;
+        assert_eq!(block.tables.len(), 1);
+        assert_eq!(block.tables[0]["rows"].as_array().unwrap().len(), 2);
+
+        let batch =
+            run("INSERT INTO people VALUES ('X', 1); SELECT name FROM people ORDER BY name").await;
+        assert_eq!(batch.tables.len(), 2);
+        assert_eq!(batch.tables[0]["rows"][0][0]["v"], 1);
+        assert_eq!(batch.tables[1]["rows"].as_array().unwrap().len(), 3);
+
+        let returning = run("INSERT INTO people VALUES ('Y', 2) RETURNING name").await;
+        assert_eq!(returning.tables.len(), 1);
+        assert_eq!(returning.tables[0]["rows"][0][0]["v"], "Y");
+
+        let two = run("SELECT 1 AS a; SELECT 99 AS b;").await;
+        assert_eq!(two.tables.len(), 2);
+        assert_eq!(two.tables[0]["rows"][0][0]["v"], 1);
+        assert_eq!(two.tables[1]["rows"][0][0]["v"], 99);
+    }
+
+    #[tokio::test]
+    async fn sqlite_cells_keep_large_integers_exact_and_cap_large_text() {
+        let (_directory, _connections, _secrets, manager, _database) = setup();
+        let result = manager
+            .run(
+                "sql",
+                "-- codingpad: connection=sample\nSELECT 9007199254740993 AS id, replace(printf('%0*d', 2000, 0), '0', 'x') AS big",
+                None,
+            )
+            .await
+            .unwrap();
+        let cells = &result.tables[0]["rows"][0];
+        assert_eq!(cells[0]["kind"], "string");
+        assert_eq!(cells[0]["v"], "9007199254740993");
+        assert_eq!(cells[1]["truncated"], true);
+        assert_eq!(cells[1]["total"], 2000);
+        assert_eq!(cells[1]["v"].as_str().unwrap().chars().count(), 1000);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_interrupts_a_running_query_and_an_early_stop_is_kept() {
+        use std::time::Duration;
+        let (_directory, _connections, _secrets, manager, _database) = setup();
+        let manager = Arc::new(manager);
+        let endless = "-- codingpad: connection=sample\nWITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c";
+        let run = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.run("sql", endless, None).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        manager.stop("sql");
+        let result = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("stop should interrupt the query")
+            .unwrap()
+            .unwrap();
+        assert!(result.stopped);
+        assert!(!result.ok);
+
+        let run = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.run("sql", endless, None).await })
+        };
+        tokio::task::yield_now().await;
+        manager.stop("sql");
+        let result = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("an early stop should also interrupt the query")
+            .unwrap()
+            .unwrap();
+        assert!(result.stopped);
     }
 
     #[tokio::test]
@@ -701,14 +918,14 @@ mod tests {
             .unwrap_err()
             .contains("connection=<name>"));
         assert!(manager
-            .run("sql", "# codingpad: connection=missing\nSELECT 1", None)
+            .run("sql", "-- codingpad: connection=missing\nSELECT 1", None)
             .await
             .unwrap_err()
             .contains("Connections"));
         assert!(manager
             .run(
                 "sql",
-                "# codingpad: connection=sample\nSELECT nope FROM people",
+                "-- codingpad: connection=sample\nSELECT nope FROM people",
                 None
             )
             .await
@@ -745,13 +962,13 @@ mod tests {
     async fn stopping_clears_running_results_and_keeps_new_runs_working() {
         let (_directory, _connections, _secrets, manager, _database) = setup();
         manager
-            .run("sql", "# codingpad: connection=sample\nSELECT 1", None)
+            .run("sql", "-- codingpad: connection=sample\nSELECT 1", None)
             .await
             .unwrap();
         manager.reset("sql");
         assert!(manager.expand("sql", "sql-1", None, None).is_err());
         let result = manager
-            .run("sql", "# codingpad: connection=sample\nSELECT 2", None)
+            .run("sql", "-- codingpad: connection=sample\nSELECT 2", None)
             .await
             .unwrap();
         assert!(result.ok);

@@ -48,7 +48,7 @@ await Task.Delay(10);
 Enumerable.Range(1, 10).Sum();
 `;
 
-const SQL_SAMPLE = `# codingpad: connection=sample
+const SQL_SAMPLE = `-- codingpad: connection=sample
 
 SELECT 1 AS answer;
 `;
@@ -317,7 +317,7 @@ export default function App() {
           kind: "dump" as const,
           node,
         })),
-        status: result.stopped ? "Stopped" : result.ok ? "Finished" : "Query error",
+        status: result.stopped ? "Stopped" : "Finished",
       }));
     } catch (failure) {
       if (generation.current.get(script.id) !== version) return;

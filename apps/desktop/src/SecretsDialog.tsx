@@ -3,36 +3,45 @@ import { invoke } from "@tauri-apps/api/core";
 
 type SecretOrigin = "vault" | "session";
 
+type SecretEntry = {
+  name: string;
+  origin: SecretOrigin;
+};
+
 type SecretsDialogProps = {
   open: boolean;
   onClose: () => void;
 };
 
 export function SecretsDialog({ open, onClose }: SecretsDialogProps) {
-  const [names, setNames] = useState<string[]>([]);
+  const [entries, setEntries] = useState<SecretEntry[]>([]);
   const [name, setName] = useState("");
   const [value, setValue] = useState("");
-  const [vault, setVault] = useState(true);
+  const [vault, setVault] = useState<boolean | null>(null);
   const [status, setStatus] = useState<string | undefined>();
   const [error, setError] = useState<string | undefined>();
+  const [sessionOffer, setSessionOffer] = useState(false);
   const [busy, setBusy] = useState(false);
   const valueInput = useRef<HTMLInputElement>(null);
+  const dialog = useRef<HTMLElement>(null);
 
   useEffect(() => {
     if (!open) return;
     setStatus(undefined);
     setError(undefined);
+    setSessionOffer(false);
     setValue("");
     void refresh();
+    dialog.current?.focus();
   }, [open]);
 
   async function refresh() {
     try {
       const [listed, available] = await Promise.all([
-        invoke<string[]>("list_secrets"),
-        invoke<boolean>("vault_available"),
+        invoke<SecretEntry[]>("list_secrets"),
+        invoke<boolean | null>("vault_available"),
       ]);
-      setNames(listed);
+      setEntries(listed);
       setVault(available);
     } catch (failure) {
       setError(String(failure));
@@ -44,43 +53,54 @@ export function SecretsDialog({ open, onClose }: SecretsDialogProps) {
     setValue("");
     setStatus(undefined);
     setError(undefined);
+    setSessionOffer(false);
     valueInput.current?.focus();
   }
 
-  async function save() {
+  async function save(sessionOnly = false) {
     if (busy) return;
     setBusy(true);
     setError(undefined);
     setStatus(undefined);
+    setSessionOffer(false);
     try {
-      const origin = await invoke<SecretOrigin>("save_secret", { name, value });
+      const origin = await invoke<SecretOrigin>("save_secret", {
+        name,
+        value,
+        sessionOnly,
+      });
       setStatus(
         origin === "vault"
           ? `Saved "${name.trim()}" to the OS password vault.`
-          : `Saved "${name.trim()}" for this session only; no OS password vault is available.`,
+          : `Saved "${name.trim()}" for this session only; it disappears when CodingPad exits.`,
       );
-      setVault(origin === "vault");
+      setVault(origin === "vault" ? true : vault === true ? vault : false);
       setValue("");
       await refresh();
     } catch (failure) {
       setError(String(failure));
+      setSessionOffer(!sessionOnly);
     } finally {
       setBusy(false);
     }
   }
 
-  async function remove(secret: string) {
+  async function remove(entry: SecretEntry) {
     if (busy) return;
     setBusy(true);
     setError(undefined);
     setStatus(undefined);
+    setSessionOffer(false);
     try {
-      await invoke("delete_secret", { name: secret });
-      if (name === secret) {
+      await invoke("delete_secret", {
+        name: entry.name,
+        sessionOnly: entry.origin === "session",
+      });
+      if (name === entry.name) {
         setName("");
         setValue("");
       }
-      setStatus(`Removed "${secret}".`);
+      setStatus(`Removed "${entry.name}".`);
       await refresh();
     } catch (failure) {
       setError(String(failure));
@@ -99,10 +119,12 @@ export function SecretsDialog({ open, onClose }: SecretsDialogProps) {
       }}
     >
       <section
+        ref={dialog}
         className="modal secrets-dialog"
         role="dialog"
         aria-modal="true"
         aria-label="Secrets"
+        tabIndex={-1}
         onKeyDown={(event) => {
           if (event.key === "Escape") onClose();
         }}
@@ -114,23 +136,32 @@ export function SecretsDialog({ open, onClose }: SecretsDialogProps) {
           </button>
         </header>
         <p className="modal-note">
-          Secret values never appear in scripts or logs. They are kept in{" "}
-          {vault ? "the OS password vault" : "memory for this session because no OS password vault is available"}.
+          {vault === false
+            ? "The OS password vault is unavailable. You can still store a value for this session only."
+            : vault === true
+              ? "Secret values never appear in scripts or logs. They are kept in the OS password vault."
+              : "Secret values never appear in scripts or logs. They are kept in the OS password vault; if it is unavailable, you can store a value for this session only."}
         </p>
         <div className="secret-list" aria-label="Named secrets">
-          {names.length === 0 ? (
+          {entries.length === 0 ? (
             <p className="tree-status">No secrets yet</p>
           ) : (
-            names.map((secret) => (
-              <div className={`secret-row ${secret === name ? "active" : ""}`} key={secret}>
-                <button className="secret-name" onClick={() => choose(secret)}>
-                  {secret}
+            entries.map((entry) => (
+              <div
+                className={`secret-row ${entry.name === name ? "active" : ""}`}
+                key={entry.name}
+              >
+                <button className="secret-name" onClick={() => choose(entry.name)}>
+                  {entry.name}
+                  {entry.origin === "session" && (
+                    <span className="muted"> · this session</span>
+                  )}
                 </button>
                 <button
                   className="section-action"
-                  aria-label={`Remove ${secret}`}
+                  aria-label={`Remove ${entry.name}`}
                   disabled={busy}
-                  onClick={() => void remove(secret)}
+                  onClick={() => void remove(entry)}
                 >
                   Remove
                 </button>
@@ -169,8 +200,20 @@ export function SecretsDialog({ open, onClose }: SecretsDialogProps) {
               type="submit"
               disabled={busy || !name.trim() || !value}
             >
-              {names.includes(name.trim()) ? "Update secret" : "Add secret"}
+              {entries.some((entry) => entry.name === name.trim())
+                ? "Update secret"
+                : "Add secret"}
             </button>
+            {sessionOffer && (
+              <button
+                className="control-button"
+                type="button"
+                disabled={busy || !name.trim() || !value}
+                onClick={() => void save(true)}
+              >
+                Store for this session only
+              </button>
+            )}
             <button className="control-button" type="button" onClick={onClose}>
               Done
             </button>

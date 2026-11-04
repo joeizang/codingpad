@@ -125,7 +125,7 @@ class KernelTests(unittest.TestCase):
         messages = self.request(
             "run",
             {
-                "source": "from codingpad import secret\nsecret('token')",
+                "source": "secret('token')",
                 "secrets": {"token": "s3cret"},
             },
         )
@@ -137,7 +137,7 @@ class KernelTests(unittest.TestCase):
         ]
         self.assertEqual(dumped[-1]["kind"], "string")
         self.assertEqual(dumped[-1]["v"], "s3cret")
-        messages = self.run_script("from codingpad import secret\nsecret('token')")
+        messages = self.run_script("secret('token')")
         self.assertFalse(messages[-1]["result"]["ok"])
         errors = [
             message["params"]["node"]

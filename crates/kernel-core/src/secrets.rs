@@ -1,9 +1,9 @@
 //! Named secrets backed by the OS password vault.
 //!
 //! Only secret names are written next to the app settings; values live in the
-//! Keychain, Credential Manager or Secret Service. When no vault is available,
-//! values fall back to a session-only memory store so scripts keep working
-//! until the app exits.
+//! Keychain, Credential Manager or Secret Service. A value can also be stored
+//! for the current session only, explicitly, when no vault is available. Session
+//! names are not persisted.
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -11,13 +11,16 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
         Arc, Mutex,
     },
 };
 
 const SERVICE: &str = "CodingPad";
 const NAMES_FILE: &str = "secrets.json";
+const UNKNOWN: u8 = 0;
+const AVAILABLE: u8 = 1;
+const FAILED: u8 = 2;
 
 /// Where a secret value is kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +28,13 @@ const NAMES_FILE: &str = "secrets.json";
 pub enum SecretOrigin {
     Vault,
     Session,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretEntry {
+    pub name: String,
+    pub origin: SecretOrigin,
 }
 
 /// The platform password vault. Tests inject an in-memory implementation.
@@ -67,15 +77,16 @@ fn vault_error(error: keyring::Error) -> String {
     format!("The OS password vault is unavailable: {error}")
 }
 
-/// The app-wide secret store. Cloning is not allowed because one store owns the
-/// in-memory fallback; share it with `Arc` instead.
+/// The app-wide secret store. Share it with `Arc`; one store owns the
+/// in-memory session values.
 pub struct SecretStore {
     names_path: PathBuf,
     names: Mutex<BTreeSet<String>>,
     session: Mutex<BTreeMap<String, String>>,
     cache: Mutex<BTreeMap<String, String>>,
+    missing: Mutex<BTreeSet<String>>,
     vault: Arc<dyn Vault>,
-    vault_available: AtomicBool,
+    vault_state: AtomicU8,
 }
 
 impl SecretStore {
@@ -91,48 +102,79 @@ impl SecretStore {
             names: Mutex::new(names),
             session: Mutex::new(BTreeMap::new()),
             cache: Mutex::new(BTreeMap::new()),
+            missing: Mutex::new(BTreeSet::new()),
             vault,
-            vault_available: AtomicBool::new(true),
+            vault_state: AtomicU8::new(UNKNOWN),
         }
     }
 
-    /// Whether values are currently reaching the OS vault. It becomes false
-    /// after a vault failure and stays false for the session.
-    pub fn vault_available(&self) -> bool {
-        self.vault_available.load(Ordering::Relaxed)
+    /// `None` until the vault has been exercised this session. `Some(false)`
+    /// means the last vault call failed; values then require an explicit
+    /// session-only save.
+    pub fn vault_available(&self) -> Option<bool> {
+        match self.vault_state.load(Ordering::Relaxed) {
+            AVAILABLE => Some(true),
+            FAILED => Some(false),
+            _ => None,
+        }
     }
 
-    pub fn list(&self) -> Vec<String> {
-        let mut names = self.names.lock().unwrap().clone();
-        names.extend(self.session.lock().unwrap().keys().cloned());
-        names.into_iter().collect()
+    fn set_state(&self, state: u8) {
+        self.vault_state.store(state, Ordering::Relaxed);
+    }
+
+    pub fn entries(&self) -> Vec<SecretEntry> {
+        let names = self.names.lock().unwrap().clone();
+        let session = self.session.lock().unwrap();
+        let mut all: BTreeSet<String> = names.clone();
+        all.extend(session.keys().cloned());
+        all.into_iter()
+            .map(|name| SecretEntry {
+                origin: if session.contains_key(&name) {
+                    SecretOrigin::Session
+                } else {
+                    SecretOrigin::Vault
+                },
+                name,
+            })
+            .collect()
     }
 
     pub fn set(&self, name: &str, value: &str) -> Result<SecretOrigin, String> {
         let name = validate_name(name)?;
-        let origin = match self.vault.set(name, value) {
-            Ok(()) => {
-                self.vault_available.store(true, Ordering::Relaxed);
-                self.session.lock().unwrap().remove(name);
-                SecretOrigin::Vault
-            }
-            Err(_) => {
-                self.vault_available.store(false, Ordering::Relaxed);
-                self.session
-                    .lock()
-                    .unwrap()
-                    .insert(name.to_owned(), value.to_owned());
-                SecretOrigin::Session
-            }
-        };
+        self.vault.set(name, value).map_err(|error| {
+            self.set_state(FAILED);
+            format!(
+                "Could not save secret \"{name}\" to the OS password vault: {error}. Nothing was changed; you can try again or store it for this session only."
+            )
+        })?;
+        self.set_state(AVAILABLE);
+        self.session.lock().unwrap().remove(name);
         self.cache
             .lock()
             .unwrap()
             .insert(name.to_owned(), value.to_owned());
+        self.missing.lock().unwrap().remove(name);
         let mut names = self.names.lock().unwrap();
         names.insert(name.to_owned());
         save_names(&self.names_path, &names)?;
-        Ok(origin)
+        Ok(SecretOrigin::Vault)
+    }
+
+    /// Keep a value in memory for the rest of the session. The name is not
+    /// written to `secrets.json`, so it disappears on restart.
+    pub fn set_session(&self, name: &str, value: &str) -> Result<(), String> {
+        let name = validate_name(name)?;
+        self.session
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), value.to_owned());
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), value.to_owned());
+        self.missing.lock().unwrap().remove(name);
+        Ok(())
     }
 
     pub fn get(&self, name: &str) -> Result<String, String> {
@@ -140,63 +182,72 @@ impl SecretStore {
         if let Some(value) = self.cache.lock().unwrap().get(name).cloned() {
             return Ok(value);
         }
+        if let Some(value) = self.session.lock().unwrap().get(name).cloned() {
+            return Ok(value);
+        }
+        if self.missing.lock().unwrap().contains(name) {
+            return Err(missing_secret(name));
+        }
         match self.vault.get(name) {
             Ok(Some(value)) => {
-                self.vault_available.store(true, Ordering::Relaxed);
+                self.set_state(AVAILABLE);
                 self.cache
                     .lock()
                     .unwrap()
                     .insert(name.to_owned(), value.clone());
                 Ok(value)
             }
-            Ok(None) => self.session_get(name),
-            Err(_) => {
-                self.vault_available.store(false, Ordering::Relaxed);
-                self.session_get(name)
+            Ok(None) => {
+                self.set_state(AVAILABLE);
+                self.missing.lock().unwrap().insert(name.to_owned());
+                Err(missing_secret(name))
+            }
+            Err(error) => {
+                self.set_state(FAILED);
+                Err(format!(
+                    "Could not read secret \"{name}\" from the OS password vault: {error}"
+                ))
             }
         }
     }
 
-    fn session_get(&self, name: &str) -> Result<String, String> {
-        self.session
-            .lock()
-            .unwrap()
-            .get(name)
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "Secret \"{name}\" was not found. Add it in Secrets… or set it for this session."
-                )
-            })
-    }
-
-    pub fn delete(&self, name: &str) -> Result<(), String> {
+    /// Delete a vault-backed secret. `session_only` removes only the in-memory
+    /// override, leaving any vault entry untouched.
+    pub fn delete(&self, name: &str, session_only: bool) -> Result<(), String> {
         let name = validate_name(name)?;
-        let vault_error = self.vault.delete(name).err();
-        let had_session_value = self.session.lock().unwrap().remove(name).is_some();
-        self.cache.lock().unwrap().remove(name);
-        self.names.lock().unwrap().remove(name);
-        save_names(&self.names_path, &self.names.lock().unwrap())?;
-        if let Some(error) = vault_error {
-            // Removing a session-only value is complete even without a vault. If
-            // the value may live in the vault, say its entry could not be removed.
-            if !had_session_value {
-                return Err(format!(
-                    "{error} The secret was removed from this session, but its vault entry could not be deleted."
-                ));
-            }
+        if session_only {
+            self.session.lock().unwrap().remove(name);
+            self.cache.lock().unwrap().remove(name);
+            self.missing.lock().unwrap().remove(name);
+            return Ok(());
         }
-        Ok(())
+        self.vault.delete(name).map_err(|error| {
+            self.set_state(FAILED);
+            format!(
+                "Could not delete secret \"{name}\" from the OS password vault: {error}. The name was kept so you can try again."
+            )
+        })?;
+        self.set_state(AVAILABLE);
+        self.session.lock().unwrap().remove(name);
+        self.cache.lock().unwrap().remove(name);
+        self.missing.lock().unwrap().remove(name);
+        let mut names = self.names.lock().unwrap();
+        names.remove(name);
+        save_names(&self.names_path, &names)
     }
 
     /// Values handed to kernels before a run. Missing or unreadable entries are
     /// omitted; the script gets the same clear error from `secret()` instead.
     pub fn snapshot(&self) -> BTreeMap<String, String> {
-        self.list()
+        self.entries()
             .into_iter()
-            .filter_map(|name| self.get(&name).ok().map(|value| (name, value)))
+            .filter_map(|entry| self.get(&entry.name).ok().map(|value| (entry.name, value)))
             .collect()
     }
+}
+
+fn missing_secret(name: &str) -> String {
+    format!("Secret \"{name}\" was not found. Add it in Secrets… or set it for this session.")
 }
 
 fn validate_name(name: &str) -> Result<&str, String> {
@@ -288,26 +339,45 @@ mod tests {
             let store = SecretStore::with_vault(directory.path(), vault.clone());
             assert_eq!(store.set("token", "s3cret").unwrap(), SecretOrigin::Vault);
             assert_eq!(store.get("token").unwrap(), "s3cret");
-            assert_eq!(store.list(), vec!["token"]);
+            assert_eq!(store.entries()[0].name, "token");
+            assert_eq!(store.entries()[0].origin, SecretOrigin::Vault);
         }
         let text = fs::read_to_string(directory.path().join(NAMES_FILE)).unwrap();
         assert!(text.contains("token"));
         assert!(!text.contains("s3cret"));
         let store = SecretStore::with_vault(directory.path(), vault);
         assert_eq!(store.get("token").unwrap(), "s3cret");
-        store.delete("token").unwrap();
+        store.delete("token", false).unwrap();
         assert!(store.get("token").is_err());
-        assert!(store.list().is_empty());
+        assert!(store.entries().is_empty());
     }
 
     #[test]
-    fn falls_back_to_the_session_without_a_vault() {
+    fn a_failing_vault_does_not_replace_a_value_silently() {
         let (_directory, store) = store(Arc::new(BrokenVault));
-        assert_eq!(store.set("token", "value").unwrap(), SecretOrigin::Session);
-        assert!(!store.vault_available());
-        assert_eq!(store.get("token").unwrap(), "value");
-        store.delete("token").unwrap();
+        assert_eq!(store.vault_available(), None);
+        let error = store.set("token", "value").unwrap_err();
+        assert!(error.contains("Nothing was changed"));
         assert!(store.get("token").is_err());
+        assert!(!store.vault_available().unwrap());
+    }
+
+    #[test]
+    fn session_values_are_explicit_and_never_persisted() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SecretStore::with_vault(directory.path(), Arc::new(BrokenVault));
+        store.set_session("token", "value").unwrap();
+        assert_eq!(store.get("token").unwrap(), "value");
+        assert_eq!(
+            store.entries(),
+            vec![SecretEntry {
+                name: "token".into(),
+                origin: SecretOrigin::Session,
+            }]
+        );
+        assert!(!directory.path().join(NAMES_FILE).exists());
+        store.delete("token", true).unwrap();
+        assert!(store.entries().is_empty());
     }
 
     #[test]
@@ -319,12 +389,39 @@ mod tests {
     }
 
     #[test]
+    fn a_vault_read_error_is_not_reported_as_missing() {
+        let (_directory, store) = store(Arc::new(BrokenVault));
+        let error = store.get("token").unwrap_err();
+        assert!(error.contains("Could not read"));
+        assert!(error.contains("no vault"));
+        assert!(!error.contains("was not found"));
+    }
+
+    #[test]
+    fn failed_delete_keeps_the_name_and_reports_the_error() {
+        let (_directory, store) = store(Arc::new(BrokenVault));
+        store.set_session("token", "value").unwrap();
+        let error = store.delete("token", false).unwrap_err();
+        assert!(error.contains("Could not delete"));
+        assert_eq!(store.get("token").unwrap(), "value");
+        store.delete("token", true).unwrap();
+        assert!(store.entries().is_empty());
+    }
+
+    #[test]
     fn snapshot_omits_missing_values() {
-        let (_directory, store) = store(Arc::new(MemoryVault::default()));
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join(NAMES_FILE),
+            "[\"one\", \"empty\", \"absent\"]",
+        )
+        .unwrap();
+        let store = SecretStore::with_vault(directory.path(), Arc::new(MemoryVault::default()));
         store.set("one", "1").unwrap();
         store.set("empty", "").unwrap();
         let snapshot = store.snapshot();
         assert_eq!(snapshot.get("one").map(String::as_str), Some("1"));
         assert_eq!(snapshot.get("empty").map(String::as_str), Some(""));
+        assert!(!snapshot.contains_key("absent"));
     }
 }

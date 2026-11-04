@@ -177,21 +177,20 @@ static class LocalHelpers { public static T Cache<T>(string key, Func<T> factory
         self.assertEqual(replies[4]["error"]["code"], -32601)
         self.assertTrue(replies[5]["result"]["ok"])
 
-    def test_hosted_run_receives_secrets(self):
+    def test_hosted_run_receives_secrets_and_clears_them_afterwards(self):
         events = self.exchange([
             json.dumps({"jsonrpc": "2.0", "id": 1, "method": "run",
                         "params": {"source": 'Secret("token");',
-                                   "secrets": {"token": "s3cret"}}})
-        ], 1)
-        dumps = [event["params"]["node"] for event in events
-                 if event.get("method") == "dump"]
-        self.assertEqual(dumps[-1]["v"], "s3cret")
-        missing = self.exchange([
-            json.dumps({"jsonrpc": "2.0", "id": 1, "method": "run",
+                                   "secrets": {"token": "s3cret"}}}),
+            json.dumps({"jsonrpc": "2.0", "id": 2, "method": "run",
                         "params": {"source": 'Secret("token");'}})
-        ], 1)
-        errors = [event["params"]["node"] for event in missing
-                  if event.get("method") == "dump" and event["params"]["node"]["kind"] == "error"]
+        ], 2)
+        first = [event["params"]["node"] for event in events
+                 if event.get("method") == "dump" and event["params"]["runId"] == 1]
+        self.assertEqual(first[-1]["v"], "s3cret")
+        errors = [event["params"]["node"] for event in events
+                  if event.get("method") == "dump" and event["params"]["runId"] == 2
+                  and event["params"]["node"]["kind"] == "error"]
         self.assertTrue(errors)
         self.assertIn("Secrets", errors[-1]["message"])
 

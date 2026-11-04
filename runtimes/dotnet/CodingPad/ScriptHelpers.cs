@@ -35,6 +35,8 @@ public static class ScriptHelpers
     internal static void SetSecrets(IReadOnlyDictionary<string, string> secrets) =>
         Secrets = secrets;
 
+    internal static void ClearSecrets() => Secrets = new Dictionary<string, string>();
+
     /// <summary>Keep successful results across runs. Factories execute outside the cache lock.</summary>
     public static T Cache<T>(string key, Func<T> factory)
     {

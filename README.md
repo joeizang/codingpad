@@ -320,9 +320,10 @@ user privileges.
 
 Click **Secrets…** to add, update or remove named secrets. Values are stored in
 the OS password vault (Keychain on macOS, Credential Manager on Windows, Secret
-Service on Linux); scripts and settings never contain them. If no vault is
-available, values are kept in memory for the current session and the dialog says
-so.
+Service on Linux); scripts and settings never contain them. A failed vault write
+returns an error instead of silently replacing a value. If the vault is
+unavailable, the dialog offers an explicit **Store for this session only** action;
+those values disappear when CodingPad exits.
 
 Python scripts read a secret with `secret("name")` (also importable from
 `codingpad`), and C# scripts with `Secret("name")`:

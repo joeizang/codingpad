@@ -2,7 +2,7 @@
 
 use codingpad_kernel_core::{
     lsp::{LanguageServers, LspEvent, LspStartResult},
-    secrets::{SecretOrigin, SecretStore},
+    secrets::{SecretEntry, SecretOrigin, SecretStore},
     store::{self, FolderEntry, LibrarySettings, ScriptFile},
     toolchains::Toolchains,
     ExpandResult, KernelEvent, Language, RunResult, Supervisor,
@@ -53,26 +53,45 @@ fn bench_phase(phase: &str, detail: serde_json::Value) {
 }
 
 #[tauri::command]
-fn save_secret(
+async fn save_secret(
     secrets: State<'_, Arc<SecretStore>>,
     name: String,
     value: String,
+    session_only: Option<bool>,
 ) -> Result<SecretOrigin, String> {
-    secrets.set(&name, &value)
+    let store = secrets.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if session_only.unwrap_or(false) {
+            store
+                .set_session(&name, &value)
+                .map(|()| SecretOrigin::Session)
+        } else {
+            store.set(&name, &value)
+        }
+    })
+    .await
+    .map_err(|error| format!("The secret operation failed: {error}"))?
 }
 
 #[tauri::command]
-fn delete_secret(secrets: State<'_, Arc<SecretStore>>, name: String) -> Result<(), String> {
-    secrets.delete(&name)
+async fn delete_secret(
+    secrets: State<'_, Arc<SecretStore>>,
+    name: String,
+    session_only: Option<bool>,
+) -> Result<(), String> {
+    let store = secrets.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.delete(&name, session_only.unwrap_or(false)))
+        .await
+        .map_err(|error| format!("The secret operation failed: {error}"))?
 }
 
 #[tauri::command]
-fn list_secrets(secrets: State<'_, Arc<SecretStore>>) -> Vec<String> {
-    secrets.list()
+fn list_secrets(secrets: State<'_, Arc<SecretStore>>) -> Vec<SecretEntry> {
+    secrets.entries()
 }
 
 #[tauri::command]
-fn vault_available(secrets: State<'_, Arc<SecretStore>>) -> bool {
+fn vault_available(secrets: State<'_, Arc<SecretStore>>) -> Option<bool> {
     secrets.vault_available()
 }
 

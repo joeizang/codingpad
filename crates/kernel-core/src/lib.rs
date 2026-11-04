@@ -214,6 +214,20 @@ impl Supervisor {
             .clone();
         let mut closed = slot.closed.subscribe();
         let mut stop = slot.stop.subscribe();
+        // Vault prompts block. Resolve values off the async thread and let Stop
+        // or Close cancel the wait before the kernel slot lock is taken.
+        let secrets = match self.secrets.clone() {
+            None => std::collections::BTreeMap::new(),
+            Some(store) => {
+                let snapshot = tokio::task::spawn_blocking(move || store.snapshot());
+                tokio::select! {
+                    result = snapshot => result
+                        .map_err(|error| format!("Could not read secrets from the vault: {error}"))?,
+                    _ = closed.changed() => return Err("Script was closed".into()),
+                    _ = stop.changed() => return Ok(RunResult { ok: false, stopped: true, cache_cleared: true }),
+                }
+            }
+        };
         let mut guard = slot.kernel.lock().await;
         if *closed.borrow() {
             return Err("Script was closed".into());
@@ -254,11 +268,6 @@ impl Supervisor {
             };
             *guard = Some(startup?);
         }
-        let secrets = self
-            .secrets
-            .as_ref()
-            .map(|store| store.snapshot())
-            .unwrap_or_default();
         let result = tokio::select! {
             result = guard.as_mut().unwrap().run(source, path, &secrets, &mut emit, &mut stop) => result,
             _ = closed.changed() => Err("Script was closed".into()),

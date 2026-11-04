@@ -204,6 +204,7 @@ internal static class Program
         {
             // Close the helper context before the host can observe completion.
             helpers?.Dispose();
+            ScriptHelpers.ClearSecrets();
             cancellation.Request();
             lock (InspectionGate)
             lock (Gate)

@@ -492,6 +492,7 @@ def run(request):
             "__builtins__": dict(vars(builtins)),
             "dump": codingpad.dump,
             "cache": codingpad.cache,
+            "secret": codingpad.secret,
         }
     )
     auto_name = "__codingpad_auto_dump__"

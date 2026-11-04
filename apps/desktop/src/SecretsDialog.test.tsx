@@ -92,3 +92,22 @@ test("offers an explicit session-only save when the vault fails", async () => {
     }),
   );
 });
+
+test("does not offer session storage for non-vault errors", async () => {
+  invoke.mockImplementation(async (command: string) => {
+    if (command === "list_secrets") return [];
+    if (command === "vault_available") return true;
+    if (command === "save_secret") throw new Error("A secret name cannot be empty");
+    return undefined;
+  });
+  render(<SecretsDialog open onClose={() => {}} />);
+  fireEvent.change(screen.getByLabelText("Name"), { target: { value: "token" } });
+  fireEvent.change(screen.getByLabelText("Value"), { target: { value: "value" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add secret" }));
+  await waitFor(() =>
+    expect(screen.getByRole("alert")).toHaveTextContent("cannot be empty"),
+  );
+  expect(
+    screen.queryByRole("button", { name: "Store for this session only" }),
+  ).not.toBeInTheDocument();
+});

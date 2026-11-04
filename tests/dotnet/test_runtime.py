@@ -183,8 +183,11 @@ static class LocalHelpers { public static T Cache<T>(string key, Func<T> factory
                         "params": {"source": 'Secret("token");',
                                    "secrets": {"token": "s3cret"}}}),
             json.dumps({"jsonrpc": "2.0", "id": 2, "method": "run",
-                        "params": {"source": 'Secret("token");'}})
-        ], 2)
+                        "params": {"source": 'Secret("token");'}}),
+            json.dumps({"jsonrpc": "2.0", "id": 3, "method": "run",
+                        "params": {"source": 'Secret("token");',
+                                   "secret_errors": {"token": "Could not read secret: locked"}}})
+        ], 3)
         first = [event["params"]["node"] for event in events
                  if event.get("method") == "dump" and event["params"]["runId"] == 1]
         self.assertEqual(first[-1]["v"], "s3cret")
@@ -193,6 +196,10 @@ static class LocalHelpers { public static T Cache<T>(string key, Func<T> factory
                   and event["params"]["node"]["kind"] == "error"]
         self.assertTrue(errors)
         self.assertIn("Secrets", errors[-1]["message"])
+        locked = [event["params"]["node"] for event in events
+                  if event.get("method") == "dump" and event["params"]["runId"] == 3
+                  and event["params"]["node"]["kind"] == "error"]
+        self.assertIn("locked", locked[-1]["message"])
 
     def test_early_and_expired_cancellation_ids(self):
         messages = [

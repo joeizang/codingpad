@@ -12,6 +12,7 @@ _sink = None
 _update_sink = None
 _registry = None
 _secrets = {}
+_secret_errors = {}
 
 _MAX_ITEMS = 100
 _MAX_TABLE_ROWS = 100
@@ -182,21 +183,25 @@ def _begin(sink=None, update_sink=None, run_id=None):
 
 
 def _end():
-    global _sink, _update_sink, _secrets
+    global _sink, _update_sink, _secrets, _secret_errors
     _sink = None
     _update_sink = None
     _secrets = {}
+    _secret_errors = {}
 
 
-def _set_secrets(values):
-    global _secrets
+def _set_secrets(values, errors=None):
+    global _secrets, _secret_errors
     _secrets = dict(values or {})
+    _secret_errors = dict(errors or {})
 
 
 def secret(name):
     """Return a named secret supplied by the OS password vault."""
     if not isinstance(name, str) or not name.strip():
         raise ValueError("A secret name cannot be empty")
+    if name in _secret_errors:
+        raise KeyError(_secret_errors[name])
     try:
         return _secrets[name]
     except KeyError:

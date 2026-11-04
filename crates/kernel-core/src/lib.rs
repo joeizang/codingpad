@@ -10,7 +10,7 @@ pub mod store;
 pub mod toolchains;
 
 use packages::Packages;
-use secrets::SecretStore;
+use secrets::{SecretSnapshot, SecretStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
@@ -217,14 +217,14 @@ impl Supervisor {
         // Vault prompts block. Resolve values off the async thread and let Stop
         // or Close cancel the wait before the kernel slot lock is taken.
         let secrets = match self.secrets.clone() {
-            None => std::collections::BTreeMap::new(),
+            None => SecretSnapshot::default(),
             Some(store) => {
                 let snapshot = tokio::task::spawn_blocking(move || store.snapshot());
                 tokio::select! {
                     result = snapshot => result
                         .map_err(|error| format!("Could not read secrets from the vault: {error}"))?,
                     _ = closed.changed() => return Err("Script was closed".into()),
-                    _ = stop.changed() => return Ok(RunResult { ok: false, stopped: true, cache_cleared: true }),
+                    _ = stop.changed() => return Ok(RunResult { ok: false, stopped: true, cache_cleared: false }),
                 }
             }
         };
@@ -536,14 +536,14 @@ impl Kernel {
         &mut self,
         source: &str,
         path: Option<&str>,
-        secrets: &std::collections::BTreeMap<String, String>,
+        secrets: &SecretSnapshot,
         emit: &mut (impl FnMut(KernelEvent) + Send),
         stop: &mut watch::Receiver<u64>,
     ) -> Result<RunResult, String> {
         self.next_id += 1;
         let id = self.next_id;
         let mut request = serde_json::to_vec(
-            &json!({"jsonrpc": "2.0", "id": id, "method": "run", "params": {"source": source, "path": path, "secrets": secrets}}),
+            &json!({"jsonrpc": "2.0", "id": id, "method": "run", "params": {"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors}}),
         )
         .map_err(|e| e.to_string())?;
         request.push(b'\n');
@@ -757,6 +757,49 @@ impl Drop for Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stop_during_a_vault_read_does_not_claim_the_cache_was_cleared() {
+        use crate::secrets::Vault;
+        use std::time::Duration;
+
+        struct SlowVault;
+        impl Vault for SlowVault {
+            fn get(&self, _: &str) -> Result<Option<String>, String> {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(None)
+            }
+            fn set(&self, _: &str, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn delete(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("secrets.json"), "[\"token\"]").unwrap();
+        let store = Arc::new(SecretStore::with_vault(
+            directory.path(),
+            Arc::new(SlowVault),
+        ));
+        let supervisor =
+            Supervisor::with_data_dir_and_secrets(directory.path().to_path_buf(), store);
+        let mut run = std::pin::pin!(supervisor.run("slow-secret", "1 + 1", |_| {}));
+        let result = tokio::select! {
+            result = &mut run => result,
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                supervisor.stop("slow-secret").await;
+                run.await
+            }
+        };
+        let result = result.unwrap();
+        assert!(result.stopped);
+        assert!(
+            !result.cache_cleared,
+            "no kernel existed, so no cache was cleared"
+        );
+    }
 
     #[tokio::test]
     async fn interpreter_probe_writes_utf8_with_an_ascii_stdout_encoding() {

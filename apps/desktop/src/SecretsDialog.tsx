@@ -35,7 +35,7 @@ export function SecretsDialog({ open, onClose }: SecretsDialogProps) {
     dialog.current?.focus();
   }, [open]);
 
-  async function refresh() {
+  async function refresh(): Promise<SecretEntry[] | undefined> {
     try {
       const [listed, available] = await Promise.all([
         invoke<SecretEntry[]>("list_secrets"),
@@ -43,8 +43,10 @@ export function SecretsDialog({ open, onClose }: SecretsDialogProps) {
       ]);
       setEntries(listed);
       setVault(available);
+      return listed;
     } catch (failure) {
       setError(String(failure));
+      return undefined;
     }
   }
 
@@ -78,8 +80,11 @@ export function SecretsDialog({ open, onClose }: SecretsDialogProps) {
       setValue("");
       await refresh();
     } catch (failure) {
-      setError(String(failure));
-      setSessionOffer(!sessionOnly);
+      const message = String(failure);
+      setError(message);
+      // Only a vault failure needs the explicit session fallback. A bad name or
+      // settings write would fail the same way again.
+      setSessionOffer(!sessionOnly && message.includes("OS password vault"));
     } finally {
       setBusy(false);
     }
@@ -100,8 +105,14 @@ export function SecretsDialog({ open, onClose }: SecretsDialogProps) {
         setName("");
         setValue("");
       }
-      setStatus(`Removed "${entry.name}".`);
-      await refresh();
+      const remaining = await refresh();
+      if (entry.origin === "session" && remaining?.some((item) => item.name === entry.name)) {
+        setStatus(
+          `Removed the session value for "${entry.name}"; the vault value is still in use.`,
+        );
+      } else {
+        setStatus(`Removed "${entry.name}".`);
+      }
     } catch (failure) {
       setError(String(failure));
     } finally {

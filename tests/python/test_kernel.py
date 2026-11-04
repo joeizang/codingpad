@@ -148,6 +148,22 @@ class KernelTests(unittest.TestCase):
         self.assertTrue(errors)
         self.assertIn("token", errors[-1]["message"])
         self.assertIn("Secrets", errors[-1]["message"])
+        messages = self.request(
+            "run",
+            {
+                "source": "secret('token')",
+                "secrets": {},
+                "secret_errors": {"token": "Could not read secret \"token\": locked"},
+            },
+        )
+        self.assertFalse(messages[-1]["result"]["ok"])
+        errors = [
+            message["params"]["node"]
+            for message in messages
+            if message.get("method") == "dump"
+            and message["params"]["node"]["kind"] == "error"
+        ]
+        self.assertIn("locked", errors[-1]["message"])
 
     def test_cancel_before_execution_is_retained_and_stale_ids_are_ignored(self):
         messages = [

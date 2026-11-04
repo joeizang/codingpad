@@ -37,6 +37,14 @@ pub struct SecretEntry {
     pub origin: SecretOrigin,
 }
 
+/// Values and read failures for one run. A vault failure is sent to the kernel
+/// so `secret()` can report the real reason instead of calling the name missing.
+#[derive(Clone, Debug, Default)]
+pub struct SecretSnapshot {
+    pub values: BTreeMap<String, String>,
+    pub errors: BTreeMap<String, String>,
+}
+
 /// The platform password vault. Tests inject an in-memory implementation.
 pub trait Vault: Send + Sync {
     fn get(&self, name: &str) -> Result<Option<String>, String>;
@@ -85,6 +93,7 @@ pub struct SecretStore {
     session: Mutex<BTreeMap<String, String>>,
     cache: Mutex<BTreeMap<String, String>>,
     missing: Mutex<BTreeSet<String>>,
+    failures: Mutex<BTreeMap<String, String>>,
     vault: Arc<dyn Vault>,
     vault_state: AtomicU8,
 }
@@ -103,6 +112,7 @@ impl SecretStore {
             session: Mutex::new(BTreeMap::new()),
             cache: Mutex::new(BTreeMap::new()),
             missing: Mutex::new(BTreeSet::new()),
+            failures: Mutex::new(BTreeMap::new()),
             vault,
             vault_state: AtomicU8::new(UNKNOWN),
         }
@@ -155,6 +165,7 @@ impl SecretStore {
             .unwrap()
             .insert(name.to_owned(), value.to_owned());
         self.missing.lock().unwrap().remove(name);
+        self.failures.lock().unwrap().remove(name);
         let mut names = self.names.lock().unwrap();
         names.insert(name.to_owned());
         save_names(&self.names_path, &names)?;
@@ -174,19 +185,32 @@ impl SecretStore {
             .unwrap()
             .insert(name.to_owned(), value.to_owned());
         self.missing.lock().unwrap().remove(name);
+        self.failures.lock().unwrap().remove(name);
         Ok(())
     }
 
     pub fn get(&self, name: &str) -> Result<String, String> {
         let name = validate_name(name)?;
+        match self.resolve(name)? {
+            Some(value) => Ok(value),
+            None => Err(missing_secret(name)),
+        }
+    }
+
+    /// `Ok(None)` means the vault has no entry; `Err` means the vault refused or
+    /// failed. Callers report those differently.
+    fn resolve(&self, name: &str) -> Result<Option<String>, String> {
         if let Some(value) = self.cache.lock().unwrap().get(name).cloned() {
-            return Ok(value);
+            return Ok(Some(value));
         }
         if let Some(value) = self.session.lock().unwrap().get(name).cloned() {
-            return Ok(value);
+            return Ok(Some(value));
         }
         if self.missing.lock().unwrap().contains(name) {
-            return Err(missing_secret(name));
+            return Ok(None);
+        }
+        if let Some(error) = self.failures.lock().unwrap().get(name).cloned() {
+            return Err(error);
         }
         match self.vault.get(name) {
             Ok(Some(value)) => {
@@ -195,18 +219,22 @@ impl SecretStore {
                     .lock()
                     .unwrap()
                     .insert(name.to_owned(), value.clone());
-                Ok(value)
+                Ok(Some(value))
             }
             Ok(None) => {
                 self.set_state(AVAILABLE);
                 self.missing.lock().unwrap().insert(name.to_owned());
-                Err(missing_secret(name))
+                Ok(None)
             }
             Err(error) => {
                 self.set_state(FAILED);
-                Err(format!(
-                    "Could not read secret \"{name}\" from the OS password vault: {error}"
-                ))
+                let message =
+                    format!("Could not read secret \"{name}\" from the OS password vault: {error}");
+                self.failures
+                    .lock()
+                    .unwrap()
+                    .insert(name.to_owned(), message.clone());
+                Err(message)
             }
         }
     }
@@ -219,6 +247,7 @@ impl SecretStore {
             self.session.lock().unwrap().remove(name);
             self.cache.lock().unwrap().remove(name);
             self.missing.lock().unwrap().remove(name);
+            self.failures.lock().unwrap().remove(name);
             return Ok(());
         }
         self.vault.delete(name).map_err(|error| {
@@ -231,6 +260,7 @@ impl SecretStore {
         self.session.lock().unwrap().remove(name);
         self.cache.lock().unwrap().remove(name);
         self.missing.lock().unwrap().remove(name);
+        self.failures.lock().unwrap().remove(name);
         let mut names = self.names.lock().unwrap();
         names.remove(name);
         save_names(&self.names_path, &names)
@@ -238,11 +268,20 @@ impl SecretStore {
 
     /// Values handed to kernels before a run. Missing or unreadable entries are
     /// omitted; the script gets the same clear error from `secret()` instead.
-    pub fn snapshot(&self) -> BTreeMap<String, String> {
-        self.entries()
-            .into_iter()
-            .filter_map(|entry| self.get(&entry.name).ok().map(|value| (entry.name, value)))
-            .collect()
+    pub fn snapshot(&self) -> SecretSnapshot {
+        let mut snapshot = SecretSnapshot::default();
+        for entry in self.entries() {
+            match self.resolve(&entry.name) {
+                Ok(Some(value)) => {
+                    snapshot.values.insert(entry.name, value);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    snapshot.errors.insert(entry.name, error);
+                }
+            }
+        }
+        snapshot
     }
 }
 
@@ -381,6 +420,40 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_reports_vault_errors_and_caches_them_for_the_session() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join(NAMES_FILE), "[\"token\"]").unwrap();
+        let calls = Arc::new(Mutex::new(0));
+        struct CountingVault(Arc<Mutex<usize>>);
+        impl Vault for CountingVault {
+            fn get(&self, _: &str) -> Result<Option<String>, String> {
+                *self.0.lock().unwrap() += 1;
+                Err("locked".into())
+            }
+            fn set(&self, _: &str, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn delete(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let store =
+            SecretStore::with_vault(directory.path(), Arc::new(CountingVault(calls.clone())));
+        let snapshot = store.snapshot();
+        assert!(snapshot.values.is_empty());
+        assert!(snapshot.errors["token"].contains("locked"));
+        assert_eq!(store.get("token").unwrap_err(), snapshot.errors["token"]);
+        store.snapshot();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "failures are cached for the session"
+        );
+        store.set("token", "new").unwrap();
+        assert_eq!(store.get("token").unwrap(), "new");
+    }
+
+    #[test]
     fn missing_secret_has_an_actionable_error() {
         let (_directory, store) = store(Arc::new(MemoryVault::default()));
         let error = store.get("missing").unwrap_err();
@@ -420,8 +493,8 @@ mod tests {
         store.set("one", "1").unwrap();
         store.set("empty", "").unwrap();
         let snapshot = store.snapshot();
-        assert_eq!(snapshot.get("one").map(String::as_str), Some("1"));
-        assert_eq!(snapshot.get("empty").map(String::as_str), Some(""));
-        assert!(!snapshot.contains_key("absent"));
+        assert_eq!(snapshot.values.get("one").map(String::as_str), Some("1"));
+        assert_eq!(snapshot.values.get("empty").map(String::as_str), Some(""));
+        assert!(!snapshot.values.contains_key("absent"));
     }
 }

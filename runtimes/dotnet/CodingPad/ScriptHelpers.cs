@@ -17,6 +17,8 @@ public static class ScriptHelpers
     private static readonly AsyncLocal<RunScope?> Current = new();
     private static IReadOnlyDictionary<string, string> Secrets =
         new Dictionary<string, string>();
+    private static IReadOnlyDictionary<string, string> SecretErrors =
+        new Dictionary<string, string>();
     private static long generation;
     private static bool hosted;
 
@@ -27,15 +29,25 @@ public static class ScriptHelpers
     {
         if (string.IsNullOrWhiteSpace(name))
             throw new ArgumentException("A secret name cannot be empty.", nameof(name));
+        if (SecretErrors.TryGetValue(name, out var error)) throw new KeyNotFoundException(error);
         if (Secrets.TryGetValue(name, out var value)) return value;
         throw new KeyNotFoundException(
             $"Secret \"{name}\" was not found. Add it in Secrets… or set it for this session.");
     }
 
-    internal static void SetSecrets(IReadOnlyDictionary<string, string> secrets) =>
+    internal static void SetSecrets(
+        IReadOnlyDictionary<string, string> secrets,
+        IReadOnlyDictionary<string, string> errors)
+    {
         Secrets = secrets;
+        SecretErrors = errors;
+    }
 
-    internal static void ClearSecrets() => Secrets = new Dictionary<string, string>();
+    internal static void ClearSecrets()
+    {
+        Secrets = new Dictionary<string, string>();
+        SecretErrors = new Dictionary<string, string>();
+    }
 
     /// <summary>Keep successful results across runs. Factories execute outside the cache lock.</summary>
     public static T Cache<T>(string key, Func<T> factory)

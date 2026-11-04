@@ -26,7 +26,7 @@ futures-util = "0.3"
 rust_decimal = { version = "1", default-features = false, features = ["std", "db-tokio-postgres"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 uuid = "1"
-tiberius = { version = "0.13", default-features = false, features = ["tds80", "native-tls"] }
+tiberius = { version = "0.13", default-features = false, features = ["tds80", "rustls", "chrono"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 
 [target.'cfg(unix)'.dependencies]

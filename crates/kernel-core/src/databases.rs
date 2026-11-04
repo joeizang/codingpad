@@ -381,6 +381,12 @@ impl SqlManager {
             format!("Connection \"{name}\" was not found. Add it in Connections…")
         })?;
         self.clear_results(script_id);
+        if connection.kind == DatabaseKind::SqlServer && has_go_batch(source) {
+            return Err(
+                "GO is a client-side batch separator, not T-SQL. Remove it or run each batch separately."
+                    .into(),
+            );
+        }
         if cancelled.load(Ordering::Relaxed) {
             return Ok(SqlRunResult {
                 ok: false,
@@ -658,17 +664,24 @@ impl SqlManager {
         config.port(server_port(connection, 1433));
         config.database(connection.database.as_deref().unwrap_or(""));
         let user = connection.user.as_deref().unwrap_or("");
-        let password = connection
+        let password = match connection
             .secret
             .as_deref()
             .map(str::trim)
             .filter(|secret| !secret.is_empty())
-            .map(|secret| self.secrets.get(secret))
-            .transpose()
-            .map_err(|error| {
-                format!("Could not read the SQL Server password from the vault: {error}")
-            })?
-            .unwrap_or_default();
+        {
+            Some(secret) => {
+                let store = self.secrets.clone();
+                let secret = secret.to_owned();
+                tokio::task::spawn_blocking(move || store.get(&secret))
+                    .await
+                    .map_err(|error| format!("The password read failed: {error}"))?
+                    .map_err(|error| {
+                        format!("Could not read the SQL Server password from the vault: {error}")
+                    })?
+            }
+            None => String::new(),
+        };
         config.authentication(tiberius::AuthMethod::sql_server(user, password));
         config.encryption(match connection.tls {
             TlsMode::Prefer => tiberius::EncryptionLevel::On,
@@ -678,27 +691,25 @@ impl SqlManager {
         if connection.trust_server_certificate {
             config.trust_cert();
         }
-        let tcp = tokio::net::TcpStream::connect(config.get_addr())
+        let address = format!(
+            "{}:{}/{}",
+            server_host(connection),
+            server_port(connection, 1433),
+            connection.database.as_deref().unwrap_or("")
+        );
+        let connect = async {
+            let tcp = tokio::net::TcpStream::connect(config.get_addr())
+                .await
+                .map_err(|error| error.to_string())?;
+            tcp.set_nodelay(true).map_err(|error| error.to_string())?;
+            tiberius::Client::connect(config, tcp.compat_write())
+                .await
+                .map_err(|error| error.to_string())
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(15), connect)
             .await
-            .map_err(|error| {
-                format!(
-                    "Could not connect to SQL Server at {}:{}/{}: {error}",
-                    server_host(connection),
-                    server_port(connection, 1433),
-                    connection.database.as_deref().unwrap_or("")
-                )
-            })?;
-        tcp.set_nodelay(true).map_err(|error| error.to_string())?;
-        tiberius::Client::connect(config, tcp.compat_write())
-            .await
-            .map_err(|error| {
-                format!(
-                    "Could not connect to SQL Server at {}:{}/{}: {error}",
-                    server_host(connection),
-                    server_port(connection, 1433),
-                    connection.database.as_deref().unwrap_or("")
-                )
-            })
+            .map_err(|_| format!("Timed out connecting to SQL Server at {address}"))?
+            .map_err(|error| format!("Could not connect to SQL Server at {address}: {error}"))
     }
 
     async fn run_sqlserver(
@@ -975,6 +986,12 @@ fn postgres_port(connection: &Connection) -> u16 {
     connection.port.unwrap_or(5432)
 }
 
+fn has_go_batch(source: &str) -> bool {
+    source
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("GO"))
+}
+
 fn server_host(connection: &Connection) -> &str {
     connection
         .host
@@ -988,124 +1005,142 @@ fn server_port(connection: &Connection, default: u16) -> u16 {
     connection.port.unwrap_or(default)
 }
 
-fn is_query(source: &str) -> bool {
-    let bytes = source.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            byte if byte.is_ascii_whitespace() => index += 1,
-            b'-' if bytes.get(index + 1) == Some(&b'-') => {
-                index += 2;
-                while index < bytes.len() && bytes[index] != b'\n' {
-                    index += 1;
-                }
-            }
-            b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                index += 2;
-                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
-                {
-                    index += 1;
-                }
-                index += 2;
-            }
-            _ => break,
-        }
-    }
-    let keyword: String = source[index..]
-        .chars()
-        .take_while(|character| character.is_ascii_alphabetic())
-        .collect::<String>()
-        .to_ascii_uppercase();
-    matches!(
-        keyword.as_str(),
-        "SELECT" | "WITH" | "VALUES" | "PRAGMA" | "EXPLAIN"
-    )
-}
-
 async fn sqlserver_tables(
     client: &mut tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>,
     source: &str,
 ) -> Result<Vec<TableData>, String> {
-    if is_query(source) {
-        let Some(stream) = client.query(source, &[]).await.ok() else {
-            return sqlserver_simple_tables(client, source).await;
-        };
-        let sets = stream
-            .into_results()
-            .await
-            .map_err(|error| format!("SQL Server could not read the results: {error}"))?;
-        let tables: Vec<TableData> = sets
-            .into_iter()
-            .filter(|rows| !rows.is_empty())
-            .map(sqlserver_table)
-            .collect();
-        if tables.is_empty() {
-            Ok(vec![affected_table_text("Statement completed.".into())])
-        } else {
-            Ok(tables)
-        }
-    } else {
-        match client.execute(source, &[]).await {
-            Ok(result) => Ok(vec![affected_table(result.total())]),
-            Err(error) => Err(format!("SQL Server could not run the statement: {error}")),
+    use futures_util::TryStreamExt;
+
+    let stream = client
+        .query(source, &[])
+        .await
+        .map_err(|error| format!("SQL Server could not run the statement: {error}"))?;
+    tokio::pin!(stream);
+    let mut tables: Vec<TableData> = Vec::new();
+    let mut current: Option<(Vec<Column>, Vec<Vec<Value>>, bool)> = None;
+    while let Some(item) = stream
+        .as_mut()
+        .try_next()
+        .await
+        .map_err(|error| format!("SQL Server could not read the results: {error}"))?
+    {
+        if let Some(metadata) = item.as_metadata() {
+            if let Some((columns, rows, truncated)) = current.take() {
+                tables.push(TableData {
+                    columns,
+                    rows,
+                    truncated,
+                });
+            }
+            current = Some((
+                metadata
+                    .columns()
+                    .iter()
+                    .map(|column| Column {
+                        name: column.name().to_owned(),
+                    })
+                    .collect(),
+                Vec::new(),
+                false,
+            ));
+        } else if let Some(row) = item.as_row() {
+            if current.is_none() {
+                current = Some((
+                    row.columns()
+                        .iter()
+                        .map(|column| Column {
+                            name: column.name().to_owned(),
+                        })
+                        .collect(),
+                    Vec::new(),
+                    false,
+                ));
+            }
+            let (_, rows, truncated) = current.as_mut().unwrap();
+            if rows.len() >= MAX_ROWS {
+                *truncated = true;
+                break;
+            }
+            let mut cells = Vec::with_capacity(row.columns().len());
+            for (index, (column, value)) in row.cells().enumerate() {
+                cells.push(sqlserver_cell(row, index, column, value, rows.len()));
+            }
+            rows.push(cells);
         }
     }
-}
-
-async fn sqlserver_simple_tables(
-    client: &mut tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>,
-    source: &str,
-) -> Result<Vec<TableData>, String> {
-    let sets = client
-        .simple_query(source)
-        .await
-        .map_err(|error| format!("SQL Server could not run the query: {error}"))?
-        .into_results()
-        .await
-        .map_err(|error| format!("SQL Server could not read the results: {error}"))?;
-    let tables: Vec<TableData> = sets
-        .into_iter()
-        .filter(|rows| !rows.is_empty())
-        .map(sqlserver_table)
-        .collect();
+    if let Some((columns, rows, truncated)) = current {
+        tables.push(TableData {
+            columns,
+            rows,
+            truncated,
+        });
+    }
     if tables.is_empty() {
-        Ok(vec![affected_table_text("Statement completed.".into())])
-    } else {
-        Ok(tables)
+        tables.push(affected_table_text("Statement completed.".into()));
     }
+    Ok(tables)
 }
 
-fn sqlserver_table(rows: Vec<tiberius::Row>) -> TableData {
-    let columns: Vec<Column> = rows
-        .first()
-        .map(|row| {
-            row.columns()
-                .iter()
-                .map(|column| Column {
-                    name: column.name().to_owned(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut values = Vec::with_capacity(rows.len().min(MAX_ROWS));
-    for (row_index, row) in rows.iter().take(MAX_ROWS).enumerate() {
-        let cells = row
-            .cells()
-            .enumerate()
-            .map(|(column, (_, value))| sqlserver_cell(value, row_index, column))
-            .collect();
-        values.push(cells);
+fn sqlserver_cell(
+    row: &tiberius::Row,
+    index: usize,
+    column: &tiberius::Column,
+    value: &tiberius::ColumnData<'_>,
+    row_index: usize,
+) -> Value {
+    use tiberius::{ColumnData, ColumnType};
+    let id = format!("sql:r{row_index}c{index}");
+    match column.column_type() {
+        ColumnType::Daten => {
+            if let Ok(value) = row.try_get::<chrono::NaiveDate, _>(index) {
+                return value.map_or_else(
+                    || null_node(&id),
+                    |value| bounded_text(&id, value.format("%Y-%m-%d").to_string(), Some("date")),
+                );
+            }
+        }
+        ColumnType::Timen => {
+            if let Ok(value) = row.try_get::<chrono::NaiveTime, _>(index) {
+                return value.map_or_else(
+                    || null_node(&id),
+                    |value| {
+                        bounded_text(&id, value.format("%H:%M:%S%.f").to_string(), Some("time"))
+                    },
+                );
+            }
+        }
+        ColumnType::Datetime2
+        | ColumnType::Datetime
+        | ColumnType::Datetimen
+        | ColumnType::Datetime4 => {
+            if let Ok(value) = row.try_get::<chrono::NaiveDateTime, _>(index) {
+                return value.map_or_else(
+                    || null_node(&id),
+                    |value| {
+                        bounded_text(
+                            &id,
+                            value.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
+                            Some("datetime"),
+                        )
+                    },
+                );
+            }
+        }
+        ColumnType::DatetimeOffsetn => {
+            if let Ok(value) = row.try_get::<chrono::DateTime<chrono::FixedOffset>, _>(index) {
+                return value.map_or_else(
+                    || null_node(&id),
+                    |value| bounded_text(&id, value.to_rfc3339(), Some("datetimeoffset")),
+                );
+            }
+        }
+        ColumnType::Money | ColumnType::Money4 => {
+            if let ColumnData::F64(Some(value)) = value {
+                return bounded_text(&id, format!("{value:.4}"), Some("money"));
+            }
+        }
+        _ => {}
     }
-    TableData {
-        columns,
-        rows: values,
-        truncated: rows.len() > MAX_ROWS,
-    }
-}
-
-fn sqlserver_cell(value: &tiberius::ColumnData<'_>, row: usize, column: usize) -> Value {
-    use tiberius::ColumnData;
-    let id = format!("sql:r{row}c{column}");
     match value {
         ColumnData::U8(value) => {
             value.map_or_else(|| null_node(&id), |value| integer_node(&id, value as i64))
@@ -1162,7 +1197,7 @@ fn sqlserver_cell(value: &tiberius::ColumnData<'_>, row: usize, column: usize) -
         ),
         ColumnData::Xml(value) => value.as_ref().map_or_else(
             || null_node(&id),
-            |value| bounded_text(&id, format!("{value:?}"), Some("xml")),
+            |value| bounded_text(&id, value.to_string(), Some("xml")),
         ),
         ColumnData::DateTime(value) => value.map_or_else(
             || null_node(&id),
@@ -2262,6 +2297,8 @@ mod tests {
                     "{header}SELECT CAST(1 AS bigint) AS n, CAST(12.5 AS decimal(10,2)) AS amount, \
                      CAST('2020-01-02' AS date) AS day, NEWID() AS id, N'hello' AS name, \
                      CAST(0x0102 AS varbinary(2)) AS bin, CAST(1 AS bit) AS flag, \
+                     CAST(12.50 AS money) AS money, '<a>1</a>' AS xml, \
+                     CAST('2020-01-02T03:04:05+02:00' AS datetimeoffset) AS offset, \
                      CAST(9007199254740993 AS bigint) AS big"
                 ),
                 None,
@@ -2276,7 +2313,10 @@ mod tests {
         assert_eq!(cells[4]["v"], "hello");
         assert!(cells[5]["v"].as_str().unwrap().starts_with("0x"));
         assert_eq!(cells[6]["v"], true);
-        assert_eq!(cells[7]["v"], "9007199254740993");
+        assert_eq!(cells[7]["v"], "12.5000");
+        assert_eq!(cells[8]["v"], "<a>1</a>");
+        assert!(cells[9]["v"].as_str().unwrap().contains("+02:00"));
+        assert_eq!(cells[10]["v"], "9007199254740993");
 
         let stop = {
             let manager = manager.clone();
@@ -2311,6 +2351,42 @@ mod tests {
             .run("mssql", &format!("{header}DROP TABLE {table}"), None)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlserver_go_batches_are_rejected_before_connecting() {
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(SecretStore::with_vault(
+            directory.path(),
+            Arc::new(MemoryVault(Mutex::new(BTreeMap::new()))),
+        ));
+        let connections = Arc::new(ConnectionStore::new(directory.path()));
+        connections
+            .save(Connection {
+                id: String::new(),
+                name: "mssql".into(),
+                kind: DatabaseKind::SqlServer,
+                tls: TlsMode::Prefer,
+                trust_server_certificate: false,
+                path: None,
+                host: Some("127.0.0.1".into()),
+                port: Some(1433),
+                database: Some("master".into()),
+                user: Some("sa".into()),
+                secret: None,
+            })
+            .unwrap();
+        let manager = SqlManager::new(connections, secrets);
+        let error = manager
+            .run(
+                "mssql",
+                "-- codingpad: connection=mssql\nSELECT 1\nGO\nSELECT 2",
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("GO"));
+        assert!(error.contains("client-side batch separator"));
     }
 
     #[test]

@@ -14,6 +14,8 @@ export type Connection = {
   database?: string | null;
   user?: string | null;
   secret?: string | null;
+  tls?: "prefer" | "require" | "disable";
+  trustServerCertificate?: boolean;
 };
 
 type ConnectionsDialogProps = {
@@ -76,6 +78,9 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
     if (/\s/.test(draft.name.trim())) {
       return "A connection name cannot contain spaces; use letters, digits, dashes or underscores.";
     }
+    if (!draft.id && connections.some((item) => item.name === draft.name.trim())) {
+      return `A connection named "${draft.name.trim()}" already exists`;
+    }
     if (draft.kind === "sqlite") {
       if (!draft.path?.trim()) return "A SQLite connection needs a database file";
       return undefined;
@@ -102,34 +107,30 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
     setStatus(undefined);
     try {
       const connection = { ...draft };
-      let wroteSecret = false;
       if (connection.kind !== "sqlite" && password) {
         connection.secret = connection.secret || `connection:${connection.name.trim()}`;
-        await invoke("save_secret", {
-          name: connection.secret,
-          value: password,
-        });
-        wroteSecret = true;
       }
-      let saved: Connection;
-      try {
-        saved = await invoke<Connection>("save_connection", {
-          connection,
-        });
-      } catch (failure) {
-        // A new connection that failed to save must not leave an unreferenced
-        // password behind in the vault.
-        if (wroteSecret && !draft.id && connection.secret) {
-          try {
-            await invoke("delete_secret", {
-              name: connection.secret,
-              sessionOnly: false,
-            });
-          } catch {
-            // Keep the original save error.
+      // Save the connection first: a duplicate or invalid name must not touch
+      // the password of an existing connection with the same name.
+      const saved = await invoke<Connection>("save_connection", {
+        connection,
+      });
+      if (connection.kind !== "sqlite" && password && saved.secret) {
+        try {
+          await invoke("save_secret", {
+            name: saved.secret,
+            value: password,
+          });
+        } catch (failure) {
+          if (!draft.id) {
+            try {
+              await invoke("delete_connection", { id: saved.id });
+            } catch {
+              // Keep the original password error.
+            }
           }
+          throw failure;
         }
-        throw failure;
       }
       setDraft({ ...saved });
       setPassword("");
@@ -334,6 +335,22 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
                 />
               </label>
               <label>
+                TLS
+                <select
+                  value={draft.tls ?? "prefer"}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      tls: event.target.value as "prefer" | "require" | "disable",
+                    }))
+                  }
+                >
+                  <option value="prefer">Prefer TLS</option>
+                  <option value="require">Require TLS</option>
+                  <option value="disable">Disable TLS</option>
+                </select>
+              </label>
+              <label>
                 Password
                 <input
                   type="password"
@@ -342,6 +359,19 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
                   placeholder={draft.secret ? "Leave blank to keep the saved password" : "Stored in the OS vault"}
                   onChange={(event) => setPassword(event.target.value)}
                 />
+              </label>
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={draft.trustServerCertificate ?? false}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      trustServerCertificate: event.target.checked,
+                    }))
+                  }
+                />
+                Trust the server certificate (self-signed or private CA)
               </label>
             </>
           )}

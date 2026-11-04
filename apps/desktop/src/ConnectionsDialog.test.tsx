@@ -147,15 +147,25 @@ test("validates a server connection before writing its password", async () => {
   expect(invoke).not.toHaveBeenCalledWith("save_secret", expect.anything());
 });
 
-test("removes a new connection's password when the save fails", async () => {
+test("a duplicate name never touches the existing connection's password", async () => {
   invoke.mockImplementation(async (command: string) => {
-    if (command === "list_connections") return [];
-    if (command === "save_secret") return "vault";
-    if (command === "save_connection") throw new Error("name already exists");
-    if (command === "delete_secret") return undefined;
+    if (command === "list_connections") {
+      return [
+        {
+          id: "pg",
+          name: "northwind",
+          kind: "postgres",
+          host: "db.example.com",
+          database: "northwind",
+          user: "reader",
+          secret: "connection:northwind",
+        },
+      ];
+    }
     return undefined;
   });
   render(<ConnectionsDialog open onClose={() => {}} />);
+  expect(await screen.findByRole("button", { name: /^northwind/ })).toBeInTheDocument();
   fireEvent.change(screen.getByLabelText("Name"), {
     target: { value: "northwind" },
   });
@@ -163,13 +173,13 @@ test("removes a new connection's password when the save fails", async () => {
     target: { value: "postgres" },
   });
   fireEvent.change(screen.getByLabelText("Host"), {
-    target: { value: "db.example.com" },
+    target: { value: "other.example.com" },
   });
   fireEvent.change(screen.getByLabelText("Database"), {
     target: { value: "northwind" },
   });
   fireEvent.change(screen.getByLabelText("User"), {
-    target: { value: "reader" },
+    target: { value: "other" },
   });
   fireEvent.change(screen.getByLabelText("Password"), {
     target: { value: "hunter2" },
@@ -178,8 +188,6 @@ test("removes a new connection's password when the save fails", async () => {
   await waitFor(() =>
     expect(screen.getByRole("alert")).toHaveTextContent("already exists"),
   );
-  expect(invoke).toHaveBeenCalledWith("delete_secret", {
-    name: "connection:northwind",
-    sessionOnly: false,
-  });
+  expect(invoke).not.toHaveBeenCalledWith("save_secret", expect.anything());
+  expect(invoke).not.toHaveBeenCalledWith("delete_secret", expect.anything());
 });

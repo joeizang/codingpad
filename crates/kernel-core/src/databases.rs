@@ -26,6 +26,15 @@ const MAX_PAGE: usize = 1_000;
 const DEFAULT_PAGE: usize = 100;
 const STOPPED: &str = "\u{0}stopped";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsMode {
+    #[default]
+    Prefer,
+    Require,
+    Disable,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DatabaseKind {
@@ -55,6 +64,10 @@ pub struct Connection {
     pub user: Option<String>,
     #[serde(default)]
     pub secret: Option<String>,
+    #[serde(default)]
+    pub tls: TlsMode,
+    #[serde(default)]
+    pub trust_server_certificate: bool,
 }
 
 impl Connection {
@@ -455,7 +468,11 @@ impl SqlManager {
             .port(postgres_port(connection))
             .dbname(connection.database.as_deref().unwrap_or(""))
             .user(connection.user.as_deref().unwrap_or(""))
-            .ssl_mode(tokio_postgres::config::SslMode::Prefer);
+            .ssl_mode(match connection.tls {
+                TlsMode::Prefer => tokio_postgres::config::SslMode::Prefer,
+                TlsMode::Require => tokio_postgres::config::SslMode::Require,
+                TlsMode::Disable => tokio_postgres::config::SslMode::Disable,
+            });
         if let Some(secret) = connection
             .secret
             .as_deref()
@@ -475,6 +492,7 @@ impl SqlManager {
         config.application_name("CodingPad");
         config.connect_timeout(std::time::Duration::from_secs(10));
         let connector = native_tls::TlsConnector::builder()
+            .danger_accept_invalid_certs(connection.trust_server_certificate)
             .build()
             .map_err(|error| format!("Could not prepare TLS for PostgreSQL: {error}"))?;
         let tls = postgres_native_tls::MakeTlsConnector::new(connector);
@@ -785,7 +803,17 @@ async fn postgres_tables(
 ) -> Result<Vec<TableData>, String> {
     match client.prepare(source).await {
         Ok(statement) if !statement.columns().is_empty() => {
-            postgres_query(client, &statement, tls).await
+            if statement
+                .columns()
+                .iter()
+                .all(|column| supported_pg_type(column.type_()))
+            {
+                postgres_query(client, &statement, tls).await
+            } else {
+                // A type we cannot decode still has a text form; use the simple
+                // protocol so values and NULLs are shown instead of placeholders.
+                postgres_simple_tables(client, source, tls).await
+            }
         }
         Ok(statement) => {
             let changed = client
@@ -797,11 +825,7 @@ async fn postgres_tables(
         Err(_) => {
             // Multiple statements cannot be prepared together. Run them with
             // simple query so setup scripts still work.
-            let messages = client
-                .simple_query(source)
-                .await
-                .map_err(|error| pg_error("PostgreSQL could not run the query", error))?;
-            Ok(postgres_simple_tables(messages))
+            postgres_simple_tables(client, source, tls).await
         }
     }
 }
@@ -858,10 +882,54 @@ async fn postgres_query(
     }])
 }
 
-fn postgres_simple_tables(messages: Vec<tokio_postgres::SimpleQueryMessage>) -> Vec<TableData> {
+fn supported_pg_type(kind: &tokio_postgres::types::Type) -> bool {
+    matches!(
+        kind.name(),
+        "bool"
+            | "int2"
+            | "int4"
+            | "int8"
+            | "oid"
+            | "float4"
+            | "float8"
+            | "numeric"
+            | "date"
+            | "time"
+            | "timestamp"
+            | "timestamptz"
+            | "uuid"
+            | "json"
+            | "jsonb"
+            | "bytea"
+            | "text"
+            | "varchar"
+            | "bpchar"
+            | "name"
+            | "char"
+            | "unknown"
+    )
+}
+
+async fn postgres_simple_tables(
+    client: &tokio_postgres::Client,
+    source: &str,
+    tls: &postgres_native_tls::MakeTlsConnector,
+) -> Result<Vec<TableData>, String> {
+    use futures_util::TryStreamExt;
+
+    let messages = client
+        .simple_query_raw(source)
+        .await
+        .map_err(|error| pg_error("PostgreSQL could not run the query", error))?;
+    tokio::pin!(messages);
     let mut tables: Vec<TableData> = Vec::new();
     let mut current: Option<(Vec<Column>, Vec<Vec<Value>>, bool)> = None;
-    for message in messages {
+    while let Some(message) = messages
+        .as_mut()
+        .try_next()
+        .await
+        .map_err(|error| pg_error("PostgreSQL could not read the results", error))?
+    {
         match message {
             tokio_postgres::SimpleQueryMessage::RowDescription(columns) => {
                 if let Some((columns, rows, truncated)) = current.take() {
@@ -916,10 +984,13 @@ fn postgres_simple_tables(messages: Vec<tokio_postgres::SimpleQueryMessage>) -> 
             truncated,
         });
     }
+    if tables.iter().any(|table| table.truncated) {
+        let _ = client.cancel_token().cancel_query(tls.clone()).await;
+    }
     if tables.is_empty() {
         tables.push(affected_table_text("Statement completed.".into()));
     }
-    tables
+    Ok(tables)
 }
 
 fn affected_table(changed: u64) -> TableData {
@@ -979,7 +1050,7 @@ fn primitive_node(id: &str, value: Value) -> Value {
 }
 
 fn integer_node(id: &str, value: i64) -> Value {
-    if value.abs() > MAX_SAFE_INTEGER {
+    if value.unsigned_abs() > MAX_SAFE_INTEGER as u64 {
         string_node(id.to_owned(), value.to_string(), Some("int8"), None)
     } else {
         primitive_node(id, json!(value))
@@ -1256,6 +1327,8 @@ mod tests {
                 id: String::new(),
                 name: "sample".into(),
                 kind: DatabaseKind::Sqlite,
+                tls: TlsMode::Prefer,
+                trust_server_certificate: false,
                 path: Some(database.to_string_lossy().into_owned()),
                 host: None,
                 port: None,
@@ -1287,6 +1360,8 @@ mod tests {
                 id: String::new(),
                 name: "sample".into(),
                 kind: DatabaseKind::Sqlite,
+                tls: TlsMode::Prefer,
+                trust_server_certificate: false,
                 path: Some("/tmp/sample.db".into()),
                 host: None,
                 port: None,
@@ -1301,6 +1376,8 @@ mod tests {
                 id: String::new(),
                 name: "pg".into(),
                 kind: DatabaseKind::Postgres,
+                tls: TlsMode::Prefer,
+                trust_server_certificate: false,
                 path: None,
                 host: Some("db.example.com".into()),
                 port: None,
@@ -1316,6 +1393,8 @@ mod tests {
                 id: String::new(),
                 name: "sample".into(),
                 kind: DatabaseKind::Sqlite,
+                tls: TlsMode::Prefer,
+                trust_server_certificate: false,
                 path: Some("/tmp/other.db".into()),
                 host: None,
                 port: None,
@@ -1527,6 +1606,8 @@ mod tests {
                 id: String::new(),
                 name: "missing".into(),
                 kind: DatabaseKind::Sqlite,
+                tls: TlsMode::Prefer,
+                trust_server_certificate: false,
                 path: Some("/definitely/not/here.db".into()),
                 host: None,
                 port: None,
@@ -1566,6 +1647,8 @@ mod tests {
             id: String::new(),
             name: "pg".into(),
             kind: DatabaseKind::Postgres,
+            tls: TlsMode::Prefer,
+            trust_server_certificate: false,
             path: None,
             host: None,
             port: None,
@@ -1579,6 +1662,8 @@ mod tests {
                 id: String::new(),
                 name: "pg".into(),
                 kind: DatabaseKind::Postgres,
+                tls: TlsMode::Prefer,
+                trust_server_certificate: false,
                 path: None,
                 host: Some("db.example.com".into()),
                 port: Some(5433),
@@ -1620,6 +1705,8 @@ mod tests {
                 id: String::new(),
                 name: "pg".into(),
                 kind: DatabaseKind::Postgres,
+                tls: TlsMode::Prefer,
+                trust_server_certificate: false,
                 path: None,
                 host: Some(host),
                 port: Some(port.parse().unwrap()),

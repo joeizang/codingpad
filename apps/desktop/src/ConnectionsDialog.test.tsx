@@ -191,3 +191,51 @@ test("a duplicate name never touches the existing connection's password", async 
   expect(invoke).not.toHaveBeenCalledWith("save_secret", expect.anything());
   expect(invoke).not.toHaveBeenCalledWith("delete_secret", expect.anything());
 });
+
+test("saves SQL Server settings with a vault password and trust flag", async () => {
+  invoke.mockImplementation(async (command: string, args?: any) => {
+    if (command === "list_connections") return [];
+    if (command === "save_secret") return "vault";
+    if (command === "save_connection") return { ...args.connection, id: "mssql" };
+    return undefined;
+  });
+  render(<ConnectionsDialog open onClose={() => {}} />);
+  fireEvent.change(screen.getByLabelText("Name"), {
+    target: { value: "northwind-sql" },
+  });
+  fireEvent.change(screen.getByLabelText("Kind"), {
+    target: { value: "sqlserver" },
+  });
+  fireEvent.change(screen.getByLabelText("Host"), {
+    target: { value: "sql.example.com" },
+  });
+  fireEvent.change(screen.getByLabelText("Database"), {
+    target: { value: "northwind" },
+  });
+  fireEvent.change(screen.getByLabelText("User"), {
+    target: { value: "sa" },
+  });
+  fireEvent.change(screen.getByLabelText("Password"), {
+    target: { value: "hunter2" },
+  });
+  fireEvent.click(
+    screen.getByLabelText(/Trust the server certificate/),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Add connection" }));
+  await waitFor(() =>
+    expect(invoke).toHaveBeenCalledWith("save_secret", {
+      name: "connection:northwind-sql",
+      value: "hunter2",
+    }),
+  );
+  const call = invoke.mock.calls.find(([command]) => command === "save_connection")!;
+  expect(call[1].connection).toMatchObject({
+    kind: "sqlserver",
+    host: "sql.example.com",
+    database: "northwind",
+    user: "sa",
+    trustServerCertificate: true,
+    secret: "connection:northwind-sql",
+  });
+  expect(JSON.stringify(call[1].connection)).not.toContain("hunter2");
+});

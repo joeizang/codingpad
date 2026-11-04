@@ -319,8 +319,8 @@ user privileges.
 
 ## SQL scripts (M3.0)
 
-Click **Connections…** to add a SQLite or PostgreSQL database, then **+ SQL** or
-open a `.sql` file. The first line names the connection; the rest is plain SQL:
+Click **Connections…** to add a SQLite, PostgreSQL or SQL Server database, then
+**+ SQL** or open a `.sql` file. The first line names the connection; the rest is plain SQL:
 
 ```sql
 -- codingpad: connection=northwind
@@ -330,15 +330,18 @@ SELECT CustomerId, CompanyName FROM Customers LIMIT 100;
 
 Results appear as a paged table in Results. Statement failures and missing
 connections show a clear error. **Stop** interrupts a running query. Connections
-live in the app settings. A PostgreSQL connection uses host, port (default 5432),
-database and user; its password is written only to the OS password vault and is
-referenced by name, never stored in connection settings or scripts. TLS defaults
-to **Prefer**; choose **Require** for remote hosts. Prefer does not protect against
-an attacker who strips TLS, so it is not a security guarantee. Enable **Trust the
-server certificate** for a self-signed or private-CA server. A PostgreSQL result
-set containing a type we cannot decode is shown as text (booleans appear as
-`t`/`f`, and all batches use text). Connection passwords stay in the Rust host and
-are never passed to script kernels.
+live in the app settings. PostgreSQL (port 5432, TLS preferred) and SQL Server
+(port 1433) connections use host, database and user; their passwords are written
+only to the OS password vault and referenced by name, never stored in connection
+settings or scripts. TLS defaults to **Prefer**; choose **Require** for remote
+hosts. Prefer does not protect against an attacker who strips TLS, so it is not a
+security guarantee. Enable **Trust the server certificate** for a self-signed or
+private-CA server. A PostgreSQL result set containing a type we cannot decode is
+shown as text (booleans appear as `t`/`f`, and all batches use text). Connection
+passwords stay in the Rust host and are never passed to script kernels. SQL Server
+connections can opt in to trusting a self-signed development certificate, and SQL
+Server scripts do not accept the `GO` client-side batch separator; run each batch
+separately.
 
 ## Secrets
 

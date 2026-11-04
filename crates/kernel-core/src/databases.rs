@@ -41,6 +41,8 @@ pub enum DatabaseKind {
     Sqlite,
     #[serde(alias = "postgresql")]
     Postgres,
+    #[serde(rename = "sqlserver", alias = "mssql")]
+    SqlServer,
 }
 
 /// A saved connection. Values are never stored here; `secret` names the vault
@@ -105,6 +107,21 @@ impl Connection {
                         .is_none()
                     {
                         return Err(format!("A PostgreSQL connection needs a {field}"));
+                    }
+                }
+            }
+            DatabaseKind::SqlServer => {
+                for (field, value) in [
+                    ("host", self.host.as_deref()),
+                    ("database", self.database.as_deref()),
+                    ("user", self.user.as_deref()),
+                ] {
+                    if value
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .is_none()
+                    {
+                        return Err(format!("A SQL Server connection needs a {field}"));
                     }
                 }
             }
@@ -306,6 +323,22 @@ impl SqlManager {
                     connection.database.as_deref().unwrap_or("")
                 ))
             }
+            DatabaseKind::SqlServer => {
+                let mut client = self.connect_sqlserver(&connection).await?;
+                client
+                    .simple_query("SELECT 1")
+                    .await
+                    .map_err(|error| format!("SQL Server rejected the connection test: {error}"))?
+                    .into_results()
+                    .await
+                    .map_err(|error| format!("SQL Server rejected the connection test: {error}"))?;
+                Ok(format!(
+                    "Connected to SQL Server at {}:{}/{}.",
+                    server_host(&connection),
+                    server_port(&connection, 1433),
+                    connection.database.as_deref().unwrap_or("")
+                ))
+            }
         }
     }
 
@@ -363,6 +396,10 @@ impl SqlManager {
             }
             DatabaseKind::Postgres => {
                 self.run_postgres(script_id, &connection, body, cancelled)
+                    .await
+            }
+            DatabaseKind::SqlServer => {
+                self.run_sqlserver(script_id, &connection, body, cancelled)
                     .await
             }
         }
@@ -611,6 +648,102 @@ impl SqlManager {
         })
     }
 
+    async fn connect_sqlserver(
+        &self,
+        connection: &Connection,
+    ) -> Result<tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>, String> {
+        use tokio_util::compat::TokioAsyncWriteCompatExt;
+        let mut config = tiberius::Config::new();
+        config.host(server_host(connection));
+        config.port(server_port(connection, 1433));
+        config.database(connection.database.as_deref().unwrap_or(""));
+        let user = connection.user.as_deref().unwrap_or("");
+        let password = connection
+            .secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|secret| !secret.is_empty())
+            .map(|secret| self.secrets.get(secret))
+            .transpose()
+            .map_err(|error| {
+                format!("Could not read the SQL Server password from the vault: {error}")
+            })?
+            .unwrap_or_default();
+        config.authentication(tiberius::AuthMethod::sql_server(user, password));
+        if connection.trust_server_certificate {
+            config.trust_cert();
+        }
+        let tcp = tokio::net::TcpStream::connect(config.get_addr())
+            .await
+            .map_err(|error| {
+                format!(
+                    "Could not connect to SQL Server at {}:{}/{}: {error}",
+                    server_host(connection),
+                    server_port(connection, 1433),
+                    connection.database.as_deref().unwrap_or("")
+                )
+            })?;
+        tcp.set_nodelay(true).map_err(|error| error.to_string())?;
+        tiberius::Client::connect(config, tcp.compat_write())
+            .await
+            .map_err(|error| {
+                format!(
+                    "Could not connect to SQL Server at {}:{}/{}: {error}",
+                    server_host(connection),
+                    server_port(connection, 1433),
+                    connection.database.as_deref().unwrap_or("")
+                )
+            })
+    }
+
+    async fn run_sqlserver(
+        &self,
+        script_id: &str,
+        connection: &Connection,
+        source: &str,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<SqlRunResult, String> {
+        let mut stop = self.begin_stop(script_id);
+        if cancelled.load(Ordering::Relaxed) {
+            self.stops.lock().unwrap().remove(script_id);
+            return Ok(SqlRunResult {
+                ok: false,
+                stopped: true,
+                tables: Vec::new(),
+            });
+        }
+        let outcome = tokio::select! {
+            result = async {
+                let mut client = self.connect_sqlserver(connection).await?;
+                sqlserver_tables(&mut client, source).await
+            } => result,
+            _ = stop.changed() => return Ok(SqlRunResult { ok: false, stopped: true, tables: Vec::new() }),
+        };
+        self.stops.lock().unwrap().remove(script_id);
+        let tables = outcome?;
+        let mut nodes = Vec::with_capacity(tables.len());
+        for table in tables {
+            let handle = format!("sql-{}", self.next_handle.fetch_add(1, Ordering::Relaxed));
+            let table = Arc::new(table);
+            self.results
+                .lock()
+                .unwrap()
+                .insert(handle.clone(), table.clone());
+            self.script_results
+                .lock()
+                .unwrap()
+                .entry(script_id.to_owned())
+                .or_default()
+                .push(handle.clone());
+            nodes.push(table_node(&table, &handle, 0, DEFAULT_PAGE));
+        }
+        Ok(SqlRunResult {
+            ok: true,
+            stopped: false,
+            tables: nodes,
+        })
+    }
+
     pub fn stop(&self, script_id: &str) {
         // Stop only affects a run that has begun. A Stop on an idle tab is a
         // no-op, so it cannot cancel the next Run.
@@ -813,6 +946,176 @@ fn postgres_host(connection: &Connection) -> &str {
 
 fn postgres_port(connection: &Connection) -> u16 {
     connection.port.unwrap_or(5432)
+}
+
+fn server_host(connection: &Connection) -> &str {
+    connection
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .unwrap_or("localhost")
+}
+
+fn server_port(connection: &Connection, default: u16) -> u16 {
+    connection.port.unwrap_or(default)
+}
+
+fn is_query(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            byte if byte.is_ascii_whitespace() => index += 1,
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index += 2;
+            }
+            _ => break,
+        }
+    }
+    let keyword: String = source[index..]
+        .chars()
+        .take_while(|character| character.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    matches!(
+        keyword.as_str(),
+        "SELECT" | "WITH" | "VALUES" | "PRAGMA" | "EXPLAIN"
+    )
+}
+
+async fn sqlserver_tables(
+    client: &mut tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>,
+    source: &str,
+) -> Result<Vec<TableData>, String> {
+    if is_query(source) {
+        let Some(stream) = client.query(source, &[]).await.ok() else {
+            return sqlserver_simple_tables(client, source).await;
+        };
+        let sets = stream
+            .into_results()
+            .await
+            .map_err(|error| format!("SQL Server could not read the results: {error}"))?;
+        let tables: Vec<TableData> = sets
+            .into_iter()
+            .filter(|rows| !rows.is_empty())
+            .map(sqlserver_table)
+            .collect();
+        if tables.is_empty() {
+            Ok(vec![affected_table_text("Statement completed.".into())])
+        } else {
+            Ok(tables)
+        }
+    } else {
+        match client.execute(source, &[]).await {
+            Ok(result) => Ok(vec![affected_table(result.total())]),
+            Err(error) => Err(format!("SQL Server could not run the statement: {error}")),
+        }
+    }
+}
+
+async fn sqlserver_simple_tables(
+    client: &mut tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>,
+    source: &str,
+) -> Result<Vec<TableData>, String> {
+    let sets = client
+        .simple_query(source)
+        .await
+        .map_err(|error| format!("SQL Server could not run the query: {error}"))?
+        .into_results()
+        .await
+        .map_err(|error| format!("SQL Server could not read the results: {error}"))?;
+    let tables: Vec<TableData> = sets
+        .into_iter()
+        .filter(|rows| !rows.is_empty())
+        .map(sqlserver_table)
+        .collect();
+    if tables.is_empty() {
+        Ok(vec![affected_table_text("Statement completed.".into())])
+    } else {
+        Ok(tables)
+    }
+}
+
+fn sqlserver_table(rows: Vec<tiberius::Row>) -> TableData {
+    let columns: Vec<Column> = rows
+        .first()
+        .map(|row| {
+            row.columns()
+                .iter()
+                .map(|column| Column {
+                    name: column.name().to_owned(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut values = Vec::with_capacity(rows.len().min(MAX_ROWS));
+    for (row_index, row) in rows.iter().take(MAX_ROWS).enumerate() {
+        let cells = row
+            .cells()
+            .enumerate()
+            .map(|(column, (_, value))| sqlserver_cell(value, row_index, column))
+            .collect();
+        values.push(cells);
+    }
+    TableData {
+        columns,
+        rows: values,
+        truncated: rows.len() > MAX_ROWS,
+    }
+}
+
+fn sqlserver_cell(value: &tiberius::ColumnData<'_>, row: usize, column: usize) -> Value {
+    use tiberius::ColumnData;
+    let id = format!("sql:r{row}c{column}");
+    let null = || json!({"id": id, "kind": "null"});
+    let primitive = |value: Value| json!({"id": id, "kind": "primitive", "v": value});
+    let text = |value: String| json!({"id": id, "kind": "string", "v": value});
+    match value {
+        ColumnData::U8(value) => value.map_or_else(null, |value| primitive(json!(value))),
+        ColumnData::I16(value) => value.map_or_else(null, |value| primitive(json!(value))),
+        ColumnData::I32(value) => value.map_or_else(null, |value| primitive(json!(value))),
+        ColumnData::I64(value) => value.map_or_else(null, |value| primitive(json!(value))),
+        ColumnData::F32(value) => value
+            .filter(|value| value.is_finite())
+            .map_or_else(null, |value| primitive(json!(value))),
+        ColumnData::F64(value) => value
+            .filter(|value| value.is_finite())
+            .map_or_else(null, |value| primitive(json!(value))),
+        ColumnData::Bit(value) => value.map_or_else(null, |value| primitive(json!(value))),
+        ColumnData::String(value) => value
+            .as_ref()
+            .map_or_else(null, |value| text(value.to_string())),
+        ColumnData::Guid(value) => value.map_or_else(null, |value| text(value.to_string())),
+        ColumnData::Binary(value) => value.as_ref().map_or_else(null, |value| text(hex(value))),
+        ColumnData::Numeric(value) => value
+            .as_ref()
+            .map_or_else(null, |value| text(value.to_string())),
+        ColumnData::Xml(value) => value
+            .as_ref()
+            .map_or_else(null, |value| text(format!("{value:?}"))),
+        ColumnData::DateTime(value) => value.map_or_else(null, |value| text(format!("{value:?}"))),
+        ColumnData::SmallDateTime(value) => {
+            value.map_or_else(null, |value| text(format!("{value:?}")))
+        }
+        ColumnData::Time(value) => value.map_or_else(null, |value| text(format!("{value:?}"))),
+        ColumnData::Date(value) => value.map_or_else(null, |value| text(format!("{value:?}"))),
+        ColumnData::DateTime2(value) => value.map_or_else(null, |value| text(format!("{value:?}"))),
+        ColumnData::DateTimeOffset(value) => {
+            value.map_or_else(null, |value| text(format!("{value:?}")))
+        }
+    }
 }
 
 async fn postgres_tables(
@@ -1341,6 +1644,7 @@ mod tests {
                 database: None,
                 user: None,
                 secret: None,
+                trust_server_certificate: false,
             })
             .unwrap();
         let secrets = Arc::new(SecretStore::with_vault(
@@ -1374,6 +1678,7 @@ mod tests {
                 database: None,
                 user: None,
                 secret: Some("connection:sample".into()),
+                trust_server_certificate: false,
             })
             .unwrap();
         assert_eq!(store.by_name("sample").unwrap().secret, None);
@@ -1407,6 +1712,7 @@ mod tests {
                 database: None,
                 user: None,
                 secret: None,
+                trust_server_certificate: false,
             })
             .is_err());
         let text = fs::read_to_string(directory.path().join(CONNECTIONS_FILE)).unwrap();
@@ -1620,6 +1926,7 @@ mod tests {
                 database: None,
                 user: None,
                 secret: None,
+                trust_server_certificate: false,
             })
             .unwrap();
         assert!(manager
@@ -1661,6 +1968,7 @@ mod tests {
             database: Some("northwind".into()),
             user: Some("reader".into()),
             secret: None,
+            trust_server_certificate: false,
         };
         assert!(store.save(connection).unwrap_err().contains("host"));
         let saved = store
@@ -1676,6 +1984,7 @@ mod tests {
                 database: Some("northwind".into()),
                 user: Some("reader".into()),
                 secret: Some("connection:pg".into()),
+                trust_server_certificate: false,
             })
             .unwrap();
         assert_eq!(saved.port, Some(5433));
@@ -1785,6 +2094,43 @@ mod tests {
             .run("pg", &format!("{header}DROP TABLE {table}"), None)
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn sqlserver_connections_require_server_fields_and_keep_the_trust_flag() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConnectionStore::new(directory.path());
+        let connection = Connection {
+            id: String::new(),
+            name: "mssql".into(),
+            kind: DatabaseKind::SqlServer,
+            path: None,
+            host: Some("db.example.com".into()),
+            port: None,
+            database: Some("northwind".into()),
+            user: Some("sa".into()),
+            secret: None,
+            trust_server_certificate: true,
+        };
+        assert!(store.save(connection).is_ok());
+        let saved = store.by_name("mssql").unwrap();
+        assert!(saved.trust_server_certificate);
+        let text = fs::read_to_string(directory.path().join(CONNECTIONS_FILE)).unwrap();
+        assert!(text.contains("trustServerCertificate"));
+        assert!(!text.contains("password"));
+        let missing = Connection {
+            id: String::new(),
+            name: "broken".into(),
+            kind: DatabaseKind::SqlServer,
+            path: None,
+            host: Some("db.example.com".into()),
+            port: None,
+            database: None,
+            user: Some("sa".into()),
+            secret: None,
+            trust_server_certificate: false,
+        };
+        assert!(store.save(missing).unwrap_err().contains("database"));
     }
 
     #[test]

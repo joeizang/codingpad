@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
-export type DatabaseKind = "sqlite" | "postgres";
+export type DatabaseKind = "sqlite" | "postgres" | "sqlserver";
 
 export type Connection = {
   id: string;
@@ -266,6 +266,7 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
             >
               <option value="sqlite">SQLite</option>
               <option value="postgres">PostgreSQL</option>
+              <option value="sqlserver">SQL Server</option>
             </select>
           </label>
           {draft.kind === "sqlite" ? (
@@ -302,7 +303,7 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
                   type="number"
                   min={1}
                   max={65535}
-                  value={draft.port ?? 5432}
+                  value={draft.port ?? (draft.kind === "postgres" ? 5432 : 1433)}
                   onChange={(event) =>
                     setDraft((current) => ({
                       ...current,

@@ -329,11 +329,11 @@ SELECT CustomerId, CompanyName FROM Customers LIMIT 100;
 ```
 
 Results appear as a paged table in Results. Statement failures and missing
-connections show a clear error. **Stop** interrupts a running SQLite query.
-Connections live in the app settings. A PostgreSQL connection uses host, port
-(default 5432), database and user; its password is written only to the OS
-password vault and is referenced by name, never stored in connection settings or
-scripts.
+connections show a clear error. **Stop** interrupts a running query. Connections
+live in the app settings. A PostgreSQL connection uses host, port (default 5432,
+TLS preferred), database and user; its password is written only to the OS password
+vault and is referenced by name, never stored in connection settings or scripts.
+Connection passwords stay in the Rust host and are never passed to script kernels.
 
 ## Secrets
 

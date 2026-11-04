@@ -59,19 +59,54 @@ fn list_connections(connections: State<'_, Arc<ConnectionStore>>) -> Vec<Connect
 }
 
 #[tauri::command]
-fn save_connection(
+async fn save_connection(
     connections: State<'_, Arc<ConnectionStore>>,
+    secrets: State<'_, Arc<SecretStore>>,
     connection: Connection,
 ) -> Result<Connection, String> {
-    connections.save(connection)
+    let connections = connections.inner().clone();
+    let secrets = secrets.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let previous = connections
+            .list()
+            .into_iter()
+            .find(|item| item.id == connection.id);
+        let previous_secret = previous.and_then(|item| item.secret);
+        let saved = connections.save(connection)?;
+        if let Some(previous) = previous_secret {
+            if saved.secret.as_deref() != Some(previous.as_str()) {
+                secrets.delete(&previous, false).map_err(|error| {
+                    format!(
+                        "The connection was saved, but its old password was not removed: {error}"
+                    )
+                })?;
+            }
+        }
+        Ok(saved)
+    })
+    .await
+    .map_err(|error| format!("The connection save failed: {error}"))?
 }
 
 #[tauri::command]
-fn delete_connection(
+async fn delete_connection(
     connections: State<'_, Arc<ConnectionStore>>,
+    secrets: State<'_, Arc<SecretStore>>,
     id: String,
 ) -> Result<(), String> {
-    connections.delete(&id)
+    let connections = connections.inner().clone();
+    let secrets = secrets.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let removed = connections.delete(&id)?;
+        if let Some(secret) = removed.secret {
+            secrets.delete(&secret, false).map_err(|error| {
+                format!("The connection was removed, but its password was not: {error}")
+            })?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("The connection delete failed: {error}"))?
 }
 
 #[tauri::command]

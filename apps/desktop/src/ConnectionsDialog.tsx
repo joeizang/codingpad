@@ -76,8 +76,16 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
     if (/\s/.test(draft.name.trim())) {
       return "A connection name cannot contain spaces; use letters, digits, dashes or underscores.";
     }
-    if (draft.kind === "sqlite" && !draft.path?.trim()) {
-      return "A SQLite connection needs a database file";
+    if (draft.kind === "sqlite") {
+      if (!draft.path?.trim()) return "A SQLite connection needs a database file";
+      return undefined;
+    }
+    for (const [field, value] of [
+      ["host", draft.host],
+      ["database", draft.database],
+      ["user", draft.user],
+    ] as const) {
+      if (!value?.trim()) return `This connection needs a ${field}`;
     }
     return undefined;
   }
@@ -94,16 +102,35 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
     setStatus(undefined);
     try {
       const connection = { ...draft };
+      let wroteSecret = false;
       if (connection.kind !== "sqlite" && password) {
         connection.secret = connection.secret || `connection:${connection.name.trim()}`;
         await invoke("save_secret", {
           name: connection.secret,
           value: password,
         });
+        wroteSecret = true;
       }
-      const saved = await invoke<Connection>("save_connection", {
-        connection,
-      });
+      let saved: Connection;
+      try {
+        saved = await invoke<Connection>("save_connection", {
+          connection,
+        });
+      } catch (failure) {
+        // A new connection that failed to save must not leave an unreferenced
+        // password behind in the vault.
+        if (wroteSecret && !draft.id && connection.secret) {
+          try {
+            await invoke("delete_secret", {
+              name: connection.secret,
+              sessionOnly: false,
+            });
+          } catch {
+            // Keep the original save error.
+          }
+        }
+        throw failure;
+      }
       setDraft({ ...saved });
       setPassword("");
       setStatus(`Saved "${saved.name}".`);

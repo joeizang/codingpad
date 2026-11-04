@@ -251,7 +251,7 @@ script objects until their next lookup or Reset. A successful recompute reports
 callbacks and inspection failures have their own reasons. A failed factory keeps
 its note pending for a retry in that run. Unused notes expire at completion.
 Late cache calls and cache calls from idle previews fail.
-`Secret("name")` throws an explanation that vault support is planned for M3.
+`Secret("name")` reads a named secret from the OS password vault (see [Secrets](#secrets)).
 
 The runtime is packable as `CodingPad`; its direct-consumer `build` imports make
 helper names available in .NET 10 file scripts with `#:package CodingPad@0.1.0`.
@@ -315,6 +315,31 @@ Roslyn ships with the VS Code C# extension; CodingPad finds it there, in its own
 install follows in a later M2 issue. Only managed `Console` output is
 captured; direct native writes are outside this increment. Scripts run with your
 user privileges.
+
+## Secrets
+
+Click **Secrets…** to add, update or remove named secrets. Values are stored in
+the OS password vault (Keychain on macOS, Credential Manager on Windows, Secret
+Service on Linux); scripts and settings never contain them. If no vault is
+available, values are kept in memory for the current session and the dialog says
+so.
+
+Python scripts read a secret with `secret("name")` (also importable from
+`codingpad`), and C# scripts with `Secret("name")`:
+
+```python
+from codingpad import secret
+
+api_key = secret("api-key")
+```
+
+```csharp
+var password = Secret("database-password");
+```
+
+A missing secret raises an actionable error. Secret values are not written to
+logs, script files or connection settings. Changing a secret takes effect on the
+next run of each script.
 
 ## Repository layout
 

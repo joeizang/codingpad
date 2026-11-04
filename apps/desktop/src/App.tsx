@@ -17,6 +17,7 @@ import {
   type KernelEvent,
   type Output,
 } from "./protocol";
+import { SecretsDialog } from "./SecretsDialog";
 import { Sidebar } from "./Sidebar";
 import {
   headerSummary,
@@ -114,6 +115,7 @@ export default function App() {
   const counter = useRef(1);
   const opening = useRef(new Set<string>());
   const [closing, setClosing] = useState(false);
+  const [secretsOpen, setSecretsOpen] = useState(false);
   const [installProgress, setInstallProgress] = useState<string | null>(null);
   const installingToolchain = useRef(false);
   const [toolchainVersion, setToolchainVersion] = useState(0);
@@ -637,6 +639,13 @@ export default function App() {
             Save as…
           </button>
           <button
+            className="control-button"
+            aria-label="Secrets"
+            onClick={() => setSecretsOpen(true)}
+          >
+            Secrets…
+          </button>
+          <button
             className="run-button"
             disabled={
               !runnable ||
@@ -841,6 +850,7 @@ export default function App() {
           </section>
         </div>
       </div>
+      <SecretsDialog open={secretsOpen} onClose={() => setSecretsOpen(false)} />
       <footer>
         <span>
           {active.path

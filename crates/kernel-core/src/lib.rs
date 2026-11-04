@@ -4,11 +4,13 @@ pub mod installer;
 pub mod lsp;
 mod packages;
 mod roslyn;
+pub mod secrets;
 mod shadow;
 pub mod store;
 pub mod toolchains;
 
 use packages::Packages;
+use secrets::SecretStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
@@ -79,6 +81,7 @@ pub struct Supervisor {
     data_dir: Option<PathBuf>,
     kernels: Mutex<HashMap<String, SharedSlot>>,
     csharp: OnceCell<csharp::Installation>,
+    secrets: Option<Arc<SecretStore>>,
 }
 
 impl Default for Supervisor {
@@ -129,6 +132,7 @@ impl Supervisor {
             data_dir: None,
             kernels: Mutex::new(HashMap::new()),
             csharp: OnceCell::new(),
+            secrets: None,
         }
     }
 
@@ -141,6 +145,7 @@ impl Supervisor {
             data_dir: None,
             kernels: Mutex::new(HashMap::new()),
             csharp: OnceCell::new(),
+            secrets: None,
         }
     }
 
@@ -149,6 +154,14 @@ impl Supervisor {
         Self {
             data_dir: Some(data_dir),
             ..Self::default()
+        }
+    }
+
+    /// Share the app's secret store with every kernel this supervisor starts.
+    pub fn with_data_dir_and_secrets(data_dir: PathBuf, secrets: Arc<SecretStore>) -> Self {
+        Self {
+            secrets: Some(secrets),
+            ..Self::with_data_dir(data_dir)
         }
     }
 
@@ -241,8 +254,13 @@ impl Supervisor {
             };
             *guard = Some(startup?);
         }
+        let secrets = self
+            .secrets
+            .as_ref()
+            .map(|store| store.snapshot())
+            .unwrap_or_default();
         let result = tokio::select! {
-            result = guard.as_mut().unwrap().run(source, path, &mut emit, &mut stop) => result,
+            result = guard.as_mut().unwrap().run(source, path, &secrets, &mut emit, &mut stop) => result,
             _ = closed.changed() => Err("Script was closed".into()),
         };
         if result.as_ref().is_ok_and(|result| result.cache_cleared) {
@@ -509,13 +527,14 @@ impl Kernel {
         &mut self,
         source: &str,
         path: Option<&str>,
+        secrets: &std::collections::BTreeMap<String, String>,
         emit: &mut (impl FnMut(KernelEvent) + Send),
         stop: &mut watch::Receiver<u64>,
     ) -> Result<RunResult, String> {
         self.next_id += 1;
         let id = self.next_id;
         let mut request = serde_json::to_vec(
-            &json!({"jsonrpc": "2.0", "id": id, "method": "run", "params": {"source": source, "path": path}}),
+            &json!({"jsonrpc": "2.0", "id": id, "method": "run", "params": {"source": source, "path": path, "secrets": secrets}}),
         )
         .map_err(|e| e.to_string())?;
         request.push(b'\n');

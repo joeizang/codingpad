@@ -15,14 +15,25 @@ public static class ScriptHelpers
     private static readonly Dictionary<string, Entry> Values = new();
     private static readonly Dictionary<string, Entry> ScriptRoots = new();
     private static readonly AsyncLocal<RunScope?> Current = new();
+    private static IReadOnlyDictionary<string, string> Secrets =
+        new Dictionary<string, string>();
     private static long generation;
     private static bool hosted;
 
     public static CancellationToken Cancel => Current.Value?.Token ?? CancellationToken.None;
 
-    /// <summary>The vault integration will be available in M3.</summary>
-    public static string Secret(string name) => throw new NotSupportedException(
-        "Secret storage is not available yet; vault support is planned for M3.");
+    /// <summary>Return a named secret supplied by the OS password vault.</summary>
+    public static string Secret(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            throw new ArgumentException("A secret name cannot be empty.", nameof(name));
+        if (Secrets.TryGetValue(name, out var value)) return value;
+        throw new KeyNotFoundException(
+            $"Secret \"{name}\" was not found. Add it in Secrets… or set it for this session.");
+    }
+
+    internal static void SetSecrets(IReadOnlyDictionary<string, string> secrets) =>
+        Secrets = secrets;
 
     /// <summary>Keep successful results across runs. Factories execute outside the cache lock.</summary>
     public static T Cache<T>(string key, Func<T> factory)

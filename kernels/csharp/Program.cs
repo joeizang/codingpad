@@ -69,7 +69,21 @@ internal static class Program
             [directives.Usings, tree], references, directives.CompilationOptions);
     }
 
-    private static async Task Run(long id, string source, string? scriptPath, RunCancellation cancellation)
+    private static IReadOnlyDictionary<string, string> ParseSecrets(JsonElement parameters)
+    {
+        var values = new Dictionary<string, string>();
+        if (!parameters.TryGetProperty("secrets", out var secrets) ||
+            secrets.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+            return values;
+        if (secrets.ValueKind != JsonValueKind.Object)
+            throw new JsonException("run params.secrets must be an object");
+        foreach (var secret in secrets.EnumerateObject())
+            values[secret.Name] = secret.Value.GetString() ?? "";
+        return values;
+    }
+
+    private static async Task Run(long id, string source, string? scriptPath,
+        IReadOnlyDictionary<string, string> secrets, RunCancellation cancellation)
     {
         var cancel = cancellation.Token;
         Session?.Dispose();
@@ -169,6 +183,7 @@ internal static class Program
             pe.Position = pdb.Position = 0;
             cancel.ThrowIfCancellationRequested();
             // Do not scan cached graphs for source that fails compilation.
+            ScriptHelpers.SetSecrets(secrets);
             helpers = ScriptHelpers.BeginRun(cancel, text =>
                 Notify(context, "stream", new { runId = id, stream = "stdout", text }));
             cancel.ThrowIfCancellationRequested();
@@ -371,7 +386,8 @@ internal static class Program
                 if (root.GetProperty("jsonrpc").GetString() != "2.0") throw new JsonException("Expected JSON-RPC 2.0");
                 if (root.GetProperty("method").GetString() == "run")
                     Run(id.Value, root.GetProperty("params").GetProperty("source").GetString()!,
-                        root.GetProperty("params").TryGetProperty("path", out var path) ? path.GetString() : null, cancel ?? new RunCancellation()).GetAwaiter().GetResult();
+                        root.GetProperty("params").TryGetProperty("path", out var path) ? path.GetString() : null,
+                        ParseSecrets(root.GetProperty("params")), cancel ?? new RunCancellation()).GetAwaiter().GetResult();
                 else if (root.GetProperty("method").GetString() == "expand")
                 {
                     var parameters = root.GetProperty("params");

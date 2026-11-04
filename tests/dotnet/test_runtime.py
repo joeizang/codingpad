@@ -80,7 +80,7 @@ if (await Cache("async", async () => { await Task.Delay(1); return 7; }) != 7)
 if (await Cache("async", () => Task.FromResult(-1)) != 7)
     throw new Exception("Async cache recomputed");
 try { Secret("test"); throw new Exception("Secret should fail"); }
-catch (NotSupportedException) { }
+catch (KeyNotFoundException error) when (error.Message.Contains("Secrets")) { }
 Console.WriteLine(result);
 ''', encoding="utf-8")
         # File apps default to AOT; execution needs no AOT compiler download.
@@ -176,6 +176,24 @@ static class LocalHelpers { public static T Cache<T>(string key, Func<T> factory
         self.assertTrue(all(reply["error"]["code"] == -32600 for reply in replies[:4]))
         self.assertEqual(replies[4]["error"]["code"], -32601)
         self.assertTrue(replies[5]["result"]["ok"])
+
+    def test_hosted_run_receives_secrets(self):
+        events = self.exchange([
+            json.dumps({"jsonrpc": "2.0", "id": 1, "method": "run",
+                        "params": {"source": 'Secret("token");',
+                                   "secrets": {"token": "s3cret"}}})
+        ], 1)
+        dumps = [event["params"]["node"] for event in events
+                 if event.get("method") == "dump"]
+        self.assertEqual(dumps[-1]["v"], "s3cret")
+        missing = self.exchange([
+            json.dumps({"jsonrpc": "2.0", "id": 1, "method": "run",
+                        "params": {"source": 'Secret("token");'}})
+        ], 1)
+        errors = [event["params"]["node"] for event in missing
+                  if event.get("method") == "dump" and event["params"]["node"]["kind"] == "error"]
+        self.assertTrue(errors)
+        self.assertIn("Secrets", errors[-1]["message"])
 
     def test_early_and_expired_cancellation_ids(self):
         messages = [

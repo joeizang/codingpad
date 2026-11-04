@@ -527,6 +527,10 @@ def run(request):
                     {"runId": run_id, "nodeId": node_id, "node": node},
                 )
 
+            secrets = request["params"].get("secrets") or {}
+            if not isinstance(secrets, dict):
+                raise ValueError("run params.secrets must be an object")
+            codingpad._set_secrets(secrets)
             codingpad._begin(emit_dump, emit_update, run_id)
             try:
                 tree = ast.parse(source, filename=filename)

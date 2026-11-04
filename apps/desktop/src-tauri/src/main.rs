@@ -2,6 +2,7 @@
 
 use codingpad_kernel_core::{
     lsp::{LanguageServers, LspEvent, LspStartResult},
+    secrets::{SecretOrigin, SecretStore},
     store::{self, FolderEntry, LibrarySettings, ScriptFile},
     toolchains::Toolchains,
     ExpandResult, KernelEvent, Language, RunResult, Supervisor,
@@ -10,6 +11,7 @@ use std::{
     fs,
     io::Write,
     path::PathBuf,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{ipc::Channel, Manager, State};
@@ -48,6 +50,30 @@ fn bench_phase(phase: &str, detail: serde_json::Value) {
             serde_json::json!({"phase": phase, "unix_ns": nanos as u64, "detail": detail})
         );
     }
+}
+
+#[tauri::command]
+fn save_secret(
+    secrets: State<'_, Arc<SecretStore>>,
+    name: String,
+    value: String,
+) -> Result<SecretOrigin, String> {
+    secrets.set(&name, &value)
+}
+
+#[tauri::command]
+fn delete_secret(secrets: State<'_, Arc<SecretStore>>, name: String) -> Result<(), String> {
+    secrets.delete(&name)
+}
+
+#[tauri::command]
+fn list_secrets(secrets: State<'_, Arc<SecretStore>>) -> Vec<String> {
+    secrets.list()
+}
+
+#[tauri::command]
+fn vault_available(secrets: State<'_, Arc<SecretStore>>) -> bool {
+    secrets.vault_available()
 }
 
 #[tauri::command]
@@ -258,7 +284,12 @@ fn main() {
         .setup(|app| {
             bench_phase("setup_started", serde_json::Value::Null);
             let data_dir = app.path().app_data_dir()?;
-            app.manage(Supervisor::with_data_dir(data_dir.clone()));
+            let secrets = Arc::new(SecretStore::new(&data_dir));
+            app.manage(secrets.clone());
+            app.manage(Supervisor::with_data_dir_and_secrets(
+                data_dir.clone(),
+                secrets,
+            ));
             app.manage(Toolchains::new(data_dir.clone()));
             app.manage(LanguageServers::with_data_dir(data_dir));
             bench_phase("setup_finished", serde_json::Value::Null);
@@ -266,6 +297,10 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             ui_ready,
+            save_secret,
+            delete_secret,
+            list_secrets,
+            vault_available,
             install_uv,
             install_dotnet,
             run_script,

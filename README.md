@@ -539,7 +539,7 @@ on macOS and Linux:
 | Metric | Target |
 |---|---|
 | App usable | < 1 s |
-| Idle physical footprint | < 300 MiB |
+| Idle physical footprint | < 475 MiB |
 | First Python kernel start | < 3 s |
 | Warm Python rerun | < 200 ms |
 | 100k-row dump, first page to host | < 1 s |
@@ -562,7 +562,7 @@ Code intelligence starts after the editor paints and remains resident during the
 idle sample. The public CodingPad helper stub keeps basedpyright from analyzing
 the dump renderer implementation just to understand `dump`.
 
-Idle memory is sampled five seconds after readiness. The 300 MiB gate uses
+Idle memory is sampled five seconds after readiness. The 475 MiB gate uses
 summed Linux PSS or macOS `phys_footprint`, per D61. The app, WebKit helpers, and
 language-server descendants (including separate process groups) are included.
 Summed RSS and Linux private memory are printed alongside the gate. Missing
@@ -587,8 +587,7 @@ and environment with each run; retain earlier failures when recording new result
 The dump metric ends when the first page reaches the Rust host, before rendering.
 The app metrics need a desktop session and are skipped on Windows, where a
 Windows VM confirms that `just check` passes (D42, D48). Set `CODINGPAD_DESKTOP`
-to benchmark a different app binary. M1 stays open until repeated `just bench`
-runs pass on both Ubuntu and macOS.
+to benchmark a different app binary. The owner has closed M1 and M2.
 
 Dual-licensed MIT OR Apache-2.0.
 

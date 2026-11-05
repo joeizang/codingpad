@@ -34,12 +34,12 @@ Builds and tests run locally with `just`, no CI (D39, D42, D43).
 
 | Milestone | Scope | Release |
 |---|---|---|
-| M1 | Foundations: skeleton first (D40), then full dump, run control, library, Python packages, basedpyright, `uv` install (D47). Done when Python speed targets pass (D48) | |
-| M2 | C# kernel: skeleton, full dump, run control, `#:package`/`#:property`/`#:sdk Web`, Roslyn LSP via shadow project, .NET SDK install (D49–D60). Done when C# speed targets pass (D55) | |
+| M1 | Foundations: skeleton first (D40), then full dump, run control, library, Python packages, basedpyright, `uv` install (D47). Closed by owner (D48) | |
+| M2 | C# kernel: skeleton, full dump, run control, `#:package`/`#:property`/`#:sdk Web`, Roslyn LSP via shadow project, .NET SDK install (D49–D60). Closed by owner (D55) | |
 | M3 | Databases: connections, schema panel, SQL scripts, database client, data contexts (Python + C#), secrets, export | |
 | M4 | Polish: samples + sample DB, `cpad run`, update notice, "Report on GitHub", first-launch docs | **0.1 preview** |
-| M5 | Rust kernel, shared build cache | 0.2 |
-| M6 | TypeScript (Bun) kernel | **1.0** |
+| M5 | TypeScript (Bun) kernel | 0.2 |
+| M6 | Rust kernel, shared build cache | **1.0** |
 
 ## After 1.0
 - Debugger via DAP for all four languages (D32).

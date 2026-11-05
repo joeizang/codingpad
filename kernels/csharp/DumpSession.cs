@@ -269,7 +269,7 @@ internal sealed class DumpSession(long runId) : IDisposable
         return new {
             id = nodeId ?? Id(), kind = "table", type = nameof(DatabaseRows),
             columns = value.Columns.Select(name => new { name }).ToArray(), rows,
-            total = value.Rows.Count, totalKnown = true,
+            total = value.Rows.Count, totalKnown = true, truncated = value.Truncated,
             next = end < value.Rows.Count ? end.ToString(CultureInfo.InvariantCulture) : null,
             handle = Handle(value, budget.View)
         };

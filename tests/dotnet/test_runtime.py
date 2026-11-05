@@ -98,12 +98,15 @@ class RuntimeTests(unittest.TestCase):
             run(1, 'db.Query("select name from item").Dump();', {"settings": settings}),
             run(2, 'db.Query("select name from item where 0").Dump();', {"settings": settings}),
             run(3, 'db.Query("select 1").Dump();'),
-        ], 3)
+            run(4, 'db.Query("with recursive t(n) as (select 1 union all select n+1 from t where n<10001) select n from t").Dump();', {"settings": settings}),
+        ], 4)
         tables = [event["params"]["node"] for event in events if event.get("method") == "dump" and event["params"]["node"]["kind"] == "table"]
         self.assertEqual(tables[0]["columns"][0]["name"], "name")
         self.assertEqual(tables[0]["rows"][0][0]["v"], "Ada")
         self.assertEqual(tables[1]["columns"][0]["name"], "name")
         self.assertEqual(tables[1]["rows"], [])
+        self.assertEqual(tables[2]["total"], 10000)
+        self.assertTrue(tables[2]["truncated"])
         self.assertTrue(any("No connection is attached" in str(event) for event in events))
 
     def test_file_script_imports_helpers_from_package(self):

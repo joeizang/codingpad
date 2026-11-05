@@ -343,7 +343,7 @@ db.Query("SELECT * FROM customers").Dump();
 ```
 
 C# parameters can be supplied as a dictionary keyed by the database parameter
-name. The `CodingPad` package supplies the same API for `dotnet run`; without
+name. Queries return at most 10,000 rows and show when results are truncated. The `CodingPad` package supplies the same API for `dotnet run`; without
 an attached CodingPad connection, calling `db` reports how to attach one.
 
 Click **Connections…** to add a SQLite, PostgreSQL or SQL Server database, then

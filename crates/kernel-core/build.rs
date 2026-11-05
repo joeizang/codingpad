@@ -31,11 +31,43 @@ fn main() {
         .status()
         .expect("Building CodingPad requires the .NET 10 SDK on PATH");
     assert!(status.success(), "Could not publish the bundled C# kernel");
-    fn collect(root: &std::path::Path, dir: &std::path::Path, entries: &mut Vec<String>) {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let target_arch = match env::var("CARGO_CFG_TARGET_ARCH").unwrap().as_str() {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        "x86" => "x86",
+        "arm" => "arm",
+        other => panic!("Unsupported .NET target architecture: {other}"),
+    };
+    let os = match target_os.as_str() {
+        "macos" => "osx",
+        "windows" => "win",
+        "linux" if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("musl") => "linux-musl",
+        "linux" => "linux",
+        other => panic!("Unsupported .NET target OS: {other}"),
+    };
+    let rid = format!("{os}-{target_arch}");
+    fn collect(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        entries: &mut Vec<String>,
+        rid: &str,
+        os: &str,
+    ) {
         for file in fs::read_dir(dir).unwrap() {
             let file = file.unwrap();
             if file.file_type().unwrap().is_dir() {
-                collect(root, &file.path(), entries);
+                if dir == root.join("runtimes") {
+                    let name = file.file_name();
+                    let name = name.to_string_lossy();
+                    if name != rid
+                        && !(name == "unix" && os != "win")
+                        && !(name == "win" && os == "win")
+                    {
+                        continue;
+                    }
+                }
+                collect(root, &file.path(), entries, rid, os);
             } else if file.file_type().unwrap().is_file() {
                 entries.push(format!(
                     "({:?}, include_bytes!({:?})),",
@@ -46,7 +78,7 @@ fn main() {
         }
     }
     let mut entries = Vec::new();
-    collect(&publish, &publish, &mut entries);
+    collect(&publish, &publish, &mut entries, &rid, os);
     entries.sort();
     fs::write(
         out.join("csharp_assets.rs"),

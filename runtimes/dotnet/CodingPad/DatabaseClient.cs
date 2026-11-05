@@ -7,7 +7,7 @@ using Npgsql;
 namespace CodingPad;
 
 /// <summary>Rows returned by a database query.</summary>
-public sealed record DatabaseRows(IReadOnlyList<string> Columns, IReadOnlyList<object?[]> Rows);
+public sealed record DatabaseRows(IReadOnlyList<string> Columns, IReadOnlyList<object?[]> Rows, bool Truncated = false);
 
 /// <summary>A database client bound to the current script run.</summary>
 public sealed class DatabaseClient : IDisposable
@@ -38,7 +38,7 @@ public sealed class DatabaseClient : IDisposable
             "sqlserver" => new SqlConnection(new SqlConnectionStringBuilder {
                 DataSource = Get("host") + "," + (Get("port") ?? "1433"), InitialCatalog = Get("database"),
                 UserID = Get("user"), Password = password ?? "", TrustServerCertificate = trust,
-                Encrypt = tls == "require" ? SqlConnectionEncryptOption.Mandatory : SqlConnectionEncryptOption.Optional
+                Encrypt = tls == "disable" ? SqlConnectionEncryptOption.Optional : SqlConnectionEncryptOption.Mandatory
             }.ConnectionString),
             _ => throw new InvalidOperationException("Unsupported database type.")
         };
@@ -77,13 +77,16 @@ public sealed class DatabaseClient : IDisposable
         using var reader = command.ExecuteReader();
         var columns = Enumerable.Range(0, reader.FieldCount).Select(reader.GetName).ToArray();
         var rows = new List<object?[]>();
+        const int maxRows = 10_000;
+        var truncated = false;
         while (reader.Read())
         {
+            if (rows.Count == maxRows) { truncated = true; break; }
             var values = new object[reader.FieldCount];
             reader.GetValues(values);
             rows.Add(values.Select(value => value is DBNull ? null : value).ToArray());
         }
-        return new DatabaseRows(columns, rows);
+        return new DatabaseRows(columns, rows, truncated);
     }
 
     /// <summary>Execute a statement and return its affected row count.</summary>

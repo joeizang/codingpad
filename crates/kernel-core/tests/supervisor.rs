@@ -766,6 +766,7 @@ async fn csharp_uses_the_attached_sqlite_connection() {
 
 /// Run against explicitly configured local test servers; no credentials are stored.
 #[tokio::test]
+#[ignore = "requires CODINGPAD_TEST_PG_* and CODINGPAD_TEST_MSSQL_* local servers"]
 async fn language_clients_query_attached_server_databases() {
     use codingpad_kernel_core::{
         databases::{Connection, ConnectionStore, DatabaseKind, TlsMode},
@@ -783,7 +784,7 @@ async fn language_clients_query_attached_server_databases() {
             std::env::var(format!("{prefix}_USER")),
             std::env::var(format!("{prefix}_PASSWORD")),
         ) else {
-            continue;
+            panic!("{prefix}_PORT, _DATABASE, _USER, and _PASSWORD must be set");
         };
         let dir = tempfile::tempdir().unwrap();
         let connections = Arc::new(ConnectionStore::new(dir.path()));
@@ -801,11 +802,11 @@ async fn language_clients_query_attached_server_databases() {
                 user: Some(user),
                 secret: Some("connection:test".into()),
                 tls: if kind == DatabaseKind::Postgres {
-                    TlsMode::Disable
+                    TlsMode::Prefer
                 } else {
                     TlsMode::Require
                 },
-                trust_server_certificate: true,
+                trust_server_certificate: kind != DatabaseKind::Postgres,
             })
             .unwrap();
         let supervisor = Supervisor::with_data_dir_and_secrets(dir.path().into(), secrets)

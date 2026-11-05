@@ -543,31 +543,50 @@ impl SqlManager {
         let (client, tls) = client;
         let cancel = client.cancel_token();
         let cancel_tls = tls.clone();
-        let query = postgres_tables(&client, source, &tls);
+        let query = postgres_tables(&client, source);
         tokio::pin!(query);
-        let outcome = tokio::select! {
-            result = &mut query => result,
+        let outcome: Result<Vec<TableData>, (bool, String)> = tokio::select! {
+            result = &mut query => result.map_err(|error| (false, error)),
             _ = stop.changed() => {
                 // Dropping the future only abandons the client side. Ask the
-                // server to cancel and wait for it to acknowledge.
-                let _ = cancel.cancel_query(cancel_tls).await;
-                match tokio::time::timeout(std::time::Duration::from_secs(2), &mut query).await {
-                    Ok(result) => result,
-                    Err(_) => Err("PostgreSQL did not confirm cancellation within 2 seconds.".into()),
+                // server to cancel and wait for its response, all within one
+                // deadline so an unresponsive server cannot hang the run.
+                let deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                match tokio::time::timeout_at(deadline, cancel.cancel_query(cancel_tls)).await {
+                    Err(_) => Err((
+                        false,
+                        "PostgreSQL did not accept the cancel request within 2 seconds; the statement may still be running."
+                            .into(),
+                    )),
+                    Ok(Err(error)) => Err((
+                        false,
+                        format!("Could not cancel the PostgreSQL query: {}", pg_detail(&error)),
+                    )),
+                    Ok(Ok(())) => match tokio::time::timeout_at(deadline, &mut query).await {
+                        // The statement finished before it could be cancelled.
+                        Ok(Ok(tables)) => Ok(tables),
+                        Ok(Err(error)) => Err((true, error)),
+                        Err(_) => Err((
+                            false,
+                            "PostgreSQL did not confirm cancellation within 2 seconds; the statement may still be running."
+                                .into(),
+                        )),
+                    },
                 }
             }
         };
         self.stops.lock().unwrap().remove(script_id);
         let tables = match outcome {
             Ok(tables) => tables,
-            Err(_error) if cancelled.load(Ordering::Relaxed) => {
+            Err((true, _)) if cancelled.load(Ordering::Relaxed) => {
                 return Ok(SqlRunResult {
                     ok: false,
                     stopped: true,
                     tables: Vec::new(),
                 })
             }
-            Err(error) => return Err(error),
+            Err((_, message)) => return Err(message),
         };
         let mut nodes = Vec::with_capacity(tables.len());
         for table in tables {
@@ -799,7 +818,6 @@ fn postgres_port(connection: &Connection) -> u16 {
 async fn postgres_tables(
     client: &tokio_postgres::Client,
     source: &str,
-    tls: &postgres_native_tls::MakeTlsConnector,
 ) -> Result<Vec<TableData>, String> {
     match client.prepare(source).await {
         Ok(statement) if !statement.columns().is_empty() => {
@@ -808,11 +826,11 @@ async fn postgres_tables(
                 .iter()
                 .all(|column| supported_pg_type(column.type_()))
             {
-                postgres_query(client, &statement, tls).await
+                postgres_query(client, &statement).await
             } else {
                 // A type we cannot decode still has a text form; use the simple
                 // protocol so values and NULLs are shown instead of placeholders.
-                postgres_simple_tables(client, source, tls).await
+                postgres_simple_tables(client, source).await
             }
         }
         Ok(statement) => {
@@ -825,7 +843,7 @@ async fn postgres_tables(
         Err(_) => {
             // Multiple statements cannot be prepared together. Run them with
             // simple query so setup scripts still work.
-            postgres_simple_tables(client, source, tls).await
+            postgres_simple_tables(client, source).await
         }
     }
 }
@@ -833,7 +851,6 @@ async fn postgres_tables(
 async fn postgres_query(
     client: &tokio_postgres::Client,
     statement: &tokio_postgres::Statement,
-    tls: &postgres_native_tls::MakeTlsConnector,
 ) -> Result<Vec<TableData>, String> {
     use futures_util::TryStreamExt;
 
@@ -859,18 +876,15 @@ async fn postgres_query(
             break;
         };
         if values.len() >= MAX_ROWS {
+            // Keep reading so later result sets and writes still happen.
             truncated = true;
-            break;
+            continue;
         }
         let mut cells = Vec::with_capacity(columns.len());
         for (index, (_, kind)) in columns.iter().enumerate() {
             cells.push(pg_cell(&row, index, kind, values.len()));
         }
         values.push(cells);
-    }
-    if truncated {
-        // Stop the server from finishing a result we will never display.
-        let _ = client.cancel_token().cancel_query(tls.clone()).await;
     }
     Ok(vec![TableData {
         columns: columns
@@ -892,11 +906,7 @@ fn supported_pg_type(kind: &tokio_postgres::types::Type) -> bool {
             | "oid"
             | "float4"
             | "float8"
-            | "numeric"
-            | "date"
             | "time"
-            | "timestamp"
-            | "timestamptz"
             | "uuid"
             | "json"
             | "jsonb"
@@ -913,7 +923,6 @@ fn supported_pg_type(kind: &tokio_postgres::types::Type) -> bool {
 async fn postgres_simple_tables(
     client: &tokio_postgres::Client,
     source: &str,
-    tls: &postgres_native_tls::MakeTlsConnector,
 ) -> Result<Vec<TableData>, String> {
     use futures_util::TryStreamExt;
 
@@ -983,9 +992,6 @@ async fn postgres_simple_tables(
             rows,
             truncated,
         });
-    }
-    if tables.iter().any(|table| table.truncated) {
-        let _ = client.cancel_token().cancel_query(tls.clone()).await;
     }
     if tables.is_empty() {
         tables.push(affected_table_text("Statement completed.".into()));

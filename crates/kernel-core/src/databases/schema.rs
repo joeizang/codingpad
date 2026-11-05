@@ -58,11 +58,12 @@ SELECT s.name,t.name,c.name,
        WHEN ty.name IN ('decimal','numeric') THEN '(' + CAST(c.precision AS varchar(10)) + ',' + CAST(c.scale AS varchar(10)) + ')' ELSE '' END,
        rs.name,rt.name,rc.name,
        CASE WHEN EXISTS (SELECT 1 FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id=ic.object_id AND i.index_id=ic.index_id WHERE i.is_primary_key=1 AND ic.object_id=t.object_id AND ic.column_id=c.column_id) THEN '1' ELSE '0' END,
-       COALESCE(f.name,''), CAST(COALESCE(f.constraint_column_id,0) AS varchar(10))
+       COALESCE(fk.name,''), CAST(COALESCE(f.constraint_column_id,0) AS varchar(10))
 FROM sys.objects t JOIN sys.schemas s ON s.schema_id=t.schema_id
 JOIN sys.columns c ON c.object_id=t.object_id
 JOIN sys.types ty ON ty.user_type_id=c.user_type_id
 LEFT JOIN sys.foreign_key_columns f ON f.parent_object_id=t.object_id AND f.parent_column_id=c.column_id
+LEFT JOIN sys.foreign_keys fk ON fk.object_id=f.constraint_object_id
 LEFT JOIN sys.objects rt ON rt.object_id=f.referenced_object_id
 LEFT JOIN sys.schemas rs ON rs.schema_id=rt.schema_id
 LEFT JOIN sys.columns rc ON rc.object_id=rt.object_id AND rc.column_id=f.referenced_column_id

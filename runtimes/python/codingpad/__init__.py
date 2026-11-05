@@ -330,16 +330,32 @@ def _start_database(connection):
         query = {"sslmode": sslmode}
         if sslmode == "verify-full":
             query["sslrootcert"] = "system"
-        url = URL.create(
-            "postgresql+psycopg",
-            username=connection.get("user"),
-            password=connection.get("password"),
-            host=connection.get("host") or "localhost",
-            port=connection.get("port") or 5432,
-            database=connection.get("database"),
-            query=query,
-        )
-        engine = create_engine(url, future=True)
+        def postgres_url():
+            return URL.create(
+                "postgresql+psycopg",
+                username=connection.get("user"),
+                password=connection.get("password"),
+                host=connection.get("host") or "localhost",
+                port=connection.get("port") or 5432,
+                database=connection.get("database"),
+                query=query,
+            )
+
+        engine = create_engine(postgres_url(), future=True)
+        if sslmode == "verify-full" and tls == "prefer":
+            # Prefer permits plaintext only when the server explicitly reports
+            # that it does not support TLS; certificate failures never downgrade.
+            try:
+                with engine.connect():
+                    pass
+            except Exception as error:
+                if "server does not support SSL" not in str(error):
+                    engine.dispose()
+                    raise
+                query["sslmode"] = "disable"
+                query.pop("sslrootcert", None)
+                engine.dispose()
+                engine = create_engine(postgres_url(), future=True)
     elif kind == "sqlserver":
         try:
             import mssql_python
@@ -351,7 +367,7 @@ def _start_database(connection):
         def quote(value):
             return "{" + str(value or "").replace("}", "}}") + "}"
 
-        encrypt = "Optional" if tls in ("prefer", "disable") else "Mandatory"
+        encrypt = "Optional" if tls == "disable" else "Mandatory"
         connection_string = ";".join(
             [
                 "Server="

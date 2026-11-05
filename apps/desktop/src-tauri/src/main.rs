@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use codingpad_kernel_core::{
+    databases::{Connection, ConnectionStore, SqlManager, SqlRunResult},
     lsp::{LanguageServers, LspEvent, LspStartResult},
     secrets::{SecretEntry, SecretOrigin, SecretStore},
     store::{self, FolderEntry, LibrarySettings, ScriptFile},
@@ -50,6 +51,94 @@ fn bench_phase(phase: &str, detail: serde_json::Value) {
             serde_json::json!({"phase": phase, "unix_ns": nanos as u64, "detail": detail})
         );
     }
+}
+
+#[tauri::command]
+fn list_connections(connections: State<'_, Arc<ConnectionStore>>) -> Vec<Connection> {
+    connections.list()
+}
+
+#[tauri::command]
+async fn save_connection(
+    connections: State<'_, Arc<ConnectionStore>>,
+    secrets: State<'_, Arc<SecretStore>>,
+    connection: Connection,
+) -> Result<Connection, String> {
+    let connections = connections.inner().clone();
+    let secrets = secrets.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let previous = connections
+            .list()
+            .into_iter()
+            .find(|item| item.id == connection.id);
+        let previous_secret = previous.and_then(|item| item.secret);
+        let saved = connections.save(connection)?;
+        if let Some(previous) = previous_secret {
+            if saved.secret.as_deref() != Some(previous.as_str()) {
+                secrets.delete(&previous, false).map_err(|error| {
+                    format!(
+                        "The connection was saved, but its old password was not removed: {error}"
+                    )
+                })?;
+            }
+        }
+        Ok(saved)
+    })
+    .await
+    .map_err(|error| format!("The connection save failed: {error}"))?
+}
+
+#[tauri::command]
+async fn delete_connection(
+    connections: State<'_, Arc<ConnectionStore>>,
+    secrets: State<'_, Arc<SecretStore>>,
+    id: String,
+) -> Result<(), String> {
+    let connections = connections.inner().clone();
+    let secrets = secrets.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let removed = connections.delete(&id)?;
+        if let Some(secret) = removed.secret {
+            secrets.delete(&secret, false).map_err(|error| {
+                format!("The connection was removed, but its password was not: {error}")
+            })?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("The connection delete failed: {error}"))?
+}
+
+#[tauri::command]
+async fn test_connection(sql: State<'_, Arc<SqlManager>>, id: String) -> Result<String, String> {
+    sql.test(&id).await
+}
+
+#[tauri::command]
+fn begin_sql_run(sql: State<'_, Arc<SqlManager>>, script_id: String) {
+    sql.begin_run(&script_id);
+}
+
+#[tauri::command]
+async fn run_sql(
+    sql: State<'_, Arc<SqlManager>>,
+    script_id: String,
+    source: String,
+    path: Option<String>,
+) -> Result<SqlRunResult, String> {
+    sql.run(&script_id, &source, path.as_deref()).await
+}
+
+#[tauri::command]
+fn expand_sql(
+    sql: State<'_, Arc<SqlManager>>,
+    script_id: String,
+    handle: String,
+    cursor: Option<String>,
+    limit: Option<u32>,
+) -> Result<ExpandResult, String> {
+    sql.expand(&script_id, &handle, cursor.as_deref(), limit)
+        .map(|node| ExpandResult { node })
 }
 
 #[tauri::command]
@@ -158,13 +247,23 @@ async fn expand_node(
 }
 
 #[tauri::command]
-async fn stop_script(supervisor: State<'_, Supervisor>, script_id: String) -> Result<(), String> {
+async fn stop_script(
+    supervisor: State<'_, Supervisor>,
+    sql: State<'_, Arc<SqlManager>>,
+    script_id: String,
+) -> Result<(), String> {
     supervisor.stop(&script_id).await;
+    sql.stop(&script_id);
     Ok(())
 }
 
 #[tauri::command]
-async fn reset_script(supervisor: State<'_, Supervisor>, script_id: String) -> Result<(), String> {
+async fn reset_script(
+    supervisor: State<'_, Supervisor>,
+    sql: State<'_, Arc<SqlManager>>,
+    script_id: String,
+) -> Result<(), String> {
+    sql.reset(&script_id);
     supervisor.reset(&script_id).await
 }
 
@@ -235,10 +334,12 @@ async fn request_language_server(
 async fn close_script(
     supervisor: State<'_, Supervisor>,
     language_servers: State<'_, LanguageServers>,
+    sql: State<'_, Arc<SqlManager>>,
     script_id: String,
 ) -> Result<(), String> {
     supervisor.close(&script_id).await;
     language_servers.close(&script_id).await;
+    sql.reset(&script_id);
     Ok(())
 }
 
@@ -306,6 +407,9 @@ fn main() {
             let data_dir = app.path().app_data_dir()?;
             let secrets = Arc::new(SecretStore::new(&data_dir));
             app.manage(secrets.clone());
+            let connections = Arc::new(ConnectionStore::new(&data_dir));
+            app.manage(connections.clone());
+            app.manage(Arc::new(SqlManager::new(connections, secrets.clone())));
             app.manage(Supervisor::with_data_dir_and_secrets(
                 data_dir.clone(),
                 secrets,
@@ -317,6 +421,13 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             ui_ready,
+            list_connections,
+            save_connection,
+            delete_connection,
+            test_connection,
+            begin_sql_run,
+            run_sql,
+            expand_sql,
             save_secret,
             delete_secret,
             list_secrets,
@@ -342,6 +453,7 @@ fn main() {
         .expect("Could not start CodingPad")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
+                app.state::<Arc<SqlManager>>().shutdown();
                 tauri::async_runtime::block_on(async {
                     app.state::<Supervisor>().shutdown().await;
                     app.state::<LanguageServers>().shutdown().await;

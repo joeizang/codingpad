@@ -652,3 +652,25 @@ footer {
   gap: 8px;
   margin-top: 4px;
 }
+.field-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.field-row input {
+  flex: 1;
+}
+.secret-form select {
+  padding: 8px 10px;
+  color: inherit;
+  background: #171a20;
+  border: 1px solid #3a424f;
+  border-radius: 4px;
+  font: inherit;
+}
+.modal-note code {
+  padding: 1px 4px;
+  background: #171a20;
+  border-radius: 3px;
+  font-size: 11px;
+}

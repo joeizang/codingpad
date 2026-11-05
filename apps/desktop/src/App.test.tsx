@@ -896,3 +896,38 @@ test("C# scratch runs with compiler diagnostics and clears stale diagnostics on 
   fireEvent.change(screen.getByLabelText("Code"), { target: { value: "42.Dump();" } });
   expect(screen.getByTestId("compiler-diagnostics")).toBeEmptyDOMElement();
 });
+
+test("SQL tabs run through the direct connection and render table results", async () => {
+  invoke.mockImplementation(async (command: string) => {
+    if (command === "run_sql") {
+      return {
+        ok: true,
+        stopped: false,
+        tables: [
+          {
+            id: "sql-1:0",
+            kind: "table",
+            type: "query",
+            columns: [{ name: "answer" }],
+            rows: [[{ id: "sql:r0c0", kind: "primitive", v: 42 }]],
+            total: 1,
+            next: null,
+            handle: "sql-1",
+          },
+        ],
+      };
+    }
+    return undefined;
+  });
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "New SQL scratch script" }));
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "▶ Run" })).toBeEnabled(),
+  );
+  expect(
+    invoke.mock.calls.filter(([command]) => command === "run_sql"),
+  ).toHaveLength(1);
+  expect(screen.getByText("42")).toBeInTheDocument();
+  expect(screen.getByText("Finished")).toBeInTheDocument();
+});

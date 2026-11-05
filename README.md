@@ -126,7 +126,8 @@ prompts for its location the first time and can use **Save as…** afterwards.
 CodingPad settings live in the app config folder, never in your scripts.
 
 A script's optional single-line header stays at the top of the file and is shown
-in the footer. For Python it is a `#` comment; C#, Rust and TypeScript use `//`:
+in the footer. For Python it is a `#` comment; C#, Rust and TypeScript use `//`;
+SQL uses `--`:
 
 ```python
 # codingpad: connection=northwind
@@ -315,6 +316,30 @@ Roslyn ships with the VS Code C# extension; CodingPad finds it there, in its own
 install follows in a later M2 issue. Only managed `Console` output is
 captured; direct native writes are outside this increment. Scripts run with your
 user privileges.
+
+## SQL scripts (M3.0)
+
+Click **Connections…** to add a SQLite or PostgreSQL database, then **+ SQL** or
+open a `.sql` file. The first line names the connection; the rest is plain SQL:
+
+```sql
+-- codingpad: connection=northwind
+
+SELECT CustomerId, CompanyName FROM Customers LIMIT 100;
+```
+
+Results appear as a paged table in Results. Statement failures and missing
+connections show a clear error. **Stop** interrupts a running query. Connections
+live in the app settings. A PostgreSQL connection uses host, port (default 5432),
+database and user; its password is written only to the OS password vault and is
+referenced by name, never stored in connection settings or scripts. TLS defaults
+to **Prefer**; choose **Require** for remote hosts. Prefer does not protect against
+an attacker who strips TLS, so it is not a security guarantee. Enable **Trust the
+server certificate** for a self-signed or private-CA server. PostgreSQL decimals,
+dates and timestamps use their exact server text; other columns in the same result keep their integer, boolean or float values.
+Multi-statement PostgreSQL batches use text for every column (including `t`/`f`
+for booleans). Connection passwords stay in the Rust host and
+are never passed to script kernels.
 
 ## Secrets
 

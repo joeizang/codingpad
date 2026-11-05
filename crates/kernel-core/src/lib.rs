@@ -1,5 +1,6 @@
 //! Desktop-independent supervisor for one warm kernel process per script.
 mod csharp;
+pub mod databases;
 pub mod installer;
 pub mod lsp;
 mod packages;

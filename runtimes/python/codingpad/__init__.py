@@ -16,6 +16,7 @@ _secret_errors = {}
 
 _MAX_ITEMS = 100
 _MAX_TABLE_ROWS = 100
+_MAX_DATABASE_ROWS = 10_000
 _MAX_TABLE_SAMPLE = 100
 _MAX_COLUMNS = 32
 _MAX_DEPTH = 6
@@ -44,6 +45,111 @@ _IMAGE_TYPES = {
     ".bmp": "image/bmp",
     ".svg": "image/svg+xml",
 }
+
+
+class _DatabaseRows(list):
+    def __init__(self, columns, rows, truncated=False):
+        unique = []
+        used = set()
+        for name in columns:
+            candidate = name
+            suffix = 2
+            while candidate in used:
+                candidate = f"{name}_{suffix}"
+                suffix += 1
+            used.add(candidate)
+            unique.append(candidate)
+        super().__init__(dict(zip(unique, row)) for row in rows)
+        self.columns = unique
+        self.truncated = truncated
+
+
+class _Database:
+    """A connection belonging to one script run."""
+
+    def __init__(self, config):
+        self._config = config
+        self._connection = None
+        self._closed = False
+
+    def _open(self):
+        if self._closed:
+            raise RuntimeError("This database client belongs to a finished script run.")
+        if self._connection is not None:
+            return self._connection
+        if not self._config:
+            raise RuntimeError("No connection is attached. Add a codingpad: connection=<name> header.")
+        settings = self._config["settings"]
+        kind = settings["kind"]
+        if kind == "sqlite":
+            import sqlite3
+            connection = sqlite3.connect(settings["path"], isolation_level=None)
+        elif kind == "postgres":
+            import psycopg
+            tls = settings.get("tls", "prefer")
+            verified = tls != "disable" and not settings.get("trustServerCertificate")
+            options = dict(host=settings["host"], port=settings.get("port") or 5432,
+                dbname=settings["database"], user=settings["user"], password=self._config.get("password"),
+                sslmode="verify-full" if verified else tls, connect_timeout=10, autocommit=True)
+            if verified:
+                options["sslrootcert"] = "system"
+            try:
+                connection = psycopg.connect(**options)
+            except psycopg.OperationalError as error:
+                # Prefer permits plaintext only when the server explicitly reports
+                # that it does not support TLS; certificate failures never downgrade.
+                if not (verified and tls == "prefer" and "server does not support SSL" in str(error)):
+                    raise
+                options["sslmode"] = "disable"
+                options.pop("sslrootcert", None)
+                connection = psycopg.connect(**options)
+        elif kind == "sqlserver":
+            import mssql_python
+            def quote(value):
+                return "{" + str(value or "").replace("}", "}}") + "}"
+            tls = settings.get("tls", "prefer")
+            encrypt = {"prefer": "Mandatory", "require": "Mandatory", "disable": "Optional"}[tls]
+            connection = mssql_python.connect(";".join([
+                "Server=" + quote(settings["host"] + "," + str(settings.get("port") or 1433)),
+                "Database=" + quote(settings["database"]), "UID=" + quote(settings["user"]),
+                "PWD=" + quote(self._config.get("password")), "Encrypt=" + encrypt,
+                "TrustServerCertificate=" + ("yes" if settings.get("trustServerCertificate") else "no"),
+            ]))
+            connection.autocommit = True
+        else:
+            raise RuntimeError("Unsupported database type: " + str(kind))
+        self._connection = connection
+        return connection
+
+    def query(self, sql, parameters=()):
+        """Execute SQL and return rows as dictionaries suitable for dump()."""
+        cursor = self._open().cursor()
+        try:
+            cursor.execute(sql, parameters) if parameters else cursor.execute(sql)
+            if cursor.description is None:
+                return _DatabaseRows([], [])
+            columns = [column[0] for column in cursor.description]
+            rows = cursor.fetchmany(_MAX_DATABASE_ROWS + 1)
+            return _DatabaseRows(columns, rows[:_MAX_DATABASE_ROWS], len(rows) > _MAX_DATABASE_ROWS)
+        finally:
+            cursor.close()
+
+    def execute(self, sql, parameters=()):
+        """Execute a statement and return its affected row count."""
+        connection = self._open()
+        cursor = connection.cursor()
+        try:
+            cursor.execute(sql, parameters) if parameters else cursor.execute(sql)
+            return cursor.rowcount
+        finally:
+            cursor.close()
+
+    def close(self):
+        connection, self._connection = self._connection, None
+        self._config = None
+        self._closed = True
+        if connection is not None:
+            connection.close()
 
 
 class _Registry:
@@ -292,6 +398,8 @@ def _is_record(value):
 
 
 def _is_table(value):
+    if isinstance(value, _DatabaseRows):
+        return True
     if not isinstance(value, (list, tuple)) or not value:
         return False
     sample = value[:_MAX_TABLE_SAMPLE]
@@ -301,6 +409,8 @@ def _is_table(value):
 
 
 def _columns(value):
+    if isinstance(value, _DatabaseRows):
+        return [(column, str(column)[:1000]) for column in value.columns[:_MAX_COLUMNS]]
     columns = {}
     for item in islice(value, _MAX_TABLE_SAMPLE):
         for key in _keys(item):
@@ -340,6 +450,8 @@ def _table(value, cursor, limit, budget):
         total=total,
         next=next_cursor,
     )
+    if isinstance(value, _DatabaseRows) and value.truncated:
+        node["truncated"] = True
     if next_cursor is not None:
         node["handle"] = _registry.handle(value)
     return node

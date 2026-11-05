@@ -349,6 +349,7 @@ function TableNode({
       <div className="table-footer">
         <span className="muted">
           {totalKnown ? total : Math.max(0, total - 1)}{totalKnown ? "" : "+"} rows
+          {node.truncated && " (results truncated)"}
         </span>
         {error && <span className="value-error">{error}</span>}
       </div>

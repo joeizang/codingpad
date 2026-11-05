@@ -656,3 +656,52 @@ async fn requests_first_run_and_cached_environment_after_restart() {
     let second = run(&supervisor, "requests", &source).await;
     assert_eq!(value(&first), value(&second));
 }
+
+#[tokio::test]
+async fn python_uses_the_attached_sqlite_connection() {
+    use codingpad_kernel_core::{
+        databases::{Connection, ConnectionStore, DatabaseKind, TlsMode},
+        secrets::SecretStore,
+    };
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sample.sqlite");
+    let database = rusqlite::Connection::open(&path).unwrap();
+    database
+        .execute_batch("CREATE TABLE items(name TEXT); INSERT INTO items VALUES ('Ada');")
+        .unwrap();
+    let connections = Arc::new(ConnectionStore::new(dir.path()));
+    connections
+        .save(Connection {
+            id: String::new(),
+            name: "sample".into(),
+            kind: DatabaseKind::Sqlite,
+            path: Some(path.to_string_lossy().into()),
+            host: None,
+            port: None,
+            database: None,
+            user: None,
+            secret: None,
+            tls: TlsMode::Prefer,
+            trust_server_certificate: false,
+        })
+        .unwrap();
+    let supervisor = Supervisor::with_data_dir_and_secrets(
+        dir.path().into(),
+        Arc::new(SecretStore::new(dir.path())),
+    )
+    .with_connections(connections);
+    let events = run(
+        &supervisor,
+        "db-test",
+        "# codingpad: connection=sample\ndb.query('select name from items')",
+    )
+    .await;
+    let table = &events
+        .iter()
+        .find(|event| event.method == "dump")
+        .unwrap()
+        .params["node"];
+    assert_eq!(table["kind"], "table");
+    assert_eq!(table["rows"][0][0]["v"], "Ada");
+}

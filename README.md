@@ -348,6 +348,21 @@ Ambiguous unqualified table names offer columns from each matching schema.
 
 ## SQL scripts (M3.0)
 
+Python scripts can query an attached connection with the run-scoped `db` client:
+
+```python
+# codingpad: connection=sample
+db.query("SELECT * FROM customers")
+```
+
+`db.query(sql, parameters)` returns rows as dictionaries and displays them as a
+table. `db.execute(sql, parameters)` executes a statement and returns the
+number of affected rows. Queries return at most 10,000 rows; a truncated dump is
+marked in the results panel. Duplicate column names get unique suffixes such as
+`id_2`. Parameters use the selected driver's syntax (SQLite
+and SQL Server use `?`, PostgreSQL uses `%s`). CodingPad installs the server
+driver through uv on first use. The connection is closed at the end of each run.
+
 Click **Connections…** to add a SQLite, PostgreSQL or SQL Server database, then
 **+ SQL** or open a `.sql` file. The first line names the connection; the rest is plain SQL:
 

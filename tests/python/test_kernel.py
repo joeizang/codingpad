@@ -121,6 +121,44 @@ class KernelTests(unittest.TestCase):
         self.assertEqual(pids[0], pids[1], "Stress run must preserve the warm kernel")
         return messages
 
+    def test_database_duplicate_columns_and_truncation(self):
+        config = {"settings": {"kind": "sqlite", "path": ":memory:"}}
+        source = "db.query('select 1 as id, 2 as id, 3 as id_2')"
+        messages = self.request("run", {"source": source, "connection": config})
+        node = next(message["params"]["node"] for message in messages if message.get("method") == "dump")
+        self.assertEqual([c["name"] for c in node["columns"]], ["id", "id_2", "id_2_2"])
+        self.assertEqual([cell["v"] for cell in node["rows"][0]], [1, 2, 3])
+        source = "db.query('with recursive t(n) as (select 1 union all select n+1 from t where n<10001) select n from t')"
+        messages = self.request("run", {"source": source, "connection": config})
+        node = next(message["params"]["node"] for message in messages if message.get("method") == "dump")
+        self.assertEqual(node["total"], 10000)
+        self.assertTrue(node["truncated"])
+
+    def test_database_connection_and_run_cleanup(self):
+        import sqlite3
+        path = str(Path(self.directory.name) / "sample.db")
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute("create table items (name text)")
+            connection.execute("insert into items values ('Ada')")
+            connection.commit()
+        finally:
+            connection.close()
+        config = {"settings": {"kind": "sqlite", "path": path}, "password": None}
+        messages = self.request("run", {"source": "db.query('select name from items')", "connection": config})
+        self.assertTrue(messages[-1]["result"]["ok"])
+        node = next(message["params"]["node"] for message in messages if message.get("method") == "dump")
+        self.assertEqual(node["kind"], "table")
+        self.assertEqual(node["columns"][0]["name"], "name")
+        self.assertEqual(node["rows"][0][0]["v"], "Ada")
+        messages = self.request("run", {"source": "db.query('select name from items where 0')", "connection": config})
+        node = next(message["params"]["node"] for message in messages if message.get("method") == "dump")
+        self.assertEqual(node["kind"], "table")
+        self.assertEqual(node["columns"][0]["name"], "name")
+        messages = self.run_script("db.query('select 1')")
+        self.assertFalse(messages[-1]["result"]["ok"])
+        self.assertTrue(any("No connection is attached" in str(message) for message in messages))
+
     def test_secrets_are_scoped_to_the_run(self):
         messages = self.request(
             "run",

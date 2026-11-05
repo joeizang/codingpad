@@ -164,6 +164,7 @@ pub struct Supervisor {
     kernels: Mutex<HashMap<String, SharedSlot>>,
     csharp: OnceCell<csharp::Installation>,
     secrets: Option<Arc<SecretStore>>,
+    connections: Option<Arc<databases::ConnectionStore>>,
 }
 
 impl Default for Supervisor {
@@ -215,6 +216,7 @@ impl Supervisor {
             kernels: Mutex::new(HashMap::new()),
             csharp: OnceCell::new(),
             secrets: None,
+            connections: None,
         }
     }
 
@@ -228,6 +230,7 @@ impl Supervisor {
             kernels: Mutex::new(HashMap::new()),
             csharp: OnceCell::new(),
             secrets: None,
+            connections: None,
         }
     }
 
@@ -245,6 +248,12 @@ impl Supervisor {
             secrets: Some(secrets),
             ..Self::with_data_dir(data_dir)
         }
+    }
+
+    /// Use the same live connection store as the desktop connection editor.
+    pub fn with_connections(mut self, connections: Arc<databases::ConnectionStore>) -> Self {
+        self.connections = Some(connections);
+        self
     }
 
     fn uv_path(&self) -> PathBuf {
@@ -312,15 +321,73 @@ impl Supervisor {
                 }
             }
         };
+        let connection = (language == Language::Python)
+            .then(|| store::parse_header(source))
+            .flatten()
+            .and_then(|header| header.settings.get("connection").cloned())
+            .filter(|name| !name.trim().is_empty());
+        let connection = match connection {
+            Some(name) => {
+                let connection = self
+                    .connections
+                    .as_ref()
+                    .and_then(|store| store.by_name(&name))
+                    .ok_or_else(|| {
+                        format!("Connection \"{name}\" was not found. Add it in Connections…")
+                    })?;
+                let secret = connection
+                    .secret
+                    .clone()
+                    .filter(|name| !name.trim().is_empty());
+                let password = if connection.kind != databases::DatabaseKind::Sqlite {
+                    if let Some(secret) = secret {
+                        let store = self
+                            .secrets
+                            .clone()
+                            .ok_or("The password vault is unavailable")?;
+                        let read = tokio::task::spawn_blocking(move || store.get(&secret));
+                        Some(tokio::select! {
+                            result = read => result.map_err(|error| format!("The password read failed: {error}"))??,
+                            _ = closed.changed() => return Err("Script was closed".into()),
+                            _ = stop.changed() => return Ok(RunResult { ok: false, stopped: true, cache_cleared: false }),
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                Some(json!({"settings": connection, "password": password}))
+            }
+            None => None,
+        };
         let mut guard = slot.kernel.lock().await;
         if *closed.borrow() {
             return Err("Script was closed".into());
         }
-        let packages = if language == Language::Python {
+        let mut packages = if language == Language::Python {
             Packages::parse(source)?
         } else {
             Packages::parse("")?
         };
+        if language == Language::Python {
+            if let Some(kind) = connection
+                .as_ref()
+                .and_then(|value| value["settings"]["kind"].as_str())
+            {
+                let driver = match kind {
+                    "postgres" => Some("psycopg[binary]>=3.2,<4"),
+                    "sqlserver" => Some("mssql-python>=1,<2"),
+                    _ => None,
+                };
+                if let Some(driver) = driver {
+                    packages.dependencies.push(driver.to_owned());
+                    packages.dependencies.sort();
+                    packages.dependencies.dedup();
+                    packages.declared = true;
+                }
+            }
+        }
         if guard
             .as_ref()
             .is_some_and(|kernel| kernel.packages != packages || kernel.language != language)
@@ -353,7 +420,7 @@ impl Supervisor {
             *guard = Some(startup?);
         }
         let result = tokio::select! {
-            result = guard.as_mut().unwrap().run(source, path, &secrets, &mut emit, &mut stop) => result,
+            result = guard.as_mut().unwrap().run(source, path, &secrets, connection.as_ref(), &mut emit, &mut stop) => result,
             _ = closed.changed() => Err("Script was closed".into()),
         };
         if result.as_ref().is_ok_and(|result| result.cache_cleared) {
@@ -621,13 +688,14 @@ impl Kernel {
         source: &str,
         path: Option<&str>,
         secrets: &SecretSnapshot,
+        connection: Option<&Value>,
         emit: &mut (impl FnMut(KernelEvent) + Send),
         stop: &mut watch::Receiver<u64>,
     ) -> Result<RunResult, String> {
         self.next_id += 1;
         let id = self.next_id;
         let mut request = serde_json::to_vec(
-            &json!({"jsonrpc": "2.0", "id": id, "method": "run", "params": {"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors}}),
+            &json!({"jsonrpc": "2.0", "id": id, "method": "run", "params": {"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection}}),
         )
         .map_err(|e| e.to_string())?;
         request.push(b'\n');
@@ -766,7 +834,16 @@ async fn prepare_packages(
         progress
     )?;
     if !output.status.success() {
-        return Err("Python package preparation failed. See uv output in Results; check the dependencies, requires-python and network connection. Python 3.10+ must already be installed.".into());
+        let driver = packages
+            .dependencies
+            .iter()
+            .any(|name| name.starts_with("psycopg[") || name.starts_with("mssql-python"));
+        let detail = if driver {
+            " The attached connection needs a database driver, which may require network access on first use."
+        } else {
+            ""
+        };
+        return Err(format!("Python package preparation failed. See uv output in Results; check the dependencies, requires-python and network connection. Python 3.10+ must already be installed.{detail}"));
     }
     let executable = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
     if !std::path::Path::new(executable.trim()).is_file() {

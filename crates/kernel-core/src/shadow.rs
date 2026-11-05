@@ -4,6 +4,7 @@
 //! so completion and diagnostics see the script's packages, compiler options,
 //! SDK choice and the built-in `CodingPad` library. Rust and TypeScript can
 //! reuse the manager shape later with their own project writers.
+use crate::data_context::GeneratedContext;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -130,6 +131,16 @@ impl Directives {
             }
         }
         Ok(result)
+    }
+
+    /// Add the packages a generated EF Core data context needs. User packages
+    /// win when they already name the same package.
+    pub(crate) fn add_data_packages(&mut self, kind: &str) {
+        for (name, version) in data_packages(kind) {
+            self.packages
+                .entry(name.to_owned())
+                .or_insert_with(|| version.to_owned());
+        }
     }
 
     /// A stable restart key for the language server.
@@ -267,8 +278,12 @@ impl ShadowProject {
         source: &str,
         script_path: Option<&Path>,
         key: &str,
+        data: Option<&GeneratedContext>,
     ) -> Result<Self, String> {
-        let directives = Directives::parse(source)?;
+        let mut directives = Directives::parse(source)?;
+        if let Some(data) = data {
+            directives.add_data_packages(&data.connection.kind);
+        }
         let temp = tempfile::tempdir()
             .map_err(|error| format!("Could not create a code-intelligence workspace: {error}"))?;
         let temporary = temp.path().join("shadow");
@@ -304,14 +319,23 @@ impl ShadowProject {
         fs::write(root.join("CodingPadUsings.cs"), directives.usings()).map_err(|error| {
             format!("Could not stage the CodingPad imports for code intelligence: {error}")
         })?;
+        if let Some(data) = data {
+            fs::write(root.join("CodingPadDataContext.cs"), &data.csharp)
+                .map_err(|error| format!("Could not stage the generated data context: {error}"))?;
+        }
 
         let sdk = if directives.web {
             "Microsoft.NET.Sdk.Web"
         } else {
             "Microsoft.NET.Sdk"
         };
+        let data_source = if data.is_some() {
+            "    <Compile Include=\"CodingPadDataContext.cs\" />\n"
+        } else {
+            ""
+        };
         let project = format!(
-            "<Project Sdk=\"{sdk}\">\n  <PropertyGroup>\n{}\n  </PropertyGroup>\n  <ItemGroup>\n{}\n    <Compile Include=\"Program.cs\" />\n    <Compile Include=\"CodingPadUsings.cs\" />\n    <Compile Include=\"CodingPad/*.cs\" />\n  </ItemGroup>\n</Project>\n",
+            "<Project Sdk=\"{sdk}\">\n  <PropertyGroup>\n{}\n  </PropertyGroup>\n  <ItemGroup>\n{}\n    <Compile Include=\"Program.cs\" />\n    <Compile Include=\"CodingPadUsings.cs\" />\n{data_source}    <Compile Include=\"CodingPad/*.cs\" />\n  </ItemGroup>\n</Project>\n",
             directives.property_manifest(),
             directives.package_manifest(),
         );
@@ -402,6 +426,19 @@ fn canonical_property(name: &str) -> Option<&'static str> {
         "targetframework" => "TargetFramework",
         _ => return None,
     })
+}
+
+fn data_packages(kind: &str) -> Vec<(&'static str, &'static str)> {
+    let provider = match kind {
+        "postgres" => Some("Npgsql.EntityFrameworkCore.PostgreSQL"),
+        "sqlserver" => Some("Microsoft.EntityFrameworkCore.SqlServer"),
+        _ => Some("Microsoft.EntityFrameworkCore.Sqlite"),
+    };
+    let mut packages = vec![("Microsoft.EntityFrameworkCore", "10.0.0")];
+    if let Some(provider) = provider {
+        packages.push((provider, "10.0.0"));
+    }
+    packages
 }
 
 fn prepare(root: &Path) -> std::io::Result<()> {
@@ -583,7 +620,7 @@ mod tests {
     fn generates_a_project_with_packages_properties_and_the_runtime() {
         let source = "#:package Newtonsoft.Json@13.0.3\n#:property Nullable=disable\n#:property CodingPadImplicitUsings=false\nConsole.WriteLine(\"hi\");";
         let directives = Directives::parse(source).unwrap();
-        let project = ShadowProject::create(source, None, &directives.key()).unwrap();
+        let project = ShadowProject::create(source, None, &directives.key(), None).unwrap();
         let csproj = fs::read_to_string(project.root().join("CodingPad.Script.csproj")).unwrap();
         assert!(csproj.contains("Microsoft.NET.Sdk\""));
         assert!(csproj.contains("Newtonsoft.Json"));
@@ -648,10 +685,32 @@ mod tests {
     }
 
     #[test]
+    fn generated_data_context_is_compiled_with_its_provider_packages() {
+        let data = crate::data_context::GeneratedContext {
+            csharp: "public sealed class DataContext { }\n".into(),
+            connection: crate::data_context::ConnectionInfo {
+                kind: "postgres".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let project =
+            ShadowProject::create("new DataContext();", None, "key", Some(&data)).unwrap();
+        let csproj = fs::read_to_string(project.root().join("CodingPad.Script.csproj")).unwrap();
+        assert!(csproj.contains("CodingPadDataContext.cs"));
+        assert!(csproj.contains("Microsoft.EntityFrameworkCore"));
+        assert!(csproj.contains("Npgsql.EntityFrameworkCore.PostgreSQL"));
+        assert_eq!(
+            fs::read_to_string(project.root().join("CodingPadDataContext.cs")).unwrap(),
+            data.csharp
+        );
+    }
+
+    #[test]
     fn saved_scripts_get_a_hidden_neighbour_project() {
         let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("script.cs");
-        let project = ShadowProject::create("42", Some(&script), "key").unwrap();
+        let project = ShadowProject::create("42", Some(&script), "key", None).unwrap();
         assert_eq!(
             project.root(),
             directory.path().join(".codingpad").join(short_hash("key"))

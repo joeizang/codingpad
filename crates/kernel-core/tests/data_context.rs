@@ -1,7 +1,8 @@
-//! Acceptance check for generated Python data contexts.
+//! Acceptance checks for generated Python and C# data contexts.
 //!
-//! It is ignored in the normal suite because the first run installs SQLAlchemy
-//! and may need a network or a warm package cache. Run it explicitly with
+//! These are ignored in the normal suite because the first run installs
+//! SQLAlchemy/EF Core packages and may need a network or a warm package cache.
+//! Run them explicitly with
 //! `cargo test -p codingpad-kernel-core --test data_context -- --ignored`.
 use codingpad_kernel_core::{
     data_context::GeneratedContext,
@@ -74,6 +75,10 @@ async fn run(
     events
 }
 
+fn dumped_text(events: &[KernelEvent]) -> String {
+    serde_json::to_string(events).unwrap()
+}
+
 #[tokio::test]
 #[ignore = "installs SQLAlchemy and runs a Python kernel; run explicitly"]
 async fn python_queries_generated_models_and_dumps_the_rows() {
@@ -93,7 +98,32 @@ async fn python_queries_generated_models_and_dumps_the_rows() {
         data,
     )
     .await;
-    let text = serde_json::to_string(&events).unwrap();
+    let text = dumped_text(&events);
+    assert!(text.contains("Ada"), "{text}");
+    assert!(text.contains("Grace"), "{text}");
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "restores EF Core and runs a C# kernel; run explicitly"]
+async fn csharp_queries_the_generated_context_and_dumps_the_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sample.db");
+    sample_database(&path);
+    let context = generated(directory.path(), &path).await;
+    let data = DataContextRun {
+        source: context.csharp,
+        connection: context.connection,
+    };
+    let supervisor = Supervisor::default();
+    let events = run(
+        &supervisor,
+        Language::Csharp,
+        "var context = new DataContext();\ncontext.Customers.OrderBy(customer => customer.Id).Select(customer => customer.Name).ToList().Dump();\n",
+        data,
+    )
+    .await;
+    let text = dumped_text(&events);
     assert!(text.contains("Ada"), "{text}");
     assert!(text.contains("Grace"), "{text}");
     supervisor.shutdown().await;

@@ -277,10 +277,12 @@ impl LanguageServers {
             return Err("A script id is required".into());
         }
         let directives = crate::shadow::Directives::parse(source)?;
+        let data = self.data_context(source).await;
         let restart_key = format!(
-            "{}\n{}",
+            "{}\n{}\n{}",
             directives.key(),
-            path.map(|p| p.display().to_string()).unwrap_or_default()
+            path.map(|p| p.display().to_string()).unwrap_or_default(),
+            data.as_ref().map(|data| data.csharp.as_str()).unwrap_or("")
         );
         let events: EventSink = Arc::new(emit);
 
@@ -309,7 +311,12 @@ impl LanguageServers {
         }
 
         let project_key = format!("{script_id}\n{restart_key}");
-        let workspace = Workspace::Csharp(ShadowProject::create(source, path, &project_key)?);
+        let workspace = Workspace::Csharp(ShadowProject::create(
+            source,
+            path,
+            &project_key,
+            data.as_ref(),
+        )?);
         let dotnet = toolchains::resolve_dotnet(self.data_dir.as_deref()).await;
         let roslyn = roslyn::find(self.data_dir.as_deref(), &dotnet)?;
         let mut command = roslyn.command();

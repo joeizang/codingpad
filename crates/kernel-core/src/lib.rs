@@ -411,15 +411,23 @@ impl Supervisor {
             if let Some(data) = &data {
                 packages.declared = true;
                 let driver = match data.connection.kind.as_str() {
-                    "postgres" => Some("psycopg[binary]"),
-                    "sqlserver" => Some("pymssql"),
+                    "postgres" => Some("psycopg[binary]>=3.2,<4"),
+                    "sqlserver" => Some("mssql-python>=1,<2"),
                     _ => None,
                 };
-                for dependency in ["sqlalchemy"].into_iter().chain(driver) {
+                let dependency_name = |dependency: &str| {
+                    dependency
+                        .split(['[', '<', '>', '=', ' ', '!', '~'])
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                };
+                for dependency in ["sqlalchemy>=2.0,<2.2"].into_iter().chain(driver) {
+                    let name = dependency_name(dependency);
                     if !packages
                         .dependencies
                         .iter()
-                        .any(|item| item.eq_ignore_ascii_case(dependency))
+                        .any(|item| dependency_name(item) == name)
                     {
                         packages.dependencies.push(dependency.to_owned());
                     }

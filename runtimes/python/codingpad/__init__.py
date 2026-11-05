@@ -318,9 +318,18 @@ def _start_database(connection):
             "SQLAlchemy is not available in this Python environment. Run the script again; CodingPad prepares it for attached connections."
         ) from error
     kind = str(connection.get("kind") or "").lower()
+    tls = str(connection.get("tls") or "prefer")
+    trust = bool(connection.get("trustServerCertificate"))
     if kind == "sqlite":
         url = URL.create("sqlite", database=str(connection.get("path") or ""))
+        engine = create_engine(url, future=True)
     elif kind == "postgres":
+        # match the Rust and Level 2 paths: verify the certificate unless the
+        # user explicitly trusts the server. `require` alone does not verify.
+        sslmode = "disable" if tls == "disable" else ("verify-full" if not trust else tls)
+        query = {"sslmode": sslmode}
+        if sslmode == "verify-full":
+            query["sslrootcert"] = "system"
         url = URL.create(
             "postgresql+psycopg",
             username=connection.get("user"),
@@ -328,20 +337,50 @@ def _start_database(connection):
             host=connection.get("host") or "localhost",
             port=connection.get("port") or 5432,
             database=connection.get("database"),
-            query={"sslmode": str(connection.get("tls") or "prefer")},
+            query=query,
         )
+        engine = create_engine(url, future=True)
     elif kind == "sqlserver":
-        url = URL.create(
-            "mssql+pymssql",
-            username=connection.get("user"),
-            password=connection.get("password"),
-            host=connection.get("host") or "localhost",
-            port=connection.get("port") or 1433,
-            database=connection.get("database"),
+        try:
+            import mssql_python
+        except ImportError as error:
+            raise RuntimeError(
+                "The SQL Server driver is not available in this Python environment. Run the script again; CodingPad prepares it for attached connections."
+            ) from error
+
+        def quote(value):
+            return "{" + str(value or "").replace("}", "}}") + "}"
+
+        encrypt = "Optional" if tls in ("prefer", "disable") else "Mandatory"
+        connection_string = ";".join(
+            [
+                "Server="
+                + quote(
+                    str(connection.get("host") or "localhost")
+                    + ","
+                    + str(connection.get("port") or 1433)
+                ),
+                "Database=" + quote(connection.get("database")),
+                "UID=" + quote(connection.get("user")),
+                "PWD=" + quote(connection.get("password")),
+                "Encrypt=" + encrypt,
+                "TrustServerCertificate=" + ("yes" if trust else "no"),
+            ]
         )
+        if not hasattr(mssql_python, "version"):
+            mssql_python.version = getattr(mssql_python, "__version__", "1.0")
+        engine = create_engine(
+            "mssql+pyodbc://",
+            module=mssql_python,
+            creator=lambda: mssql_python.connect(connection_string),
+            paramstyle="qmark",
+            future=True,
+        )
+        # pyodbc's optional output-converter hook is not available on this driver.
+        engine.dialect.on_connect = lambda: None
     else:
         raise ValueError(f"Unsupported database kind: {kind or 'none'}")
-    _database_engine = create_engine(url, future=True)
+    _database_engine = engine
     _database_session = sessionmaker(
         bind=_database_engine, expire_on_commit=False
     )()

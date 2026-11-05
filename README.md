@@ -319,8 +319,8 @@ user privileges.
 
 ## SQL scripts (M3.0)
 
-Click **Connections…** to add a SQLite database, then **+ SQL** or open a `.sql`
-file. The first line names the connection; the rest is plain SQL:
+Click **Connections…** to add a SQLite or PostgreSQL database, then **+ SQL** or
+open a `.sql` file. The first line names the connection; the rest is plain SQL:
 
 ```sql
 -- codingpad: connection=northwind
@@ -329,9 +329,17 @@ SELECT CustomerId, CompanyName FROM Customers LIMIT 100;
 ```
 
 Results appear as a paged table in Results. Statement failures and missing
-connections show a clear error. **Stop** interrupts a running SQLite query.
-Connections live in the app settings; passwords for server databases are held
-only in the vault (see below), never in connection settings or scripts.
+connections show a clear error. **Stop** interrupts a running query. Connections
+live in the app settings. A PostgreSQL connection uses host, port (default 5432),
+database and user; its password is written only to the OS password vault and is
+referenced by name, never stored in connection settings or scripts. TLS defaults
+to **Prefer**; choose **Require** for remote hosts. Prefer does not protect against
+an attacker who strips TLS, so it is not a security guarantee. Enable **Trust the
+server certificate** for a self-signed or private-CA server. PostgreSQL decimals,
+dates and timestamps use their exact server text; other columns in the same result keep their integer, boolean or float values.
+Multi-statement PostgreSQL batches use text for every column (including `t`/`f`
+for booleans). Connection passwords stay in the Rust host and
+are never passed to script kernels.
 
 ## Secrets
 
@@ -358,8 +366,9 @@ var password = Secret("database-password");
 Names starting with `connection:` are reserved for database connection
 passwords. A missing secret raises an actionable error. Secret values are not written to
 logs, script files or connection settings. Each run reads only the secrets its
-source names (dynamic calls fall back to every non-connection secret), so scripts
-that never call `secret()` do not wait on the vault. Changing a secret takes
+source names. Imports and dynamic uses fall back to every non-connection secret,
+because imported modules may call `secret()`. Scripts that neither import anything
+nor reference `secret` do not wait on the vault. Changing a secret takes
 effect on the next run of each script.
 
 ## Repository layout

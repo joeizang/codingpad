@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
-export type DatabaseKind = "sqlite";
+export type DatabaseKind = "sqlite" | "postgres";
 
 export type Connection = {
   id: string;
@@ -14,6 +14,8 @@ export type Connection = {
   database?: string | null;
   user?: string | null;
   secret?: string | null;
+  tls?: "prefer" | "require" | "disable";
+  trustServerCertificate?: boolean;
 };
 
 type ConnectionsDialogProps = {
@@ -26,6 +28,7 @@ const EMPTY: Connection = { id: "", name: "", kind: "sqlite", path: "" };
 export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
   const [connections, setConnections] = useState<Connection[]>([]);
   const [draft, setDraft] = useState<Connection>(EMPTY);
+  const [password, setPassword] = useState("");
   const [status, setStatus] = useState<string | undefined>();
   const [error, setError] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
@@ -34,6 +37,7 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
   useEffect(() => {
     if (!open) return;
     setDraft(EMPTY);
+    setPassword("");
     setStatus(undefined);
     setError(undefined);
     void refresh();
@@ -50,6 +54,7 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
 
   function edit(connection: Connection) {
     setDraft({ ...connection });
+    setPassword("");
     setStatus(undefined);
     setError(undefined);
   }
@@ -73,8 +78,19 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
     if (/\s/.test(draft.name.trim())) {
       return "A connection name cannot contain spaces; use letters, digits, dashes or underscores.";
     }
-    if (draft.kind === "sqlite" && !draft.path?.trim()) {
-      return "A SQLite connection needs a database file";
+    if (!draft.id && connections.some((item) => item.name === draft.name.trim())) {
+      return `A connection named "${draft.name.trim()}" already exists`;
+    }
+    if (draft.kind === "sqlite") {
+      if (!draft.path?.trim()) return "A SQLite connection needs a database file";
+      return undefined;
+    }
+    for (const [field, value] of [
+      ["host", draft.host],
+      ["database", draft.database],
+      ["user", draft.user],
+    ] as const) {
+      if (!value?.trim()) return `This connection needs a ${field}`;
     }
     return undefined;
   }
@@ -90,10 +106,34 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
     setError(undefined);
     setStatus(undefined);
     try {
+      const connection = { ...draft };
+      if (connection.kind !== "sqlite" && password) {
+        connection.secret = connection.secret || `connection:${connection.name.trim()}`;
+      }
+      // Save the connection first: a duplicate or invalid name must not touch
+      // the password of an existing connection with the same name.
       const saved = await invoke<Connection>("save_connection", {
-        connection: draft,
+        connection,
       });
+      if (connection.kind !== "sqlite" && password && saved.secret) {
+        try {
+          await invoke("save_secret", {
+            name: saved.secret,
+            value: password,
+          });
+        } catch (failure) {
+          if (!draft.id) {
+            try {
+              await invoke("delete_connection", { id: saved.id });
+            } catch {
+              // Keep the original password error.
+            }
+          }
+          throw failure;
+        }
+      }
       setDraft({ ...saved });
+      setPassword("");
       setStatus(`Saved "${saved.name}".`);
       await refresh();
     } catch (failure) {
@@ -225,23 +265,116 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
               }
             >
               <option value="sqlite">SQLite</option>
+              <option value="postgres">PostgreSQL</option>
             </select>
           </label>
-          <label>
-            Database file
-            <span className="field-row">
-              <input
-                value={draft.path ?? ""}
-                placeholder="/path/to/northwind.db"
-                onChange={(event) =>
-                  setDraft((current) => ({ ...current, path: event.target.value }))
-                }
-              />
-              <button className="control-button" type="button" onClick={() => void browse()}>
-                Browse…
-              </button>
-            </span>
-          </label>
+          {draft.kind === "sqlite" ? (
+            <label>
+              Database file
+              <span className="field-row">
+                <input
+                  value={draft.path ?? ""}
+                  placeholder="/path/to/northwind.db"
+                  onChange={(event) =>
+                    setDraft((current) => ({ ...current, path: event.target.value }))
+                  }
+                />
+                <button className="control-button" type="button" onClick={() => void browse()}>
+                  Browse…
+                </button>
+              </span>
+            </label>
+          ) : (
+            <>
+              <label>
+                Host
+                <input
+                  value={draft.host ?? ""}
+                  placeholder="localhost"
+                  onChange={(event) =>
+                    setDraft((current) => ({ ...current, host: event.target.value }))
+                  }
+                />
+              </label>
+              <label>
+                Port
+                <input
+                  type="number"
+                  min={1}
+                  max={65535}
+                  value={draft.port ?? 5432}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      port: event.target.value ? Number(event.target.value) : null,
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                Database
+                <input
+                  value={draft.database ?? ""}
+                  placeholder="northwind"
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      database: event.target.value,
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                User
+                <input
+                  value={draft.user ?? ""}
+                  placeholder="postgres"
+                  onChange={(event) =>
+                    setDraft((current) => ({ ...current, user: event.target.value }))
+                  }
+                />
+              </label>
+              <label>
+                TLS
+                <select
+                  value={draft.tls ?? "prefer"}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      tls: event.target.value as "prefer" | "require" | "disable",
+                    }))
+                  }
+                >
+                  <option value="prefer">Prefer TLS</option>
+                  <option value="require">Require TLS</option>
+                  <option value="disable">Disable TLS</option>
+                </select>
+              </label>
+              <label>
+                Password
+                <input
+                  type="password"
+                  autoComplete="off"
+                  value={password}
+                  placeholder={draft.secret ? "Leave blank to keep the saved password" : "Stored in the OS vault"}
+                  onChange={(event) => setPassword(event.target.value)}
+                />
+              </label>
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={draft.trustServerCertificate ?? false}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      trustServerCertificate: event.target.checked,
+                    }))
+                  }
+                />
+                Trust the server certificate (self-signed or private CA)
+              </label>
+            </>
+          )}
           <div className="modal-actions">
             <button
               className="run-button"

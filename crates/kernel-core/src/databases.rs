@@ -26,10 +26,21 @@ const MAX_PAGE: usize = 1_000;
 const DEFAULT_PAGE: usize = 100;
 const STOPPED: &str = "\u{0}stopped";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsMode {
+    #[default]
+    Prefer,
+    Require,
+    Disable,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DatabaseKind {
     Sqlite,
+    #[serde(alias = "postgresql")]
+    Postgres,
 }
 
 /// A saved connection. Values are never stored here; `secret` names the vault
@@ -53,6 +64,10 @@ pub struct Connection {
     pub user: Option<String>,
     #[serde(default)]
     pub secret: Option<String>,
+    #[serde(default)]
+    pub tls: TlsMode,
+    #[serde(default)]
+    pub trust_server_certificate: bool,
 }
 
 impl Connection {
@@ -76,6 +91,21 @@ impl Connection {
                     .is_none()
                 {
                     return Err("A SQLite connection needs a database file".into());
+                }
+            }
+            DatabaseKind::Postgres => {
+                for (field, value) in [
+                    ("host", self.host.as_deref()),
+                    ("database", self.database.as_deref()),
+                    ("user", self.user.as_deref()),
+                ] {
+                    if value
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .is_none()
+                    {
+                        return Err(format!("A PostgreSQL connection needs a {field}"));
+                    }
                 }
             }
         }
@@ -126,6 +156,9 @@ impl ConnectionStore {
     pub fn save(&self, mut connection: Connection) -> Result<Connection, String> {
         connection.name = connection.name.trim().to_owned();
         connection.path = connection.path.map(|path| path.trim().to_owned());
+        if connection.kind == DatabaseKind::Sqlite {
+            connection.secret = None;
+        }
         connection.validate()?;
         let mut all = self.connections.lock().unwrap();
         if all.iter().any(|item| {
@@ -148,14 +181,15 @@ impl ConnectionStore {
         Ok(connection)
     }
 
-    pub fn delete(&self, id: &str) -> Result<(), String> {
+    pub fn delete(&self, id: &str) -> Result<Connection, String> {
         let mut all = self.connections.lock().unwrap();
-        let before = all.len();
-        all.retain(|connection| connection.id != id);
-        if all.len() == before {
-            return Err("That connection no longer exists".into());
-        }
-        save_connections(&self.path, &all)
+        let index = all
+            .iter()
+            .position(|connection| connection.id == id)
+            .ok_or_else(|| "That connection no longer exists".to_owned())?;
+        let connection = all.remove(index);
+        save_connections(&self.path, &all)?;
+        Ok(connection)
     }
 }
 
@@ -212,11 +246,12 @@ type Interrupt = Arc<Mutex<Option<rusqlite::InterruptHandle>>>;
 
 pub struct SqlManager {
     connections: Arc<ConnectionStore>,
-    _secrets: Arc<SecretStore>,
+    secrets: Arc<SecretStore>,
     results: Mutex<HashMap<String, Arc<TableData>>>,
     script_results: Mutex<HashMap<String, Vec<String>>>,
     interrupts: Mutex<HashMap<String, Interrupt>>,
     cancel_flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    stops: Mutex<HashMap<String, tokio::sync::watch::Sender<u64>>>,
     next_handle: AtomicU64,
 }
 
@@ -224,11 +259,12 @@ impl SqlManager {
     pub fn new(connections: Arc<ConnectionStore>, secrets: Arc<SecretStore>) -> Self {
         Self {
             connections,
-            _secrets: secrets,
+            secrets,
             results: Mutex::new(HashMap::new()),
             script_results: Mutex::new(HashMap::new()),
             interrupts: Mutex::new(HashMap::new()),
             cancel_flags: Mutex::new(HashMap::new()),
+            stops: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
         }
     }
@@ -256,6 +292,19 @@ impl SqlManager {
                 })
                 .await
                 .map_err(|error| format!("The connection test failed: {error}"))?
+            }
+            DatabaseKind::Postgres => {
+                let (client, _) = self.connect_postgres(&connection).await?;
+                client
+                    .simple_query("SELECT 1")
+                    .await
+                    .map_err(|error| format!("PostgreSQL rejected the connection test: {error}"))?;
+                Ok(format!(
+                    "Connected to PostgreSQL at {}:{}/{}.",
+                    postgres_host(&connection),
+                    postgres_port(&connection),
+                    connection.database.as_deref().unwrap_or("")
+                ))
             }
         }
     }
@@ -310,6 +359,10 @@ impl SqlManager {
         match connection.kind {
             DatabaseKind::Sqlite => {
                 self.run_sqlite(script_id, &connection, body, cancelled)
+                    .await
+            }
+            DatabaseKind::Postgres => {
+                self.run_postgres(script_id, &connection, body, cancelled)
                     .await
             }
         }
@@ -390,6 +443,178 @@ impl SqlManager {
             .or_insert_with(|| Arc::new(AtomicBool::new(false)));
     }
 
+    fn begin_stop(&self, script_id: &str) -> tokio::sync::watch::Receiver<u64> {
+        self.stops
+            .lock()
+            .unwrap()
+            .entry(script_id.to_owned())
+            .or_insert_with(|| tokio::sync::watch::channel(0).0)
+            .subscribe()
+    }
+
+    async fn connect_postgres(
+        &self,
+        connection: &Connection,
+    ) -> Result<
+        (
+            tokio_postgres::Client,
+            postgres_native_tls::MakeTlsConnector,
+        ),
+        String,
+    > {
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host(postgres_host(connection))
+            .port(postgres_port(connection))
+            .dbname(connection.database.as_deref().unwrap_or(""))
+            .user(connection.user.as_deref().unwrap_or(""))
+            .ssl_mode(match connection.tls {
+                TlsMode::Prefer => tokio_postgres::config::SslMode::Prefer,
+                TlsMode::Require => tokio_postgres::config::SslMode::Require,
+                TlsMode::Disable => tokio_postgres::config::SslMode::Disable,
+            });
+        if let Some(secret) = connection
+            .secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|secret| !secret.is_empty())
+        {
+            let store = self.secrets.clone();
+            let secret = secret.to_owned();
+            let password = tokio::task::spawn_blocking(move || store.get(&secret))
+                .await
+                .map_err(|error| format!("The password read failed: {error}"))?
+                .map_err(|error| {
+                    format!("Could not read the PostgreSQL password from the vault: {error}")
+                })?;
+            config.password(password);
+        }
+        config.application_name("CodingPad");
+        config.connect_timeout(std::time::Duration::from_secs(10));
+        let connector = native_tls::TlsConnector::builder()
+            .danger_accept_invalid_certs(connection.trust_server_certificate)
+            .build()
+            .map_err(|error| format!("Could not prepare TLS for PostgreSQL: {error}"))?;
+        let tls = postgres_native_tls::MakeTlsConnector::new(connector);
+        let (client, connection) = config.connect(tls.clone()).await.map_err(|error| {
+            let mut detail = pg_detail(&error);
+            if !connection.trust_server_certificate && detail.to_ascii_lowercase().contains("tls handshake") {
+                detail.push_str(". For a self-signed development server, enable \"Trust the server certificate\" in Connections.");
+            }
+            format!(
+                "Could not connect to PostgreSQL at {}:{}/{}: {}",
+                postgres_host(connection),
+                postgres_port(connection),
+                connection.database.as_deref().unwrap_or(""),
+                detail
+            )
+        })?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok((client, tls))
+    }
+
+    async fn run_postgres(
+        &self,
+        script_id: &str,
+        connection: &Connection,
+        source: &str,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<SqlRunResult, String> {
+        let mut stop = self.begin_stop(script_id);
+        if cancelled.load(Ordering::Relaxed) {
+            self.stops.lock().unwrap().remove(script_id);
+            return Ok(SqlRunResult {
+                ok: false,
+                stopped: true,
+                tables: Vec::new(),
+            });
+        }
+        let client = tokio::select! {
+            result = self.connect_postgres(connection) => match result {
+                Ok((client, tls)) => (client, tls),
+                Err(error) => {
+                    self.stops.lock().unwrap().remove(script_id);
+                    return Err(error);
+                }
+            },
+            _ = stop.changed() => {
+                self.stops.lock().unwrap().remove(script_id);
+                return Ok(SqlRunResult { ok: false, stopped: true, tables: Vec::new() });
+            }
+        };
+        let (client, tls) = client;
+        let cancel = client.cancel_token();
+        let cancel_tls = tls.clone();
+        let query = postgres_tables(&client, source);
+        tokio::pin!(query);
+        let outcome: Result<Vec<TableData>, (bool, String)> = tokio::select! {
+            result = &mut query => result.map_err(|error| (false, error)),
+            _ = stop.changed() => {
+                // Dropping the future only abandons the client side. Ask the
+                // server to cancel and wait for its response, all within one
+                // deadline so an unresponsive server cannot hang the run.
+                let deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                match tokio::time::timeout_at(deadline, cancel.cancel_query(cancel_tls)).await {
+                    Err(_) => Err((
+                        false,
+                        "PostgreSQL did not accept the cancel request within 2 seconds; the statement may still be running."
+                            .into(),
+                    )),
+                    Ok(Err(error)) => Err((
+                        false,
+                        format!("Could not cancel the PostgreSQL query: {}", pg_detail(&error)),
+                    )),
+                    Ok(Ok(())) => match tokio::time::timeout_at(deadline, &mut query).await {
+                        // The statement finished before it could be cancelled.
+                        Ok(Ok(tables)) => Ok(tables),
+                        Ok(Err(error)) => Err((true, error)),
+                        Err(_) => Err((
+                            false,
+                            "PostgreSQL did not confirm cancellation within 2 seconds; the statement may still be running."
+                                .into(),
+                        )),
+                    },
+                }
+            }
+        };
+        self.stops.lock().unwrap().remove(script_id);
+        let tables = match outcome {
+            Ok(tables) => tables,
+            Err((true, _)) if cancelled.load(Ordering::Relaxed) => {
+                return Ok(SqlRunResult {
+                    ok: false,
+                    stopped: true,
+                    tables: Vec::new(),
+                })
+            }
+            Err((_, message)) => return Err(message),
+        };
+        let mut nodes = Vec::with_capacity(tables.len());
+        for table in tables {
+            let handle = format!("sql-{}", self.next_handle.fetch_add(1, Ordering::Relaxed));
+            let table = Arc::new(table);
+            self.results
+                .lock()
+                .unwrap()
+                .insert(handle.clone(), table.clone());
+            self.script_results
+                .lock()
+                .unwrap()
+                .entry(script_id.to_owned())
+                .or_default()
+                .push(handle.clone());
+            nodes.push(table_node(&table, &handle, 0, DEFAULT_PAGE));
+        }
+        Ok(SqlRunResult {
+            ok: true,
+            stopped: false,
+            tables: nodes,
+        })
+    }
+
     pub fn stop(&self, script_id: &str) {
         // Stop only affects a run that has begun. A Stop on an idle tab is a
         // no-op, so it cannot cancel the next Run.
@@ -401,6 +626,9 @@ impl SqlManager {
                 handle.interrupt();
             }
         }
+        if let Some(stop) = self.stops.lock().unwrap().get(script_id) {
+            stop.send_modify(|version| *version += 1);
+        }
     }
 
     /// Release every query and buffered result when the app exits.
@@ -409,6 +637,7 @@ impl SqlManager {
         self.script_results.lock().unwrap().clear();
         self.interrupts.lock().unwrap().clear();
         self.cancel_flags.lock().unwrap().clear();
+        self.stops.lock().unwrap().clear();
     }
 
     pub fn reset(&self, script_id: &str) {
@@ -577,6 +806,407 @@ fn sqlite_error(error: &rusqlite::Error) -> String {
         format!("SQLite could not run the statement: {error}")
     }
 }
+fn postgres_host(connection: &Connection) -> &str {
+    connection
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .unwrap_or("localhost")
+}
+
+fn postgres_port(connection: &Connection) -> u16 {
+    connection.port.unwrap_or(5432)
+}
+
+async fn postgres_tables(
+    client: &tokio_postgres::Client,
+    source: &str,
+) -> Result<Vec<TableData>, String> {
+    match client.prepare(source).await {
+        Ok(statement) if !statement.columns().is_empty() => {
+            if statement
+                .columns()
+                .iter()
+                .all(|column| supported_pg_type(column.type_()))
+            {
+                postgres_query(client, &statement).await
+            } else {
+                // A type we cannot decode still has a text form; use the simple
+                // protocol so values and NULLs are shown instead of placeholders.
+                postgres_simple_tables(client, source, statement.columns()).await
+            }
+        }
+        Ok(statement) => {
+            let changed = client
+                .execute(&statement, &[])
+                .await
+                .map_err(|error| pg_error("PostgreSQL could not run the statement", error))?;
+            Ok(vec![affected_table(changed)])
+        }
+        Err(_) => {
+            // Multiple statements cannot be prepared together. Run them with
+            // simple query so setup scripts still work.
+            postgres_simple_tables(client, source, &[]).await
+        }
+    }
+}
+
+async fn postgres_query(
+    client: &tokio_postgres::Client,
+    statement: &tokio_postgres::Statement,
+) -> Result<Vec<TableData>, String> {
+    use futures_util::TryStreamExt;
+
+    let columns: Vec<(String, tokio_postgres::types::Type)> = statement
+        .columns()
+        .iter()
+        .map(|column| (column.name().to_owned(), column.type_().clone()))
+        .collect();
+    let rows = client
+        .query_raw(statement, std::iter::empty::<&str>())
+        .await
+        .map_err(|error| pg_error("PostgreSQL could not run the query", error))?;
+    tokio::pin!(rows);
+    let mut values = Vec::new();
+    let mut truncated = false;
+    loop {
+        let row = rows
+            .as_mut()
+            .try_next()
+            .await
+            .map_err(|error| pg_error("PostgreSQL could not read the results", error))?;
+        let Some(row) = row else {
+            break;
+        };
+        if values.len() >= MAX_ROWS {
+            // Keep reading so later result sets and writes still happen.
+            truncated = true;
+            continue;
+        }
+        let mut cells = Vec::with_capacity(columns.len());
+        for (index, (_, kind)) in columns.iter().enumerate() {
+            cells.push(pg_cell(&row, index, kind, values.len()));
+        }
+        values.push(cells);
+    }
+    Ok(vec![TableData {
+        columns: columns
+            .into_iter()
+            .map(|(name, _)| Column { name })
+            .collect(),
+        rows: values,
+        truncated,
+    }])
+}
+
+fn supported_pg_type(kind: &tokio_postgres::types::Type) -> bool {
+    matches!(
+        kind.name(),
+        "bool"
+            | "int2"
+            | "int4"
+            | "int8"
+            | "oid"
+            | "float4"
+            | "float8"
+            | "time"
+            | "uuid"
+            | "json"
+            | "jsonb"
+            | "bytea"
+            | "text"
+            | "varchar"
+            | "bpchar"
+            | "name"
+            | "char"
+            | "unknown"
+    )
+}
+
+async fn postgres_simple_tables(
+    client: &tokio_postgres::Client,
+    source: &str,
+    column_types: &[tokio_postgres::Column],
+) -> Result<Vec<TableData>, String> {
+    use futures_util::TryStreamExt;
+
+    let messages = client
+        .simple_query_raw(source)
+        .await
+        .map_err(|error| pg_error("PostgreSQL could not run the query", error))?;
+    tokio::pin!(messages);
+    let mut tables: Vec<TableData> = Vec::new();
+    let mut current: Option<(Vec<Column>, Vec<Vec<Value>>, bool)> = None;
+    while let Some(message) = messages
+        .as_mut()
+        .try_next()
+        .await
+        .map_err(|error| pg_error("PostgreSQL could not read the results", error))?
+    {
+        match message {
+            tokio_postgres::SimpleQueryMessage::RowDescription(columns) => {
+                if let Some((columns, rows, truncated)) = current.take() {
+                    tables.push(TableData {
+                        columns,
+                        rows,
+                        truncated,
+                    });
+                }
+                current = Some((
+                    columns
+                        .iter()
+                        .map(|column| Column {
+                            name: column.name().to_owned(),
+                        })
+                        .collect(),
+                    Vec::new(),
+                    false,
+                ));
+            }
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                if let Some((_, rows, truncated)) = current.as_mut() {
+                    if rows.len() >= MAX_ROWS {
+                        *truncated = true;
+                        continue;
+                    }
+                    let mut cells = Vec::with_capacity(row.columns().len());
+                    for (index, _) in row.columns().iter().enumerate() {
+                        cells.push(pg_text_cell(
+                            row.get(index),
+                            column_types.get(index).map(|column| column.type_()),
+                            rows.len(),
+                            index,
+                        ));
+                    }
+                    rows.push(cells);
+                }
+            }
+            tokio_postgres::SimpleQueryMessage::CommandComplete(count) => {
+                if let Some((columns, rows, truncated)) = current.take() {
+                    tables.push(TableData {
+                        columns,
+                        rows,
+                        truncated,
+                    });
+                } else if count > 0 {
+                    tables.push(affected_table(count));
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((columns, rows, truncated)) = current {
+        tables.push(TableData {
+            columns,
+            rows,
+            truncated,
+        });
+    }
+    if tables.is_empty() {
+        tables.push(affected_table_text("Statement completed.".into()));
+    }
+    Ok(tables)
+}
+
+fn affected_table(changed: u64) -> TableData {
+    TableData {
+        columns: vec![Column {
+            name: "rows affected".into(),
+        }],
+        rows: vec![vec![
+            json!({"id": "sql:affected", "kind": "primitive", "v": changed}),
+        ]],
+        truncated: false,
+    }
+}
+
+fn affected_table_text(text: String) -> TableData {
+    TableData {
+        columns: vec![Column {
+            name: "result".into(),
+        }],
+        rows: vec![vec![
+            json!({"id": "sql:result", "kind": "string", "v": text}),
+        ]],
+        truncated: false,
+    }
+}
+
+fn pg_detail(error: &tokio_postgres::Error) -> String {
+    if let Some(database) = error.as_db_error() {
+        return format!(
+            "{} (SQLSTATE {})",
+            database.message(),
+            database.code().code()
+        );
+    }
+    let mut detail = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !text.is_empty() && !detail.contains(&text) {
+            detail = format!("{detail}: {text}");
+        }
+        source = cause.source();
+    }
+    detail
+}
+
+fn pg_error(context: &str, error: tokio_postgres::Error) -> String {
+    format!("{context}: {}", pg_detail(&error))
+}
+
+fn null_node(id: &str) -> Value {
+    json!({"id": id, "kind": "null"})
+}
+
+fn primitive_node(id: &str, value: Value) -> Value {
+    json!({"id": id, "kind": "primitive", "v": value})
+}
+
+fn integer_node(id: &str, value: i64) -> Value {
+    if value.unsigned_abs() > MAX_SAFE_INTEGER as u64 {
+        string_node(id.to_owned(), value.to_string(), Some("int8"), None)
+    } else {
+        primitive_node(id, json!(value))
+    }
+}
+
+fn bounded_text(id: &str, text: String, kind: Option<&str>) -> Value {
+    let total = text.chars().count();
+    if total > MAX_CELL_TEXT {
+        string_node(
+            id.to_owned(),
+            text.chars().take(MAX_CELL_TEXT).collect(),
+            kind,
+            Some(total),
+        )
+    } else {
+        string_node(id.to_owned(), text, kind, None)
+    }
+}
+
+fn pg_cell(
+    row: &tokio_postgres::Row,
+    column: usize,
+    kind: &tokio_postgres::types::Type,
+    row_index: usize,
+) -> Value {
+    let id = format!("sql:r{row_index}c{column}");
+    if let Ok(value) = row.try_get::<_, Option<bool>>(column) {
+        return value.map_or_else(|| null_node(&id), |value| primitive_node(&id, json!(value)));
+    }
+    if let Ok(value) = row.try_get::<_, Option<i16>>(column) {
+        return value.map_or_else(|| null_node(&id), |value| integer_node(&id, value as i64));
+    }
+    if let Ok(value) = row.try_get::<_, Option<i32>>(column) {
+        return value.map_or_else(|| null_node(&id), |value| integer_node(&id, value as i64));
+    }
+    if let Ok(value) = row.try_get::<_, Option<i64>>(column) {
+        return value.map_or_else(|| null_node(&id), |value| integer_node(&id, value));
+    }
+    if let Ok(value) = row.try_get::<_, Option<u32>>(column) {
+        return value.map_or_else(|| null_node(&id), |value| integer_node(&id, value as i64));
+    }
+    if let Ok(value) = row.try_get::<_, Option<f32>>(column) {
+        return match value {
+            None => null_node(&id),
+            Some(value) if !value.is_finite() => bounded_text(&id, value.to_string(), None),
+            Some(value) => primitive_node(
+                &id,
+                json!(value.to_string().parse::<f64>().unwrap_or(value as f64)),
+            ),
+        };
+    }
+    if let Ok(value) = row.try_get::<_, Option<f64>>(column) {
+        return match value {
+            None => null_node(&id),
+            Some(value) if value.is_nan() => bounded_text(&id, "NaN".into(), None),
+            Some(value) if value.is_infinite() => bounded_text(
+                &id,
+                if value.is_sign_negative() {
+                    "-Infinity".into()
+                } else {
+                    "Infinity".into()
+                },
+                None,
+            ),
+            Some(value) => primitive_node(&id, json!(value)),
+        };
+    }
+    if let Ok(value) = row.try_get::<_, Option<chrono::NaiveTime>>(column) {
+        return value.map_or_else(
+            || null_node(&id),
+            |value| bounded_text(&id, value.to_string(), Some("time")),
+        );
+    }
+    if let Ok(value) = row.try_get::<_, Option<uuid::Uuid>>(column) {
+        return value.map_or_else(
+            || null_node(&id),
+            |value| bounded_text(&id, value.to_string(), Some("uuid")),
+        );
+    }
+    if let Ok(value) = row.try_get::<_, Option<serde_json::Value>>(column) {
+        return value.map_or_else(
+            || null_node(&id),
+            |value| bounded_text(&id, value.to_string(), Some(kind.name())),
+        );
+    }
+    if let Ok(value) = row.try_get::<_, Option<Vec<u8>>>(column) {
+        return value.map_or_else(
+            || null_node(&id),
+            |value| bounded_text(&id, hex(&value), Some("bytea")),
+        );
+    }
+    if let Ok(value) = row.try_get::<_, Option<String>>(column) {
+        return value.map_or_else(
+            || null_node(&id),
+            |value| bounded_text(&id, value, Some(kind.name())),
+        );
+    }
+    bounded_text(&id, format!("<{}>", kind.name()), None)
+}
+
+fn pg_text_cell(
+    text: Option<&str>,
+    kind: Option<&tokio_postgres::types::Type>,
+    row: usize,
+    column: usize,
+) -> Value {
+    let id = format!("sql:r{row}c{column}");
+    let Some(text) = text else {
+        return null_node(&id);
+    };
+    // Simple-query rows are text, but a prepared single statement still supplies
+    // types. Preserve primitive cells even when another column needs text decoding.
+    match kind.map(|kind| kind.name()) {
+        Some("bool") => match text {
+            "t" => return primitive_node(&id, json!(true)),
+            "f" => return primitive_node(&id, json!(false)),
+            _ => {}
+        },
+        Some("int2" | "int4" | "int8") => {
+            if let Ok(value) = text.parse::<i64>() {
+                return integer_node(&id, value);
+            }
+        }
+        Some("oid") => {
+            if let Ok(value) = text.parse::<u32>() {
+                return integer_node(&id, value as i64);
+            }
+        }
+        Some("float4" | "float8") => {
+            if let Ok(value) = text.parse::<f64>() {
+                if value.is_finite() {
+                    return primitive_node(&id, json!(value));
+                }
+            }
+        }
+        _ => {}
+    }
+    bounded_text(&id, text.to_owned(), None)
+}
 
 fn is_interrupted(error: &rusqlite::Error) -> bool {
     matches!(
@@ -681,6 +1311,42 @@ mod tests {
     use crate::secrets::{SecretOrigin, Vault};
     use std::collections::BTreeMap;
 
+    #[test]
+    fn postgres_text_fallback_preserves_known_primitives_and_exact_text() {
+        use tokio_postgres::types::Type;
+        for (text, kind, expected) in [
+            ("t", Type::BOOL, json!(true)),
+            ("f", Type::BOOL, json!(false)),
+            ("-32768", Type::INT2, json!(-32768)),
+            ("2147483647", Type::INT4, json!(2147483647)),
+            ("1", Type::INT8, json!(1)),
+            ("4294967295", Type::OID, json!(4294967295_u64)),
+            ("1.1", Type::FLOAT4, json!(1.1)),
+            ("1.25", Type::FLOAT8, json!(1.25)),
+            ("NaN", Type::FLOAT8, json!("NaN")),
+            ("Infinity", Type::FLOAT8, json!("Infinity")),
+            ("-Infinity", Type::FLOAT8, json!("-Infinity")),
+            (
+                "-9223372036854775808",
+                Type::INT8,
+                json!("-9223372036854775808"),
+            ),
+            ("9007199254740993", Type::INT8, json!("9007199254740993")),
+            ("12.50", Type::NUMERIC, json!("12.50")),
+            ("infinity", Type::DATE, json!("infinity")),
+            ("-infinity", Type::TIMESTAMP, json!("-infinity")),
+            ("t", Type::TEXT, json!("t")),
+        ] {
+            assert_eq!(
+                pg_text_cell(Some(text), Some(&kind), 0, 0)["v"],
+                expected,
+                "{kind}: {text}"
+            );
+            assert_eq!(pg_text_cell(None, Some(&kind), 0, 0)["kind"], "null");
+        }
+        assert_eq!(pg_text_cell(Some("1"), None, 0, 0)["v"], "1");
+    }
+
     struct MemoryVault(Mutex<BTreeMap<String, String>>);
     impl Vault for MemoryVault {
         fn get(&self, name: &str) -> Result<Option<String>, String> {
@@ -721,6 +1387,8 @@ mod tests {
                 id: String::new(),
                 name: "sample".into(),
                 kind: DatabaseKind::Sqlite,
+                tls: TlsMode::Prefer,
+                trust_server_certificate: false,
                 path: Some(database.to_string_lossy().into_owned()),
                 host: None,
                 port: None,
@@ -752,6 +1420,8 @@ mod tests {
                 id: String::new(),
                 name: "sample".into(),
                 kind: DatabaseKind::Sqlite,
+                tls: TlsMode::Prefer,
+                trust_server_certificate: false,
                 path: Some("/tmp/sample.db".into()),
                 host: None,
                 port: None,
@@ -760,13 +1430,31 @@ mod tests {
                 secret: Some("connection:sample".into()),
             })
             .unwrap();
-        assert_eq!(store.list().len(), 1);
+        assert_eq!(store.by_name("sample").unwrap().secret, None);
+        store
+            .save(Connection {
+                id: String::new(),
+                name: "pg".into(),
+                kind: DatabaseKind::Postgres,
+                tls: TlsMode::Prefer,
+                trust_server_certificate: false,
+                path: None,
+                host: Some("db.example.com".into()),
+                port: None,
+                database: Some("sample".into()),
+                user: Some("reader".into()),
+                secret: Some("connection:pg".into()),
+            })
+            .unwrap();
+        assert_eq!(store.list().len(), 2);
         assert_eq!(store.by_name("sample").unwrap().id, saved.id);
         assert!(store
             .save(Connection {
                 id: String::new(),
                 name: "sample".into(),
                 kind: DatabaseKind::Sqlite,
+                tls: TlsMode::Prefer,
+                trust_server_certificate: false,
                 path: Some("/tmp/other.db".into()),
                 host: None,
                 port: None,
@@ -776,11 +1464,12 @@ mod tests {
             })
             .is_err());
         let text = fs::read_to_string(directory.path().join(CONNECTIONS_FILE)).unwrap();
-        assert!(text.contains("connection:sample"));
+        assert!(text.contains("connection:pg"));
+        assert!(!text.contains("connection:sample"));
         let reloaded = ConnectionStore::new(directory.path());
-        assert_eq!(reloaded.list().len(), 1);
+        assert_eq!(reloaded.list().len(), 2);
         reloaded.delete(&saved.id).unwrap();
-        assert!(reloaded.list().is_empty());
+        assert_eq!(reloaded.list().len(), 1);
     }
 
     #[tokio::test]
@@ -977,6 +1666,8 @@ mod tests {
                 id: String::new(),
                 name: "missing".into(),
                 kind: DatabaseKind::Sqlite,
+                tls: TlsMode::Prefer,
+                trust_server_certificate: false,
                 path: Some("/definitely/not/here.db".into()),
                 host: None,
                 port: None,
@@ -1006,6 +1697,157 @@ mod tests {
             .await
             .unwrap();
         assert!(result.ok);
+    }
+
+    #[test]
+    fn postgres_connections_require_server_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConnectionStore::new(directory.path());
+        let connection = Connection {
+            id: String::new(),
+            name: "pg".into(),
+            kind: DatabaseKind::Postgres,
+            tls: TlsMode::Prefer,
+            trust_server_certificate: false,
+            path: None,
+            host: None,
+            port: None,
+            database: Some("northwind".into()),
+            user: Some("reader".into()),
+            secret: None,
+        };
+        assert!(store.save(connection).unwrap_err().contains("host"));
+        let saved = store
+            .save(Connection {
+                id: String::new(),
+                name: "pg".into(),
+                kind: DatabaseKind::Postgres,
+                tls: TlsMode::Prefer,
+                trust_server_certificate: false,
+                path: None,
+                host: Some("db.example.com".into()),
+                port: Some(5433),
+                database: Some("northwind".into()),
+                user: Some("reader".into()),
+                secret: Some("connection:pg".into()),
+            })
+            .unwrap();
+        assert_eq!(saved.port, Some(5433));
+        let text = fs::read_to_string(directory.path().join(CONNECTIONS_FILE)).unwrap();
+        assert!(text.contains("connection:pg"));
+        assert!(!text.contains("password"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODINGPAD_TEST_POSTGRES_HOST/PORT/DATABASE/USER/PASSWORD"]
+    async fn postgres_integration_round_trip_and_cancel() {
+        use std::time::Duration;
+
+        let (Ok(host), Ok(port), Ok(database), Ok(user), Ok(password)) = (
+            std::env::var("CODINGPAD_TEST_POSTGRES_HOST"),
+            std::env::var("CODINGPAD_TEST_POSTGRES_PORT"),
+            std::env::var("CODINGPAD_TEST_POSTGRES_DATABASE"),
+            std::env::var("CODINGPAD_TEST_POSTGRES_USER"),
+            std::env::var("CODINGPAD_TEST_POSTGRES_PASSWORD"),
+        ) else {
+            eprintln!("Set the CODINGPAD_TEST_POSTGRES_* variables to run this test.");
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(SecretStore::with_vault(
+            directory.path(),
+            Arc::new(MemoryVault(Mutex::new(BTreeMap::new()))),
+        ));
+        secrets.set_session("connection:pg", &password).unwrap();
+        let connections = Arc::new(ConnectionStore::new(directory.path()));
+        connections
+            .save(Connection {
+                id: String::new(),
+                name: "pg".into(),
+                kind: DatabaseKind::Postgres,
+                tls: TlsMode::Prefer,
+                trust_server_certificate: false,
+                path: None,
+                host: Some(host),
+                port: Some(port.parse().unwrap()),
+                database: Some(database),
+                user: Some(user),
+                secret: Some("connection:pg".into()),
+            })
+            .unwrap();
+        let manager = Arc::new(SqlManager::new(connections, secrets));
+        let header = "-- codingpad: connection=pg\n";
+        let table = format!("codingpad_m3_2_{}", std::process::id());
+
+        manager
+            .run(
+                "pg",
+                &format!("{header}DROP TABLE IF EXISTS {table}; CREATE TABLE {table} (n integer)"),
+                None,
+            )
+            .await
+            .unwrap();
+        let typed = manager
+            .run(
+                "pg",
+                &format!(
+                    "{header}SELECT 1::int8 AS n, 12.50::numeric AS amount, now()::date AS day, \
+                     gen_random_uuid() AS id, '{{\"a\":1}}'::jsonb AS data, NULL::numeric AS missing, \
+                     1.1::float4 AS f, 'NaN'::float8 AS nan, true AS b, \
+                     '-9223372036854775808'::int8 AS min, 9007199254740993::int8 AS big, \
+                     '123456789012345678901234567890.123456789'::numeric AS precise, \
+                     'infinity'::date AS forever, '-infinity'::timestamp AS past"
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let cells = &typed.tables[0]["rows"][0];
+        assert_eq!(cells[0]["v"], 1);
+        assert_eq!(cells[1]["v"], "12.50");
+        assert!(cells[2]["v"].as_str().unwrap().len() >= 10);
+        assert!(cells[3]["v"].as_str().unwrap().contains('-'));
+        assert!(cells[4]["v"].as_str().unwrap().contains("\"a\""));
+        assert_eq!(cells[5]["kind"], "null");
+        assert_eq!(cells[6]["v"], 1.1);
+        assert_eq!(cells[7]["v"], "NaN");
+        assert_eq!(cells[8]["v"], true);
+        assert_eq!(cells[9]["v"], "-9223372036854775808");
+        assert_eq!(cells[10]["v"], "9007199254740993");
+        assert_eq!(cells[11]["v"], "123456789012345678901234567890.123456789");
+        assert_eq!(cells[12]["v"], "infinity");
+        assert_eq!(cells[13]["v"], "-infinity");
+
+        let stop = {
+            let manager = manager.clone();
+            let source = format!("{header}INSERT INTO {table} SELECT 1 FROM pg_sleep(5)");
+            tokio::spawn(async move { manager.run("pg-stop", &source, None).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        manager.stop("pg-stop");
+        let stopped = tokio::time::timeout(Duration::from_secs(5), stop)
+            .await
+            .expect("PostgreSQL must confirm cancellation")
+            .unwrap()
+            .unwrap();
+        assert!(stopped.stopped);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let check = manager
+            .run(
+                "pg-check",
+                &format!("{header}SELECT count(*) AS n FROM {table}"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            check.tables[0]["rows"][0][0]["v"], 0,
+            "a stopped INSERT must not commit"
+        );
+        manager
+            .run("pg", &format!("{header}DROP TABLE {table}"), None)
+            .await
+            .unwrap();
     }
 
     #[test]

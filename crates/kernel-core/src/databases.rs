@@ -3,6 +3,8 @@
 //! SQL scripts run through their connection without starting a kernel. Passwords
 //! are referenced by secret name and read from the vault at connection time, so
 //! connection settings never contain them.
+pub mod schema;
+
 use crate::{
     secrets::SecretStore,
     store::{parse_header, ScriptHeader},
@@ -2338,7 +2340,35 @@ mod tests {
         manager
             .run(
                 "pg",
-                &format!("{header}DROP TABLE IF EXISTS {table}; CREATE TABLE {table} (n integer)"),
+                &format!("{header}DROP TABLE IF EXISTS {table}; CREATE TABLE {table} (n integer PRIMARY KEY)"),
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .run(
+                "pg-schema",
+                &format!(
+                    "{header}CREATE TABLE {table}_child (parent integer REFERENCES {table}(n))"
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let schema = manager.schema("pg").await.unwrap();
+        let child = schema
+            .tables
+            .iter()
+            .find(|item| item.name == format!("{table}_child"))
+            .unwrap();
+        assert_eq!(child.columns[0].name, "parent");
+        assert_eq!(child.columns[0].references[0].table, table);
+        assert_eq!(child.columns[0].references[0].column, "n");
+        assert!(!child.columns[0].data_type.is_empty());
+        manager
+            .run(
+                "pg-schema",
+                &format!("{header}DROP TABLE {table}_child"),
                 None,
             )
             .await
@@ -2492,8 +2522,34 @@ mod tests {
                 "mssql",
                 &format!(
                     "{header}IF OBJECT_ID('{table}', 'U') IS NOT NULL DROP TABLE {table}; \
-                     CREATE TABLE {table} (n int)"
+                     CREATE TABLE {table} (n int PRIMARY KEY)"
                 ),
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .run(
+                "mssql-schema",
+                &format!("{header}CREATE TABLE {table}_child (parent int REFERENCES {table}(n))"),
+                None,
+            )
+            .await
+            .unwrap();
+        let schema = manager.schema("mssql").await.unwrap();
+        let child = schema
+            .tables
+            .iter()
+            .find(|item| item.name == format!("{table}_child"))
+            .unwrap();
+        assert_eq!(child.columns[0].name, "parent");
+        assert_eq!(child.columns[0].references[0].table, table);
+        assert_eq!(child.columns[0].references[0].column, "n");
+        assert!(!child.columns[0].data_type.is_empty());
+        manager
+            .run(
+                "mssql-schema",
+                &format!("{header}DROP TABLE {table}_child"),
                 None,
             )
             .await

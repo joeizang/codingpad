@@ -682,3 +682,13 @@ footer {
 .checkbox-row input {
   width: auto;
 }
+
+.schema-panel { width: 280px; min-width: 200px; max-width: 35vw; overflow: auto; border-right: 1px solid #3a3a3a; padding: 8px; font-size: 12px; }
+.schema-panel .pane-heading { padding: 0 0 8px; gap: 8px; flex-wrap: wrap; }
+.schema-panel p { overflow-wrap: anywhere; }
+.schema-panel input { width: 100%; box-sizing: border-box; }
+.schema-table > button { width: 100%; text-align: left; overflow-wrap: anywhere; }
+.schema-table ul { padding-left: 18px; list-style: none; }
+.schema-table li { margin: 6px 0; overflow-wrap: anywhere; }
+.schema-table code { color: #a9b9ca; }
+@media (max-width: 800px) { .schema-panel { width: 200px; min-width: 140px; } }

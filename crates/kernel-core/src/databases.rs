@@ -2355,7 +2355,18 @@ mod tests {
             )
             .await
             .unwrap();
+        // Keep a different backend's temporary namespace alive during discovery.
+        let (temp_client, _) = manager
+            .connect_postgres(&manager.connections.by_name("pg").unwrap())
+            .await
+            .unwrap();
+        temp_client
+            .batch_execute("CREATE TEMP TABLE hidden_temp(id integer)")
+            .await
+            .unwrap();
         let schema = manager.schema("pg").await.unwrap();
+        assert!(!schema.tables.iter().any(|item| item.name == "hidden_temp"));
+        drop(temp_client);
         let child = schema
             .tables
             .iter()

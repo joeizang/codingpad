@@ -19,6 +19,11 @@ public static class ScriptHelpers
         new Dictionary<string, string>();
     private static IReadOnlyDictionary<string, string> SecretErrors =
         new Dictionary<string, string>();
+    private static readonly AsyncLocal<DatabaseClient?> Database = new();
+    /// <summary>The database attached to this run.</summary>
+    public static DatabaseClient db => Database.Value ?? new DatabaseClient(null);
+    internal static void SetDatabase(System.Text.Json.JsonElement? config) => Database.Value = new DatabaseClient(config);
+    internal static void ClearDatabase() { Database.Value?.Dispose(); Database.Value = null; }
     private static long generation;
     private static bool hosted;
 

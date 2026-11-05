@@ -3,6 +3,7 @@
 import json
 import os
 import queue
+import shutil
 import threading
 from pathlib import Path
 import subprocess
@@ -26,6 +27,20 @@ class RuntimeTests(unittest.TestCase):
             ["dotnet", "publish", str(ROOT / "kernels/csharp"), "-c", "Release", "-o", str(cls.kernel), "-p:RestoreLockedMode=true"],
         ]:
             subprocess.run(command, check=True, capture_output=True, text=True, timeout=120)
+
+        # Seed the isolated feed with the package's restored transitive
+        # dependencies, so standalone tests do not depend on network access.
+        assets = json.loads((ROOT / "runtimes/dotnet/CodingPad/obj/project.assets.json").read_text())
+        folders = [Path(folder) for folder in assets["packageFolders"]]
+        for name, metadata in assets["libraries"].items():
+            if metadata.get("type") != "package":
+                continue
+            package, version = name.lower().split("/", 1)
+            candidates = [folder / package / version / f"{package}.{version}.nupkg" for folder in folders]
+            archive = next((path for path in candidates if path.is_file()), None)
+            if archive is None:
+                raise RuntimeError(f"Restored package archive not found: {name}")
+            shutil.copy2(archive, cls.feed / archive.name)
 
         (cls.work / "NuGet.Config").write_text(
             '<configuration><packageSources><clear />'
@@ -68,9 +83,36 @@ class RuntimeTests(unittest.TestCase):
             process.stdout.close()
             process.stderr.close()
 
+    def test_attached_sqlite_database_returns_a_table(self):
+        import sqlite3
+        path = self.work / "db-client.sqlite"
+        db = sqlite3.connect(path)
+        try:
+            db.executescript("create table item(name text); insert into item values ('Ada');")
+            db.commit()
+        finally:
+            db.close()
+        settings = {"kind": "sqlite", "path": str(path)}
+        run = lambda ident, source, connection=None: json.dumps({"jsonrpc": "2.0", "id": ident, "method": "run", "params": {"source": source, "connection": connection}})
+        events = self.exchange([
+            run(1, 'db.Query("select name from item").Dump();', {"settings": settings}),
+            run(2, 'db.Query("select name from item where 0").Dump();', {"settings": settings}),
+            run(3, 'db.Query("select 1").Dump();'),
+            run(4, 'db.Query("with recursive t(n) as (select 1 union all select n+1 from t where n<10001) select n from t").Dump();', {"settings": settings}),
+        ], 4)
+        tables = [event["params"]["node"] for event in events if event.get("method") == "dump" and event["params"]["node"]["kind"] == "table"]
+        self.assertEqual(tables[0]["columns"][0]["name"], "name")
+        self.assertEqual(tables[0]["rows"][0][0]["v"], "Ada")
+        self.assertEqual(tables[1]["columns"][0]["name"], "name")
+        self.assertEqual(tables[1]["rows"], [])
+        self.assertEqual(tables[2]["total"], 10000)
+        self.assertTrue(tables[2]["truncated"])
+        self.assertTrue(any("No connection is attached" in str(event) for event in events))
+
     def test_file_script_imports_helpers_from_package(self):
         script = self.work / "script.cs"
-        script.write_text('''#:package CodingPad@0.1.0
+        script.write_text('''// codingpad: connection=sample
+#:package CodingPad@0.1.0
 var result = Cache("value", () => 42);
 if (Cache("value", () => -1) != 42) throw new Exception("Cache missed");
 result.Dump();
@@ -79,6 +121,8 @@ if (await Cache("async", async () => { await Task.Delay(1); return 7; }) != 7)
     throw new Exception("Async cache missed");
 if (await Cache("async", () => Task.FromResult(-1)) != 7)
     throw new Exception("Async cache recomputed");
+try { db.Query("select 1"); throw new Exception("db should fail"); }
+catch (InvalidOperationException error) when (error.Message.Contains("No connection is attached")) { }
 try { Secret("test"); throw new Exception("Secret should fail"); }
 catch (KeyNotFoundException error) when (error.Message.Contains("Secrets")) { }
 Console.WriteLine(result);

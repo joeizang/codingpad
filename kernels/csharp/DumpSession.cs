@@ -137,6 +137,7 @@ internal sealed class DumpSession(long runId) : IDisposable
             }
             finally { path.Remove(live); }
         }
+        if (value is DatabaseRows databaseRows) return DatabaseTable(databaseRows, 0, PageSize, depth, budget, path, id);
         if (value is PropertyValue) return Lazy(value, budget.View, id);
         if (!path.Add(value)) return new { id, kind = "string", v = "<cycle>", type = value.GetType().ToString() };
         try
@@ -260,6 +261,20 @@ internal sealed class DumpSession(long runId) : IDisposable
         };
     }
 
+    private object DatabaseTable(DatabaseRows value, int offset, int limit, int depth, Budget budget, HashSet<object> path, string? nodeId = null)
+    {
+        var rows = value.Rows.Skip(offset).Take(limit)
+            .Select(row => row.Select(cell => Node(cell, depth + 1, budget, path, cell: true)).ToArray()).ToArray();
+        var end = offset + rows.Length;
+        return new {
+            id = nodeId ?? Id(), kind = "table", type = nameof(DatabaseRows),
+            columns = value.Columns.Select(name => new { name }).ToArray(), rows,
+            total = value.Rows.Count, totalKnown = true, truncated = value.Truncated,
+            next = end < value.Rows.Count ? end.ToString(CultureInfo.InvariantCulture) : null,
+            handle = Handle(value, budget.View)
+        };
+    }
+
     private static bool IsScalar(object value) => value is string or char or bool or byte or sbyte or short or ushort or int or uint or long or ulong or decimal or double or float or Enum or DateTime or DateTimeOffset or TimeSpan or Guid;
 
     public bool Contains(string handle) => handles.ContainsKey(handle);
@@ -272,6 +287,7 @@ internal sealed class DumpSession(long runId) : IDisposable
         if (offset < 0) throw new ArgumentException("Cursor must be a nonnegative offset.");
         limit = Math.Clamp(limit, 1, PageSize);
         if (value is PropertyValue property) return Node(property.Read(), 0, budget, path);
+        if (value is DatabaseRows rows) return DatabaseTable(rows, offset, limit, 0, budget, path);
         if (value is IEnumerable enumerable && value is not string)
             return Table(enumerable, offset, limit, 0, budget, new HashSet<object>(ReferenceEqualityComparer.Instance) { value });
         if (cursor is null) return Node(value, 0, budget, path);

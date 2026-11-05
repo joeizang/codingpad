@@ -363,6 +363,18 @@ marked in the results panel. Duplicate column names get unique suffixes such as
 and SQL Server use `?`, PostgreSQL uses `%s`). CodingPad installs the server
 driver through uv on first use. The connection is closed at the end of each run.
 
+C# scripts use the same attached connection with `db.Query` and `db.Execute`:
+
+```csharp
+// codingpad: connection=sample
+#:package CodingPad@0.1.0
+db.Query("SELECT * FROM customers").Dump();
+```
+
+C# parameters can be supplied as a dictionary keyed by the database parameter
+name. Queries return at most 10,000 rows and show when results are truncated. The `CodingPad` package supplies the same API for `dotnet run`; without
+an attached CodingPad connection, calling `db` reports how to attach one.
+
 Click **Connections…** to add a SQLite, PostgreSQL or SQL Server database, then
 **+ SQL** or open a `.sql` file. The first line names the connection; the rest is plain SQL:
 

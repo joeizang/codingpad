@@ -335,9 +335,10 @@ database and user; its password is written only to the OS password vault and is
 referenced by name, never stored in connection settings or scripts. TLS defaults
 to **Prefer**; choose **Require** for remote hosts. Prefer does not protect against
 an attacker who strips TLS, so it is not a security guarantee. Enable **Trust the
-server certificate** for a self-signed or private-CA server. A PostgreSQL result
-set containing a type we cannot decode is shown as text (booleans appear as
-`t`/`f`, and all batches use text). Connection passwords stay in the Rust host and
+server certificate** for a self-signed or private-CA server. PostgreSQL decimals,
+dates and timestamps use their exact server text; other columns in the same result keep their integer, boolean or float values.
+Multi-statement PostgreSQL batches use text for every column (including `t`/`f`
+for booleans). Connection passwords stay in the Rust host and
 are never passed to script kernels.
 
 ## Secrets

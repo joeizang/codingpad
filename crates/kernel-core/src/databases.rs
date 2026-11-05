@@ -497,12 +497,16 @@ impl SqlManager {
             .map_err(|error| format!("Could not prepare TLS for PostgreSQL: {error}"))?;
         let tls = postgres_native_tls::MakeTlsConnector::new(connector);
         let (client, connection) = config.connect(tls.clone()).await.map_err(|error| {
+            let mut detail = pg_detail(&error);
+            if !connection.trust_server_certificate && detail.to_ascii_lowercase().contains("tls handshake") {
+                detail.push_str(". For a self-signed development server, enable \"Trust the server certificate\" in Connections.");
+            }
             format!(
                 "Could not connect to PostgreSQL at {}:{}/{}: {}",
                 postgres_host(connection),
                 postgres_port(connection),
                 connection.database.as_deref().unwrap_or(""),
-                pg_detail(&error)
+                detail
             )
         })?;
         tokio::spawn(async move {
@@ -830,7 +834,7 @@ async fn postgres_tables(
             } else {
                 // A type we cannot decode still has a text form; use the simple
                 // protocol so values and NULLs are shown instead of placeholders.
-                postgres_simple_tables(client, source).await
+                postgres_simple_tables(client, source, statement.columns()).await
             }
         }
         Ok(statement) => {
@@ -843,7 +847,7 @@ async fn postgres_tables(
         Err(_) => {
             // Multiple statements cannot be prepared together. Run them with
             // simple query so setup scripts still work.
-            postgres_simple_tables(client, source).await
+            postgres_simple_tables(client, source, &[]).await
         }
     }
 }
@@ -923,6 +927,7 @@ fn supported_pg_type(kind: &tokio_postgres::types::Type) -> bool {
 async fn postgres_simple_tables(
     client: &tokio_postgres::Client,
     source: &str,
+    column_types: &[tokio_postgres::Column],
 ) -> Result<Vec<TableData>, String> {
     use futures_util::TryStreamExt;
 
@@ -967,7 +972,12 @@ async fn postgres_simple_tables(
                     }
                     let mut cells = Vec::with_capacity(row.columns().len());
                     for (index, _) in row.columns().iter().enumerate() {
-                        cells.push(pg_text_cell(row.get(index), rows.len(), index));
+                        cells.push(pg_text_cell(
+                            row.get(index),
+                            column_types.get(index).map(|column| column.type_()),
+                            rows.len(),
+                            index,
+                        ));
                     }
                     rows.push(cells);
                 }
@@ -1125,34 +1135,10 @@ fn pg_cell(
             Some(value) => primitive_node(&id, json!(value)),
         };
     }
-    if let Ok(value) = row.try_get::<_, Option<rust_decimal::Decimal>>(column) {
-        return value.map_or_else(
-            || null_node(&id),
-            |value| bounded_text(&id, value.to_string(), Some("numeric")),
-        );
-    }
-    if let Ok(value) = row.try_get::<_, Option<chrono::NaiveDate>>(column) {
-        return value.map_or_else(
-            || null_node(&id),
-            |value| bounded_text(&id, value.to_string(), Some("date")),
-        );
-    }
     if let Ok(value) = row.try_get::<_, Option<chrono::NaiveTime>>(column) {
         return value.map_or_else(
             || null_node(&id),
             |value| bounded_text(&id, value.to_string(), Some("time")),
-        );
-    }
-    if let Ok(value) = row.try_get::<_, Option<chrono::NaiveDateTime>>(column) {
-        return value.map_or_else(
-            || null_node(&id),
-            |value| bounded_text(&id, value.to_string(), Some("timestamp")),
-        );
-    }
-    if let Ok(value) = row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(column) {
-        return value.map_or_else(
-            || null_node(&id),
-            |value| bounded_text(&id, value.to_string(), Some("timestamptz")),
         );
     }
     if let Ok(value) = row.try_get::<_, Option<uuid::Uuid>>(column) {
@@ -1182,12 +1168,44 @@ fn pg_cell(
     bounded_text(&id, format!("<{}>", kind.name()), None)
 }
 
-fn pg_text_cell(text: Option<&str>, row: usize, column: usize) -> Value {
+fn pg_text_cell(
+    text: Option<&str>,
+    kind: Option<&tokio_postgres::types::Type>,
+    row: usize,
+    column: usize,
+) -> Value {
     let id = format!("sql:r{row}c{column}");
-    match text {
-        Some(text) => bounded_text(&id, text.to_owned(), None),
-        None => null_node(&id),
+    let Some(text) = text else {
+        return null_node(&id);
+    };
+    // Simple-query rows are text, but a prepared single statement still supplies
+    // types. Preserve primitive cells even when another column needs text decoding.
+    match kind.map(|kind| kind.name()) {
+        Some("bool") => match text {
+            "t" => return primitive_node(&id, json!(true)),
+            "f" => return primitive_node(&id, json!(false)),
+            _ => {}
+        },
+        Some("int2" | "int4" | "int8") => {
+            if let Ok(value) = text.parse::<i64>() {
+                return integer_node(&id, value);
+            }
+        }
+        Some("oid") => {
+            if let Ok(value) = text.parse::<u32>() {
+                return integer_node(&id, value as i64);
+            }
+        }
+        Some("float4" | "float8") => {
+            if let Ok(value) = text.parse::<f64>() {
+                if value.is_finite() {
+                    return primitive_node(&id, json!(value));
+                }
+            }
+        }
+        _ => {}
     }
+    bounded_text(&id, text.to_owned(), None)
 }
 
 fn is_interrupted(error: &rusqlite::Error) -> bool {
@@ -1292,6 +1310,42 @@ mod tests {
     use super::*;
     use crate::secrets::{SecretOrigin, Vault};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn postgres_text_fallback_preserves_known_primitives_and_exact_text() {
+        use tokio_postgres::types::Type;
+        for (text, kind, expected) in [
+            ("t", Type::BOOL, json!(true)),
+            ("f", Type::BOOL, json!(false)),
+            ("-32768", Type::INT2, json!(-32768)),
+            ("2147483647", Type::INT4, json!(2147483647)),
+            ("1", Type::INT8, json!(1)),
+            ("4294967295", Type::OID, json!(4294967295_u64)),
+            ("1.1", Type::FLOAT4, json!(1.1)),
+            ("1.25", Type::FLOAT8, json!(1.25)),
+            ("NaN", Type::FLOAT8, json!("NaN")),
+            ("Infinity", Type::FLOAT8, json!("Infinity")),
+            ("-Infinity", Type::FLOAT8, json!("-Infinity")),
+            (
+                "-9223372036854775808",
+                Type::INT8,
+                json!("-9223372036854775808"),
+            ),
+            ("9007199254740993", Type::INT8, json!("9007199254740993")),
+            ("12.50", Type::NUMERIC, json!("12.50")),
+            ("infinity", Type::DATE, json!("infinity")),
+            ("-infinity", Type::TIMESTAMP, json!("-infinity")),
+            ("t", Type::TEXT, json!("t")),
+        ] {
+            assert_eq!(
+                pg_text_cell(Some(text), Some(&kind), 0, 0)["v"],
+                expected,
+                "{kind}: {text}"
+            );
+            assert_eq!(pg_text_cell(None, Some(&kind), 0, 0)["kind"], "null");
+        }
+        assert_eq!(pg_text_cell(Some("1"), None, 0, 0)["v"], "1");
+    }
 
     struct MemoryVault(Mutex<BTreeMap<String, String>>);
     impl Vault for MemoryVault {
@@ -1739,7 +1793,10 @@ mod tests {
                 &format!(
                     "{header}SELECT 1::int8 AS n, 12.50::numeric AS amount, now()::date AS day, \
                      gen_random_uuid() AS id, '{{\"a\":1}}'::jsonb AS data, NULL::numeric AS missing, \
-                     1.1::float4 AS f, 'NaN'::float8 AS nan"
+                     1.1::float4 AS f, 'NaN'::float8 AS nan, true AS b, \
+                     '-9223372036854775808'::int8 AS min, 9007199254740993::int8 AS big, \
+                     '123456789012345678901234567890.123456789'::numeric AS precise, \
+                     'infinity'::date AS forever, '-infinity'::timestamp AS past"
                 ),
                 None,
             )
@@ -1754,6 +1811,12 @@ mod tests {
         assert_eq!(cells[5]["kind"], "null");
         assert_eq!(cells[6]["v"], 1.1);
         assert_eq!(cells[7]["v"], "NaN");
+        assert_eq!(cells[8]["v"], true);
+        assert_eq!(cells[9]["v"], "-9223372036854775808");
+        assert_eq!(cells[10]["v"], "9007199254740993");
+        assert_eq!(cells[11]["v"], "123456789012345678901234567890.123456789");
+        assert_eq!(cells[12]["v"], "infinity");
+        assert_eq!(cells[13]["v"], "-infinity");
 
         let stop = {
             let manager = manager.clone();

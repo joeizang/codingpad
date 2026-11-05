@@ -1058,8 +1058,9 @@ async fn sqlserver_tables(
             }
             let (_, rows, truncated) = current.as_mut().unwrap();
             if rows.len() >= MAX_ROWS {
+                // Keep draining so later result sets and writes still happen.
                 *truncated = true;
-                break;
+                continue;
             }
             let mut cells = Vec::with_capacity(row.columns().len());
             for (index, (column, value)) in row.cells().enumerate() {
@@ -1114,15 +1115,15 @@ fn sqlserver_cell(
         | ColumnType::Datetimen
         | ColumnType::Datetime4 => {
             if let Ok(value) = row.try_get::<chrono::NaiveDateTime, _>(index) {
+                let format = match column.column_type() {
+                    ColumnType::Datetime | ColumnType::Datetimen | ColumnType::Datetime4 => {
+                        "%Y-%m-%dT%H:%M:%S%.3f"
+                    }
+                    _ => "%Y-%m-%dT%H:%M:%S%.f",
+                };
                 return value.map_or_else(
                     || null_node(&id),
-                    |value| {
-                        bounded_text(
-                            &id,
-                            value.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
-                            Some("datetime"),
-                        )
-                    },
+                    |value| bounded_text(&id, value.format(format).to_string(), Some("datetime")),
                 );
             }
         }
@@ -2297,7 +2298,7 @@ mod tests {
                     "{header}SELECT CAST(1 AS bigint) AS n, CAST(12.5 AS decimal(10,2)) AS amount, \
                      CAST('2020-01-02' AS date) AS day, NEWID() AS id, N'hello' AS name, \
                      CAST(0x0102 AS varbinary(2)) AS bin, CAST(1 AS bit) AS flag, \
-                     CAST(12.50 AS money) AS money, '<a>1</a>' AS xml, \
+                     CAST(12.50 AS money) AS money, CAST('<a>1</a>' AS xml) AS xml, \
                      CAST('2020-01-02T03:04:05+02:00' AS datetimeoffset) AS offset, \
                      CAST(9007199254740993 AS bigint) AS big"
                 ),

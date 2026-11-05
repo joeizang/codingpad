@@ -341,7 +341,8 @@ shown as text (booleans appear as `t`/`f`, and all batches use text). Connection
 passwords stay in the Rust host and are never passed to script kernels. SQL Server
 connections can opt in to trusting a self-signed development certificate, and SQL
 Server scripts do not accept the `GO` client-side batch separator; run each batch
-separately.
+separately. SQL Server statements without a result set show `Statement completed.`
+rather than a rows-affected count.
 
 ## Secrets
 

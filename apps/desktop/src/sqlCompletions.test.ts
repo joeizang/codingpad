@@ -119,6 +119,19 @@ describe("SQL schema completions", () => {
       columns("SELECT | FROM public.users /* ; FROM public.orders */"),
     ).toEqual(["user_id", "email"]);
   });
+  it("allows completions immediately after closed comments and strings", () => {
+    for (const token of ["/* c */", "/* outer /* inner */ c */", "'abc'", "'a''b'", "E'a\\'b'", "$$abc$$", "$tag$abc$tag$"]) {
+      expect(complete(`SELECT ${token}| FROM public.users`).suggestions.map((s) => s.label), token).toContain("email");
+      expect(complete(`SELECT ${token}|`).suggestions.map((s) => s.label), token).toContain("SELECT");
+    }
+    expect(columns("SELECT -- c\n| FROM public.users")).toContain("email");
+  });
+  it("keeps line comments and unfinished comments or strings opaque at EOF", () => {
+    for (const token of ["-- c", "/* c", "/* outer /* inner */", "'abc", "'a''", "E'abc\\", "$$abc", "$tag$abc"]) {
+      expect(complete(`SELECT ${token}|`).suggestions, token).toEqual([]);
+    }
+    expect(complete("SELECT -- c|\n FROM public.users").suggestions).toEqual([]);
+  });
   it("does not invent columns for CTE or derived-table projections", () => {
     expect(
       columns(

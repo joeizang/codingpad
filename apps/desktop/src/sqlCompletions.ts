@@ -11,6 +11,7 @@ export type SqlSuggestion = {
   kind: "table" | "column" | "keyword";
   detail?: string;
 };
+type OpaqueRange = { start: number; end: number; endInclusive: boolean };
 type Token = {
   value: string;
   start: number;
@@ -26,12 +27,12 @@ function tokenize(source: string): {
   tokens: Token[];
   scopes: number[];
   ranges: [number, number][];
-  opaque: [number, number][];
+  opaque: OpaqueRange[];
 } {
   const tokens: Token[] = [],
     scopes = [-1],
     stack = [0],
-    opaque: [number, number][] = [];
+    opaque: OpaqueRange[] = [];
   const ranges: [number, number][] = [[0, source.length]];
   let i = 0;
   while (i < source.length) {
@@ -55,7 +56,7 @@ function tokenize(source: string): {
           if (--depth === 0) break;
         } else i++;
       }
-      opaque.push([start, i]);
+      opaque.push({ start, end: i, endInclusive: line || depth > 0 });
       continue;
     }
     const dollar =
@@ -63,24 +64,29 @@ function tokenize(source: string): {
         ? source.slice(i).match(/^\$(?:[A-Za-z_][\w]*)?\$/)?.[0]
         : undefined;
     if (char === "'" || dollar) {
+      let closed = false;
       if (dollar) {
         const end = source.indexOf(dollar, i + dollar.length);
+        closed = end >= 0;
         i = end < 0 ? source.length : end + dollar.length;
       } else {
         const escaped = start > 0 && /[eE]/.test(source[start - 1]);
         i++;
         while (i < source.length) {
           if (escaped && source[i] === "\\") {
-            i += 2;
+            i = Math.min(i + 2, source.length);
             continue;
           }
           if (source[i++] === "'") {
-            if (source[i] !== "'") break;
+            if (source[i] !== "'") {
+              closed = true;
+              break;
+            }
             i++;
           }
         }
       }
-      opaque.push([start, i]);
+      opaque.push({ start, end: i, endInclusive: !closed });
       continue;
     }
     let value = "",
@@ -167,7 +173,9 @@ export function createSqlCompletions(schema: ConnectionSchema | undefined) {
     end: number;
   } => {
     const lexed = tokenize(source);
-    if (lexed.opaque.some(([start, end]) => offset > start && offset <= end))
+    if (lexed.opaque.some(({ start, end, endInclusive }) =>
+      offset > start && (offset < end || (endInclusive && offset === end)),
+    ))
       return { suggestions: [], incomplete: false, start: offset, end: offset };
     // Semicolons inside comments and literals were removed by the scanner.
     const begin = lastIndex(

@@ -334,11 +334,16 @@ export default function CodeEditor({
             triggerCharacters: ["."],
             provideCompletionItems: (model, position) => {
               if (model !== editor.getModel()) return { suggestions: [] };
-              const result = completeSqlRef.current(model.getValue(), model.getOffsetAt(position));
+              const source = model.getValue(), offset = model.getOffsetAt(position);
+              const result = completeSqlRef.current(source, offset);
+              // Monaco filters from the replacement range, including a typed quote.
+              const first = source[result.start];
+              const opener = result.start < offset && (first === '"' || first === "[" || first === "`") ? first : "";
               const start = model.getPositionAt(result.start), end = model.getPositionAt(result.end);
               const range = new monaco.Range(start.lineNumber, start.column, end.lineNumber, end.column);
               return {
                 suggestions: result.suggestions.map((item) => ({ ...item, range,
+                  filterText: opener + item.label,
                   kind: item.kind === "table" ? monaco.languages.CompletionItemKind.Struct
                     : item.kind === "column" ? monaco.languages.CompletionItemKind.Field
                     : monaco.languages.CompletionItemKind.Keyword,

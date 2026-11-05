@@ -338,6 +338,7 @@ C# scripts use the same attached connection with `db.Query` and `db.Execute`:
 
 ```csharp
 // codingpad: connection=sample
+#:package CodingPad@0.1.0
 db.Query("SELECT * FROM customers").Dump();
 ```
 

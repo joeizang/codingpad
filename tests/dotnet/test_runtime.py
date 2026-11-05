@@ -108,7 +108,8 @@ class RuntimeTests(unittest.TestCase):
 
     def test_file_script_imports_helpers_from_package(self):
         script = self.work / "script.cs"
-        script.write_text('''#:package CodingPad@0.1.0
+        script.write_text('''// codingpad: connection=sample
+#:package CodingPad@0.1.0
 var result = Cache("value", () => 42);
 if (Cache("value", () => -1) != 42) throw new Exception("Cache missed");
 result.Dump();

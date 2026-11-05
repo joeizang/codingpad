@@ -899,6 +899,7 @@ test("C# scratch runs with compiler diagnostics and clears stale diagnostics on 
 
 test("SQL tabs run through the direct connection and render table results", async () => {
   invoke.mockImplementation(async (command: string) => {
+    if (command === "connection_schema") return { kind: "sqlite", tables: [{ schema: "main", name: "sample_table", columns: [] }] };
     if (command === "run_sql") {
       return {
         ok: true,
@@ -928,6 +929,8 @@ test("SQL tabs run through the direct connection and render table results", asyn
   expect(
     invoke.mock.calls.filter(([command]) => command === "run_sql"),
   ).toHaveLength(1);
+  expect(invoke).toHaveBeenCalledWith("connection_schema", { name: "sample" });
+  expect(await screen.findByRole("button", { name: /main.sample_table/ })).toBeInTheDocument();
   expect(screen.getByText("42")).toBeInTheDocument();
   expect(screen.getByText("Finished")).toBeInTheDocument();
 });

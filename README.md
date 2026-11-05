@@ -317,6 +317,21 @@ install follows in a later M2 issue. Only managed `Console` output is
 captured; direct native writes are outside this increment. Scripts run with your
 user privileges.
 
+## Connection schema
+
+An attached connection (the `connection` setting in any script header) shows a
+schema panel with tables and views, declared column types, and foreign-key targets.
+Expand a table to inspect its columns. Filter by table name and use **More tables**
+or **More columns** to browse large schemas in pages of 100. **Refresh schema**
+loads current metadata; a failed refresh keeps the last snapshot visible. Editing
+connections and closing the Connections dialog also reloads the schema.
+
+Discovery uses SQLite's read-only catalog and PostgreSQL / SQL Server system
+catalogs through the saved connection's existing authentication and TLS settings.
+Only objects visible to that connection are shown; discovery never runs a script
+or starts a kernel. SQLite shows the saved file's `main` schema (temporary objects
+and script-local `ATTACH` databases are not persistent connection metadata).
+
 ## SQL scripts (M3.0)
 
 Click **Connections…** to add a SQLite, PostgreSQL or SQL Server database, then

@@ -110,6 +110,14 @@ async fn delete_connection(
 }
 
 #[tauri::command]
+async fn connection_schema(
+    sql: State<'_, Arc<SqlManager>>,
+    name: String,
+) -> Result<codingpad_kernel_core::databases::schema::Schema, String> {
+    sql.schema(&name).await
+}
+
+#[tauri::command]
 async fn test_connection(sql: State<'_, Arc<SqlManager>>, id: String) -> Result<String, String> {
     sql.test(&id).await
 }
@@ -425,6 +433,7 @@ fn main() {
             save_connection,
             delete_connection,
             test_connection,
+            connection_schema,
             begin_sql_run,
             run_sql,
             expand_sql,

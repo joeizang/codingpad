@@ -19,6 +19,8 @@ import {
   type Output,
 } from "./protocol";
 import { SecretsDialog } from "./SecretsDialog";
+import { SchemaPanel } from "./SchemaPanel";
+import { useConnectionSchema } from "./schema";
 import { Sidebar } from "./Sidebar";
 import {
   headerSummary,
@@ -171,6 +173,9 @@ export default function App() {
     ? active.compilation.diagnostics
     : EMPTY_DIAGNOSTICS;
   const activeHeader = parseHeader(active.source);
+  const connectionName = activeHeader?.settings.connection || undefined;
+  const [schemaRevision, setSchemaRevision] = useState(0);
+  const schemaState = useConnectionSchema(connectionName, schemaRevision);
   const update = (id: string, change: (script: Script) => Script) =>
     setScripts((all) =>
       all.map((script) => (script.id === id ? change(script) : script)),
@@ -810,6 +815,7 @@ export default function App() {
           onRemovePinned={(path) => void removePinnedFolder(path)}
           error={libraryError}
         />
+        {connectionName && <SchemaPanel key={connectionName} name={connectionName} {...schemaState} onRefresh={() => setSchemaRevision((value) => value + 1)} />}
         <div className="workspace">
           <section className="editor-pane" aria-label={`${languageLabel(language)} editor`}>
             <div className="pane-heading">
@@ -932,7 +938,7 @@ export default function App() {
       </div>
       <ConnectionsDialog
         open={connectionsOpen}
-        onClose={() => setConnectionsOpen(false)}
+        onClose={() => { setConnectionsOpen(false); setSchemaRevision((value) => value + 1); }}
       />
       <SecretsDialog open={secretsOpen} onClose={() => setSecretsOpen(false)} />
       <footer>

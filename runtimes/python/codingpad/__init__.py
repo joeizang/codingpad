@@ -1,6 +1,7 @@
 """The built-in CodingPad helpers. No third-party dependencies."""
 
 import base64
+from contextlib import closing
 import math
 import threading
 import os
@@ -123,13 +124,47 @@ class _Database:
 
     def query(self, sql, parameters=()):
         """Execute SQL and return rows as dictionaries suitable for dump()."""
-        cursor = self._open().cursor()
+        connection = self._open()
+        cursor = connection.cursor()
         try:
-            cursor.execute(sql, parameters) if parameters else cursor.execute(sql)
-            if cursor.description is None:
-                return _DatabaseRows([], [])
-            columns = [column[0] for column in cursor.description]
-            rows = cursor.fetchmany(_MAX_DATABASE_ROWS + 1)
+            if self._config["settings"]["kind"] == "postgres":
+                import psycopg
+                try:
+                    # A regular psycopg cursor buffers the entire server result
+                    # during execute, before fetchmany can enforce the cap.
+                    with closing(cursor.stream(sql, parameters or None)) as stream:
+                        rows = list(islice(stream, _MAX_DATABASE_ROWS + 1))
+                        # Finishing the statement matters for INSERT/UPDATE ...
+                        # RETURNING: cancelling at the cap can roll back writes.
+                        # Discard later rows rather than keeping them in memory.
+                        for _ in stream:
+                            pass
+                except psycopg.ProgrammingError as error:
+                    if str(error) != "the operation in stream() didn't produce a result":
+                        raise
+                    return _DatabaseRows([], [])
+                if cursor.description is None:
+                    # Psycopg's streaming API discards the metadata for zero
+                    # rows. Describe an unnamed prepared statement without
+                    # executing the user's SQL a second time.
+                    with psycopg.ClientCursor(connection) as formatter:
+                        query = formatter.mogrify(sql, parameters) if parameters else sql
+                    with connection.lock:
+                        prepared = connection.pgconn.prepare(b"", query.encode(connection.info.encoding))
+                        if prepared.status != psycopg.pq.ExecStatus.COMMAND_OK:
+                            raise psycopg.ProgrammingError(prepared.error_message.decode(connection.info.encoding))
+                        described = connection.pgconn.describe_prepared(b"")
+                        if described.status != psycopg.pq.ExecStatus.COMMAND_OK:
+                            raise psycopg.ProgrammingError(described.error_message.decode(connection.info.encoding))
+                        columns = [described.fname(i).decode(connection.info.encoding) for i in range(described.nfields)]
+                else:
+                    columns = [column[0] for column in cursor.description]
+            else:
+                cursor.execute(sql, parameters) if parameters else cursor.execute(sql)
+                if cursor.description is None:
+                    return _DatabaseRows([], [])
+                columns = [column[0] for column in cursor.description]
+                rows = cursor.fetchmany(_MAX_DATABASE_ROWS + 1)
             return _DatabaseRows(columns, rows[:_MAX_DATABASE_ROWS], len(rows) > _MAX_DATABASE_ROWS)
         finally:
             cursor.close()

@@ -30,4 +30,15 @@ describe("schema panel", () => {
     await waitFor(() => expect(result.current.error).toBe("offline")); expect(result.current.schema).toBe(schema);
     rerender({name:"",revision:1}); expect(result.current.schema).toBeUndefined();
   });
+  it("keeps per-connection snapshots available when switching tabs offline", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce(schema);
+    const { result, rerender } = renderHook(({name}) => useConnectionSchema(name, 0), {initialProps:{name:"sample"}});
+    await waitFor(() => expect(result.current.schema).toBe(schema));
+    vi.mocked(invoke).mockRejectedValue("offline");
+    rerender({name:"other"}); await waitFor(() => expect(result.current.error).toBe("offline"));
+    expect(result.current.schema).toBeUndefined();
+    rerender({name:"sample"}); expect(result.current.schema).toBe(schema);
+    await waitFor(() => expect(result.current.error).toBe("offline")); expect(result.current.schema).toBe(schema);
+  });
+
 });

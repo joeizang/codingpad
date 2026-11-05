@@ -332,6 +332,20 @@ Only objects visible to that connection are shown; discovery never runs a script
 or starts a kernel. SQLite shows the saved file's `main` schema (temporary objects
 and script-local `ATTACH` databases are not persistent connection metadata).
 
+SQL scripts use the loaded schema for local table/column completion and bundled
+SQL keywords. Type a name, use **Ctrl+Space**, or type an alias followed by `.`.
+Column suggestions follow tables in the current statement, including joins,
+aliases, and enclosing correlated-query scopes. Schema-qualified names disambiguate
+same-named tables. Inserted identifiers use the connection's quoting rules.
+
+Completion requests perform no IPC, network access, or kernel startup. Snapshots
+remain in memory across script switches, including offline use; **Refresh schema**
+updates them after DDL changes. At most 200 suggestions are returned per request;
+typing more narrows the list. The lexical resolver handles common SQL statements,
+not full dialect grammars: CTE/derived-table output inference, table-valued function
+outputs, server search-path/collation rules, and procedural SQL are not inferred.
+Ambiguous unqualified table names offer columns from each matching schema.
+
 ## SQL scripts (M3.0)
 
 Click **Connections…** to add a SQLite, PostgreSQL or SQL Server database, then

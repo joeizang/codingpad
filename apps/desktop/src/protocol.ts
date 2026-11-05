@@ -61,6 +61,7 @@ export type DumpNode =
       rows: DumpNode[][];
       total: number;
       totalKnown?: boolean;
+      truncated?: boolean;
       next: string | null;
       handle?: string;
     }

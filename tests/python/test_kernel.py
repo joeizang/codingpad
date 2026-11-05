@@ -121,6 +121,19 @@ class KernelTests(unittest.TestCase):
         self.assertEqual(pids[0], pids[1], "Stress run must preserve the warm kernel")
         return messages
 
+    def test_database_duplicate_columns_and_truncation(self):
+        config = {"settings": {"kind": "sqlite", "path": ":memory:"}}
+        source = "db.query('select 1 as id, 2 as id, 3 as id_2')"
+        messages = self.request("run", {"source": source, "connection": config})
+        node = next(message["params"]["node"] for message in messages if message.get("method") == "dump")
+        self.assertEqual([c["name"] for c in node["columns"]], ["id", "id_2", "id_2_2"])
+        self.assertEqual([cell["v"] for cell in node["rows"][0]], [1, 2, 3])
+        source = "db.query('with recursive t(n) as (select 1 union all select n+1 from t where n<10001) select n from t')"
+        messages = self.request("run", {"source": source, "connection": config})
+        node = next(message["params"]["node"] for message in messages if message.get("method") == "dump")
+        self.assertEqual(node["total"], 10000)
+        self.assertTrue(node["truncated"])
+
     def test_database_connection_and_run_cleanup(self):
         import sqlite3
         path = str(Path(self.directory.name) / "sample.db")

@@ -16,6 +16,7 @@ _secret_errors = {}
 
 _MAX_ITEMS = 100
 _MAX_TABLE_ROWS = 100
+_MAX_DATABASE_ROWS = 10_000
 _MAX_TABLE_SAMPLE = 100
 _MAX_COLUMNS = 32
 _MAX_DEPTH = 6
@@ -47,9 +48,20 @@ _IMAGE_TYPES = {
 
 
 class _DatabaseRows(list):
-    def __init__(self, columns, rows):
-        super().__init__(dict(zip(columns, row)) for row in rows)
-        self.columns = columns
+    def __init__(self, columns, rows, truncated=False):
+        unique = []
+        used = set()
+        for name in columns:
+            candidate = name
+            suffix = 2
+            while candidate in used:
+                candidate = f"{name}_{suffix}"
+                suffix += 1
+            used.add(candidate)
+            unique.append(candidate)
+        super().__init__(dict(zip(unique, row)) for row in rows)
+        self.columns = unique
+        self.truncated = truncated
 
 
 class _Database:
@@ -96,7 +108,7 @@ class _Database:
             def quote(value):
                 return "{" + str(value or "").replace("}", "}}") + "}"
             tls = settings.get("tls", "prefer")
-            encrypt = {"prefer": "Optional", "require": "Mandatory", "disable": "Optional"}[tls]
+            encrypt = {"prefer": "Mandatory", "require": "Mandatory", "disable": "Optional"}[tls]
             connection = mssql_python.connect(";".join([
                 "Server=" + quote(settings["host"] + "," + str(settings.get("port") or 1433)),
                 "Database=" + quote(settings["database"]), "UID=" + quote(settings["user"]),
@@ -117,7 +129,8 @@ class _Database:
             if cursor.description is None:
                 return _DatabaseRows([], [])
             columns = [column[0] for column in cursor.description]
-            return _DatabaseRows(columns, cursor.fetchall())
+            rows = cursor.fetchmany(_MAX_DATABASE_ROWS + 1)
+            return _DatabaseRows(columns, rows[:_MAX_DATABASE_ROWS], len(rows) > _MAX_DATABASE_ROWS)
         finally:
             cursor.close()
 
@@ -437,6 +450,8 @@ def _table(value, cursor, limit, budget):
         total=total,
         next=next_cursor,
     )
+    if isinstance(value, _DatabaseRows) and value.truncated:
+        node["truncated"] = True
     if next_cursor is not None:
         node["handle"] = _registry.handle(value)
     return node

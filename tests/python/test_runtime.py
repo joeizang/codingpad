@@ -5,6 +5,8 @@ import json
 import sys
 import time
 import unittest
+from unittest import mock
+import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -19,6 +21,16 @@ class RuntimeTests(unittest.TestCase):
 
     def tearDown(self):
         codingpad._end()
+
+    def test_sqlserver_tls_modes_select_explicit_encryption(self):
+        for mode, expected in [("prefer", "Mandatory"), ("require", "Mandatory"), ("disable", "Optional")]:
+            connect = mock.Mock(return_value=mock.Mock())
+            config = {"settings": {"kind": "sqlserver", "host": "localhost", "database": "test", "user": "sa", "tls": mode}}
+            with mock.patch.dict(sys.modules, {"mssql_python": types.SimpleNamespace(connect=connect)}):
+                db = codingpad._Database(config)
+                db._open()
+                self.assertIn("Encrypt=" + expected, connect.call_args.args[0])
+                db.close()
 
     def test_100k_row_table_produces_first_page_under_one_second(self):
         rows = [{"name": f"row {index}", "score": index} for index in range(100_000)]

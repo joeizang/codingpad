@@ -834,7 +834,16 @@ async fn prepare_packages(
         progress
     )?;
     if !output.status.success() {
-        return Err("Python package preparation failed. See uv output in Results; check the dependencies, requires-python and network connection. Python 3.10+ must already be installed.".into());
+        let driver = packages
+            .dependencies
+            .iter()
+            .any(|name| name.starts_with("psycopg[") || name.starts_with("mssql-python"));
+        let detail = if driver {
+            " The attached connection needs a database driver, which may require network access on first use."
+        } else {
+            ""
+        };
+        return Err(format!("Python package preparation failed. See uv output in Results; check the dependencies, requires-python and network connection. Python 3.10+ must already be installed.{detail}"));
     }
     let executable = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
     if !std::path::Path::new(executable.trim()).is_file() {

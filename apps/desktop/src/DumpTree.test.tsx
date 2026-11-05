@@ -291,3 +291,8 @@ test("an endless table keeps growing one page at a time", async () => {
   }
   expect(expand).toHaveBeenCalledTimes(2);
 });
+
+test("truncated database results show a warning", () => {
+  render(<DumpTree node={{ kind: "table", type: "DatabaseRows", columns: [{ name: "id" }], rows: [], total: 10000, truncated: true, next: null }} />);
+  expect(screen.getByText(/results truncated/)).toBeInTheDocument();
+});

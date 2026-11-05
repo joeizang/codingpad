@@ -5,7 +5,7 @@ import CodeEditor from "./CodeEditor";
 const { invoke, mounted, completionProvider } = vi.hoisted(() => ({
   invoke: vi.fn(),
   mounted: { callback: undefined as undefined | ((editor: unknown) => void) },
-  completionProvider: { current: undefined as undefined | { resolveCompletionItem: (item: unknown) => Promise<{ tags?: number[] }> } },
+  completionProvider: { dispose: vi.fn(), current: undefined as undefined | { resolveCompletionItem: (item: unknown) => Promise<{ tags?: number[] }>; provideCompletionItems: (model: unknown, position: unknown) => { suggestions: {label: string}[] }; } },
 }));
 const disposable = () => ({ dispose: vi.fn() });
 function mountEditor() {
@@ -31,9 +31,10 @@ vi.mock("monaco-editor/editor/editor.api.js", () => ({
   Range: class {},
   languages: {
     CompletionItemTag: { Deprecated: 1 },
+    CompletionItemKind: { Struct: 22, Field: 5, Keyword: 17 },
     registerCompletionItemProvider: (_: string, provider: unknown) => {
       completionProvider.current = provider as typeof completionProvider.current;
-      return { dispose: vi.fn() };
+      return { dispose: completionProvider.dispose };
     },
     registerHoverProvider: () => ({ dispose: vi.fn() }),
   },
@@ -103,4 +104,25 @@ test("reports editor readiness before starting intelligence and preserves resolv
   expect(commands.indexOf("ui_ready")).toBeLessThan(commands.indexOf("start_language_server"));
   const resolved = await completionProvider.current!.resolveCompletionItem({ label: "old", data: {} });
   expect(resolved.tags).toEqual([1]);
+});
+
+
+test("SQL provider reads live snapshots locally, isolates its model, and disposes on unmount", () => {
+  invoke.mockClear();
+  completionProvider.dispose.mockClear();
+  const props = { id: "sql", language: "sql", source: "SELECT u. FROM main.users u", onChange: vi.fn(), onRun: vi.fn() };
+  const schema = { kind: "sqlite" as const, tables: [{ schema: "main", name: "users", columns: [{name:"email",dataType:"TEXT",references:[]}]}] };
+  const view = render(<CodeEditor {...props} sqlSchema={schema} />);
+  const model = { getValue: () => props.source, getOffsetAt: () => 9, getPositionAt: (offset: number) => ({lineNumber:1,column:offset+1}) };
+  act(() => mounted.callback?.({ addCommand: vi.fn(), getModel: () => model, getDomNode: () => document.body, getOption: () => false }));
+  const provider = completionProvider.current!;
+  expect(provider.provideCompletionItems(model, {} as never).suggestions.map((s) => s.label)).toEqual(["email"]);
+  expect(provider.provideCompletionItems({}, {} as never).suggestions).toEqual([]);
+  view.rerender(<CodeEditor {...props} sqlSchema={{ ...schema, tables: [{ ...schema.tables[0], columns: [{name:"refreshed",dataType:"TEXT",references:[]}]}] }} />);
+  expect(provider.provideCompletionItems(model, {} as never).suggestions.map((s) => s.label)).toEqual(["refreshed"]);
+  view.rerender(<CodeEditor {...props} />);
+  expect(provider.provideCompletionItems(model, {} as never).suggestions).toEqual([]);
+  expect(invoke.mock.calls.filter(([command]) => command !== "ui_ready")).toEqual([]);
+  view.unmount();
+  expect(completionProvider.dispose).toHaveBeenCalledOnce();
 });

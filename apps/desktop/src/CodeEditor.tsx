@@ -1,10 +1,12 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import Editor from "./MonacoEditor";
 import * as monaco from "monaco-editor/editor/editor.api.js";
 import "monaco-editor/languages/definitions/python/register.js";
 import "monaco-editor/languages/definitions/csharp/register.js";
 import "monaco-editor/languages/definitions/sql/register.js";
+import { createSqlCompletions } from "./sqlCompletions";
+import type { ConnectionSchema } from "./schema";
 import type { CompileDiagnostic } from "./protocol";
 import EditorWorker from "monaco-editor/editor/editor.worker.js?worker";
 import {
@@ -42,6 +44,7 @@ type Props = {
   path?: string;
   compileDiagnostics?: CompileDiagnostic[];
   toolchainVersion?: number;
+  sqlSchema?: ConnectionSchema;
   source: string;
   onChange: (source: string) => void;
   onRun: () => void;
@@ -113,12 +116,16 @@ export default function CodeEditor({
   path,
   compileDiagnostics = EMPTY_DIAGNOSTICS,
   toolchainVersion = 0,
+  sqlSchema,
   source,
   onChange,
   onRun,
   onMount,
   onDiagnostics,
 }: Props) {
+  const completeSql = useMemo(() => createSqlCompletions(sqlSchema), [sqlSchema]);
+  const completeSqlRef = useRef(completeSql);
+  completeSqlRef.current = completeSql;
   const generation = useRef(0);
   const [interactive, setInteractive] = useState(false);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
@@ -322,6 +329,26 @@ export default function CodeEditor({
           }));
         };
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, onRun);
+        if (language === "sql") {
+          const completion = monaco.languages.registerCompletionItemProvider("sql", {
+            triggerCharacters: ["."],
+            provideCompletionItems: (model, position) => {
+              if (model !== editor.getModel()) return { suggestions: [] };
+              const result = completeSqlRef.current(model.getValue(), model.getOffsetAt(position));
+              const start = model.getPositionAt(result.start), end = model.getPositionAt(result.end);
+              const range = new monaco.Range(start.lineNumber, start.column, end.lineNumber, end.column);
+              return {
+                suggestions: result.suggestions.map((item) => ({ ...item, range,
+                  kind: item.kind === "table" ? monaco.languages.CompletionItemKind.Struct
+                    : item.kind === "column" ? monaco.languages.CompletionItemKind.Field
+                    : monaco.languages.CompletionItemKind.Keyword,
+                })),
+                incomplete: result.incomplete,
+              };
+            },
+          });
+          cleanup.current = () => completion.dispose();
+        }
         if (!supportsCodeIntelligence(language)) {
           onMount?.(editor);
           reportReady();

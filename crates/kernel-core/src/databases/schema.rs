@@ -1,5 +1,6 @@
 //! Read-only catalog discovery; independent of script execution and its row caps.
 use super::*;
+use rusqlite::OptionalExtension;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Serialize)]
@@ -40,7 +41,7 @@ LEFT JOIN pg_catalog.pg_constraint f ON f.conrelid=t.oid AND f.contype='f' AND a
 LEFT JOIN pg_catalog.pg_class rt ON rt.oid=f.confrelid
 LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid=rt.relnamespace
 LEFT JOIN pg_catalog.pg_attribute ra ON ra.attrelid=rt.oid AND ra.attnum=f.confkey[array_position(f.conkey,a.attnum)]
-WHERE t.relkind IN ('r','p','v','m','f') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%'
+WHERE t.relkind IN ('r','p','v','m','f') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg\_temp\_%' ESCAPE '\'
 ORDER BY n.nspname,t.relname,a.attnum
 "#;
 const SQLSERVER: &str = r#"
@@ -156,59 +157,71 @@ fn sqlite_schema(path: &str) -> Result<Schema, String> {
             SqliteConnection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         // Keep all catalog reads on one snapshot if another connection changes DDL.
         db.execute_batch("BEGIN")?;
-        let mut tables = db.prepare("SELECT name FROM sqlite_schema WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name")?;
+        let mut tables = db.prepare("SELECT name,type FROM sqlite_schema WHERE type IN ('table','view') AND name NOT GLOB 'sqlite_*' ORDER BY name")?;
         let names = tables
-            .query_map([], |r| r.get::<_, String>(0))?
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
         let mut result = vec![];
-        for name in names {
-            let mut columns = db.prepare(
-                "SELECT name,type FROM pragma_table_xinfo(?1) WHERE hidden != 1 ORDER BY cid",
-            )?;
-            let mut columns = columns
-                .query_map([&name], |r| {
-                    Ok(SchemaColumn {
-                        name: r.get(0)?,
-                        data_type: r.get(1)?,
-                        references: vec![],
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut keys = db
-                .prepare("SELECT \"from\",\"table\",\"to\",seq FROM pragma_foreign_key_list(?1)")?;
-            let keys = keys
-                .query_map([&name], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, i64>(3)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            for (from, target, to, seq) in keys {
-                // An omitted target means the matching column of the parent's primary key.
-                let to = match to {
-                    Some(to) => to,
-                    None => db.query_row(
-                        "SELECT name FROM pragma_table_info(?1) WHERE pk=?2",
-                        rusqlite::params![target, seq + 1],
-                        |r| r.get(0),
-                    )?,
-                };
-                if let Some(column) = columns.iter_mut().find(|c| c.name == from) {
-                    column.references.push(ForeignKey {
-                        schema: "main".into(),
-                        table: target,
-                        column: to,
-                    });
+        for (name, object_type) in names {
+            let object = (|| -> rusqlite::Result<SchemaTable> {
+                let mut columns = db.prepare(
+                    "SELECT name,type FROM pragma_table_xinfo(?1) WHERE hidden != 1 ORDER BY cid",
+                )?;
+                let mut columns = columns
+                    .query_map([&name], |r| {
+                        Ok(SchemaColumn {
+                            name: r.get(0)?,
+                            data_type: r.get(1)?,
+                            references: vec![],
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut keys = db.prepare(
+                    "SELECT \"from\",\"table\",\"to\",seq FROM pragma_foreign_key_list(?1)",
+                )?;
+                let keys = keys
+                    .query_map([&name], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                for (from, target, to, seq) in keys {
+                    // An omitted target means the matching column of the parent's primary key.
+                    let to = match to {
+                        Some(to) => Some(to),
+                        None => db
+                            .query_row(
+                                "SELECT name FROM pragma_table_info(?1) WHERE pk=?2",
+                                rusqlite::params![target, seq + 1],
+                                |r| r.get(0),
+                            )
+                            .optional()?,
+                    };
+                    let Some(to) = to else { continue };
+                    if let Some(column) = columns.iter_mut().find(|c| c.name == from) {
+                        column.references.push(ForeignKey {
+                            schema: "main".into(),
+                            table: target,
+                            column: to,
+                        });
+                    }
                 }
+                Ok(SchemaTable {
+                    schema: "main".into(),
+                    name,
+                    columns,
+                })
+            })();
+            match object {
+                Ok(table) => result.push(table),
+                // Views can remain in sqlite_schema after their base table is dropped.
+                Err(_) if object_type == "view" => continue,
+                Err(error) => return Err(error),
             }
-            result.push(SchemaTable {
-                schema: "main".into(),
-                name,
-                columns,
-            });
         }
         Ok(Schema {
             kind: DatabaseKind::Sqlite,
@@ -255,6 +268,53 @@ mod tests {
         assert!(sqlite_schema(missing.to_str().unwrap()).is_err());
         assert!(!missing.exists());
     }
+    #[test]
+    fn sqlite_catalog_keeps_tables_with_unresolvable_implicit_foreign_keys() {
+        for parent in ["", "CREATE TABLE parent(a INTEGER);"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("dangling.db");
+            let db = SqliteConnection::open(&path).unwrap();
+            db.execute_batch(&format!("PRAGMA foreign_keys=OFF; CREATE TABLE ok(id INTEGER PRIMARY KEY); {parent} CREATE TABLE child(x INTEGER REFERENCES parent);"))
+                .unwrap();
+            let schema = sqlite_schema(path.to_str().unwrap()).unwrap();
+            assert!(schema.tables.iter().any(|t| t.name == "ok"));
+            let child = schema.tables.iter().find(|t| t.name == "child").unwrap();
+            assert_eq!(child.columns[0].name, "x");
+            assert!(child.columns[0].references.is_empty());
+        }
+    }
+
+    #[test]
+    fn sqlite_catalog_keeps_healthy_objects_when_a_view_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("view.db");
+        let db = SqliteConnection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE ok(id INTEGER PRIMARY KEY); CREATE VIEW valid AS SELECT id FROM ok; CREATE TABLE gone(a); CREATE VIEW broken AS SELECT a FROM gone; DROP TABLE gone;").unwrap();
+        let schema = sqlite_schema(path.to_str().unwrap()).unwrap();
+        for name in ["ok", "valid"] {
+            let table = schema.tables.iter().find(|t| t.name == name).unwrap();
+            assert_eq!(table.columns[0].name, "id");
+        }
+        assert!(!schema.tables.iter().any(|t| t.name == "broken"));
+    }
+
+    #[test]
+    fn sqlite_catalog_only_excludes_the_reserved_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("names.db");
+        let db = SqliteConnection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE sqliteusers(id INTEGER PRIMARY KEY AUTOINCREMENT); CREATE TABLE ok(id INTEGER);").unwrap();
+        let schema = sqlite_schema(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            schema
+                .tables
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ok", "sqliteusers"]
+        );
+    }
+
     #[test]
     fn server_catalog_rows_preserve_namespaces_and_multiple_references() {
         for kind in [DatabaseKind::Postgres, DatabaseKind::SqlServer] {

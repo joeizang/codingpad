@@ -30,6 +30,7 @@ class RuntimeTests(unittest.TestCase):
         (cls.work / "NuGet.Config").write_text(
             '<configuration><packageSources><clear />'
             f'<add key="local" value="{escape(str(cls.feed))}" />'
+            '<add key="nuget.org" value="https://api.nuget.org/v3/index.json" />'
             '</packageSources></configuration>', encoding="utf-8"
         )
         cls.env = {**os.environ, "NUGET_PACKAGES": str(cls.work / "packages")}
@@ -68,6 +69,29 @@ class RuntimeTests(unittest.TestCase):
             process.stdout.close()
             process.stderr.close()
 
+    def test_attached_sqlite_database_returns_a_table(self):
+        import sqlite3
+        path = self.work / "db-client.sqlite"
+        db = sqlite3.connect(path)
+        try:
+            db.executescript("create table item(name text); insert into item values ('Ada');")
+            db.commit()
+        finally:
+            db.close()
+        settings = {"kind": "sqlite", "path": str(path)}
+        run = lambda ident, source, connection=None: json.dumps({"jsonrpc": "2.0", "id": ident, "method": "run", "params": {"source": source, "connection": connection}})
+        events = self.exchange([
+            run(1, 'db.Query("select name from item").Dump();', {"settings": settings}),
+            run(2, 'db.Query("select name from item where 0").Dump();', {"settings": settings}),
+            run(3, 'db.Query("select 1").Dump();'),
+        ], 3)
+        tables = [event["params"]["node"] for event in events if event.get("method") == "dump" and event["params"]["node"]["kind"] == "table"]
+        self.assertEqual(tables[0]["columns"][0]["name"], "name")
+        self.assertEqual(tables[0]["rows"][0][0]["v"], "Ada")
+        self.assertEqual(tables[1]["columns"][0]["name"], "name")
+        self.assertEqual(tables[1]["rows"], [])
+        self.assertTrue(any("No connection is attached" in str(event) for event in events))
+
     def test_file_script_imports_helpers_from_package(self):
         script = self.work / "script.cs"
         script.write_text('''#:package CodingPad@0.1.0
@@ -79,6 +103,8 @@ if (await Cache("async", async () => { await Task.Delay(1); return 7; }) != 7)
     throw new Exception("Async cache missed");
 if (await Cache("async", () => Task.FromResult(-1)) != 7)
     throw new Exception("Async cache recomputed");
+try { db.Query("select 1"); throw new Exception("db should fail"); }
+catch (InvalidOperationException error) when (error.Message.Contains("No connection is attached")) { }
 try { Secret("test"); throw new Exception("Secret should fail"); }
 catch (KeyNotFoundException error) when (error.Message.Contains("Secrets")) { }
 Console.WriteLine(result);

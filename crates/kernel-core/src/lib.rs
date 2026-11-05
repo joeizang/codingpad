@@ -321,9 +321,7 @@ impl Supervisor {
                 }
             }
         };
-        let connection = (language == Language::Python)
-            .then(|| store::parse_header(source))
-            .flatten()
+        let connection = store::parse_header(source)
             .and_then(|header| header.settings.get("connection").cloned())
             .filter(|name| !name.trim().is_empty());
         let connection = match connection {

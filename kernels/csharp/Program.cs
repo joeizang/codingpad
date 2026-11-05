@@ -91,6 +91,7 @@ internal static class Program
     private static async Task Run(long id, string source, string? scriptPath,
         IReadOnlyDictionary<string, string> secrets,
         IReadOnlyDictionary<string, string> secretErrors,
+        JsonElement? connection,
         RunCancellation cancellation)
     {
         var cancel = cancellation.Token;
@@ -192,6 +193,7 @@ internal static class Program
             cancel.ThrowIfCancellationRequested();
             // Do not scan cached graphs for source that fails compilation.
             ScriptHelpers.SetSecrets(secrets, secretErrors);
+            ScriptHelpers.SetDatabase(connection);
             helpers = ScriptHelpers.BeginRun(cancel, text =>
                 Notify(context, "stream", new { runId = id, stream = "stdout", text }));
             cancel.ThrowIfCancellationRequested();
@@ -212,6 +214,7 @@ internal static class Program
         {
             // Close the helper context before the host can observe completion.
             helpers?.Dispose();
+            ScriptHelpers.ClearDatabase();
             ScriptHelpers.ClearSecrets();
             cancellation.Request();
             lock (InspectionGate)
@@ -400,6 +403,7 @@ internal static class Program
                     Run(id.Value, parameters.GetProperty("source").GetString()!,
                         parameters.TryGetProperty("path", out var path) ? path.GetString() : null,
                         secrets.Item1, secrets.Item2,
+                        parameters.TryGetProperty("connection", out var connection) && connection.ValueKind == JsonValueKind.Object ? connection : null,
                         cancel ?? new RunCancellation()).GetAwaiter().GetResult();
                 }
                 else if (root.GetProperty("method").GetString() == "expand")

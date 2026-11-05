@@ -79,6 +79,8 @@ class _Database:
             options = dict(host=settings["host"], port=settings.get("port") or 5432,
                 dbname=settings["database"], user=settings["user"], password=self._config.get("password"),
                 sslmode="verify-full" if verified else tls, connect_timeout=10, autocommit=True)
+            if verified:
+                options["sslrootcert"] = "system"
             try:
                 connection = psycopg.connect(**options)
             except psycopg.OperationalError as error:
@@ -87,6 +89,7 @@ class _Database:
                 if not (verified and tls == "prefer" and "server does not support SSL" in str(error)):
                     raise
                 options["sslmode"] = "disable"
+                options.pop("sslrootcert", None)
                 connection = psycopg.connect(**options)
         elif kind == "sqlserver":
             import mssql_python

@@ -341,8 +341,9 @@ var password = Secret("database-password");
 Names starting with `connection:` are reserved for database connection
 passwords. A missing secret raises an actionable error. Secret values are not written to
 logs, script files or connection settings. Each run reads only the secrets its
-source names (dynamic calls fall back to every non-connection secret), so scripts
-that never call `secret()` do not wait on the vault. Changing a secret takes
+source names. Imports and dynamic uses fall back to every non-connection secret,
+because imported modules may call `secret()`. Scripts that neither import anything
+nor reference `secret` do not wait on the vault. Changing a secret takes
 effect on the next run of each script.
 
 ## Repository layout

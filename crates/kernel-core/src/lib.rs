@@ -16,14 +16,12 @@ use secrets::{SecretSnapshot, SecretStore};
 /// `Some(names)` means read only those; `None` means a dynamic call or an
 /// ambiguous use, so every non-connection secret must be available.
 fn referenced_secret_names(source: &str) -> Option<Vec<String>> {
-    // Any import may call secret() inside a module we cannot see.
-    if source.lines().any(|line| {
-        let line = line.trim_start();
-        line.starts_with("import ") || line.starts_with("from ")
-    }) {
+    // Imports (including inline/dynamic imports) can call secret() in unseen modules.
+    // A conservative substring check may fetch extra names, but cannot omit them.
+    let lower = source.to_ascii_lowercase();
+    if lower.contains("import") {
         return None;
     }
-    let lower = source.to_ascii_lowercase();
     if !lower.contains("secret") {
         return Some(Vec::new());
     }
@@ -845,6 +843,17 @@ mod tests {
 
     #[test]
     fn secret_names_are_read_lexically_or_not_at_all() {
+        for source in [
+            "x = 1; import hlp",
+            "if True: import hlp",
+            "try: import hlp",
+            "__import__('hlp').run()",
+            "import\thlp",
+            "secret('a')\nx = 1; import hlp",
+            "importlib.import_module('hlp').run()",
+        ] {
+            assert_eq!(referenced_secret_names(source), None, "{source}");
+        }
         assert_eq!(referenced_secret_names("print(1)"), Some(vec![]));
         assert_eq!(
             referenced_secret_names("from codingpad import secret\nsecret('token')"),

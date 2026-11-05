@@ -6,7 +6,7 @@ use codingpad_kernel_core::{
     secrets::{SecretEntry, SecretOrigin, SecretStore},
     store::{self, FolderEntry, LibrarySettings, ScriptFile},
     toolchains::Toolchains,
-    ExpandResult, KernelEvent, Language, RunResult, Supervisor,
+    DataContextRun, ExpandResult, KernelEvent, Language, RunResult, Supervisor,
 };
 use std::{
     fs,
@@ -219,21 +219,42 @@ async fn install_dotnet(
     Ok(())
 }
 
+fn attached_connection(source: &str) -> Option<String> {
+    store::parse_header(source)?
+        .settings
+        .get("connection")
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+}
+
+async fn generated_data_context(sql: &SqlManager, source: &str) -> Option<DataContextRun> {
+    let name = attached_connection(source)?;
+    let generated = sql.data_context(&name).await.ok()?;
+    Some(DataContextRun {
+        source: generated.python,
+        connection: generated.connection,
+    })
+}
+
 #[tauri::command]
 async fn run_script(
     supervisor: State<'_, Supervisor>,
+    sql: State<'_, Arc<SqlManager>>,
     script_id: String,
     source: String,
     language: Option<Language>,
     path: Option<String>,
     on_event: Channel<KernelEvent>,
 ) -> Result<RunResult, String> {
+    let language = language.unwrap_or_default();
+    let data = generated_data_context(sql.inner().as_ref(), &source).await;
     supervisor
-        .run_language_at(
+        .run_language_at_with_data(
             &script_id,
             &source,
-            language.unwrap_or_default(),
+            language,
             path.as_deref(),
+            data,
             |event| {
                 let _ = on_event.send(event);
             },
@@ -417,16 +438,14 @@ fn main() {
             app.manage(secrets.clone());
             let connections = Arc::new(ConnectionStore::new(&data_dir));
             app.manage(connections.clone());
-            app.manage(Arc::new(SqlManager::new(
-                connections.clone(),
-                secrets.clone(),
-            )));
+            let sql = Arc::new(SqlManager::new(connections.clone(), secrets.clone()));
+            app.manage(sql.clone());
             app.manage(
                 Supervisor::with_data_dir_and_secrets(data_dir.clone(), secrets)
                     .with_connections(connections),
             );
             app.manage(Toolchains::new(data_dir.clone()));
-            app.manage(LanguageServers::with_data_dir(data_dir));
+            app.manage(LanguageServers::with_data_dir_and_databases(data_dir, sql));
             bench_phase("setup_finished", serde_json::Value::Null);
             Ok(())
         })

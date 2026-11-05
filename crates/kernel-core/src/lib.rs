@@ -1,5 +1,6 @@
 //! Desktop-independent supervisor for one warm kernel process per script.
 mod csharp;
+pub mod data_context;
 pub mod databases;
 pub mod installer;
 pub mod lsp;
@@ -137,6 +138,14 @@ pub struct RunResult {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExpandResult {
     pub node: Value,
+}
+
+/// Generated models and connection details for one run. The connection may
+/// contain a vault password and is never written to disk.
+#[derive(Clone, Debug)]
+pub struct DataContextRun {
+    pub source: String,
+    pub connection: crate::data_context::ConnectionInfo,
 }
 
 struct Slot {
@@ -291,6 +300,20 @@ impl Supervisor {
         source: &str,
         language: Language,
         path: Option<&str>,
+        emit: impl FnMut(KernelEvent) + Send,
+    ) -> Result<RunResult, String> {
+        self.run_language_at_with_data(script_id, source, language, path, None, emit)
+            .await
+    }
+
+    /// Run a script with generated data-context models available to it.
+    pub async fn run_language_at_with_data(
+        &self,
+        script_id: &str,
+        source: &str,
+        language: Language,
+        path: Option<&str>,
+        data: Option<DataContextRun>,
         mut emit: impl FnMut(KernelEvent) + Send,
     ) -> Result<RunResult, String> {
         if script_id.is_empty() {
@@ -385,6 +408,25 @@ impl Supervisor {
                     packages.declared = true;
                 }
             }
+            if let Some(data) = &data {
+                packages.declared = true;
+                let driver = match data.connection.kind.as_str() {
+                    "postgres" => Some("psycopg[binary]"),
+                    "sqlserver" => Some("pymssql"),
+                    _ => None,
+                };
+                for dependency in ["sqlalchemy"].into_iter().chain(driver) {
+                    if !packages
+                        .dependencies
+                        .iter()
+                        .any(|item| item.eq_ignore_ascii_case(dependency))
+                    {
+                        packages.dependencies.push(dependency.to_owned());
+                    }
+                }
+                packages.dependencies.sort();
+                packages.dependencies.dedup();
+            }
         }
         if guard
             .as_ref()
@@ -418,7 +460,7 @@ impl Supervisor {
             *guard = Some(startup?);
         }
         let result = tokio::select! {
-            result = guard.as_mut().unwrap().run(source, path, &secrets, connection.as_ref(), &mut emit, &mut stop) => result,
+            result = guard.as_mut().unwrap().run(source, path, &secrets, connection.as_ref(), data.as_ref(), &mut emit, &mut stop) => result,
             _ = closed.changed() => Err("Script was closed".into()),
         };
         if result.as_ref().is_ok_and(|result| result.cache_cleared) {
@@ -687,13 +729,15 @@ impl Kernel {
         path: Option<&str>,
         secrets: &SecretSnapshot,
         connection: Option<&Value>,
+        data: Option<&DataContextRun>,
         emit: &mut (impl FnMut(KernelEvent) + Send),
         stop: &mut watch::Receiver<u64>,
     ) -> Result<RunResult, String> {
         self.next_id += 1;
         let id = self.next_id;
+        let data = data.map(|data| json!({"source": data.source, "connection": data.connection}));
         let mut request = serde_json::to_vec(
-            &json!({"jsonrpc": "2.0", "id": id, "method": "run", "params": {"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection}}),
+            &json!({"jsonrpc": "2.0", "id": id, "method": "run", "params": {"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection, "data": data}}),
         )
         .map_err(|e| e.to_string())?;
         request.push(b'\n');

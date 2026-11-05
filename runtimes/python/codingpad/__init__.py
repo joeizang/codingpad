@@ -288,8 +288,82 @@ def _begin(sink=None, update_sink=None, run_id=None):
     _registry.reset(run_id)
 
 
+_database_session = None
+_database_engine = None
+_database_connection = None
+
+
+def _set_database_connection(connection):
+    global _database_connection
+    _database_connection = dict(connection or {})
+
+
+def _connect_data_context():
+    if not _database_connection:
+        raise RuntimeError(
+            "No database connection is attached. Add one in Connections… and name it in the script header."
+        )
+    return _start_database(_database_connection)
+
+
+def _start_database(connection):
+    """Open the attached connection for generated SQLAlchemy models."""
+    global _database_session, _database_engine
+    try:
+        from sqlalchemy import create_engine
+        from sqlalchemy.engine import URL
+        from sqlalchemy.orm import sessionmaker
+    except ImportError as error:
+        raise RuntimeError(
+            "SQLAlchemy is not available in this Python environment. Run the script again; CodingPad prepares it for attached connections."
+        ) from error
+    kind = str(connection.get("kind") or "").lower()
+    if kind == "sqlite":
+        url = URL.create("sqlite", database=str(connection.get("path") or ""))
+    elif kind == "postgres":
+        url = URL.create(
+            "postgresql+psycopg",
+            username=connection.get("user"),
+            password=connection.get("password"),
+            host=connection.get("host") or "localhost",
+            port=connection.get("port") or 5432,
+            database=connection.get("database"),
+            query={"sslmode": str(connection.get("tls") or "prefer")},
+        )
+    elif kind == "sqlserver":
+        url = URL.create(
+            "mssql+pymssql",
+            username=connection.get("user"),
+            password=connection.get("password"),
+            host=connection.get("host") or "localhost",
+            port=connection.get("port") or 1433,
+            database=connection.get("database"),
+        )
+    else:
+        raise ValueError(f"Unsupported database kind: {kind or 'none'}")
+    _database_engine = create_engine(url, future=True)
+    _database_session = sessionmaker(
+        bind=_database_engine, expire_on_commit=False
+    )()
+    return _database_session
+
+
 def _end():
     global _sink, _update_sink, _secrets, _secret_errors
+    global _database_session, _database_engine, _database_connection
+    if _database_session is not None:
+        try:
+            _database_session.close()
+        except Exception:
+            pass
+        _database_session = None
+    if _database_engine is not None:
+        try:
+            _database_engine.dispose()
+        except Exception:
+            pass
+        _database_engine = None
+    _database_connection = None
     _sink = None
     _update_sink = None
     _secrets = {}
@@ -382,7 +456,9 @@ def _keys(record):
     if isinstance(record, dict):
         return list(record)
     try:
-        return list(vars(record))
+        return [
+            name for name in vars(record) if not str(name).startswith("_sa_")
+        ]
     except TypeError:
         return []
 
@@ -477,6 +553,12 @@ def _sequence(value, depth, seen, budget, cursor, limit):
 
 
 def _object(value, attributes, depth, seen, budget, cursor, limit):
+    if not isinstance(value, dict):
+        attributes = {
+            name: item
+            for name, item in attributes.items()
+            if not str(name).startswith("_sa_")
+        }
     items = list(attributes.items())
     page = items[cursor : cursor + limit]
     fields = [

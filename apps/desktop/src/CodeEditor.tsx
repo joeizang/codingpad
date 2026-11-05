@@ -45,6 +45,7 @@ type Props = {
   compileDiagnostics?: CompileDiagnostic[];
   toolchainVersion?: number;
   sqlSchema?: ConnectionSchema;
+  dataRevision?: number;
   source: string;
   onChange: (source: string) => void;
   onRun: () => void;
@@ -117,6 +118,7 @@ export default function CodeEditor({
   compileDiagnostics = EMPTY_DIAGNOSTICS,
   toolchainVersion = 0,
   sqlSchema,
+  dataRevision = 0,
   source,
   onChange,
   onRun,
@@ -290,7 +292,7 @@ export default function CodeEditor({
       const model = editorRef.current?.getModel();
       if (model) monaco.editor.setModelMarkers(model, "codingpad-lsp", []);
     };
-  }, [id, dependencyKey, toolchainVersion, language, path, interactive]);
+  }, [id, dependencyKey, toolchainVersion, dataRevision, language, path, interactive]);
 
   useEffect(
     () => () => {

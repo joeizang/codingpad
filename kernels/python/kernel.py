@@ -5,6 +5,7 @@ import ast
 import builtins
 import codecs
 import contextlib
+import importlib
 import io
 import json
 import linecache
@@ -537,6 +538,20 @@ def run(request):
             codingpad._set_secrets(secrets, errors)
             codingpad._begin(emit_dump, emit_update, run_id)
             try:
+                data = request["params"].get("data")
+                if isinstance(data, dict):
+                    module_source = data.get("source")
+                    if not isinstance(module_source, str) or not module_source.strip():
+                        raise ValueError("run params.data.source must contain generated model code")
+                    module_path = Path(__file__).resolve().parent / "runtime" / "codingpad_data.py"
+                    module_path.write_text(module_source, encoding="utf-8")
+                    importlib.invalidate_caches()
+                    sys.modules.pop("codingpad_data", None)
+                    import codingpad_data  # noqa: F401
+                    codingpad._set_database_connection(data.get("connection") or {})
+                    scope["context"] = codingpad_data.DataContext(
+                        codingpad._connect_data_context()
+                    )
                 tree = ast.parse(source, filename=filename)
                 if tree.body and isinstance(tree.body[-1], ast.Expr):
                     last = tree.body[-1]

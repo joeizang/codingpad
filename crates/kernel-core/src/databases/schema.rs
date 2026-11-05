@@ -21,19 +21,27 @@ pub struct SchemaColumn {
     pub name: String,
     pub data_type: String,
     pub references: Vec<ForeignKey>,
+    #[serde(default)]
+    pub primary_key: bool,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct ForeignKey {
     pub schema: String,
     pub table: String,
     pub column: String,
+    #[serde(default)]
+    pub constraint: String,
+    #[serde(default)]
+    pub ordinal: u32,
 }
 
 // One row per column/reference pair. Catalog joins preserve composite-key order.
 const POSTGRES: &str = r#"
 SELECT n.nspname::text, t.relname::text, a.attname::text,
        pg_catalog.format_type(a.atttypid,a.atttypmod),
-       rn.nspname::text, rt.relname::text, ra.attname::text
+       rn.nspname::text, rt.relname::text, ra.attname::text,
+       CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_constraint p WHERE p.conrelid=t.oid AND p.contype='p' AND a.attnum=ANY(p.conkey)) THEN '1' ELSE '0' END,
+       COALESCE(f.conname,''), COALESCE(array_position(f.conkey,a.attnum),0)::text
 FROM pg_catalog.pg_class t
 JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace
 JOIN pg_catalog.pg_attribute a ON a.attrelid=t.oid AND a.attnum>0 AND NOT a.attisdropped
@@ -48,7 +56,9 @@ const SQLSERVER: &str = r#"
 SELECT s.name,t.name,c.name,
        ty.name + CASE WHEN ty.name IN ('varchar','char','varbinary','binary','nvarchar','nchar') THEN '(' + CASE WHEN c.max_length=-1 THEN 'max' ELSE CAST(c.max_length / CASE WHEN ty.name IN ('nvarchar','nchar') THEN 2 ELSE 1 END AS varchar(10)) END + ')'
        WHEN ty.name IN ('decimal','numeric') THEN '(' + CAST(c.precision AS varchar(10)) + ',' + CAST(c.scale AS varchar(10)) + ')' ELSE '' END,
-       rs.name,rt.name,rc.name
+       rs.name,rt.name,rc.name,
+       CASE WHEN EXISTS (SELECT 1 FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id=ic.object_id AND i.index_id=ic.index_id WHERE i.is_primary_key=1 AND ic.object_id=t.object_id AND ic.column_id=c.column_id) THEN '1' ELSE '0' END,
+       COALESCE(f.name,''), CAST(COALESCE(f.constraint_column_id,0) AS varchar(10))
 FROM sys.objects t JOIN sys.schemas s ON s.schema_id=t.schema_id
 JOIN sys.columns c ON c.object_id=t.object_id
 JOIN sys.types ty ON ty.user_type_id=c.user_type_id
@@ -60,10 +70,20 @@ WHERE t.type IN ('U','V') AND t.is_ms_shipped=0
 ORDER BY s.name,t.name,c.column_id
 "#;
 
-type CatalogRow = [Option<String>; 7];
+type CatalogRow = [Option<String>; 10];
+
+fn is_primary_key(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "t"
+    )
+}
+
 fn assemble(kind: DatabaseKind, rows: Vec<CatalogRow>) -> Schema {
     let mut tables = BTreeMap::<(String, String), SchemaTable>::new();
-    for [schema, table, column, data_type, target_schema, target_table, target_column] in rows {
+    for [schema, table, column, data_type, target_schema, target_table, target_column, primary_key, constraint, ordinal] in
+        rows
+    {
         let schema = schema.unwrap_or_default();
         let name = table.unwrap_or_default();
         let table = tables
@@ -83,6 +103,7 @@ fn assemble(kind: DatabaseKind, rows: Vec<CatalogRow>) -> Schema {
                     name,
                     data_type: data_type.unwrap_or_default(),
                     references: vec![],
+                    primary_key: primary_key.as_deref().is_some_and(is_primary_key),
                 });
                 table.columns.len() - 1
             });
@@ -91,6 +112,10 @@ fn assemble(kind: DatabaseKind, rows: Vec<CatalogRow>) -> Schema {
                 schema: target_schema.unwrap_or_default(),
                 table: target,
                 column: target_column.unwrap_or_default(),
+                constraint: constraint.unwrap_or_default(),
+                ordinal: ordinal
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap_or(0),
             });
         }
     }
@@ -151,6 +176,73 @@ impl SqlManager {
             .map_err(|_| "Schema discovery timed out; try Refresh.".to_owned())?
     }
 }
+
+impl SqlManager {
+    /// Generate models only. Code intelligence does not need a password or a
+    /// live connection beyond catalog discovery.
+    pub async fn generated_models(
+        &self,
+        name: &str,
+    ) -> Result<crate::data_context::GeneratedContext, String> {
+        let schema = self.schema(name).await?;
+        Ok(crate::data_context::generate(&schema))
+    }
+
+    /// Generate a typed data context and the connection details a kernel needs
+    /// to open the same database. Passwords are read from the vault and kept in
+    /// memory; they never enter a script or a generated file.
+    pub async fn data_context(
+        &self,
+        name: &str,
+    ) -> Result<crate::data_context::GeneratedContext, String> {
+        let connection = self.connections.by_name(name).ok_or_else(|| {
+            format!("Connection \"{name}\" was not found. Add it in Connections…")
+        })?;
+        let schema = self.schema(name).await?;
+        let password = match connection
+            .secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|secret| !secret.is_empty())
+        {
+            None => None,
+            Some(secret) => {
+                let store = self.secrets.clone();
+                let secret = secret.to_owned();
+                let value = tokio::task::spawn_blocking(move || store.get(&secret))
+                    .await
+                    .map_err(|error| format!("The password read failed: {error}"))?
+                    .map_err(|error| {
+                        format!("Could not read the database password from the vault: {error}")
+                    })?;
+                Some(value)
+            }
+        };
+        let mut generated = crate::data_context::generate(&schema);
+        generated.connection = crate::data_context::ConnectionInfo {
+            kind: match connection.kind {
+                DatabaseKind::Sqlite => "sqlite",
+                DatabaseKind::Postgres => "postgres",
+                DatabaseKind::SqlServer => "sqlserver",
+            }
+            .into(),
+            path: connection.path.clone(),
+            host: connection.host.clone(),
+            port: connection.port,
+            database: connection.database.clone(),
+            user: connection.user.clone(),
+            password,
+            tls: match connection.tls {
+                TlsMode::Prefer => "prefer",
+                TlsMode::Require => "require",
+                TlsMode::Disable => "disable",
+            }
+            .into(),
+            trust_server_certificate: connection.trust_server_certificate,
+        };
+        Ok(generated)
+    }
+}
 fn sqlite_schema(path: &str) -> Result<Schema, String> {
     let read = || -> rusqlite::Result<Schema> {
         let db =
@@ -165,7 +257,7 @@ fn sqlite_schema(path: &str) -> Result<Schema, String> {
         for (name, object_type) in names {
             let object = (|| -> rusqlite::Result<SchemaTable> {
                 let mut columns = db.prepare(
-                    "SELECT name,type FROM pragma_table_xinfo(?1) WHERE hidden != 1 ORDER BY cid",
+                    "SELECT name,type,pk FROM pragma_table_xinfo(?1) WHERE hidden != 1 ORDER BY cid",
                 )?;
                 let mut columns = columns
                     .query_map([&name], |r| {
@@ -173,11 +265,12 @@ fn sqlite_schema(path: &str) -> Result<Schema, String> {
                             name: r.get(0)?,
                             data_type: r.get(1)?,
                             references: vec![],
+                            primary_key: r.get::<_, i64>(2)? > 0,
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut keys = db.prepare(
-                    "SELECT \"from\",\"table\",\"to\",seq FROM pragma_foreign_key_list(?1)",
+                    "SELECT \"from\",\"table\",\"to\",seq,id FROM pragma_foreign_key_list(?1)",
                 )?;
                 let keys = keys
                     .query_map([&name], |r| {
@@ -186,10 +279,11 @@ fn sqlite_schema(path: &str) -> Result<Schema, String> {
                             r.get::<_, String>(1)?,
                             r.get::<_, Option<String>>(2)?,
                             r.get::<_, i64>(3)?,
+                            r.get::<_, i64>(4)?,
                         ))
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
-                for (from, target, to, seq) in keys {
+                for (from, target, to, seq, id) in keys {
                     // An omitted target means the matching column of the parent's primary key.
                     let to = match to {
                         Some(to) => Some(to),
@@ -207,6 +301,8 @@ fn sqlite_schema(path: &str) -> Result<Schema, String> {
                             schema: "main".into(),
                             table: target,
                             column: to,
+                            constraint: format!("fk{id}"),
+                            ordinal: seq.max(0) as u32,
                         });
                     }
                 }
@@ -250,6 +346,13 @@ mod tests {
         assert_eq!(child.columns[0].data_type, "INTEGER");
         assert_eq!(child.columns[0].references[0].column, "a");
         assert_eq!(child.columns[1].references[0].column, "b");
+        assert_eq!(
+            child.columns[0].references[0].constraint,
+            child.columns[1].references[0].constraint
+        );
+        assert!(child.columns[0].references[0].ordinal < child.columns[1].references[0].ordinal);
+        let parent = schema.tables.iter().find(|t| t.name == "parent").unwrap();
+        assert!(parent.columns[0].primary_key && parent.columns[1].primary_key);
         assert!(schema.tables.iter().any(|t| t.name == "names"));
         db.execute_batch("ALTER TABLE parent ADD COLUMN added BLOB")
             .unwrap();
@@ -327,6 +430,9 @@ mod tests {
                     Some("other".into()),
                     Some(target.into()),
                     Some("key".into()),
+                    Some("1".into()),
+                    Some("fk".into()),
+                    Some("1".into()),
                 ]
             };
             let schema = assemble(
@@ -336,6 +442,7 @@ mod tests {
             assert_eq!(schema.tables.len(), 2);
             assert_eq!(schema.tables[0].columns.len(), 1);
             assert_eq!(schema.tables[0].columns[0].references.len(), 2);
+            assert!(schema.tables[0].columns[0].primary_key);
         }
     }
 }

@@ -133,11 +133,11 @@ internal static class Program
                 }
                 directives.AddDataPackages(kind);
                 generated = CSharpSyntaxTree.ParseText(dataSource, directives.ParseOptions, path: "CodingPadDataContext.cs", encoding: Encoding.UTF8, cancellationToken: cancel);
-                Environment.SetEnvironmentVariable("CODINGPAD_DATABASE_CONNECTION", connectionJson);
+                ScriptHelpers.DatabaseConnection = connectionJson;
             }
             else
             {
-                Environment.SetEnvironmentVariable("CODINGPAD_DATABASE_CONNECTION", null);
+                ScriptHelpers.DatabaseConnection = null;
             }
             var directory = scriptPath is null ? Environment.CurrentDirectory : Path.GetDirectoryName(Path.GetFullPath(scriptPath))!;
             var dependencies = await ScriptDependencies.Restore(directives, directory,
@@ -145,9 +145,29 @@ internal static class Program
             var tree = CSharpSyntaxTree.ParseText(source, directives.ParseOptions, path: "script.cs", encoding: Encoding.UTF8, cancellationToken: cancel);
             var compilation = Compile(tree, generated, directives, dependencies);
             var last = tree.GetRoot(cancel).ChildNodes().OfType<GlobalStatementSyntax>().LastOrDefault();
+            var diagnostics = compilation.GetDiagnostics(cancel).ToArray();
+            if (generated is not null)
+            {
+                var generatedErrors = diagnostics
+                    .Where(d => d.Severity == DiagnosticSeverity.Error &&
+                        d.Location.GetLineSpan().Path == "CodingPadDataContext.cs")
+                    .ToArray();
+                if (generatedErrors.Length > 0)
+                {
+                    Notify(context, "stream", new
+                    {
+                        runId = id,
+                        stream = "stderr",
+                        text = "Generated C# data context was ignored because it could not compile: " +
+                            string.Join("; ", generatedErrors.Select(d => d.Id + ": " + d.GetMessage())) + "\n"
+                    });
+                    compilation = Compile(tree, null, directives, dependencies);
+                    diagnostics = compilation.GetDiagnostics(cancel).ToArray();
+                }
+            }
             // Empty/comment/type-only scripts are useful no-ops. Keep every
             // other diagnostic, and preserve explicit Main programs when present.
-            var errors = compilation.GetDiagnostics(cancel)
+            var errors = diagnostics
                 .Where(d => d.Severity == DiagnosticSeverity.Error && !(last is null && d.Id == "CS5001")).ToArray();
             Notify(context, "diagnostics", new
             {
@@ -236,7 +256,7 @@ internal static class Program
             helpers?.Dispose();
             ScriptHelpers.ClearDatabase();
             ScriptHelpers.ClearSecrets();
-            Environment.SetEnvironmentVariable("CODINGPAD_DATABASE_CONNECTION", null);
+            ScriptHelpers.DatabaseConnection = null;
             cancellation.Request();
             lock (InspectionGate)
             lock (Gate)

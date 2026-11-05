@@ -13,9 +13,16 @@ use packages::Packages;
 use secrets::{SecretSnapshot, SecretStore};
 
 /// Names the script lexically passes to `secret(...)`/`Secret(...)`.
-/// `Some(names)` means read only those; `None` means a dynamic call so every
-/// non-connection secret must be available.
+/// `Some(names)` means read only those; `None` means a dynamic call or an
+/// ambiguous use, so every non-connection secret must be available.
 fn referenced_secret_names(source: &str) -> Option<Vec<String>> {
+    // Any import may call secret() inside a module we cannot see.
+    if source.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("import ") || line.starts_with("from ")
+    }) {
+        return None;
+    }
     let lower = source.to_ascii_lowercase();
     if !lower.contains("secret") {
         return Some(Vec::new());
@@ -33,7 +40,8 @@ fn referenced_secret_names(source: &str) -> Option<Vec<String>> {
             index += 1;
         }
         if bytes.get(index) != Some(&b'(') {
-            continue;
+            // `s = secret`, a non-call reference, etc.
+            return None;
         }
         index += 1;
         while index < bytes.len() && bytes[index].is_ascii_whitespace() {
@@ -44,29 +52,40 @@ fn referenced_secret_names(source: &str) -> Option<Vec<String>> {
             .copied()
             .filter(|byte| *byte == b'"' || *byte == b'\'')?;
         index += 1;
-        let mut value = String::new();
+        let mut value = Vec::new();
         let mut closed = false;
         while index < bytes.len() {
             let byte = bytes[index];
-            if byte == b'\\' && index + 1 < bytes.len() {
-                value.push(bytes[index + 1] as char);
-                index += 2;
-                continue;
+            if byte == b'\\' {
+                // Escapes make the runtime name unknowable; fetch every name.
+                return None;
             }
             if byte == quote {
                 closed = true;
                 index += 1;
                 break;
             }
-            value.push(byte as char);
+            value.push(byte);
             index += 1;
         }
         if !closed {
             return None;
         }
+        let mut lookahead = index;
+        while lookahead < bytes.len() && bytes[lookahead].is_ascii_whitespace() {
+            lookahead += 1;
+        }
+        if bytes.get(lookahead) != Some(&b')') {
+            // `secret('db-' + env)` or `secret('tok' 'en')`.
+            return None;
+        }
+        let Ok(value) = String::from_utf8(value) else {
+            return None;
+        };
         if !value.is_empty() && !names.contains(&value) {
             names.push(value);
         }
+        index = lookahead + 1;
     }
     if names.is_empty() {
         None
@@ -74,6 +93,7 @@ fn referenced_secret_names(source: &str) -> Option<Vec<String>> {
         Some(names)
     }
 }
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
@@ -828,17 +848,28 @@ mod tests {
         assert_eq!(referenced_secret_names("print(1)"), Some(vec![]));
         assert_eq!(
             referenced_secret_names("from codingpad import secret\nsecret('token')"),
-            Some(vec!["token".into()])
+            None,
+            "imports can hide calls, so every secret is read"
         );
         assert_eq!(
             referenced_secret_names("Secret(\"a\"); Secret( 'b' ); Secret(\"a\")"),
             Some(vec!["a".into(), "b".into()])
         );
         assert_eq!(referenced_secret_names("secret(name)"), None);
+        assert_eq!(referenced_secret_names("secret('db-' + env)"), None);
         assert_eq!(
-            referenced_secret_names("from codingpad import secret as s\ns('token')"),
+            referenced_secret_names("secret('token'); s = secret; s('other')"),
+            None
+        );
+        assert_eq!(referenced_secret_names("secret('tok' 'en')"), None);
+        assert_eq!(
+            referenced_secret_names("secret('clé')"),
+            Some(vec!["clé".into()])
+        );
+        assert_eq!(
+            referenced_secret_names("import hlp\nhlp.run()"),
             None,
-            "alias calls fall back to reading every name"
+            "a module may call secret()"
         );
     }
 

@@ -61,6 +61,12 @@ export function SecretsDialog({ open, onClose }: SecretsDialogProps) {
 
   async function save(sessionOnly = false) {
     if (busy) return;
+    if (name.trim().startsWith("connection:")) {
+      setError(
+        'Names starting with "connection:" are reserved for database passwords.',
+      );
+      return;
+    }
     setBusy(true);
     setError(undefined);
     setStatus(undefined);

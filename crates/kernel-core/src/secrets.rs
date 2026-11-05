@@ -133,6 +133,12 @@ impl SecretStore {
         self.vault_state.store(state, Ordering::Relaxed);
     }
 
+    /// Forget cached vault read failures so opening the Secrets dialog retries
+    /// a vault that was locked or denied earlier in the session.
+    pub fn clear_failures(&self) {
+        self.failures.lock().unwrap().clear();
+    }
+
     pub fn entries(&self) -> Vec<SecretEntry> {
         let names = self.names.lock().unwrap().clone();
         let session = self.session.lock().unwrap();

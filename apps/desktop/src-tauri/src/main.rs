@@ -92,6 +92,7 @@ fn list_secrets(secrets: State<'_, Arc<SecretStore>>) -> Vec<SecretEntry> {
 
 #[tauri::command]
 fn vault_available(secrets: State<'_, Arc<SecretStore>>) -> Option<bool> {
+    secrets.clear_failures();
     secrets.vault_available()
 }
 

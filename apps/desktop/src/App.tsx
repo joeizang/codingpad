@@ -7,6 +7,7 @@ import {
   save as saveDialog,
 } from "@tauri-apps/plugin-dialog";
 import CodeEditor, { type EditorHandle } from "./CodeEditor";
+import { ConnectionsDialog } from "./ConnectionsDialog";
 import { DumpTree } from "./DumpTree";
 import { uniqueId, type DiagnosticsSummary } from "./lsp";
 import {
@@ -17,6 +18,7 @@ import {
   type KernelEvent,
   type Output,
 } from "./protocol";
+import { SecretsDialog } from "./SecretsDialog";
 import { Sidebar } from "./Sidebar";
 import {
   headerSummary,
@@ -46,16 +48,28 @@ await Task.Delay(10);
 Enumerable.Range(1, 10).Sum();
 `;
 
+const SQL_SAMPLE = `-- codingpad: connection=sample
+
+SELECT 1 AS answer;
+`;
+
 const SCRIPT_FILTERS = [
   { name: "Python", extensions: ["py"] },
   { name: "C#", extensions: ["cs"] },
+  { name: "SQL", extensions: ["sql"] },
   { name: "All files", extensions: ["*"] },
 ];
 
 const scriptLanguage = (script: Script) => {
   const name = script.path ?? script.name;
-  return /\.py$/i.test(name) ? "python" : /\.cs$/i.test(name) ? "csharp" : "plaintext";
+  if (/\.py$/i.test(name)) return "python";
+  if (/\.cs$/i.test(name)) return "csharp";
+  if (/\.sql$/i.test(name)) return "sql";
+  return "plaintext";
 };
+
+const languageLabel = (language: string) =>
+  language === "csharp" ? "C#" : language === "python" ? "Python" : language === "sql" ? "SQL" : "Text";
 
 type Script = {
   id: string;
@@ -87,8 +101,8 @@ function intelligenceLabel(summary: DiagnosticsSummary): string {
 
 const newScript = (number: number, language = "python"): Script => ({
   id: uniqueId("scratch"),
-  name: `Scratch ${number}.${language === "csharp" ? "cs" : "py"}`,
-  source: language === "csharp" ? CSHARP_SAMPLE : SAMPLE,
+  name: `Scratch ${number}.${language === "csharp" ? "cs" : language === "sql" ? "sql" : "py"}`,
+  source: language === "csharp" ? CSHARP_SAMPLE : language === "sql" ? SQL_SAMPLE : SAMPLE,
   dirty: false,
   output: [],
   running: false,
@@ -114,6 +128,8 @@ export default function App() {
   const counter = useRef(1);
   const opening = useRef(new Set<string>());
   const [closing, setClosing] = useState(false);
+  const [secretsOpen, setSecretsOpen] = useState(false);
+  const [connectionsOpen, setConnectionsOpen] = useState(false);
   const [installProgress, setInstallProgress] = useState<string | null>(null);
   const installingToolchain = useRef(false);
   const [toolchainVersion, setToolchainVersion] = useState(0);
@@ -171,8 +187,12 @@ export default function App() {
       update(script.id, (item) => ({
         ...item,
         status: "Not runnable",
-        error: "Only Python and C# scripts run in this build.",
+        error: "Only Python, C# and SQL scripts run in this build.",
       }));
+      return;
+    }
+    if (scriptLanguage(script) === "sql") {
+      await runSqlScript(script);
       return;
     }
     running.current.add(script.id);
@@ -264,6 +284,55 @@ export default function App() {
     }
   }
 
+  async function runSqlScript(script: Script) {
+    running.current.add(script.id);
+    const version = (generation.current.get(script.id) ?? 0) + 1;
+    generation.current.set(script.id, version);
+    update(script.id, (item) => ({
+      ...item,
+      output: [],
+      running: true,
+      status: "Running…",
+      missingToolchain: undefined,
+      version,
+      updates: {},
+      compilation: undefined,
+      error: undefined,
+    }));
+    try {
+      await invoke("begin_sql_run", { scriptId: script.id });
+      const result = await invoke<{
+        ok: boolean;
+        stopped?: boolean;
+        tables: DumpNode[];
+      }>("run_sql", {
+        scriptId: script.id,
+        source: script.source,
+        path: script.path ?? null,
+      });
+      if (generation.current.get(script.id) !== version) return;
+      update(script.id, (item) => ({
+        ...item,
+        output: result.tables.map((node, index) => ({
+          id: index,
+          kind: "dump" as const,
+          node,
+        })),
+        status: result.stopped ? "Stopped" : "Finished",
+      }));
+    } catch (failure) {
+      if (generation.current.get(script.id) !== version) return;
+      update(script.id, (item) => ({
+        ...item,
+        status: "Could not run",
+        error: String(failure),
+      }));
+    } finally {
+      running.current.delete(script.id);
+      update(script.id, (item) => ({ ...item, running: false }));
+    }
+  }
+
   async function installToolchainAndRun(
     script: Script,
     toolchain: "uv" | "dotnet",
@@ -344,12 +413,15 @@ export default function App() {
     handle: string,
     cursor: string | null,
   ): Promise<DumpNode> {
-    const result = await invoke<{ node: DumpNode }>("expand_node", {
-      scriptId: active.id,
-      handle,
-      cursor,
-      limit: 100,
-    });
+    const result = await invoke<{ node: DumpNode }>(
+      language === "sql" ? "expand_sql" : "expand_node",
+      {
+        scriptId: active.id,
+        handle,
+        cursor,
+        limit: 100,
+      },
+    );
     return result.node;
   }
 
@@ -619,7 +691,7 @@ export default function App() {
         <div className="brand">
           <span className="brand-mark">c.</span>
           <strong>CodingPad</strong>
-          <span className="language">{language === "csharp" ? "C#" : language === "python" ? "Python" : "Text"}</span>
+          <span className="language">{languageLabel(language)}</span>
         </div>
         <div className="run-controls">
           <button
@@ -637,6 +709,20 @@ export default function App() {
             Save as…
           </button>
           <button
+            className="control-button"
+            aria-label="Connections"
+            onClick={() => setConnectionsOpen(true)}
+          >
+            Connections…
+          </button>
+          <button
+            className="control-button"
+            aria-label="Secrets"
+            onClick={() => setSecretsOpen(true)}
+          >
+            Secrets…
+          </button>
+          <button
             className="run-button"
             disabled={
               !runnable ||
@@ -645,7 +731,7 @@ export default function App() {
               installProgress !== null
             }
             title={
-              runnable ? undefined : "Only Python and C# scripts run in this build"
+              runnable ? undefined : "Only Python, C# and SQL scripts run in this build"
             }
             onClick={() => void runScript(active)}
           >
@@ -708,6 +794,9 @@ export default function App() {
         <button className="add-tab" aria-label="New C# scratch script" onClick={() => addScript("csharp")}>
           + C#
         </button>
+        <button className="add-tab" aria-label="New SQL scratch script" onClick={() => addScript("sql")}>
+          + SQL
+        </button>
       </nav>
       <div className="main-area">
         <Sidebar
@@ -722,7 +811,7 @@ export default function App() {
           error={libraryError}
         />
         <div className="workspace">
-          <section className="editor-pane" aria-label={`${language === "csharp" ? "C#" : language === "python" ? "Python" : "Text"} editor`}>
+          <section className="editor-pane" aria-label={`${languageLabel(language)} editor`}>
             <div className="pane-heading">
               <span>EDITOR</span>
               <span className="pane-heading-right">
@@ -841,6 +930,11 @@ export default function App() {
           </section>
         </div>
       </div>
+      <ConnectionsDialog
+        open={connectionsOpen}
+        onClose={() => setConnectionsOpen(false)}
+      />
+      <SecretsDialog open={secretsOpen} onClose={() => setSecretsOpen(false)} />
       <footer>
         <span>
           {active.path
@@ -850,7 +944,7 @@ export default function App() {
         <span>
           {activeHeader
             ? `Header: ${headerSummary(activeHeader) || activeHeader.line}`
-            : `${language === "csharp" ? "C#" : language === "python" ? "Python" : "Text"} · Library and files`}
+            : `${languageLabel(language)} · Library and files`}
         </span>
       </footer>
     </main>

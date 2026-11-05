@@ -4,6 +4,7 @@ import Editor from "./MonacoEditor";
 import * as monaco from "monaco-editor/editor/editor.api.js";
 import "monaco-editor/languages/definitions/python/register.js";
 import "monaco-editor/languages/definitions/csharp/register.js";
+import "monaco-editor/languages/definitions/sql/register.js";
 import type { CompileDiagnostic } from "./protocol";
 import EditorWorker from "monaco-editor/editor/editor.worker.js?worker";
 import {
@@ -295,7 +296,7 @@ export default function CodeEditor({
 
   return (
     <Editor
-      path={`${id}.${language === "csharp" ? "cs" : language === "python" ? "py" : "txt"}`}
+      path={`${id}.${language === "csharp" ? "cs" : language === "python" ? "py" : language === "sql" ? "sql" : "txt"}`}
       language={language}
       theme="vs-dark"
       value={source}

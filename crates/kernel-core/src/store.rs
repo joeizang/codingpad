@@ -30,7 +30,8 @@ pub fn parse_header(source: &str) -> Option<ScriptHeader> {
     let trimmed = first.trim_start();
     let rest = trimmed
         .strip_prefix('#')
-        .or_else(|| trimmed.strip_prefix("//"))?
+        .or_else(|| trimmed.strip_prefix("//"))
+        .or_else(|| trimmed.strip_prefix("--"))?
         .trim_start();
     let settings_text = rest.strip_prefix(HEADER_MARKER)?;
     Some(ScriptHeader {
@@ -289,6 +290,13 @@ mod tests {
                 "# codingpad: connection=northwind\nprint(1)\n",
                 Some((
                     "# codingpad: connection=northwind",
+                    &[("connection", "northwind")],
+                )),
+            ),
+            (
+                "-- codingpad: connection=northwind\nSELECT 1\n",
+                Some((
+                    "-- codingpad: connection=northwind",
                     &[("connection", "northwind")],
                 )),
             ),

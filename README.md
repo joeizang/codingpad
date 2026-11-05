@@ -126,7 +126,8 @@ prompts for its location the first time and can use **Save as…** afterwards.
 CodingPad settings live in the app config folder, never in your scripts.
 
 A script's optional single-line header stays at the top of the file and is shown
-in the footer. For Python it is a `#` comment; C#, Rust and TypeScript use `//`:
+in the footer. For Python it is a `#` comment; C#, Rust and TypeScript use `//`;
+SQL uses `--`:
 
 ```python
 # codingpad: connection=northwind
@@ -251,7 +252,7 @@ script objects until their next lookup or Reset. A successful recompute reports
 callbacks and inspection failures have their own reasons. A failed factory keeps
 its note pending for a retry in that run. Unused notes expire at completion.
 Late cache calls and cache calls from idle previews fail.
-`Secret("name")` throws an explanation that vault support is planned for M3.
+`Secret("name")` reads a named secret from the OS password vault (see [Secrets](#secrets)).
 
 The runtime is packable as `CodingPad`; its direct-consumer `build` imports make
 helper names available in .NET 10 file scripts with `#:package CodingPad@0.1.0`.
@@ -315,6 +316,66 @@ Roslyn ships with the VS Code C# extension; CodingPad finds it there, in its own
 install follows in a later M2 issue. Only managed `Console` output is
 captured; direct native writes are outside this increment. Scripts run with your
 user privileges.
+
+## SQL scripts (M3.0)
+
+Click **Connections…** to add a SQLite, PostgreSQL or SQL Server database, then
+**+ SQL** or open a `.sql` file. The first line names the connection; the rest is plain SQL:
+
+```sql
+-- codingpad: connection=northwind
+
+SELECT CustomerId, CompanyName FROM Customers LIMIT 100;
+```
+
+Results appear as a paged table in Results. Statement failures and missing
+connections show a clear error. **Stop** interrupts a running query. Connections
+live in the app settings. PostgreSQL (port 5432, TLS preferred) and SQL Server
+(port 1433) connections use host, database and user; their passwords are written
+only to the OS password vault and referenced by name, never stored in connection
+settings or scripts. TLS defaults to **Prefer**; choose **Require** for remote
+hosts. Prefer does not protect against an attacker who strips TLS, so it is not a
+security guarantee. Enable **Trust the server certificate** for a self-signed or
+private-CA server. PostgreSQL decimals, dates and timestamps use their exact server
+text; other columns in the same result keep their integer, boolean or float values.
+Multi-statement PostgreSQL batches use text for every column (including `t`/`f`
+for booleans). Connection passwords stay in the Rust host and are never passed to script kernels. SQL Server
+connections can opt in to trusting a self-signed development certificate, and SQL
+Server scripts do not accept the `GO` client-side batch separator; run each batch
+separately. SQL Server statements without a result set show `Statement completed.`
+rather than a rows-affected count. `money` and `smallmoney` are displayed with four
+decimal places; the driver decodes them as floating point, so very large `money`
+values may lose precision.
+
+## Secrets
+
+Click **Secrets…** to add, update or remove named secrets. Values are stored in
+the OS password vault (Keychain on macOS, Credential Manager on Windows, Secret
+Service on Linux); scripts and settings never contain them. A failed vault write
+returns an error instead of silently replacing a value. If the vault is
+unavailable, the dialog offers an explicit **Store for this session only** action;
+those values disappear when CodingPad exits.
+
+Python scripts read a secret with `secret("name")` (also importable from
+`codingpad`), and C# scripts with `Secret("name")`:
+
+```python
+from codingpad import secret
+
+api_key = secret("api-key")
+```
+
+```csharp
+var password = Secret("database-password");
+```
+
+Names starting with `connection:` are reserved for database connection
+passwords. A missing secret raises an actionable error. Secret values are not written to
+logs, script files or connection settings. Each run reads only the secrets its
+source names. Imports and dynamic uses fall back to every non-connection secret,
+because imported modules may call `secret()`. Scripts that neither import anything
+nor reference `secret` do not wait on the vault. Changing a secret takes
+effect on the next run of each script.
 
 ## Repository layout
 

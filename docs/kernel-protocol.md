@@ -18,8 +18,14 @@ invocation after streaming diagnostics. Stop/Close also cancel preparation.
 The supervisor allocates monotonically increasing integer request IDs per kernel:
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"run","params":{"source":"print('hello')\ndump([1, 2])\n42"}}
+{"jsonrpc":"2.0","id":1,"method":"run","params":{"source":"print('hello')\ndump([1, 2])\n42","secrets":{"token":"value"}}}
 ```
+
+`params.secrets` is an optional object of named secret values resolved by the
+host from the OS password vault before each run. The kernel keeps them in memory;
+Python exposes them through `secret("name")`, C# through `Secret("name")`. They
+are never written to stdout/stderr or included in dumps unless a script chooses
+to do so.
 
 A new globals dictionary includes `dump`, `cache`, `__name__ = "__main__"`, a virtual
 `__file__` and a copy of builtins. Imported modules remain cached in the process.
@@ -414,7 +420,7 @@ after its properties. Indirect dependents receive no imports. Host integration
 APIs are internal, with unsigned friend access keyed by the assembly name
 `CodingPad.Kernel`; this organizes the API and does not authenticate assemblies
 using that name. Outside the kernel, `Cancel` is `CancellationToken.None` and
-`Cache` lasts for that process. `Secret(name)` throws `NotSupportedException`
-until the M3 vault implementation. Package acceptance checks build a local feed
+`Cache` lasts for that process. `Secret(name)` throws a clear
+`KeyNotFoundException` when no value was supplied. Package acceptance checks build a local feed
 and use `#:package CodingPad@0.1.0`, disabling AOT publishing to avoid downloading
 an AOT compiler. Registry publication is a separate release action.

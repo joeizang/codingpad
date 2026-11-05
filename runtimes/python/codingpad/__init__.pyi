@@ -32,6 +32,10 @@ def cache(key: Hashable, factory: Callable[[], _T]) -> _T:
     """Compute a value once per key in this script's warm kernel."""
     ...
 
+def secret(name: str) -> str:
+    """Return a named secret supplied by the OS password vault."""
+    ...
+
 def html(markup: object) -> Html:
     """Render trusted markup in a sandboxed results frame."""
     ...

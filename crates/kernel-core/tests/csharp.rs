@@ -1196,7 +1196,7 @@ Cache("thread", () => Task.Run(() => Cache("inner", () => 8)).Result).Dump();
     assert!(dumps(&secret)[0]["message"]
         .as_str()
         .unwrap()
-        .contains("M3"));
+        .contains("Secrets"));
     supervisor.shutdown().await;
 }
 

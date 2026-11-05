@@ -492,6 +492,7 @@ def run(request):
             "__builtins__": dict(vars(builtins)),
             "dump": codingpad.dump,
             "cache": codingpad.cache,
+            "secret": codingpad.secret,
         }
     )
     auto_name = "__codingpad_auto_dump__"
@@ -527,6 +528,11 @@ def run(request):
                     {"runId": run_id, "nodeId": node_id, "node": node},
                 )
 
+            secrets = request["params"].get("secrets") or {}
+            errors = request["params"].get("secret_errors") or {}
+            if not isinstance(secrets, dict) or not isinstance(errors, dict):
+                raise ValueError("run params.secrets and secret_errors must be objects")
+            codingpad._set_secrets(secrets, errors)
             codingpad._begin(emit_dump, emit_update, run_id)
             try:
                 tree = ast.parse(source, filename=filename)

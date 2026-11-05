@@ -41,6 +41,13 @@ test("parses the same header forms as the Rust store", () => {
       },
     ],
     [
+      "-- codingpad: connection=northwind\nSELECT 1\n",
+      {
+        line: "-- codingpad: connection=northwind",
+        settings: { connection: "northwind" },
+      },
+    ],
+    [
       '// codingpad: connection="north wind" theme=dark\n',
       {
         line: '// codingpad: connection="north wind" theme=dark',

@@ -1,14 +1,98 @@
 //! Desktop-independent supervisor for one warm kernel process per script.
 mod csharp;
+pub mod databases;
 pub mod installer;
 pub mod lsp;
 mod packages;
 mod roslyn;
+pub mod secrets;
 mod shadow;
 pub mod store;
 pub mod toolchains;
 
 use packages::Packages;
+use secrets::{SecretSnapshot, SecretStore};
+
+/// Names the script lexically passes to `secret(...)`/`Secret(...)`.
+/// `Some(names)` means read only those; `None` means a dynamic call or an
+/// ambiguous use, so every non-connection secret must be available.
+fn referenced_secret_names(source: &str) -> Option<Vec<String>> {
+    // Imports (including inline/dynamic imports) can call secret() in unseen modules.
+    // A conservative substring check may fetch extra names, but cannot omit them.
+    let lower = source.to_ascii_lowercase();
+    if lower.contains("import") {
+        return None;
+    }
+    if !lower.contains("secret") {
+        return Some(Vec::new());
+    }
+    let bytes = source.as_bytes();
+    let mut names = Vec::new();
+    let mut index = 0;
+    while index + 6 <= bytes.len() {
+        if !bytes[index..index + 6].eq_ignore_ascii_case(b"secret") {
+            index += 1;
+            continue;
+        }
+        index += 6;
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if bytes.get(index) != Some(&b'(') {
+            // `s = secret`, a non-call reference, etc.
+            return None;
+        }
+        index += 1;
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let quote = bytes
+            .get(index)
+            .copied()
+            .filter(|byte| *byte == b'"' || *byte == b'\'')?;
+        index += 1;
+        let mut value = Vec::new();
+        let mut closed = false;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if byte == b'\\' {
+                // Escapes make the runtime name unknowable; fetch every name.
+                return None;
+            }
+            if byte == quote {
+                closed = true;
+                index += 1;
+                break;
+            }
+            value.push(byte);
+            index += 1;
+        }
+        if !closed {
+            return None;
+        }
+        let mut lookahead = index;
+        while lookahead < bytes.len() && bytes[lookahead].is_ascii_whitespace() {
+            lookahead += 1;
+        }
+        if bytes.get(lookahead) != Some(&b')') {
+            // `secret('db-' + env)` or `secret('tok' 'en')`.
+            return None;
+        }
+        let Ok(value) = String::from_utf8(value) else {
+            return None;
+        };
+        if !value.is_empty() && !names.contains(&value) {
+            names.push(value);
+        }
+        index = lookahead + 1;
+    }
+    if names.is_empty() {
+        None
+    } else {
+        Some(names)
+    }
+}
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
@@ -79,6 +163,7 @@ pub struct Supervisor {
     data_dir: Option<PathBuf>,
     kernels: Mutex<HashMap<String, SharedSlot>>,
     csharp: OnceCell<csharp::Installation>,
+    secrets: Option<Arc<SecretStore>>,
 }
 
 impl Default for Supervisor {
@@ -129,6 +214,7 @@ impl Supervisor {
             data_dir: None,
             kernels: Mutex::new(HashMap::new()),
             csharp: OnceCell::new(),
+            secrets: None,
         }
     }
 
@@ -141,6 +227,7 @@ impl Supervisor {
             data_dir: None,
             kernels: Mutex::new(HashMap::new()),
             csharp: OnceCell::new(),
+            secrets: None,
         }
     }
 
@@ -149,6 +236,14 @@ impl Supervisor {
         Self {
             data_dir: Some(data_dir),
             ..Self::default()
+        }
+    }
+
+    /// Share the app's secret store with every kernel this supervisor starts.
+    pub fn with_data_dir_and_secrets(data_dir: PathBuf, secrets: Arc<SecretStore>) -> Self {
+        Self {
+            secrets: Some(secrets),
+            ..Self::with_data_dir(data_dir)
         }
     }
 
@@ -201,6 +296,22 @@ impl Supervisor {
             .clone();
         let mut closed = slot.closed.subscribe();
         let mut stop = slot.stop.subscribe();
+        // Vault prompts block. Resolve values off the async thread and let Stop
+        // or Close cancel the wait before the kernel slot lock is taken.
+        let names = referenced_secret_names(source);
+        let secrets = match self.secrets.clone() {
+            None => SecretSnapshot::default(),
+            Some(store) => {
+                let snapshot =
+                    tokio::task::spawn_blocking(move || store.snapshot_named(names.as_deref()));
+                tokio::select! {
+                    result = snapshot => result
+                        .map_err(|error| format!("Could not read secrets from the vault: {error}"))?,
+                    _ = closed.changed() => return Err("Script was closed".into()),
+                    _ = stop.changed() => return Ok(RunResult { ok: false, stopped: true, cache_cleared: false }),
+                }
+            }
+        };
         let mut guard = slot.kernel.lock().await;
         if *closed.borrow() {
             return Err("Script was closed".into());
@@ -242,7 +353,7 @@ impl Supervisor {
             *guard = Some(startup?);
         }
         let result = tokio::select! {
-            result = guard.as_mut().unwrap().run(source, path, &mut emit, &mut stop) => result,
+            result = guard.as_mut().unwrap().run(source, path, &secrets, &mut emit, &mut stop) => result,
             _ = closed.changed() => Err("Script was closed".into()),
         };
         if result.as_ref().is_ok_and(|result| result.cache_cleared) {
@@ -509,13 +620,14 @@ impl Kernel {
         &mut self,
         source: &str,
         path: Option<&str>,
+        secrets: &SecretSnapshot,
         emit: &mut (impl FnMut(KernelEvent) + Send),
         stop: &mut watch::Receiver<u64>,
     ) -> Result<RunResult, String> {
         self.next_id += 1;
         let id = self.next_id;
         let mut request = serde_json::to_vec(
-            &json!({"jsonrpc": "2.0", "id": id, "method": "run", "params": {"source": source, "path": path}}),
+            &json!({"jsonrpc": "2.0", "id": id, "method": "run", "params": {"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors}}),
         )
         .map_err(|e| e.to_string())?;
         request.push(b'\n');
@@ -729,6 +841,90 @@ impl Drop for Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_names_are_read_lexically_or_not_at_all() {
+        for source in [
+            "x = 1; import hlp",
+            "if True: import hlp",
+            "try: import hlp",
+            "__import__('hlp').run()",
+            "import\thlp",
+            "secret('a')\nx = 1; import hlp",
+            "importlib.import_module('hlp').run()",
+        ] {
+            assert_eq!(referenced_secret_names(source), None, "{source}");
+        }
+        assert_eq!(referenced_secret_names("print(1)"), Some(vec![]));
+        assert_eq!(
+            referenced_secret_names("from codingpad import secret\nsecret('token')"),
+            None,
+            "imports can hide calls, so every secret is read"
+        );
+        assert_eq!(
+            referenced_secret_names("Secret(\"a\"); Secret( 'b' ); Secret(\"a\")"),
+            Some(vec!["a".into(), "b".into()])
+        );
+        assert_eq!(referenced_secret_names("secret(name)"), None);
+        assert_eq!(referenced_secret_names("secret('db-' + env)"), None);
+        assert_eq!(
+            referenced_secret_names("secret('token'); s = secret; s('other')"),
+            None
+        );
+        assert_eq!(referenced_secret_names("secret('tok' 'en')"), None);
+        assert_eq!(
+            referenced_secret_names("secret('clé')"),
+            Some(vec!["clé".into()])
+        );
+        assert_eq!(
+            referenced_secret_names("import hlp\nhlp.run()"),
+            None,
+            "a module may call secret()"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_during_a_vault_read_does_not_claim_the_cache_was_cleared() {
+        use crate::secrets::Vault;
+        use std::time::Duration;
+
+        struct SlowVault;
+        impl Vault for SlowVault {
+            fn get(&self, _: &str) -> Result<Option<String>, String> {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(None)
+            }
+            fn set(&self, _: &str, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn delete(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("secrets.json"), "[\"token\"]").unwrap();
+        let store = Arc::new(SecretStore::with_vault(
+            directory.path(),
+            Arc::new(SlowVault),
+        ));
+        let supervisor =
+            Supervisor::with_data_dir_and_secrets(directory.path().to_path_buf(), store);
+        let mut run = std::pin::pin!(supervisor.run("slow-secret", "secret('token')", |_| {}));
+        let result = tokio::select! {
+            result = &mut run => result,
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                supervisor.stop("slow-secret").await;
+                run.await
+            }
+        };
+        let result = result.unwrap();
+        assert!(result.stopped);
+        assert!(
+            !result.cache_cleared,
+            "no kernel existed, so no cache was cleared"
+        );
+    }
 
     #[tokio::test]
     async fn interpreter_probe_writes_utf8_with_an_ascii_stdout_encoding() {

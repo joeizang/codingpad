@@ -159,7 +159,8 @@ internal static class Program
                         runId = id,
                         stream = "stderr",
                         text = "Generated C# data context was ignored because it could not compile: " +
-                            string.Join("; ", generatedErrors.Select(d => d.Id + ": " + d.GetMessage())) + "\n"
+                            string.Join("; ", generatedErrors.Select(d => d.Id + ": " + d.GetMessage())) +
+                            ". DataContext will not be available in this run.\n"
                     });
                     compilation = Compile(tree, null, directives, dependencies);
                     diagnostics = compilation.GetDiagnostics(cancel).ToArray();

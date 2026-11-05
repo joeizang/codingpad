@@ -495,6 +495,8 @@ def run(request):
             "secret": codingpad.secret,
         }
     )
+    database = codingpad._Database(request["params"].get("connection"))
+    scope["db"] = database
     auto_name = "__codingpad_auto_dump__"
     callable_name = "__codingpad_last_callable__"
 
@@ -586,6 +588,7 @@ def run(request):
                 # SystemExit/KeyboardInterrupt must not kill the kernel either.
                 emit_dump(error_node(error, filename))
     finally:
+        database.close()
         codingpad._end()
         sys.stdin = previous_input
         sys.modules["__main__"] = previous_main

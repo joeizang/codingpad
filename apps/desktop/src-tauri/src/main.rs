@@ -409,11 +409,14 @@ fn main() {
             app.manage(secrets.clone());
             let connections = Arc::new(ConnectionStore::new(&data_dir));
             app.manage(connections.clone());
-            app.manage(Arc::new(SqlManager::new(connections, secrets.clone())));
-            app.manage(Supervisor::with_data_dir_and_secrets(
-                data_dir.clone(),
-                secrets,
-            ));
+            app.manage(Arc::new(SqlManager::new(
+                connections.clone(),
+                secrets.clone(),
+            )));
+            app.manage(
+                Supervisor::with_data_dir_and_secrets(data_dir.clone(), secrets)
+                    .with_connections(connections),
+            );
             app.manage(Toolchains::new(data_dir.clone()));
             app.manage(LanguageServers::with_data_dir(data_dir));
             bench_phase("setup_finished", serde_json::Value::Null);

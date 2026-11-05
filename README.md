@@ -342,7 +342,9 @@ passwords stay in the Rust host and are never passed to script kernels. SQL Serv
 connections can opt in to trusting a self-signed development certificate, and SQL
 Server scripts do not accept the `GO` client-side batch separator; run each batch
 separately. SQL Server statements without a result set show `Statement completed.`
-rather than a rows-affected count.
+rather than a rows-affected count. `money` and `smallmoney` are displayed with four
+decimal places; the driver decodes them as floating point, so very large `money`
+values may lose precision.
 
 ## Secrets
 

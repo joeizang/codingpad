@@ -704,7 +704,13 @@ impl SqlManager {
             tcp.set_nodelay(true).map_err(|error| error.to_string())?;
             tiberius::Client::connect(config, tcp.compat_write())
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| {
+                    if matches!(error, tiberius::error::Error::Tls(_)) && !connection.trust_server_certificate {
+                        format!("{error}. For a self-signed development server, enable \"Trust the server certificate\" in Connections.")
+                    } else {
+                        error.to_string()
+                    }
+                })
         };
         tokio::time::timeout(std::time::Duration::from_secs(15), connect)
             .await
@@ -987,9 +993,78 @@ fn postgres_port(connection: &Connection) -> u16 {
 }
 
 fn has_go_batch(source: &str) -> bool {
-    source
-        .lines()
-        .any(|line| line.trim().eq_ignore_ascii_case("GO"))
+    fn is_separator(line: &str) -> bool {
+        let mut words = line.split_whitespace();
+        if !words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("GO"))
+        {
+            return false;
+        }
+        match words.next() {
+            None => true,
+            Some(count) => {
+                count.bytes().all(|byte| byte.is_ascii_digit()) && words.next().is_none()
+            }
+        }
+    }
+
+    let mut chars = source.chars().peekable();
+    let mut line = String::new();
+    let mut quote = None;
+    let mut block_depth = 0;
+    let mut line_comment = false;
+    while let Some(ch) = chars.next() {
+        if ch == '\n' {
+            if is_separator(&line) {
+                return true;
+            }
+            line.clear();
+            line_comment = false;
+            if quote.is_some() {
+                line.push('?');
+            }
+            continue;
+        }
+        if line_comment {
+            continue;
+        }
+        if let Some(end) = quote {
+            if ch == end {
+                if chars.peek() == Some(&end) {
+                    chars.next();
+                } else {
+                    quote = None;
+                }
+            }
+        } else if block_depth > 0 {
+            if ch == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                block_depth += 1;
+            } else if ch == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                block_depth -= 1;
+            }
+        } else {
+            match ch {
+                '-' if chars.peek() == Some(&'-') => {
+                    chars.next();
+                    line_comment = true;
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    block_depth = 1;
+                    line.push(' ');
+                }
+                '\'' | '"' | '[' => {
+                    quote = Some(if ch == '[' { ']' } else { ch });
+                    line.push('?');
+                }
+                _ => line.push(ch),
+            }
+        }
+    }
+    is_separator(&line)
 }
 
 fn server_host(connection: &Connection) -> &str {
@@ -1082,6 +1157,17 @@ async fn sqlserver_tables(
     Ok(tables)
 }
 
+fn sqlserver_datetime_text(value: chrono::NaiveDateTime, kind: tiberius::ColumnType) -> String {
+    match kind {
+        tiberius::ColumnType::Datetime
+        | tiberius::ColumnType::Datetimen
+        | tiberius::ColumnType::Datetime4 => (value + chrono::Duration::microseconds(500))
+            .format("%Y-%m-%dT%H:%M:%S%.3f")
+            .to_string(),
+        _ => value.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
+    }
+}
+
 fn sqlserver_cell(
     row: &tiberius::Row,
     index: usize,
@@ -1091,7 +1177,17 @@ fn sqlserver_cell(
 ) -> Value {
     use tiberius::{ColumnData, ColumnType};
     let id = format!("sql:r{row_index}c{index}");
-    match column.column_type() {
+    // sql_variant columns carry the concrete type in the value, not the metadata.
+    let kind = match value {
+        ColumnData::Date(_) => ColumnType::Daten,
+        ColumnData::Time(_) => ColumnType::Timen,
+        ColumnData::DateTime(_) => ColumnType::Datetime,
+        ColumnData::SmallDateTime(_) => ColumnType::Datetime4,
+        ColumnData::DateTime2(_) => ColumnType::Datetime2,
+        ColumnData::DateTimeOffset(_) => ColumnType::DatetimeOffsetn,
+        _ => column.column_type(),
+    };
+    match kind {
         ColumnType::Daten => {
             if let Ok(value) = row.try_get::<chrono::NaiveDate, _>(index) {
                 return value.map_or_else(
@@ -1115,15 +1211,11 @@ fn sqlserver_cell(
         | ColumnType::Datetimen
         | ColumnType::Datetime4 => {
             if let Ok(value) = row.try_get::<chrono::NaiveDateTime, _>(index) {
-                let format = match column.column_type() {
-                    ColumnType::Datetime | ColumnType::Datetimen | ColumnType::Datetime4 => {
-                        "%Y-%m-%dT%H:%M:%S%.3f"
-                    }
-                    _ => "%Y-%m-%dT%H:%M:%S%.f",
-                };
                 return value.map_or_else(
                     || null_node(&id),
-                    |value| bounded_text(&id, value.format(format).to_string(), Some("datetime")),
+                    |value| {
+                        bounded_text(&id, sqlserver_datetime_text(value, kind), Some("datetime"))
+                    },
                 );
             }
         }
@@ -1704,6 +1796,58 @@ mod tests {
     use super::*;
     use crate::secrets::{SecretOrigin, Vault};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn sqlserver_go_detection_respects_sql_tokens() {
+        for sql in [
+            "GO",
+            " go 5 ",
+            "SELECT 1;\nGO 5\nSELECT 2",
+            "/* comment */ GO 2 -- repeat",
+            "GO\r\n",
+        ] {
+            assert!(has_go_batch(sql), "{sql:?}");
+        }
+        for sql in [
+            "SELECT 'a\nGO\nb'",
+            "/*\nGO\n*/ SELECT 1",
+            "/* outer /* inner */\nGO 2\n*/",
+            "SELECT [a\nGO\nb]",
+            "SELECT \"a\nGO\nb\"",
+            "-- GO",
+            "SELECT 'it''s\nGO\nfine'",
+            "GO away",
+            "GOTO label",
+        ] {
+            assert!(!has_go_batch(sql), "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn sqlserver_datetime_rounds_storage_ticks_to_milliseconds() {
+        let base = chrono::NaiveDate::from_ymd_opt(2020, 1, 2)
+            .unwrap()
+            .and_hms_opt(3, 4, 5)
+            .unwrap();
+        for (ticks, fraction) in [
+            (0, "000"),
+            (1, "003"),
+            (2, "007"),
+            (37, "123"),
+            (299, "997"),
+        ] {
+            let value = base + chrono::Duration::nanoseconds(ticks * 1_000_000_000 / 300);
+            assert_eq!(
+                sqlserver_datetime_text(value, tiberius::ColumnType::Datetime),
+                format!("2020-01-02T03:04:05.{fraction}")
+            );
+        }
+        let precise = base + chrono::Duration::nanoseconds(123_456_700);
+        assert_eq!(
+            sqlserver_datetime_text(precise, tiberius::ColumnType::Datetime2),
+            "2020-01-02T03:04:05.123456700"
+        );
+    }
 
     struct MemoryVault(Mutex<BTreeMap<String, String>>);
     impl Vault for MemoryVault {
@@ -2318,6 +2462,24 @@ mod tests {
         assert_eq!(cells[8]["v"], "<a>1</a>");
         assert!(cells[9]["v"].as_str().unwrap().contains("+02:00"));
         assert_eq!(cells[10]["v"], "9007199254740993");
+
+        let dates = manager
+            .run(
+                "mssql-dates",
+                &format!(
+                    "{header}SELECT \
+            CAST('2020-01-02T03:04:05.007' AS datetime) AS a, \
+            CAST('2020-01-02T03:04:05.997' AS datetime) AS b, \
+            CAST(CAST('2020-01-02' AS date) AS sql_variant) AS c"
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let cells = &dates.tables[0]["rows"][0];
+        assert_eq!(cells[0]["v"], "2020-01-02T03:04:05.007");
+        assert_eq!(cells[1]["v"], "2020-01-02T03:04:05.997");
+        assert_eq!(cells[2]["v"], "2020-01-02");
 
         let stop = {
             let manager = manager.clone();

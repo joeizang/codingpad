@@ -3,6 +3,7 @@
 import json
 import os
 import queue
+import shutil
 import threading
 from pathlib import Path
 import subprocess
@@ -27,10 +28,23 @@ class RuntimeTests(unittest.TestCase):
         ]:
             subprocess.run(command, check=True, capture_output=True, text=True, timeout=120)
 
+        # Seed the isolated feed with the package's restored transitive
+        # dependencies, so standalone tests do not depend on network access.
+        assets = json.loads((ROOT / "runtimes/dotnet/CodingPad/obj/project.assets.json").read_text())
+        folders = [Path(folder) for folder in assets["packageFolders"]]
+        for name, metadata in assets["libraries"].items():
+            if metadata.get("type") != "package":
+                continue
+            package, version = name.lower().split("/", 1)
+            candidates = [folder / package / version / f"{package}.{version}.nupkg" for folder in folders]
+            archive = next((path for path in candidates if path.is_file()), None)
+            if archive is None:
+                raise RuntimeError(f"Restored package archive not found: {name}")
+            shutil.copy2(archive, cls.feed / archive.name)
+
         (cls.work / "NuGet.Config").write_text(
             '<configuration><packageSources><clear />'
             f'<add key="local" value="{escape(str(cls.feed))}" />'
-            '<add key="nuget.org" value="https://api.nuget.org/v3/index.json" />'
             '</packageSources></configuration>', encoding="utf-8"
         )
         cls.env = {**os.environ, "NUGET_PACKAGES": str(cls.work / "packages")}

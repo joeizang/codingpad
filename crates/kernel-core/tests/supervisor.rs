@@ -763,3 +763,79 @@ async fn csharp_uses_the_attached_sqlite_connection() {
     assert_eq!(table["kind"], "table");
     assert_eq!(table["rows"][0][0]["v"], "Ada");
 }
+
+/// Run against explicitly configured local test servers; no credentials are stored.
+#[tokio::test]
+async fn language_clients_query_attached_server_databases() {
+    use codingpad_kernel_core::{
+        databases::{Connection, ConnectionStore, DatabaseKind, TlsMode},
+        secrets::SecretStore,
+        Language,
+    };
+    use std::sync::Arc;
+    for (kind, prefix) in [
+        (DatabaseKind::Postgres, "CODINGPAD_TEST_PG"),
+        (DatabaseKind::SqlServer, "CODINGPAD_TEST_MSSQL"),
+    ] {
+        let (Ok(port), Ok(database), Ok(user), Ok(password)) = (
+            std::env::var(format!("{prefix}_PORT")),
+            std::env::var(format!("{prefix}_DATABASE")),
+            std::env::var(format!("{prefix}_USER")),
+            std::env::var(format!("{prefix}_PASSWORD")),
+        ) else {
+            continue;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Arc::new(ConnectionStore::new(dir.path()));
+        let secrets = Arc::new(SecretStore::new(dir.path()));
+        secrets.set_session("connection:test", &password).unwrap();
+        connections
+            .save(Connection {
+                id: String::new(),
+                name: "test".into(),
+                kind,
+                path: None,
+                host: Some("127.0.0.1".into()),
+                port: Some(port.parse().unwrap()),
+                database: Some(database),
+                user: Some(user),
+                secret: Some("connection:test".into()),
+                tls: if kind == DatabaseKind::Postgres {
+                    TlsMode::Disable
+                } else {
+                    TlsMode::Require
+                },
+                trust_server_certificate: true,
+            })
+            .unwrap();
+        let supervisor = Supervisor::with_data_dir_and_secrets(dir.path().into(), secrets)
+            .with_connections(connections);
+        for (language, script) in [
+            (
+                Language::Python,
+                "# codingpad: connection=test\ndb.query('select 42 as answer')",
+            ),
+            (
+                Language::Csharp,
+                "// codingpad: connection=test\ndb.Query(\"select 42 as answer\").Dump();",
+            ),
+        ] {
+            let mut events = Vec::new();
+            let result = timeout(
+                Duration::from_secs(120),
+                supervisor.run_language("live", script, language, |event| events.push(event)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(result.ok, "{kind:?} {language:?}: {events:?}");
+            let table = &events
+                .iter()
+                .find(|event| event.method == "dump")
+                .unwrap()
+                .params["node"];
+            assert_eq!(table["kind"], "table");
+            assert_eq!(table["rows"][0][0]["v"], 42);
+        }
+    }
+}

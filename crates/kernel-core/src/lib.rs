@@ -467,8 +467,10 @@ impl Supervisor {
             };
             *guard = Some(startup?);
         }
+        let data = data.map(|data| json!({"source": data.source, "connection": data.connection}));
+        let params = json!({"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection, "data": data});
         let result = tokio::select! {
-            result = guard.as_mut().unwrap().run(source, path, &secrets, connection.as_ref(), data.as_ref(), &mut emit, &mut stop) => result,
+            result = guard.as_mut().unwrap().run(params, &mut emit, &mut stop) => result,
             _ = closed.changed() => Err("Script was closed".into()),
         };
         if result.as_ref().is_ok_and(|result| result.cache_cleared) {
@@ -733,19 +735,14 @@ impl Kernel {
 
     async fn run(
         &mut self,
-        source: &str,
-        path: Option<&str>,
-        secrets: &SecretSnapshot,
-        connection: Option<&Value>,
-        data: Option<&DataContextRun>,
+        params: Value,
         emit: &mut (impl FnMut(KernelEvent) + Send),
         stop: &mut watch::Receiver<u64>,
     ) -> Result<RunResult, String> {
         self.next_id += 1;
         let id = self.next_id;
-        let data = data.map(|data| json!({"source": data.source, "connection": data.connection}));
         let mut request = serde_json::to_vec(
-            &json!({"jsonrpc": "2.0", "id": id, "method": "run", "params": {"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection, "data": data}}),
+            &json!({"jsonrpc": "2.0", "id": id, "method": "run", "params": params}),
         )
         .map_err(|e| e.to_string())?;
         request.push(b'\n');

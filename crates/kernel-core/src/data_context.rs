@@ -727,8 +727,12 @@ fn csharp_models(tables: &[TableShape], kind: crate::databases::DatabaseKind) ->
          using Microsoft.EntityFrameworkCore;\n\n",
     );
     if kind == DatabaseKind::Postgres {
-        out.push_str("// PostgreSQL intervals map to TimeSpan. Reading month/year components throws;\n");
-        out.push_str("// they cannot be represented as a fixed duration. Unsupported columns are omitted.\n");
+        out.push_str(
+            "// PostgreSQL intervals map to TimeSpan. Reading month/year components throws;\n",
+        );
+        out.push_str(
+            "// they cannot be represented as a fixed duration. Unsupported columns are omitted.\n",
+        );
         out.push_str("using NpgsqlTypes;\n");
     }
     out.push_str("namespace CodingPad.Data;\n\n");

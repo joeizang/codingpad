@@ -94,7 +94,7 @@ internal sealed class DumpSession(long runId) : IDisposable
         if (value is bool || value is byte or sbyte or short or ushort or int or uint or long or ulong or decimal ||
             value is double d && double.IsFinite(d) || value is float f && float.IsFinite(f))
             return new { id, kind = "primitive", v = value };
-        if (value is string or char or Enum or DateTime or DateTimeOffset or TimeSpan or Guid or double or float)
+        if (IsTextual(value))
         {
             var text = Convert.ToString(value, CultureInfo.InvariantCulture) ?? "";
             var limit = Math.Min(cell ? 1000 : 10000, Math.Max(0, budget.Characters));
@@ -275,7 +275,11 @@ internal sealed class DumpSession(long runId) : IDisposable
         };
     }
 
-    private static bool IsScalar(object value) => value is string or char or bool or byte or sbyte or short or ushort or int or uint or long or ulong or decimal or double or float or Enum or DateTime or DateTimeOffset or TimeSpan or Guid;
+    private static bool IsTextual(object value) =>
+        value is string or char or double or float or Enum or DateTime or DateTimeOffset or TimeSpan or Guid ||
+        value.GetType().FullName is "System.Net.IPAddress" or "System.Net.NetworkInformation.PhysicalAddress" or "NpgsqlTypes.NpgsqlCidr" or "NpgsqlTypes.NpgsqlInterval";
+
+    private static bool IsScalar(object value) => value is string or char or bool or byte or sbyte or short or ushort or int or uint or long or ulong or decimal or double or float or Enum or DateTime or DateTimeOffset or TimeSpan or Guid || IsTextual(value);
 
     public bool Contains(string handle) => handles.ContainsKey(handle);
     public object Expand(string handle, string? cursor, int limit)

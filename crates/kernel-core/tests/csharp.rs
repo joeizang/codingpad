@@ -1813,3 +1813,24 @@ async fn csharp_saved_script_uses_parent_nuget_config_and_recovers_after_restore
     assert_eq!(dumps(&events)[0]["v"], 42);
     supervisor.shutdown().await;
 }
+
+#[tokio::test]
+async fn csharp_non_finite_numbers_remain_visible_in_dumps() {
+    let supervisor = Supervisor::default();
+    let events = run(
+        &supervisor,
+        "non-finite",
+        "double.NaN.Dump(); float.PositiveInfinity.Dump(); new[] { double.NaN, 1.5 }.Dump();",
+        true,
+    )
+    .await;
+    let values = dumps(&events);
+    assert_eq!(values[0]["kind"], "string");
+    assert_eq!(values[0]["v"], "NaN");
+    assert_eq!(values[1]["kind"], "string");
+    assert_eq!(values[1]["v"], "Infinity");
+    assert_eq!(values[2]["rows"][0][0]["kind"], "string");
+    assert_eq!(values[2]["rows"][0][0]["v"], "NaN");
+    assert_eq!(values[2]["rows"][1][0]["v"], 1.5);
+    supervisor.shutdown().await;
+}

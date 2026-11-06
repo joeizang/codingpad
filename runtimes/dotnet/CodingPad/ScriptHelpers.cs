@@ -29,6 +29,9 @@ public static class ScriptHelpers
 
     public static CancellationToken Cancel => Current.Value?.Token ?? CancellationToken.None;
 
+    /// <summary>Connection JSON for this run's generated EF Core data context.</summary>
+    public static string? DatabaseConnection { get; internal set; }
+
     /// <summary>Return a named secret supplied by the OS password vault.</summary>
     public static string Secret(string name)
     {

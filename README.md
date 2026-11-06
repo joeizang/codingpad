@@ -403,11 +403,12 @@ rather than a rows-affected count. `money` and `smallmoney` are displayed with f
 decimal places; the driver decodes them as floating point, so very large `money`
 values may lose precision.
 
-## Python data contexts (M3.8)
+## Data contexts (M3.8/M3.9)
 
-A Python script with a connection header also gets a typed **data context**
+A Python or C# script with a connection header also gets a typed **data context**
 generated from that connection's schema. Tables become model classes, columns
-become typed properties, and foreign keys become relationships. The context is regenerated for every run and when the schema panel is
+become typed properties, and foreign keys become relationships or navigation
+properties. The context is regenerated for every run and when the schema panel is
 refreshed, so editing the database schema is picked up without maintaining model
 files by hand. Model sources are generated into a hidden workspace, never into
 your script.
@@ -421,11 +422,24 @@ context = DataContext.connect()
 context.session.scalars(select(Customer)).all()
 ```
 
-Python models use SQLAlchemy 2.0 `Mapped[]` annotations and `relationship()`.
-The kernel installs SQLAlchemy on first use. basedpyright sees the generated
-models, so column, table and relationship completions work while you edit.
-Passwords stay in the OS vault and are read only while a run or schema refresh
-needs them; generated files contain only the schema, never a password.
+```csharp
+// codingpad: connection=northwind
+var context = new DataContext();
+context.Customers.Where(customer => customer.Name.StartsWith("A")).ToList().Dump();
+```
+
+Python models use SQLAlchemy 2.0 `Mapped[]` annotations and `relationship()`;
+C# models use EF Core entity classes and a `DbContext`. The kernel installs the
+language's database packages on first use. basedpyright and Roslyn see the
+generated models, so column, table and relationship completions work while you
+edit. Passwords stay in the OS vault and are read only while a run or schema
+refresh needs them; generated files contain only the schema, never a password.
+
+PostgreSQL C# `interval` and `interval[]` columns map to `TimeSpan` and
+`TimeSpan[]`. [Intervals containing months or years cannot be read as a fixed duration](https://www.npgsql.org/doc/types/datetime.html)
+and raise an error. Columns without a supported EF mapping are omitted from the
+generated class, with a comment naming the column, so unavailable data cannot
+appear as a real `null` value.
 
 ## Secrets
 

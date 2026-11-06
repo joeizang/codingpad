@@ -388,10 +388,12 @@ async fn sqlserver_live_types_work_through_generated_models() {
         .unwrap();
     let (ok, events) = csharp.expect("SQL Server C# data context run failed");
     assert!(ok, "{events:?}");
-    assert!(stdout(&events).contains("00000000-0000-0000-0000-000000000001"));
-    assert!(stdout(&events).contains('1'));
+    let text = stdout(&events);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines, ["00000000-0000-0000-0000-000000000001", "1"]);
     let (ok, events) = python.expect("SQL Server Python data context run failed");
     assert!(ok, "{events:?}");
-    assert!(stdout(&events).contains("00000000-0000-0000-0000-000000000001"));
-    assert!(stdout(&events).contains('1'));
+    let text = stdout(&events);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines, ["00000000-0000-0000-0000-000000000001", "1"]);
 }

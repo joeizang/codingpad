@@ -276,7 +276,7 @@ internal sealed class DumpSession(long runId) : IDisposable
     }
 
     private static bool IsTextual(object value) =>
-        value is string or char or double or float or Enum or DateTime or DateTimeOffset or TimeSpan or Guid ||
+        value is string or char or Enum or DateTime or DateTimeOffset or TimeSpan or Guid or double or float ||
         value.GetType().FullName is "System.Net.IPAddress" or "System.Net.NetworkInformation.PhysicalAddress" or "NpgsqlTypes.NpgsqlCidr" or "NpgsqlTypes.NpgsqlInterval";
 
     private static bool IsScalar(object value) => value is string or char or bool or byte or sbyte or short or ushort or int or uint or long or ulong or decimal or double or float or Enum or DateTime or DateTimeOffset or TimeSpan or Guid || IsTextual(value);

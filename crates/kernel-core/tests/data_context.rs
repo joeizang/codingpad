@@ -247,6 +247,42 @@ async fn foreign_key_to_a_unique_non_primary_key_works() {
     supervisor.shutdown().await;
 }
 
+#[tokio::test]
+#[ignore = "installs SQLAlchemy and EF Core on the first run"]
+async fn sqlite_defaults_fill_unset_columns_in_both_languages() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("defaults.db");
+    database(
+        &path,
+        "CREATE TABLE items (id TEXT PRIMARY KEY DEFAULT 'generated', created TEXT NOT NULL DEFAULT 'now', label TEXT);",
+    );
+    let context = generated(directory.path(), &path).await;
+    let supervisor = Supervisor::default();
+    let csharp = run(
+        &supervisor,
+        Language::Csharp,
+        "var context = new DataContext();\nvar item = new Item { Id = \"cs\", Label = \"a\" };\ncontext.Add(item);\ncontext.SaveChanges();\nConsole.WriteLine(item.Created);\n",
+        DataContextRun {
+            source: context.csharp.clone(),
+            connection: context.connection.clone(),
+        },
+    )
+    .await;
+    let python = run(
+        &supervisor,
+        Language::Python,
+        "from codingpad_data import DataContext, Item\ncontext = DataContext.connect()\nitem = Item(label='b')\ncontext.session.add(item)\ncontext.session.flush()\nprint(item.id, item.created)\ncontext.session.rollback()\n",
+        DataContextRun {
+            source: context.python,
+            connection: context.connection,
+        },
+    )
+    .await;
+    supervisor.shutdown().await;
+    assert_eq!(stdout(&csharp).trim(), "now");
+    assert_eq!(stdout(&python).trim(), "generated now");
+}
+
 async fn live_manager(
     kind: DatabaseKind,
     host: String,
@@ -301,7 +337,7 @@ async fn postgres_live_types_work_through_generated_models() {
         false,
     )
     .await;
-    let setup = "-- codingpad: connection=live\nDROP TABLE IF EXISTS codingpad_dc_month; DROP TABLE IF EXISTS codingpad_dc_other; DROP TABLE IF EXISTS codingpad_dc_test; CREATE TABLE codingpad_dc_test (id uuid PRIMARY KEY, span interval, spans interval[], addr inet, t timetz, points point[], oid oid); INSERT INTO codingpad_dc_test VALUES ('00000000-0000-0000-0000-000000000001', '1 day 1 hour 0.000001 seconds', ARRAY['1 hour'::interval, '-1 day'::interval], '127.0.0.1', '12:00:00+00', ARRAY[point(1,2)], 42); CREATE TABLE codingpad_dc_other (id int PRIMARY KEY); INSERT INTO codingpad_dc_other VALUES (1); CREATE TABLE codingpad_dc_month (id int PRIMARY KEY, span interval); INSERT INTO codingpad_dc_month VALUES (1, '1 month');";
+    let setup = "-- codingpad: connection=live\nDROP TABLE IF EXISTS codingpad_dc_kinds; DROP TABLE IF EXISTS codingpad_dc_oids; DROP TABLE IF EXISTS codingpad_dc_shapes; DROP TABLE IF EXISTS codingpad_dc_month; DROP TABLE IF EXISTS codingpad_dc_other; DROP TABLE IF EXISTS codingpad_dc_test; DROP FUNCTION IF EXISTS codingpad_dc_next(); DROP SEQUENCE IF EXISTS codingpad_dc_seq; DROP TYPE IF EXISTS codingpad_dc_mood; DROP TYPE IF EXISTS \"Codingpad Odd\"; DROP SCHEMA IF EXISTS codingpad_dc_s CASCADE; CREATE TABLE codingpad_dc_test (id uuid PRIMARY KEY, span interval, spans interval[], addr inet, t timetz, points point[], oid oid); INSERT INTO codingpad_dc_test VALUES ('00000000-0000-0000-0000-000000000001', '1 day 1 hour 0.000001 seconds', ARRAY['1 hour'::interval, '-1 day'::interval], '127.0.0.1', '12:00:00+00', ARRAY[point(1,2)], 42); CREATE TABLE codingpad_dc_other (id int PRIMARY KEY); INSERT INTO codingpad_dc_other VALUES (1); CREATE TABLE codingpad_dc_month (id int PRIMARY KEY, span interval); INSERT INTO codingpad_dc_month VALUES (1, '1 month'); CREATE TYPE codingpad_dc_mood AS ENUM ('ok', 'sad'); CREATE TYPE \"Codingpad Odd\" AS ENUM ('a b', 'c'); CREATE SCHEMA codingpad_dc_s; CREATE TYPE codingpad_dc_s.smood AS ENUM ('x', 'y'); CREATE SEQUENCE codingpad_dc_seq START 700; CREATE FUNCTION codingpad_dc_next() RETURNS int LANGUAGE sql AS 'SELECT nextval(''codingpad_dc_seq'')::int'; CREATE TABLE codingpad_dc_kinds (id int PRIMARY KEY DEFAULT codingpad_dc_next(), mood codingpad_dc_mood, odd \"Codingpad Odd\", moods codingpad_dc_mood[], smood codingpad_dc_s.smood, smoods codingpad_dc_s.smood[], doc xml, price money, prices money[], stamp timestamptz NOT NULL DEFAULT now(), at timestamp, d date, t2 time, span interval, spans interval[]); INSERT INTO codingpad_dc_kinds (id, mood, moods) VALUES (1, 'sad', ARRAY['sad']::codingpad_dc_mood[]); CREATE TABLE codingpad_dc_oids (id oid PRIMARY KEY, refs oid[], label text); INSERT INTO codingpad_dc_oids VALUES (42, ARRAY[1,2]::oid[], 'answer'); CREATE TABLE codingpad_dc_shapes (points point[]);";
     manager.run("setup", setup, None).await.unwrap();
     let context = manager.data_context("live").await.unwrap();
     let supervisor = Supervisor::default();
@@ -312,16 +348,58 @@ async fn postgres_live_types_work_through_generated_models() {
 Console.WriteLine(context.CodingpadDcOthers.Single().Id);
 var row = context.CodingpadDcTests.Single();
 Console.WriteLine(row.Addr);
-Console.WriteLine(row.Span == TimeSpan.FromDays(1) + TimeSpan.FromHours(1) + TimeSpan.FromTicks(10));
-Console.WriteLine(row.Spans!.SequenceEqual(new[] { TimeSpan.FromHours(1), TimeSpan.FromDays(-1) }));
+Console.WriteLine(row.Span!.ToDuration() == NodaTime.Duration.FromDays(1) + NodaTime.Duration.FromHours(1) + NodaTime.Duration.FromTicks(10));
+Console.WriteLine(row.Spans!.Select(span => span.ToDuration()).SequenceEqual(new[] { NodaTime.Duration.FromHours(1), NodaTime.Duration.FromDays(-1) }));
 Console.WriteLine(typeof(CodingpadDcTest).GetProperty("Points") is null);
-Console.WriteLine(typeof(CodingpadDcTest).GetProperty("Oid") is null);
-try
+Console.WriteLine(row.Oid);
+var month = context.CodingpadDcMonths.Single();
+Console.WriteLine(month.Span);
+context.CodingpadDcMonths.ToList().Dump();
+
+// Enums and other types with no cast from text: insert, filter, update.
+var mood = "ok";
+var odd = "a b";
+var smood = "x";
+var added = new CodingpadDcKind
 {
-    _ = context.CodingpadDcMonths.Single();
-    throw new Exception("Month intervals must not be approximated as days");
-}
-catch (InvalidCastException) { Console.WriteLine("month interval rejected"); }
+    Mood = mood, Odd = odd, Moods = new[] { "ok", "sad" }, Smood = smood, Smoods = new[] { "y" }, Doc = "<a/>",
+    Price = 1.5m, Prices = new[] { 2.5m },
+    At = new DateTime(2024, 1, 2, 3, 4, 5), D = new DateOnly(2024, 1, 2), T2 = new TimeOnly(1, 2, 3),
+    Span = NodaTime.Period.FromMonths(2), Spans = new[] { NodaTime.Period.FromYears(1) },
+};
+context.Add(added);
+context.SaveChanges();
+Console.WriteLine(added.Id);
+Console.WriteLine(added.Stamp is not null);
+var fresh = new DataContext();
+Console.WriteLine(fresh.CodingpadDcKinds.Count(x => x.Mood == mood));
+Console.WriteLine(fresh.CodingpadDcKinds.Count(x => x.Odd == odd));
+Console.WriteLine(fresh.CodingpadDcKinds.Count(x => x.Smood == smood));
+var moods = new[] { "ok", "sad" };
+Console.WriteLine(fresh.CodingpadDcKinds.Count(x => moods.Contains(x.Mood!)));
+Console.WriteLine(fresh.CodingpadDcKinds.Count(x => x.Moods!.Contains(mood)));
+Console.WriteLine(fresh.CodingpadDcKinds.Count(x => x.Price == 1.5m));
+var period = NodaTime.Period.FromMonths(2);
+Console.WriteLine(fresh.CodingpadDcKinds.Count(x => x.Span == period));
+var saved = fresh.CodingpadDcKinds.Single(x => x.Id == added.Id);
+Console.WriteLine($"{saved.Mood}|{saved.Odd}|{string.Join(",", saved.Moods!)}|{saved.Smood}|{saved.Smoods![0]}|{saved.Doc}|{saved.Price}|{saved.Prices![0]}|{saved.At:O}|{saved.D:O}|{saved.T2:O}|{saved.Span}|{saved.Spans![0]}");
+saved.Mood = "sad";
+saved.Moods![0] = "sad";
+fresh.SaveChanges();
+var after = new DataContext().CodingpadDcKinds.Single(x => x.Id == added.Id);
+Console.WriteLine($"{after.Mood}|{string.Join(",", after.Moods!)}");
+fresh.Add(new CodingpadDcKind { Id = 5 });
+fresh.SaveChanges();
+Console.WriteLine(new DataContext().CodingpadDcKinds.Single(x => x.Id == 5).Mood is null);
+
+// oid key and table left without a mapped column.
+var answer = 42u;
+Console.WriteLine(fresh.CodingpadDcOids.Single(x => x.Id == answer).Label);
+Console.WriteLine(string.Join(",", fresh.CodingpadDcOids.Single().Refs!));
+fresh.CodingpadDcOids.Add(new CodingpadDcOid { Id = 43, Refs = new uint[] { 7 }, Label = "added" });
+fresh.SaveChanges();
+Console.WriteLine(new DataContext().CodingpadDcOids.Single(x => x.Id == 43).Label);
+Console.WriteLine(typeof(DataContext).GetProperties().Any(property => property.Name.Contains("Shape")));
 "#,
         DataContextRun {
             source: context.csharp,
@@ -333,7 +411,7 @@ catch (InvalidCastException) { Console.WriteLine("month interval rejected"); }
     manager
         .run(
             "cleanup",
-            "-- codingpad: connection=live\nDROP TABLE IF EXISTS codingpad_dc_month; DROP TABLE IF EXISTS codingpad_dc_other; DROP TABLE IF EXISTS codingpad_dc_test;",
+            "-- codingpad: connection=live\nDROP TABLE IF EXISTS codingpad_dc_kinds; DROP TABLE IF EXISTS codingpad_dc_oids; DROP TABLE IF EXISTS codingpad_dc_shapes; DROP TABLE IF EXISTS codingpad_dc_month; DROP TABLE IF EXISTS codingpad_dc_other; DROP TABLE IF EXISTS codingpad_dc_test; DROP FUNCTION IF EXISTS codingpad_dc_next(); DROP SEQUENCE IF EXISTS codingpad_dc_seq; DROP TYPE IF EXISTS codingpad_dc_mood; DROP TYPE IF EXISTS \"Codingpad Odd\"; DROP SCHEMA IF EXISTS codingpad_dc_s CASCADE;",
             None,
         )
         .await
@@ -348,9 +426,29 @@ catch (InvalidCastException) { Console.WriteLine("month interval rejected"); }
             "True",
             "True",
             "True",
+            "42",
+            "P1M",
+            "700",
             "True",
-            "month interval rejected"
+            "1",
+            "1",
+            "1",
+            "2",
+            "1",
+            "1",
+            "1",
+            "ok|a b|ok,sad|x|y|<a/>|1.50|2.50|2024-01-02T03:04:05.0000000|2024-01-02|01:02:03.0000000|P2M|P1Y",
+            "sad|sad,sad",
+            "True",
+            "answer",
+            "1,2",
+            "added",
+            "False",
         ]
+    );
+    assert!(
+        format!("{events:?}").contains("P1M"),
+        "Dump should show a month interval as text: {events:?}"
     );
 }
 
@@ -378,14 +476,14 @@ async fn sqlserver_live_types_work_through_generated_models() {
         trust,
     )
     .await;
-    let setup = "-- codingpad: connection=live\nIF OBJECT_ID('codingpad_dc_child') IS NOT NULL DROP TABLE codingpad_dc_child; IF OBJECT_ID('codingpad_dc_test') IS NOT NULL DROP TABLE codingpad_dc_test; CREATE TABLE codingpad_dc_test (id uniqueidentifier PRIMARY KEY, rv rowversion, t time); CREATE TABLE codingpad_dc_child (id int PRIMARY KEY, parent_id uniqueidentifier REFERENCES codingpad_dc_test(id)); INSERT INTO codingpad_dc_test (id, t) VALUES ('00000000-0000-0000-0000-000000000001', '12:00:00'); INSERT INTO codingpad_dc_child VALUES (1, '00000000-0000-0000-0000-000000000001');";
+    let setup = "-- codingpad: connection=live\nIF OBJECT_ID('codingpad_dc_defaults') IS NOT NULL DROP TABLE codingpad_dc_defaults; IF OBJECT_ID('codingpad_dc_child') IS NOT NULL DROP TABLE codingpad_dc_child; IF OBJECT_ID('codingpad_dc_test') IS NOT NULL DROP TABLE codingpad_dc_test; CREATE TABLE codingpad_dc_defaults (id int PRIMARY KEY DEFAULT 700, created datetime2 NOT NULL DEFAULT sysutcdatetime(), label varchar(10)); CREATE TABLE codingpad_dc_test (id uniqueidentifier PRIMARY KEY, rv rowversion, t time); CREATE TABLE codingpad_dc_child (id int PRIMARY KEY, parent_id uniqueidentifier REFERENCES codingpad_dc_test(id)); INSERT INTO codingpad_dc_test (id, t) VALUES ('00000000-0000-0000-0000-000000000001', '12:00:00'); INSERT INTO codingpad_dc_child VALUES (1, '00000000-0000-0000-0000-000000000001');";
     manager.run("setup", setup, None).await.unwrap();
     let context = manager.data_context("live").await.unwrap();
     let supervisor = Supervisor::default();
     let csharp = run_result(
         &supervisor,
         Language::Csharp,
-        "using Microsoft.EntityFrameworkCore;\nvar context = new DataContext();\nvar parent = context.CodingpadDcTests.Include(row => row.CodingpadDcChilds).First(row => row.Id == Guid.Parse(\"00000000-0000-0000-0000-000000000001\"));\nConsole.WriteLine(parent.Id);\nConsole.WriteLine(parent.CodingpadDcChilds.Count);\n",
+        "using Microsoft.EntityFrameworkCore;\nvar context = new DataContext();\nvar parent = context.CodingpadDcTests.Include(row => row.CodingpadDcChilds).First(row => row.Id == Guid.Parse(\"00000000-0000-0000-0000-000000000001\"));\nConsole.WriteLine(parent.Id);\nConsole.WriteLine(parent.CodingpadDcChilds.Count);\nvar defaulted = new CodingpadDcDefault { Label = \"cs\" };\ncontext.Add(defaulted);\ncontext.SaveChanges();\nConsole.WriteLine(defaulted.Id);\nConsole.WriteLine(defaulted.Created is not null);\ncontext.Remove(defaulted);\ncontext.SaveChanges();\n",
         DataContextRun {
             source: context.csharp.clone(),
             connection: context.connection.clone(),
@@ -395,7 +493,7 @@ async fn sqlserver_live_types_work_through_generated_models() {
     let python = run_result(
         &supervisor,
         Language::Python,
-        "from uuid import UUID\nfrom sqlalchemy import select\nfrom codingpad_data import CodingpadDcTest, DataContext\ncontext = DataContext.connect()\nparent = context.session.scalars(select(CodingpadDcTest).where(CodingpadDcTest.id == UUID('00000000-0000-0000-0000-000000000001'))).first()\nprint(parent.id)\nprint(len(parent.codingpad_dc_childs))\n",
+        "from uuid import UUID\nfrom sqlalchemy import select\nfrom codingpad_data import CodingpadDcDefault, CodingpadDcTest, DataContext\ncontext = DataContext.connect()\nparent = context.session.scalars(select(CodingpadDcTest).where(CodingpadDcTest.id == UUID('00000000-0000-0000-0000-000000000001'))).first()\nprint(parent.id)\nprint(len(parent.codingpad_dc_childs))\ndefaulted = CodingpadDcDefault(label='py')\ncontext.session.add(defaulted)\ncontext.session.flush()\nprint(defaulted.id)\nprint(defaulted.created is not None)\ncontext.session.rollback()\n",
         DataContextRun {
             source: context.python,
             connection: context.connection,
@@ -406,7 +504,7 @@ async fn sqlserver_live_types_work_through_generated_models() {
     manager
         .run(
             "cleanup",
-            "-- codingpad: connection=live\nIF OBJECT_ID('codingpad_dc_child') IS NOT NULL DROP TABLE codingpad_dc_child; IF OBJECT_ID('codingpad_dc_test') IS NOT NULL DROP TABLE codingpad_dc_test;",
+            "-- codingpad: connection=live\nIF OBJECT_ID('codingpad_dc_defaults') IS NOT NULL DROP TABLE codingpad_dc_defaults; IF OBJECT_ID('codingpad_dc_child') IS NOT NULL DROP TABLE codingpad_dc_child; IF OBJECT_ID('codingpad_dc_test') IS NOT NULL DROP TABLE codingpad_dc_test;",
             None,
         )
         .await
@@ -415,10 +513,16 @@ async fn sqlserver_live_types_work_through_generated_models() {
     assert!(ok, "{events:?}");
     let text = stdout(&events);
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines, ["00000000-0000-0000-0000-000000000001", "1"]);
+    assert_eq!(
+        lines,
+        ["00000000-0000-0000-0000-000000000001", "1", "700", "True"]
+    );
     let (ok, events) = python.expect("SQL Server Python data context run failed");
     assert!(ok, "{events:?}");
     let text = stdout(&events);
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines, ["00000000-0000-0000-0000-000000000001", "1"]);
+    assert_eq!(
+        lines,
+        ["00000000-0000-0000-0000-000000000001", "1", "700", "True"]
+    );
 }

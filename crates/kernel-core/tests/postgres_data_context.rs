@@ -40,7 +40,10 @@ async fn python_postgres_enum_arrays_read_and_bind_without_corruption() {
         .unwrap();
     let manager = SqlManager::new(connections, secrets);
     let setup = r#"-- codingpad: connection=live
+DROP TABLE IF EXISTS codingpad_kinds_test;
 DROP TABLE IF EXISTS codingpad_array_test;
+DROP FUNCTION IF EXISTS codingpad_next();
+DROP SEQUENCE IF EXISTS codingpad_seq;
 DROP TYPE IF EXISTS codingpad_mood;
 DROP TYPE IF EXISTS "Odd Mood";
 CREATE TYPE codingpad_mood AS ENUM ('ok', 'so, so', 'NULL', '', 'a"b', 'a\b');
@@ -49,13 +52,16 @@ CREATE TABLE codingpad_array_test (id int PRIMARY KEY, moods codingpad_mood[], o
 INSERT INTO codingpad_array_test VALUES
 (1, ARRAY['ok', 'so, so', NULL, 'NULL', '', 'a"b', 'a\b']::codingpad_mood[], ARRAY['a b', 'c']::"Odd Mood"[], ARRAY[point(1,2), point(3,4)], 1234.50, ARRAY[1.50, NULL, 1234.50]::money[]),
 (2, '{}', '{}', '{}', NULL, '{}'), (3, NULL, NULL, NULL, NULL, NULL);
+CREATE SEQUENCE codingpad_seq START 700;
+CREATE FUNCTION codingpad_next() RETURNS int LANGUAGE sql AS 'SELECT nextval(''codingpad_seq'')::int';
+CREATE TABLE codingpad_kinds_test (id int PRIMARY KEY DEFAULT codingpad_next(), mood codingpad_mood, odd "Odd Mood", doc xml, docs xml[], stamp timestamptz NOT NULL DEFAULT now());
 "#;
     manager.run("setup", setup, None).await.unwrap();
     let context = manager.data_context("live").await.unwrap();
     let supervisor = Supervisor::default();
     let source = r#"from decimal import Decimal
 from sqlalchemy import select
-from codingpad_data import CodingpadArrayTest, DataContext
+from codingpad_data import CodingpadArrayTest, CodingpadKindsTest, DataContext
 context = DataContext.connect()
 rows = context.session.scalars(select(CodingpadArrayTest).order_by(CodingpadArrayTest.id)).all()
 expected = ['ok', 'so, so', None, 'NULL', '', 'a"b', 'a\\b']
@@ -79,6 +85,30 @@ assert inserted.points == ['(1,2)', '(3,4)']
 assert inserted.price == Decimal('1.50') and inserted.prices == [Decimal('1234.50'), None]
 context.session.rollback()
 print('arrays read and bind correctly')
+
+# Defaults: leaving out the key or a NOT NULL column must take the database default.
+Kinds = CodingpadKindsTest
+added = Kinds(mood='ok', odd='a b', doc='<a/>', docs=['<b/>'])
+context.session.add(added)
+context.session.flush()
+assert added.id == 700, added.id
+assert added.stamp is not None
+explicit = Kinds(id=5)
+context.session.add(explicit)
+context.session.flush()
+assert explicit.id == 5 and explicit.mood is None
+
+# Scalar enums and xml: filter, IN, update and read back.
+for attribute, value in [('mood', 'ok'), ('odd', 'a b')]:
+    assert context.session.scalar(select(Kinds.id).where(getattr(Kinds, attribute) == value)) == 700
+assert context.session.scalars(select(Kinds.id).where(Kinds.mood.in_(['ok', 'so, so']))).all() == [700]
+added.mood = 'so, so'
+context.session.flush()
+context.session.expire_all()
+assert added.mood == 'so, so' and added.odd == 'a b'
+assert added.doc == '<a/>' and added.docs == ['<b/>'], (added.doc, added.docs)
+context.session.rollback()
+print('enums, xml and defaults work')
 "#;
     let mut events = Vec::new();
     let result = tokio::time::timeout(
@@ -97,6 +127,10 @@ print('arrays read and bind correctly')
     )
     .await;
     supervisor.shutdown().await;
-    manager.run("cleanup", "-- codingpad: connection=live\nDROP TABLE codingpad_array_test; DROP TYPE codingpad_mood; DROP TYPE \"Odd Mood\";", None).await.unwrap();
+    manager.run("cleanup", "-- codingpad: connection=live\nDROP TABLE codingpad_kinds_test; DROP FUNCTION codingpad_next(); DROP SEQUENCE codingpad_seq; DROP TABLE codingpad_array_test; DROP TYPE codingpad_mood; DROP TYPE \"Odd Mood\";", None).await.unwrap();
     assert!(result.unwrap().unwrap().ok, "{events:?}");
+    assert!(
+        format!("{events:?}").contains("enums, xml and defaults work"),
+        "{events:?}"
+    );
 }

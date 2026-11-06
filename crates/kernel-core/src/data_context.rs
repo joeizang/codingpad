@@ -57,6 +57,7 @@ struct ColumnShape {
     references: Vec<ForeignKey>,
     primary_key: bool,
     identity: bool,
+    has_default: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +117,7 @@ fn sample_schema() -> Schema {
                         references: vec![],
                         primary_key: true,
                         identity: true,
+                        has_default: false,
                     },
                     SchemaColumn {
                         name: "name".into(),
@@ -123,6 +125,7 @@ fn sample_schema() -> Schema {
                         references: vec![],
                         primary_key: false,
                         identity: false,
+                        has_default: false,
                     },
                 ],
             },
@@ -136,6 +139,7 @@ fn sample_schema() -> Schema {
                         references: vec![],
                         primary_key: true,
                         identity: true,
+                        has_default: false,
                     },
                     SchemaColumn {
                         name: "customer_id".into(),
@@ -149,6 +153,7 @@ fn sample_schema() -> Schema {
                         }],
                         primary_key: false,
                         identity: false,
+                        has_default: false,
                     },
                     SchemaColumn {
                         name: "total".into(),
@@ -156,6 +161,7 @@ fn sample_schema() -> Schema {
                         references: vec![],
                         primary_key: false,
                         identity: false,
+                        has_default: false,
                     },
                 ],
             },
@@ -177,6 +183,7 @@ fn shape(schema: &Schema) -> Vec<TableShape> {
                 references: column.references.clone(),
                 primary_key: column.primary_key,
                 identity: column.identity,
+                has_default: column.has_default,
             })
             .collect::<Vec<_>>();
         let no_primary_key = !columns.iter().any(|column| column.primary_key);
@@ -382,10 +389,18 @@ fn python_models(tables: &[TableShape], kind: crate::databases::DatabaseKind) ->
     out.push_str("    text = ''.join(current)\n");
     out.push_str("    items.append(None if text == 'NULL' and not was_quoted else text)\n");
     out.push_str("    return items\n\n\n");
-    out.push_str("class _PostgresArrayType(_sa.types.UserDefinedType):\n");
+    out.push_str("class _PostgresNamedType(_sa.types.UserDefinedType):\n");
     out.push_str("    cache_ok = True\n\n");
     out.push_str("    def __init__(self, type_name):\n        self.type_name = type_name\n\n");
-    out.push_str("    def get_col_spec(self, **kw):\n        return self.type_name + '[]'\n\n\n");
+    out.push_str("    def get_col_spec(self, **kw):\n        return self.type_name\n\n\n");
+    out.push_str("class _PostgresText(_sa.types.TypeDecorator):\n");
+    out.push_str("    impl = _sa.Text\n");
+    out.push_str("    cache_ok = True\n\n");
+    out.push_str("    def __init__(self, type_name):\n");
+    out.push_str("        self.type_name = type_name\n");
+    out.push_str("        super().__init__()\n\n");
+    out.push_str("    def bind_expression(self, bindvalue):\n");
+    out.push_str("        return _sa.cast(bindvalue, _PostgresNamedType(self.type_name))\n\n\n");
     out.push_str("class _PostgresEnumArray(_sa.types.TypeDecorator):\n");
     out.push_str("    impl = _sa.Text\n");
     out.push_str("    cache_ok = True\n\n");
@@ -393,7 +408,9 @@ fn python_models(tables: &[TableShape], kind: crate::databases::DatabaseKind) ->
     out.push_str("        self.type_name = type_name\n");
     out.push_str("        super().__init__()\n\n");
     out.push_str("    def bind_expression(self, bindvalue):\n");
-    out.push_str("        return _sa.cast(bindvalue, _PostgresArrayType(self.type_name))\n\n");
+    out.push_str(
+        "        return _sa.cast(bindvalue, _PostgresNamedType(self.type_name + '[]'))\n\n",
+    );
     out.push_str("    def process_result_value(self, value, dialect):\n");
     out.push_str("        return _parse_pg_array(value)\n\n\n");
     out.push_str("class _PostgresMoney(_sa.types.TypeDecorator):\n");
@@ -634,17 +651,22 @@ fn python_column(
                 "_sa.Text"
             },
         ),
+        "xml" if database_kind == DatabaseKind::Postgres => ("str", ""),
         "text" | "ntext" | "varchar" | "nvarchar" | "char" | "nchar" | "character varying"
         | "character" | "citext" | "xml" | "name" => ("str", "_sa.Text"),
+        _ if database_kind == DatabaseKind::Postgres => ("_typing.Any", ""),
         _ => ("_typing.Any", "_sa.Text"),
     };
+    // An empty SQLAlchemy type is a PostgreSQL type with no implicit cast from
+    // text: enums, domains, xml. Its name has to appear on every bound value.
+    let named = sqlalchemy.is_empty();
     let (python, sqlalchemy) = if array {
         if kind == "money" && database_kind == DatabaseKind::Postgres {
             (
                 "list[_decimal.Decimal]".to_owned(),
                 "_PostgresMoney(array=True)".to_owned(),
             )
-        } else if python == "_typing.Any" {
+        } else if named || python == "_typing.Any" {
             (
                 "list[str]".to_owned(),
                 format!(
@@ -658,6 +680,11 @@ fn python_column(
                 format!("_sa.ARRAY({sqlalchemy})"),
             )
         }
+    } else if named {
+        (
+            python.to_owned(),
+            format!("_PostgresText({})", py_string(raw)),
+        )
     } else {
         (python.to_owned(), sqlalchemy.to_owned())
     };
@@ -702,6 +729,11 @@ fn python_column_args(
     if !column.primary_key && !no_primary_key {
         keywords.push("nullable=True".to_owned());
     }
+    // Without this SQLAlchemy sends an explicit NULL for an unset column, and an
+    // integer key with autoincrement=False gets no value at all.
+    if column.has_default && !(column.primary_key && column.identity) {
+        keywords.push("server_default=_sa.FetchedValue()".to_owned());
+    }
     positional
         .into_iter()
         .chain(keywords)
@@ -728,15 +760,29 @@ fn csharp_models(tables: &[TableShape], kind: crate::databases::DatabaseKind) ->
     );
     if kind == DatabaseKind::Postgres {
         out.push_str(
-            "// PostgreSQL intervals map to TimeSpan. Reading month/year components throws;\n",
+            "// PostgreSQL intervals map to NodaTime.Period, which keeps months and years.\n",
         );
-        out.push_str(
-            "// they cannot be represented as a fixed duration. Unsupported columns are omitted.\n",
-        );
+        out.push_str("// Unsupported columns are omitted.\n");
         out.push_str("using NpgsqlTypes;\n");
     }
     out.push_str("namespace CodingPad.Data;\n\n");
+    let named_types = csharp_named_text_types(tables, kind);
+    if !named_types.is_empty() {
+        let names = named_types
+            .iter()
+            .map(|name| cs_string(name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&CSHARP_NAMED_TEXT_SUPPORT.replace("/*NAMES*/", &names));
+    }
     for table in tables {
+        if !csharp_mapped(table, kind) {
+            out.push_str(&format!(
+                "// Table {} has no column with a supported EF mapping and is omitted.\n\n",
+                cs_string(&table.name)
+            ));
+            continue;
+        }
         out.push_str(&format!("public sealed class {}\n{{\n", table.class_name));
         for column in &table.columns {
             if csharp_ignored(column, kind) && !column_used(table, &column.name) {
@@ -782,7 +828,7 @@ fn csharp_models(tables: &[TableShape], kind: crate::databases::DatabaseKind) ->
     }
 
     out.push_str("public sealed class DataContext : DbContext\n{\n");
-    for table in tables {
+    for table in tables.iter().filter(|table| csharp_mapped(table, kind)) {
         out.push_str(&format!(
             "    public DbSet<{}> {} => Set<{}>();\n",
             table.class_name, names.db_sets[&table.class_name], table.class_name
@@ -802,11 +848,25 @@ fn csharp_models(tables: &[TableShape], kind: crate::databases::DatabaseKind) ->
             "        var builder = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder\n        {\n            DataSource = Text(config, \"path\"),\n        };\n        options.UseSqlite(builder.ConnectionString);\n",
         ),
         DatabaseKind::Postgres => out.push_str(
-            "        var tls = Text(config, \"tls\");\n        var trust = Bool(config, \"trustServerCertificate\");\n        var builder = new Npgsql.NpgsqlConnectionStringBuilder\n        {\n            Host = Text(config, \"host\"),\n            Port = Number(config, \"port\") ?? 5432,\n            Database = Text(config, \"database\"),\n            Username = Text(config, \"user\"),\n            Password = Text(config, \"password\"),\n            SslMode = tls == \"disable\" ? Npgsql.SslMode.Disable : trust ? (tls == \"prefer\" ? Npgsql.SslMode.Prefer : Npgsql.SslMode.Require) : Npgsql.SslMode.VerifyFull,\n        };\n        if (!trust && tls == \"prefer\")\n        {\n            try\n            {\n                using var probe = new Npgsql.NpgsqlConnection(builder.ConnectionString);\n                probe.Open();\n            }\n            catch (Exception error) when (error.Message.Contains(\"No SSL enabled connection\"))\n            {\n                builder.SslMode = Npgsql.SslMode.Disable;\n            }\n        }\n        options.UseNpgsql(builder.ConnectionString);\n",
+            "        var tls = Text(config, \"tls\");\n        var trust = Bool(config, \"trustServerCertificate\");\n        var builder = new Npgsql.NpgsqlConnectionStringBuilder\n        {\n            Host = Text(config, \"host\"),\n            Port = Number(config, \"port\") ?? 5432,\n            Database = Text(config, \"database\"),\n            Username = Text(config, \"user\"),\n            Password = Text(config, \"password\"),\n            SslMode = tls == \"disable\" ? Npgsql.SslMode.Disable : trust ? (tls == \"prefer\" ? Npgsql.SslMode.Prefer : Npgsql.SslMode.Require) : Npgsql.SslMode.VerifyFull,\n        };\n        if (!trust && tls == \"prefer\")\n        {\n            try\n            {\n                using var probe = new Npgsql.NpgsqlConnection(builder.ConnectionString);\n                probe.Open();\n            }\n            catch (Exception error) when (error.Message.Contains(\"No SSL enabled connection\"))\n            {\n                builder.SslMode = Npgsql.SslMode.Disable;\n            }\n        }\n",
         ),
         DatabaseKind::SqlServer => out.push_str(
             "        var builder = new Microsoft.Data.SqlClient.SqlConnectionStringBuilder\n        {\n            DataSource = Text(config, \"host\") + \",\" + (Number(config, \"port\") ?? 1433),\n            InitialCatalog = Text(config, \"database\"),\n            UserID = Text(config, \"user\"),\n            Password = Text(config, \"password\"),\n            TrustServerCertificate = Bool(config, \"trustServerCertificate\"),\n        };\n        builder[\"Encrypt\"] = Text(config, \"tls\") == \"disable\" ? \"Optional\" : \"Mandatory\";\n        options.UseSqlServer(builder.ConnectionString);\n",
         ),
+    }
+    if kind == DatabaseKind::Postgres {
+        if tables.iter().any(csharp_has_interval) {
+            out.push_str(
+                "        options.UseNpgsql(builder.ConnectionString, npgsql => npgsql.UseNodaTime());\n",
+            );
+        } else {
+            out.push_str("        options.UseNpgsql(builder.ConnectionString);\n");
+        }
+        if !named_types.is_empty() {
+            out.push_str(
+                "        ((Microsoft.EntityFrameworkCore.Infrastructure.IDbContextOptionsBuilderInfrastructure)options).AddOrUpdateExtension(new CodingPadNamedTextExtension());\n",
+            );
+        }
     }
     out.push_str(
         "    }\n\n\
@@ -822,7 +882,7 @@ fn csharp_models(tables: &[TableShape], kind: crate::databases::DatabaseKind) ->
              config.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.True;\n\n\
          protected override void OnModelCreating(ModelBuilder modelBuilder)\n    {\n",
     );
-    for table in tables {
+    for table in tables.iter().filter(|table| csharp_mapped(table, kind)) {
         out.push_str(&format!(
             "        modelBuilder.Entity<{}>(entity =>\n        {{\n",
             table.class_name
@@ -868,10 +928,22 @@ fn csharp_models(tables: &[TableShape], kind: crate::databases::DatabaseKind) ->
             if csharp_ignored(column, kind) && !column_used(table, &column.name) {
                 continue;
             }
+            let mut configuration = String::new();
             if property != &column.name {
+                configuration.push_str(&format!(".HasColumnName({})", cs_string(&column.name)));
+            }
+            if csharp_needs_store_type(column, kind) {
+                configuration.push_str(&format!(
+                    ".HasColumnType({})",
+                    cs_string(column.data_type.trim())
+                ));
+            }
+            if column.has_default && !(column.primary_key && column.identity) && !keys.is_empty() {
+                configuration.push_str(".ValueGeneratedOnAdd()");
+            }
+            if !configuration.is_empty() {
                 out.push_str(&format!(
-                    "            entity.Property(e => e.{property}).HasColumnName({});\n",
-                    cs_string(&column.name)
+                    "            entity.Property(e => e.{property}){configuration};\n"
                 ));
             }
         }
@@ -958,11 +1030,10 @@ fn csharp_ignored(column: &ColumnShape, kind: crate::databases::DatabaseKind) ->
     let raw = column.data_type.trim();
     let array = raw.ends_with("[]");
     let base = base_type(raw.trim_end_matches("[]"));
-    if array {
-        matches!(
+    array
+        && matches!(
             base.as_str(),
-            "oid"
-                | "point"
+            "point"
                 | "line"
                 | "lseg"
                 | "box"
@@ -972,10 +1043,128 @@ fn csharp_ignored(column: &ColumnShape, kind: crate::databases::DatabaseKind) ->
                 | "tsvector"
                 | "tsquery"
         )
-    } else {
-        base == "oid"
+}
+
+/// A table with no column left would fail EF's model validation for the whole
+/// context, so it gets no class at all.
+fn csharp_mapped(table: &TableShape, kind: crate::databases::DatabaseKind) -> bool {
+    table
+        .columns
+        .iter()
+        .any(|column| !csharp_ignored(column, kind) || column_used(table, &column.name))
+}
+
+fn csharp_has_interval(table: &TableShape) -> bool {
+    table
+        .columns
+        .iter()
+        .any(|column| base_type(column.data_type.trim().trim_end_matches("[]")) == "interval")
+}
+
+/// PostgreSQL type that the C# model reads as a string but that does not accept
+/// a text parameter: enums, domains, xml and anything else without a mapping.
+fn csharp_named_text_type(
+    column: &ColumnShape,
+    kind: crate::databases::DatabaseKind,
+) -> Option<String> {
+    if kind != crate::databases::DatabaseKind::Postgres || csharp_ignored(column, kind) {
+        return None;
+    }
+    let name = column.data_type.trim().trim_end_matches("[]");
+    let base = base_type(name);
+    let plain_text = matches!(
+        base.as_str(),
+        "text"
+            | "varchar"
+            | "character varying"
+            | "char"
+            | "character"
+            | "bpchar"
+            | "citext"
+            | "name"
+    );
+    (!plain_text && csharp_base_type(&base, kind) == "string").then(|| name.to_owned())
+}
+
+fn csharp_named_text_types(
+    tables: &[TableShape],
+    kind: crate::databases::DatabaseKind,
+) -> BTreeSet<String> {
+    tables
+        .iter()
+        .flat_map(|table| &table.columns)
+        .filter_map(|column| csharp_named_text_type(column, kind))
+        .collect()
+}
+
+fn csharp_needs_store_type(column: &ColumnShape, kind: crate::databases::DatabaseKind) -> bool {
+    use crate::databases::DatabaseKind;
+    kind == DatabaseKind::Postgres
+        && (csharp_named_text_type(column, kind).is_some()
+            || matches!(
+                base_type(column.data_type.trim().trim_end_matches("[]")).as_str(),
+                // EF's default for DateTime is timestamptz, which rejects local values.
+                "money" | "oid" | "timestamp" | "timestamp without time zone"
+            ))
+}
+
+/// EF sends a C# string as `text`, which PostgreSQL will not compare with or
+/// assign to an enum. These mappings leave scalars untyped so the server infers
+/// them, and name the array type. The array mapping derives from the provider's
+/// so `column.Contains(value)` still translates.
+const CSHARP_NAMED_TEXT_SUPPORT: &str = r#"#pragma warning disable EF1001
+internal sealed class CodingPadNamedText : Microsoft.EntityFrameworkCore.Storage.StringTypeMapping
+{
+    public CodingPadNamedText(string storeType) : base(storeType, System.Data.DbType.String) { }
+    private CodingPadNamedText(RelationalTypeMappingParameters parameters) : base(parameters) { }
+    protected override Microsoft.EntityFrameworkCore.Storage.RelationalTypeMapping Clone(RelationalTypeMappingParameters parameters) => new CodingPadNamedText(parameters);
+    protected override void ConfigureParameter(System.Data.Common.DbParameter parameter) =>
+        ((Npgsql.NpgsqlParameter)parameter).NpgsqlDbType = NpgsqlDbType.Unknown;
+}
+
+internal sealed class CodingPadNamedTextArray : Npgsql.EntityFrameworkCore.PostgreSQL.Storage.Internal.Mapping.NpgsqlArrayTypeMapping<string[], string[], string>
+{
+    public CodingPadNamedTextArray(string element) : base(element + "[]", new CodingPadNamedText(element)) { }
+    private CodingPadNamedTextArray(RelationalTypeMappingParameters parameters) : base(parameters) { }
+    protected override Microsoft.EntityFrameworkCore.Storage.RelationalTypeMapping Clone(RelationalTypeMappingParameters parameters) => new CodingPadNamedTextArray(parameters);
+    protected override void ConfigureParameter(System.Data.Common.DbParameter parameter) =>
+        ((Npgsql.NpgsqlParameter)parameter).DataTypeName = StoreType.Replace("\"", "");
+}
+
+internal sealed class CodingPadNamedTextPlugin : Microsoft.EntityFrameworkCore.Storage.IRelationalTypeMappingSourcePlugin
+{
+    private static readonly HashSet<string> Names = new() { /*NAMES*/ };
+    public Microsoft.EntityFrameworkCore.Storage.RelationalTypeMapping? FindMapping(in Microsoft.EntityFrameworkCore.Storage.RelationalTypeMappingInfo info)
+    {
+        if (info.ElementTypeMapping is CodingPadNamedText element) return new CodingPadNamedTextArray(element.StoreType);
+        var name = info.StoreTypeName;
+        if (name is null) return null;
+        if (Names.Contains(name)) return new CodingPadNamedText(name);
+        return name.EndsWith("[]") && Names.Contains(name[..^2]) ? new CodingPadNamedTextArray(name[..^2]) : null;
     }
 }
+
+internal sealed class CodingPadNamedTextExtension : Microsoft.EntityFrameworkCore.Infrastructure.IDbContextOptionsExtension
+{
+    public Microsoft.EntityFrameworkCore.Infrastructure.DbContextOptionsExtensionInfo Info => new ExtensionInfo(this);
+    public void ApplyServices(Microsoft.Extensions.DependencyInjection.IServiceCollection services) =>
+        new Microsoft.EntityFrameworkCore.Infrastructure.EntityFrameworkRelationalServicesBuilder(services)
+            .TryAdd<Microsoft.EntityFrameworkCore.Storage.IRelationalTypeMappingSourcePlugin, CodingPadNamedTextPlugin>();
+    public void Validate(Microsoft.EntityFrameworkCore.Infrastructure.IDbContextOptions options) { }
+
+    private sealed class ExtensionInfo(Microsoft.EntityFrameworkCore.Infrastructure.IDbContextOptionsExtension extension)
+        : Microsoft.EntityFrameworkCore.Infrastructure.DbContextOptionsExtensionInfo(extension)
+    {
+        public override bool IsDatabaseProvider => false;
+        public override string LogFragment => "";
+        public override int GetServiceProviderHashCode() => 0;
+        public override bool ShouldUseSameServiceProvider(Microsoft.EntityFrameworkCore.Infrastructure.DbContextOptionsExtensionInfo other) => other is ExtensionInfo;
+        public override void PopulateDebugInfo(IDictionary<string, string> debugInfo) { }
+    }
+}
+#pragma warning restore EF1001
+
+"#;
 
 fn column_used(table: &TableShape, name: &str) -> bool {
     table
@@ -1076,11 +1265,25 @@ fn unique_member(base: &str, used: &mut BTreeSet<String>) -> String {
 }
 
 fn csharp_column(column: &ColumnShape, kind: crate::databases::DatabaseKind) -> String {
-    use crate::databases::DatabaseKind;
     let raw = column.data_type.trim();
     let array = raw.ends_with("[]");
     let base_kind = base_type(raw.trim_end_matches("[]"));
-    let base = match base_kind.as_str() {
+    let base = csharp_base_type(&base_kind, kind);
+    let base = if array {
+        format!("{base}[]")
+    } else {
+        base.to_owned()
+    };
+    if column.primary_key {
+        base
+    } else {
+        format!("{base}?")
+    }
+}
+
+fn csharp_base_type(base_kind: &str, kind: crate::databases::DatabaseKind) -> &'static str {
+    use crate::databases::DatabaseKind;
+    match base_kind {
         "smallint" | "smallserial" => "short",
         "tinyint" => "byte",
         "integer" | "int" | "int4" | "serial" => {
@@ -1099,6 +1302,7 @@ fn csharp_column(column: &ColumnShape, kind: crate::databases::DatabaseKind) -> 
         "date" => "DateOnly",
         "time" | "time without time zone" => "TimeOnly",
         "time with time zone" | "timetz" => "DateTimeOffset",
+        "interval" if kind == DatabaseKind::Postgres => "NodaTime.Period",
         "interval" => "TimeSpan",
         "timestamp" if kind == DatabaseKind::SqlServer => "byte[]",
         "timestamp"
@@ -1116,16 +1320,6 @@ fn csharp_column(column: &ColumnShape, kind: crate::databases::DatabaseKind) -> 
         "json" | "jsonb" if kind == DatabaseKind::Postgres => "JsonDocument",
         "json" | "jsonb" => "string",
         _ => "string",
-    };
-    let base = if array {
-        format!("{base}[]")
-    } else {
-        base.to_owned()
-    };
-    if column.primary_key {
-        base
-    } else {
-        format!("{base}?")
     }
 }
 
@@ -1471,6 +1665,7 @@ mod tests {
             references: vec![],
             primary_key: false,
             identity: false,
+            has_default: false,
         });
         let first = generate(&schema);
         let second = generate(&schema);
@@ -1495,6 +1690,7 @@ mod tests {
             references: vec![],
             primary_key,
             identity: false,
+            has_default: false,
         }
     }
 
@@ -1798,9 +1994,11 @@ mod tests {
         };
         let generated = generate(&schema);
         assert!(generated.csharp.contains("using NpgsqlTypes;"));
-        assert!(generated.csharp.contains("public TimeSpan? Span"));
+        assert!(generated.csharp.contains("public NodaTime.Period? Span"));
+        assert!(generated.csharp.contains("npgsql.UseNodaTime()"));
         assert!(generated.csharp.contains("public NpgsqlCidr? Net"));
-        assert!(!generated.csharp.contains("public uint? Oid"));
+        assert!(generated.csharp.contains("public uint? Oid"));
+        assert!(generated.csharp.contains(".HasColumnType(\"oid\")"));
     }
 
     #[test]
@@ -1817,7 +2015,145 @@ mod tests {
     }
 
     #[test]
-    fn postgres_intervals_use_timespan_and_unsupported_properties_are_omitted() {
+    fn columns_with_a_database_default_are_left_out_of_unset_inserts() {
+        use crate::databases::DatabaseKind;
+        let mut key = column("id", "integer", true);
+        key.has_default = true;
+        let mut created = column("created", "timestamp with time zone", false);
+        created.has_default = true;
+        let mut serial = column("id", "integer", true);
+        serial.identity = true;
+        serial.has_default = true;
+        let schema = Schema {
+            kind: DatabaseKind::Postgres,
+            tables: vec![
+                table("orders", "public", vec![key, created]),
+                table("serials", "public", vec![serial]),
+            ],
+        };
+        let generated = generate(&schema);
+        assert!(generated.python.contains(
+            "_sa.Integer, primary_key=True, autoincrement=False, server_default=_sa.FetchedValue()"
+        ));
+        assert!(generated.python.contains(
+            "_sa.DateTime(timezone=True), nullable=True, server_default=_sa.FetchedValue()"
+        ));
+        assert_eq!(
+            generated.python.matches("_sa.FetchedValue()").count(),
+            2,
+            "an identity key already gets its value from SQLAlchemy"
+        );
+        assert!(generated
+            .csharp
+            .contains("entity.Property(e => e.Id).HasColumnName(\"id\").ValueGeneratedOnAdd();"));
+        assert!(generated.csharp.contains(
+            "entity.Property(e => e.Created).HasColumnName(\"created\").ValueGeneratedOnAdd();"
+        ));
+        assert_eq!(
+            generated.csharp.matches(".ValueGeneratedOnAdd()").count(),
+            2
+        );
+    }
+
+    #[test]
+    fn postgres_types_without_a_text_cast_name_their_type_on_parameters() {
+        use crate::databases::DatabaseKind;
+        let schema = Schema {
+            kind: DatabaseKind::Postgres,
+            tables: vec![table(
+                "things",
+                "public",
+                vec![
+                    column("id", "integer", true),
+                    column("mood", "mood", false),
+                    column("odd", "\"Odd Mood\"", false),
+                    column("moods", "sch.mood[]", false),
+                    column("doc", "xml", false),
+                    column("label", "character varying(20)", false),
+                    column("price", "money", false),
+                    column("prices", "money[]", false),
+                    column("at", "timestamp without time zone", false),
+                ],
+            )],
+        };
+        let generated = generate(&schema);
+        assert!(generated.python.contains("_PostgresText('mood')"));
+        assert!(generated.python.contains("_PostgresText('\"Odd Mood\"')"));
+        assert!(generated.python.contains("_PostgresText('xml')"));
+        assert!(generated.python.contains("_PostgresEnumArray('sch.mood')"));
+        assert!(generated.python.contains(
+            "label: _orm.Mapped[str | None] = _orm.mapped_column(_sa.Text, nullable=True)"
+        ));
+        for store in [
+            "mood",
+            "\\\"Odd Mood\\\"",
+            "sch.mood[]",
+            "xml",
+            "money",
+            "money[]",
+            "timestamp without time zone",
+        ] {
+            assert!(
+                generated
+                    .csharp
+                    .contains(&format!(".HasColumnType(\"{store}\")")),
+                "{store}"
+            );
+        }
+        assert!(generated
+            .csharp
+            .contains("Names = new() { \"\\\"Odd Mood\\\"\", \"mood\", \"sch.mood\", \"xml\" };"));
+        assert!(!generated
+            .csharp
+            .contains(".HasColumnType(\"character varying(20)\")"));
+    }
+
+    #[test]
+    fn plain_postgres_tables_do_not_carry_the_named_type_support() {
+        use crate::databases::DatabaseKind;
+        let schema = Schema {
+            kind: DatabaseKind::Postgres,
+            tables: vec![table(
+                "things",
+                "public",
+                vec![
+                    column("id", "integer", true),
+                    column("label", "text", false),
+                ],
+            )],
+        };
+        let generated = generate(&schema);
+        assert!(!generated.csharp.contains("CodingPadNamedText"));
+        assert!(!generated.csharp.contains("UseNodaTime"));
+        assert!(generated
+            .csharp
+            .contains("options.UseNpgsql(builder.ConnectionString);"));
+    }
+
+    #[test]
+    fn a_table_with_no_mapped_column_is_left_out_of_the_csharp_context() {
+        use crate::databases::DatabaseKind;
+        let schema = Schema {
+            kind: DatabaseKind::Postgres,
+            tables: vec![
+                table("shapes", "public", vec![column("points", "point[]", false)]),
+                table("empty", "public", vec![]),
+                table("things", "public", vec![column("id", "integer", true)]),
+            ],
+        };
+        let generated = generate(&schema);
+        assert!(!generated.csharp.contains("class Shape"));
+        assert!(!generated.csharp.contains("DbSet<Shape>"));
+        assert!(!generated.csharp.contains("Entity<Shape>"));
+        assert!(!generated.csharp.contains("DbSet<Empty>"));
+        assert!(generated
+            .csharp
+            .contains("// Table \"shapes\" has no column with a supported EF mapping"));
+        assert!(generated.csharp.contains("DbSet<Thing>"));
+    }
+
+    #[test]
+    fn postgres_intervals_use_period_and_unsupported_properties_are_omitted() {
         use crate::databases::DatabaseKind;
         let schema = Schema {
             kind: DatabaseKind::Postgres,
@@ -1834,11 +2170,11 @@ mod tests {
             )],
         };
         let generated = generate(&schema);
-        assert!(generated.csharp.contains("public TimeSpan? Span"));
-        assert!(generated.csharp.contains("public TimeSpan[]? Spans"));
+        assert!(generated.csharp.contains("public NodaTime.Period? Span"));
+        assert!(generated.csharp.contains("public NodaTime.Period[]? Spans"));
         assert!(!generated.csharp.contains("HasConversion"));
         assert!(!generated.csharp.contains("public string[]? Points"));
-        assert!(!generated.csharp.contains("public uint? Oid"));
+        assert!(generated.csharp.contains("public uint? Oid"));
     }
 
     #[test]
@@ -1977,7 +2313,7 @@ mod tests {
         assert!(generated.python.contains("_pg.INET"));
         assert!(generated.python.contains("_pg.CIDR"));
         assert!(generated.python.contains("_pg.MACADDR"));
-        assert!(generated.csharp.contains("public TimeSpan? Span"));
+        assert!(generated.csharp.contains("public NodaTime.Period? Span"));
         assert!(generated.csharp.contains("public IPAddress? Addr"));
         assert!(generated.csharp.contains("public PhysicalAddress? Mac"));
     }
@@ -2014,6 +2350,7 @@ mod tests {
                             references: vec![],
                             primary_key: true,
                             identity: true,
+                            has_default: false,
                         },
                         SchemaColumn {
                             name: "b".into(),
@@ -2021,6 +2358,7 @@ mod tests {
                             references: vec![],
                             primary_key: true,
                             identity: true,
+                            has_default: false,
                         },
                     ],
                 },
@@ -2034,6 +2372,7 @@ mod tests {
                             references: vec![],
                             primary_key: true,
                             identity: true,
+                            has_default: false,
                         },
                         SchemaColumn {
                             name: "parent_a".into(),
@@ -2047,6 +2386,7 @@ mod tests {
                             }],
                             primary_key: false,
                             identity: false,
+                            has_default: false,
                         },
                         SchemaColumn {
                             name: "parent_b".into(),
@@ -2060,6 +2400,7 @@ mod tests {
                             }],
                             primary_key: false,
                             identity: false,
+                            has_default: false,
                         },
                     ],
                 },

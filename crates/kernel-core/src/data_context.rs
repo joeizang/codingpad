@@ -364,6 +364,7 @@ fn python_models(tables: &[TableShape], kind: crate::databases::DatabaseKind) ->
     out.push_str("        return value\n");
     out.push_str("    if not (value.startswith('{') and value.endswith('}')):\n");
     out.push_str("        return value\n");
+    out.push_str("    if value == '{}':\n        return []\n");
     out.push_str("    items, current, quoted, escaped, was_quoted = [], [], False, False, False\n");
     out.push_str("    for character in value[1:-1]:\n");
     out.push_str("        if escaped:\n");
@@ -381,18 +382,26 @@ fn python_models(tables: &[TableShape], kind: crate::databases::DatabaseKind) ->
     out.push_str("    text = ''.join(current)\n");
     out.push_str("    items.append(None if text == 'NULL' and not was_quoted else text)\n");
     out.push_str("    return items\n\n\n");
+    out.push_str("class _PostgresArrayType(_sa.types.UserDefinedType):\n");
+    out.push_str("    cache_ok = True\n\n");
+    out.push_str("    def __init__(self, type_name):\n        self.type_name = type_name\n\n");
+    out.push_str("    def get_col_spec(self, **kw):\n        return self.type_name + '[]'\n\n\n");
     out.push_str("class _PostgresEnumArray(_sa.types.TypeDecorator):\n");
-    out.push_str("    impl = _sa.ARRAY(_sa.Text)\n");
+    out.push_str("    impl = _sa.Text\n");
     out.push_str("    cache_ok = True\n\n");
     out.push_str("    def __init__(self, type_name):\n");
     out.push_str("        self.type_name = type_name\n");
     out.push_str("        super().__init__()\n\n");
     out.push_str("    def bind_expression(self, bindvalue):\n");
-    out.push_str(
-        "        return _sa.text(f'CAST(:x AS {self.type_name}[])').bindparams(x=bindvalue)\n\n",
-    );
+    out.push_str("        return _sa.cast(bindvalue, _PostgresArrayType(self.type_name))\n\n");
     out.push_str("    def process_result_value(self, value, dialect):\n");
     out.push_str("        return _parse_pg_array(value)\n\n\n");
+    out.push_str("class _PostgresMoney(_sa.types.TypeDecorator):\n");
+    out.push_str("    impl = _sa.Numeric\n    cache_ok = True\n\n");
+    out.push_str("    def __init__(self, array=False):\n        self.array = array\n        super().__init__()\n\n");
+    out.push_str("    def load_dialect_impl(self, dialect):\n        return dialect.type_descriptor(_sa.ARRAY(_sa.Numeric) if self.array else _sa.Numeric())\n\n");
+    out.push_str("    def bind_expression(self, bindvalue):\n        return _sa.cast(bindvalue, _sa.ARRAY(_pg.MONEY) if self.array else _pg.MONEY)\n\n");
+    out.push_str("    def column_expression(self, column):\n        return _sa.cast(column, _sa.ARRAY(_sa.Numeric) if self.array else _sa.Numeric)\n\n\n");
     out.push_str("class Base(_orm.DeclarativeBase):\n    pass\n\n\n");
     for table in tables {
         out.push_str("class ");
@@ -567,7 +576,7 @@ fn python_column(
         "smallint" | "integer" | "bigint" | "int" | "int2" | "int4" | "int8" | "serial"
         | "bigserial" | "smallserial" | "tinyint" => ("int", "_sa.Integer"),
         "money" | "smallmoney" if database_kind == DatabaseKind::Postgres => {
-            ("_decimal.Decimal", "_pg.MONEY")
+            ("_decimal.Decimal", "_PostgresMoney()")
         }
         "numeric" | "decimal" | "money" | "smallmoney" | "number" => {
             ("_decimal.Decimal", "_sa.Numeric")
@@ -630,10 +639,18 @@ fn python_column(
         _ => ("_typing.Any", "_sa.Text"),
     };
     let (python, sqlalchemy) = if array {
-        if python == "_typing.Any" {
+        if kind == "money" && database_kind == DatabaseKind::Postgres {
+            (
+                "list[_decimal.Decimal]".to_owned(),
+                "_PostgresMoney(array=True)".to_owned(),
+            )
+        } else if python == "_typing.Any" {
             (
                 "list[str]".to_owned(),
-                format!("_PostgresEnumArray({})", py_string(&kind)),
+                format!(
+                    "_PostgresEnumArray({})",
+                    py_string(raw.trim_end_matches("[]"))
+                ),
             )
         } else {
             (

@@ -56,6 +56,7 @@ struct ColumnShape {
     data_type: String,
     references: Vec<ForeignKey>,
     primary_key: bool,
+    identity: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -114,12 +115,14 @@ fn sample_schema() -> Schema {
                         data_type: "INTEGER".into(),
                         references: vec![],
                         primary_key: true,
+                        identity: true,
                     },
                     SchemaColumn {
                         name: "name".into(),
                         data_type: "TEXT".into(),
                         references: vec![],
                         primary_key: false,
+                        identity: false,
                     },
                 ],
             },
@@ -132,6 +135,7 @@ fn sample_schema() -> Schema {
                         data_type: "INTEGER".into(),
                         references: vec![],
                         primary_key: true,
+                        identity: true,
                     },
                     SchemaColumn {
                         name: "customer_id".into(),
@@ -144,12 +148,14 @@ fn sample_schema() -> Schema {
                             ordinal: 1,
                         }],
                         primary_key: false,
+                        identity: false,
                     },
                     SchemaColumn {
                         name: "total".into(),
                         data_type: "DECIMAL(10,2)".into(),
                         references: vec![],
                         primary_key: false,
+                        identity: false,
                     },
                 ],
             },
@@ -170,6 +176,7 @@ fn shape(schema: &Schema) -> Vec<TableShape> {
                 data_type: column.data_type.clone(),
                 references: column.references.clone(),
                 primary_key: column.primary_key,
+                identity: column.identity,
             })
             .collect::<Vec<_>>();
         let no_primary_key = !columns.iter().any(|column| column.primary_key);
@@ -352,23 +359,40 @@ fn python_models(tables: &[TableShape], kind: crate::databases::DatabaseKind) ->
     out.push_str("        return str(value) if value is not None else None\n\n");
     out.push_str("    def process_result_value(self, value, dialect):\n");
     out.push_str("        return _uuid.UUID(str(value)) if value is not None else None\n\n\n");
-    out.push_str("class _PostgresMoney(_sa.types.TypeDecorator):\n");
-    out.push_str("    impl = _sa.Text\n");
+    out.push_str("def _parse_pg_array(value):\n");
+    out.push_str("    if value is None or not isinstance(value, str):\n");
+    out.push_str("        return value\n");
+    out.push_str("    if not (value.startswith('{') and value.endswith('}')):\n");
+    out.push_str("        return value\n");
+    out.push_str("    items, current, quoted, escaped, was_quoted = [], [], False, False, False\n");
+    out.push_str("    for character in value[1:-1]:\n");
+    out.push_str("        if escaped:\n");
+    out.push_str("            current.append(character); escaped = False\n");
+    out.push_str("        elif character == '\\\\':\n");
+    out.push_str("            escaped = True\n");
+    out.push_str("        elif character == '\"':\n");
+    out.push_str("            quoted = not quoted; was_quoted = True\n");
+    out.push_str("        elif character == ',' and not quoted:\n");
+    out.push_str("            text = ''.join(current)\n");
+    out.push_str("            items.append(None if text == 'NULL' and not was_quoted else text)\n");
+    out.push_str("            current, was_quoted = [], False\n");
+    out.push_str("        else:\n");
+    out.push_str("            current.append(character)\n");
+    out.push_str("    text = ''.join(current)\n");
+    out.push_str("    items.append(None if text == 'NULL' and not was_quoted else text)\n");
+    out.push_str("    return items\n\n\n");
+    out.push_str("class _PostgresEnumArray(_sa.types.TypeDecorator):\n");
+    out.push_str("    impl = _sa.ARRAY(_sa.Text)\n");
     out.push_str("    cache_ok = True\n\n");
-    out.push_str("    def process_result_value(self, value, dialect):\n");
-    out.push_str("        return str(value) if value is not None else None\n\n\n");
-    out.push_str("class _PostgresArrayText(_sa.types.TypeDecorator):\n");
-    out.push_str("    impl = _sa.Text\n");
-    out.push_str("    cache_ok = True\n\n");
-    out.push_str("    def process_result_value(self, value, dialect):\n");
-    out.push_str("        if value is None or not isinstance(value, str):\n");
-    out.push_str("            return value\n");
-    out.push_str("        if value.startswith('{') and value.endswith('}'):\n");
-    out.push_str("            inner = value[1:-1]\n");
+    out.push_str("    def __init__(self, type_name):\n");
+    out.push_str("        self.type_name = type_name\n");
+    out.push_str("        super().__init__()\n\n");
+    out.push_str("    def bind_expression(self, bindvalue):\n");
     out.push_str(
-        "            return [item.strip('\"') for item in inner.split(',')] if inner else []\n",
+        "        return _sa.text(f'CAST(:x AS {self.type_name}[])').bindparams(x=bindvalue)\n\n",
     );
-    out.push_str("        return value\n\n\n");
+    out.push_str("    def process_result_value(self, value, dialect):\n");
+    out.push_str("        return _parse_pg_array(value)\n\n\n");
     out.push_str("class Base(_orm.DeclarativeBase):\n    pass\n\n\n");
     for table in tables {
         out.push_str("class ");
@@ -539,10 +563,11 @@ fn python_column(
     let array = raw.ends_with("[]");
     let kind = base_type(raw.trim_end_matches("[]"));
     let (python, sqlalchemy) = match kind.as_str() {
+        "oid" if database_kind == DatabaseKind::Postgres => ("int", "_pg.OID"),
         "smallint" | "integer" | "bigint" | "int" | "int2" | "int4" | "int8" | "serial"
-        | "bigserial" | "smallserial" | "tinyint" | "oid" => ("int", "_sa.Integer"),
+        | "bigserial" | "smallserial" | "tinyint" => ("int", "_sa.Integer"),
         "money" | "smallmoney" if database_kind == DatabaseKind::Postgres => {
-            ("str", "_PostgresMoney")
+            ("_decimal.Decimal", "_pg.MONEY")
         }
         "numeric" | "decimal" | "money" | "smallmoney" | "number" => {
             ("_decimal.Decimal", "_sa.Numeric")
@@ -606,7 +631,10 @@ fn python_column(
     };
     let (python, sqlalchemy) = if array {
         if python == "_typing.Any" {
-            ("list[str]".to_owned(), "_PostgresArrayText".to_owned())
+            (
+                "list[str]".to_owned(),
+                format!("_PostgresEnumArray({})", py_string(&kind)),
+            )
         } else {
             (
                 format!("list[{python}]"),
@@ -650,6 +678,9 @@ fn python_column_args(
     let mut keywords = Vec::new();
     if column.primary_key || no_primary_key {
         keywords.push("primary_key=True".to_owned());
+        if column.primary_key && !column.identity {
+            keywords.push("autoincrement=False".to_owned());
+        }
     }
     if !column.primary_key && !no_primary_key {
         keywords.push("nullable=True".to_owned());
@@ -803,10 +834,22 @@ fn csharp_models(tables: &[TableShape], kind: crate::databases::DatabaseKind) ->
         }
         for column in &table.columns {
             let property = &names.columns[&table.class_name][&column.name];
+            if csharp_ignored(column, kind) && !column_used(table, &column.name) {
+                out.push_str(&format!("            entity.Ignore(e => e.{property});\n"));
+                continue;
+            }
             if property != &column.name {
                 out.push_str(&format!(
                     "            entity.Property(e => e.{property}).HasColumnName({});\n",
                     cs_string(&column.name)
+                ));
+            }
+            if kind == DatabaseKind::Postgres
+                && base_type(&column.data_type) == "interval"
+                && !column.data_type.trim().ends_with("[]")
+            {
+                out.push_str(&format!(
+                    "            entity.Property(e => e.{property}).HasConversion(value => value.HasValue ? new NpgsqlTypes.NpgsqlInterval(0, 0, value.Value.Ticks) : (NpgsqlTypes.NpgsqlInterval?)null, value => value.HasValue ? TimeSpan.FromTicks(value.Value.Time + value.Value.Days * TimeSpan.TicksPerDay + value.Value.Months * 30 * TimeSpan.TicksPerDay) : (TimeSpan?)null);\n"
                 ));
             }
         }
@@ -883,6 +926,48 @@ fn csharp_models(tables: &[TableShape], kind: crate::databases::DatabaseKind) ->
     }
     out.push_str("    }\n}\n");
     out
+}
+
+fn csharp_ignored(column: &ColumnShape, kind: crate::databases::DatabaseKind) -> bool {
+    use crate::databases::DatabaseKind;
+    if kind != DatabaseKind::Postgres {
+        return false;
+    }
+    let raw = column.data_type.trim();
+    let array = raw.ends_with("[]");
+    let base = base_type(raw.trim_end_matches("[]"));
+    if array {
+        matches!(
+            base.as_str(),
+            "interval"
+                | "oid"
+                | "point"
+                | "line"
+                | "lseg"
+                | "box"
+                | "path"
+                | "polygon"
+                | "circle"
+                | "tsvector"
+                | "tsquery"
+        )
+    } else {
+        base == "oid"
+    }
+}
+
+fn column_used(table: &TableShape, name: &str) -> bool {
+    table
+        .columns
+        .iter()
+        .any(|column| column.primary_key && column.name == name)
+        || table.relationships.iter().any(|relationship| {
+            relationship.columns.iter().any(|column| column == name)
+                || relationship
+                    .target_columns
+                    .iter()
+                    .any(|column| column == name)
+        })
 }
 
 struct CSharpNames {
@@ -993,7 +1078,6 @@ fn csharp_column(column: &ColumnShape, kind: crate::databases::DatabaseKind) -> 
         "date" => "DateOnly",
         "time" | "time without time zone" => "TimeOnly",
         "time with time zone" | "timetz" => "DateTimeOffset",
-        "interval" if kind == DatabaseKind::Postgres => "NpgsqlInterval",
         "interval" => "TimeSpan",
         "timestamp" if kind == DatabaseKind::SqlServer => "byte[]",
         "timestamp"
@@ -1365,6 +1449,7 @@ mod tests {
             data_type: "character varying(20)".into(),
             references: vec![],
             primary_key: false,
+            identity: false,
         });
         let first = generate(&schema);
         let second = generate(&schema);
@@ -1388,6 +1473,7 @@ mod tests {
             data_type: data_type.into(),
             references: vec![],
             primary_key,
+            identity: false,
         }
     }
 
@@ -1493,10 +1579,10 @@ mod tests {
         };
         let generated = generate(&schema);
         assert!(generated.python.contains(
-            "order_id: _orm.Mapped[int] = _orm.mapped_column(_sa.Integer, _sa.ForeignKey('orders.id'), primary_key=True)"
+            "order_id: _orm.Mapped[int] = _orm.mapped_column(_sa.Integer, _sa.ForeignKey('orders.id'), primary_key=True, autoincrement=False)"
         ));
         assert!(generated.python.contains(
-            "item_id: _orm.Mapped[int] = _orm.mapped_column(_sa.Integer, _sa.ForeignKey('items.id'), primary_key=True)"
+            "item_id: _orm.Mapped[int] = _orm.mapped_column(_sa.Integer, _sa.ForeignKey('items.id'), primary_key=True, autoincrement=False)"
         ));
         assert!(generated
             .csharp
@@ -1668,8 +1754,8 @@ mod tests {
             )],
         };
         let generated = generate(&schema);
-        assert!(generated.python.contains("_PostgresMoney"));
-        assert!(generated.python.contains("_PostgresArrayText"));
+        assert!(generated.python.contains("_pg.MONEY"));
+        assert!(generated.python.contains("_PostgresEnumArray"));
         assert!(generated.python.contains("list[str]"));
     }
 
@@ -1691,9 +1777,47 @@ mod tests {
         };
         let generated = generate(&schema);
         assert!(generated.csharp.contains("using NpgsqlTypes;"));
-        assert!(generated.csharp.contains("public NpgsqlInterval? Span"));
+        assert!(generated.csharp.contains("public TimeSpan? Span"));
         assert!(generated.csharp.contains("public NpgsqlCidr? Net"));
-        assert!(generated.csharp.contains("public uint? Oid"));
+        assert!(generated.csharp.contains("entity.Ignore(e => e.Oid);"));
+    }
+
+    #[test]
+    fn non_identity_integer_primary_keys_are_not_autoincremented() {
+        use crate::databases::DatabaseKind;
+        let mut id = column("id", "integer", true);
+        id.identity = false;
+        let schema = Schema {
+            kind: DatabaseKind::SqlServer,
+            tables: vec![table("orders", "dbo", vec![id])],
+        };
+        let generated = generate(&schema);
+        assert!(generated.python.contains("autoincrement=False"));
+    }
+
+    #[test]
+    fn postgres_interval_uses_a_converter_and_unsupported_columns_are_ignored() {
+        use crate::databases::DatabaseKind;
+        let schema = Schema {
+            kind: DatabaseKind::Postgres,
+            tables: vec![table(
+                "things",
+                "public",
+                vec![
+                    column("id", "integer", true),
+                    column("span", "interval", false),
+                    column("points", "point[]", false),
+                    column("oid", "oid", false),
+                ],
+            )],
+        };
+        let generated = generate(&schema);
+        assert!(generated.csharp.contains("public TimeSpan? Span"));
+        assert!(generated
+            .csharp
+            .contains("HasConversion(value => value.HasValue ? new NpgsqlTypes.NpgsqlInterval"));
+        assert!(generated.csharp.contains("entity.Ignore(e => e.Points);"));
+        assert!(generated.csharp.contains("entity.Ignore(e => e.Oid);"));
     }
 
     #[test]
@@ -1832,7 +1956,7 @@ mod tests {
         assert!(generated.python.contains("_pg.INET"));
         assert!(generated.python.contains("_pg.CIDR"));
         assert!(generated.python.contains("_pg.MACADDR"));
-        assert!(generated.csharp.contains("public NpgsqlInterval? Span"));
+        assert!(generated.csharp.contains("public TimeSpan? Span"));
         assert!(generated.csharp.contains("public IPAddress? Addr"));
         assert!(generated.csharp.contains("public PhysicalAddress? Mac"));
     }
@@ -1868,12 +1992,14 @@ mod tests {
                             data_type: "integer".into(),
                             references: vec![],
                             primary_key: true,
+                            identity: true,
                         },
                         SchemaColumn {
                             name: "b".into(),
                             data_type: "integer".into(),
                             references: vec![],
                             primary_key: true,
+                            identity: true,
                         },
                     ],
                 },
@@ -1886,6 +2012,7 @@ mod tests {
                             data_type: "integer".into(),
                             references: vec![],
                             primary_key: true,
+                            identity: true,
                         },
                         SchemaColumn {
                             name: "parent_a".into(),
@@ -1898,6 +2025,7 @@ mod tests {
                                 ordinal: 1,
                             }],
                             primary_key: false,
+                            identity: false,
                         },
                         SchemaColumn {
                             name: "parent_b".into(),
@@ -1910,6 +2038,7 @@ mod tests {
                                 ordinal: 2,
                             }],
                             primary_key: false,
+                            identity: false,
                         },
                     ],
                 },

@@ -23,6 +23,8 @@ pub struct SchemaColumn {
     pub references: Vec<ForeignKey>,
     #[serde(default)]
     pub primary_key: bool,
+    #[serde(default)]
+    pub identity: bool,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct ForeignKey {
@@ -41,10 +43,12 @@ SELECT n.nspname::text, t.relname::text, a.attname::text,
        pg_catalog.format_type(a.atttypid,a.atttypmod),
        rn.nspname::text, rt.relname::text, ra.attname::text,
        CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_constraint p WHERE p.conrelid=t.oid AND p.contype='p' AND a.attnum=ANY(p.conkey)) THEN '1' ELSE '0' END,
-       COALESCE(f.conname,''), COALESCE(array_position(f.conkey,a.attnum),0)::text
+       COALESCE(f.conname,''), COALESCE(array_position(f.conkey,a.attnum),0)::text,
+       CASE WHEN a.attidentity <> '' OR pg_get_expr(ad.adbin, ad.adrelid) LIKE 'nextval%' THEN '1' ELSE '0' END
 FROM pg_catalog.pg_class t
 JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace
 JOIN pg_catalog.pg_attribute a ON a.attrelid=t.oid AND a.attnum>0 AND NOT a.attisdropped
+LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid=a.attrelid AND ad.adnum=a.attnum
 LEFT JOIN pg_catalog.pg_constraint f ON f.conrelid=t.oid AND f.contype='f' AND a.attnum=ANY(f.conkey)
 LEFT JOIN pg_catalog.pg_class rt ON rt.oid=f.confrelid
 LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid=rt.relnamespace
@@ -58,7 +62,8 @@ SELECT s.name,t.name,c.name,
        WHEN ty.name IN ('decimal','numeric') THEN '(' + CAST(c.precision AS varchar(10)) + ',' + CAST(c.scale AS varchar(10)) + ')' ELSE '' END,
        rs.name,rt.name,rc.name,
        CASE WHEN EXISTS (SELECT 1 FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id=ic.object_id AND i.index_id=ic.index_id WHERE i.is_primary_key=1 AND ic.object_id=t.object_id AND ic.column_id=c.column_id) THEN '1' ELSE '0' END,
-       COALESCE(fk.name,''), CAST(COALESCE(f.constraint_column_id,0) AS varchar(10))
+       COALESCE(fk.name,''), CAST(COALESCE(f.constraint_column_id,0) AS varchar(10)),
+       CASE WHEN c.is_identity = 1 THEN '1' ELSE '0' END
 FROM sys.objects t JOIN sys.schemas s ON s.schema_id=t.schema_id
 JOIN sys.columns c ON c.object_id=t.object_id
 JOIN sys.types ty ON ty.user_type_id=c.user_type_id
@@ -71,7 +76,7 @@ WHERE t.type IN ('U','V') AND t.is_ms_shipped=0
 ORDER BY s.name,t.name,c.column_id
 "#;
 
-type CatalogRow = [Option<String>; 10];
+type CatalogRow = [Option<String>; 11];
 
 fn is_primary_key(value: &str) -> bool {
     matches!(
@@ -82,7 +87,7 @@ fn is_primary_key(value: &str) -> bool {
 
 fn assemble(kind: DatabaseKind, rows: Vec<CatalogRow>) -> Schema {
     let mut tables = BTreeMap::<(String, String), SchemaTable>::new();
-    for [schema, table, column, data_type, target_schema, target_table, target_column, primary_key, constraint, ordinal] in
+    for [schema, table, column, data_type, target_schema, target_table, target_column, primary_key, constraint, ordinal, identity] in
         rows
     {
         let schema = schema.unwrap_or_default();
@@ -105,6 +110,7 @@ fn assemble(kind: DatabaseKind, rows: Vec<CatalogRow>) -> Schema {
                     data_type: data_type.unwrap_or_default(),
                     references: vec![],
                     primary_key: primary_key.as_deref().is_some_and(is_primary_key),
+                    identity: identity.as_deref().is_some_and(is_primary_key),
                 });
                 table.columns.len() - 1
             });
@@ -262,11 +268,14 @@ fn sqlite_schema(path: &str) -> Result<Schema, String> {
                 )?;
                 let mut columns = columns
                     .query_map([&name], |r| {
+                        let data_type: String = r.get(1)?;
+                        let primary_key = r.get::<_, i64>(2)? > 0;
                         Ok(SchemaColumn {
                             name: r.get(0)?,
-                            data_type: r.get(1)?,
+                            identity: primary_key && data_type.to_ascii_uppercase().contains("INT"),
+                            data_type,
                             references: vec![],
-                            primary_key: r.get::<_, i64>(2)? > 0,
+                            primary_key,
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -434,6 +443,7 @@ mod tests {
                     Some("1".into()),
                     Some("fk".into()),
                     Some("1".into()),
+                    Some("0".into()),
                 ]
             };
             let schema = assemble(

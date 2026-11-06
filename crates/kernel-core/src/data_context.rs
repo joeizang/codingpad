@@ -727,12 +727,22 @@ fn csharp_models(tables: &[TableShape], kind: crate::databases::DatabaseKind) ->
          using Microsoft.EntityFrameworkCore;\n\n",
     );
     if kind == DatabaseKind::Postgres {
+        out.push_str("// PostgreSQL intervals map to TimeSpan. Reading month/year components throws;\n");
+        out.push_str("// they cannot be represented as a fixed duration. Unsupported columns are omitted.\n");
         out.push_str("using NpgsqlTypes;\n");
     }
     out.push_str("namespace CodingPad.Data;\n\n");
     for table in tables {
         out.push_str(&format!("public sealed class {}\n{{\n", table.class_name));
         for column in &table.columns {
+            if csharp_ignored(column, kind) && !column_used(table, &column.name) {
+                out.push_str(&format!(
+                    "    // Column {} ({}) has no supported EF mapping and is omitted.\n",
+                    cs_string(&column.name),
+                    cs_string(&column.data_type)
+                ));
+                continue;
+            }
             let cs_type = csharp_column(column, kind);
             let attribute = &names.columns[&table.class_name][&column.name];
             out.push_str(&format!(
@@ -852,21 +862,12 @@ fn csharp_models(tables: &[TableShape], kind: crate::databases::DatabaseKind) ->
         for column in &table.columns {
             let property = &names.columns[&table.class_name][&column.name];
             if csharp_ignored(column, kind) && !column_used(table, &column.name) {
-                out.push_str(&format!("            entity.Ignore(e => e.{property});\n"));
                 continue;
             }
             if property != &column.name {
                 out.push_str(&format!(
                     "            entity.Property(e => e.{property}).HasColumnName({});\n",
                     cs_string(&column.name)
-                ));
-            }
-            if kind == DatabaseKind::Postgres
-                && base_type(&column.data_type) == "interval"
-                && !column.data_type.trim().ends_with("[]")
-            {
-                out.push_str(&format!(
-                    "            entity.Property(e => e.{property}).HasConversion(value => value.HasValue ? new NpgsqlTypes.NpgsqlInterval(0, 0, value.Value.Ticks) : (NpgsqlTypes.NpgsqlInterval?)null, value => value.HasValue ? TimeSpan.FromTicks(value.Value.Time + value.Value.Days * TimeSpan.TicksPerDay + value.Value.Months * 30 * TimeSpan.TicksPerDay) : (TimeSpan?)null);\n"
                 ));
             }
         }
@@ -956,8 +957,7 @@ fn csharp_ignored(column: &ColumnShape, kind: crate::databases::DatabaseKind) ->
     if array {
         matches!(
             base.as_str(),
-            "interval"
-                | "oid"
+            "oid"
                 | "point"
                 | "line"
                 | "lseg"
@@ -1796,7 +1796,7 @@ mod tests {
         assert!(generated.csharp.contains("using NpgsqlTypes;"));
         assert!(generated.csharp.contains("public TimeSpan? Span"));
         assert!(generated.csharp.contains("public NpgsqlCidr? Net"));
-        assert!(generated.csharp.contains("entity.Ignore(e => e.Oid);"));
+        assert!(!generated.csharp.contains("public uint? Oid"));
     }
 
     #[test]
@@ -1813,7 +1813,7 @@ mod tests {
     }
 
     #[test]
-    fn postgres_interval_uses_a_converter_and_unsupported_columns_are_ignored() {
+    fn postgres_intervals_use_timespan_and_unsupported_properties_are_omitted() {
         use crate::databases::DatabaseKind;
         let schema = Schema {
             kind: DatabaseKind::Postgres,
@@ -1823,6 +1823,7 @@ mod tests {
                 vec![
                     column("id", "integer", true),
                     column("span", "interval", false),
+                    column("spans", "interval[]", false),
                     column("points", "point[]", false),
                     column("oid", "oid", false),
                 ],
@@ -1830,11 +1831,10 @@ mod tests {
         };
         let generated = generate(&schema);
         assert!(generated.csharp.contains("public TimeSpan? Span"));
-        assert!(generated
-            .csharp
-            .contains("HasConversion(value => value.HasValue ? new NpgsqlTypes.NpgsqlInterval"));
-        assert!(generated.csharp.contains("entity.Ignore(e => e.Points);"));
-        assert!(generated.csharp.contains("entity.Ignore(e => e.Oid);"));
+        assert!(generated.csharp.contains("public TimeSpan[]? Spans"));
+        assert!(!generated.csharp.contains("HasConversion"));
+        assert!(!generated.csharp.contains("public string[]? Points"));
+        assert!(!generated.csharp.contains("public uint? Oid"));
     }
 
     #[test]

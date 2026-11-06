@@ -395,13 +395,37 @@ security guarantee. Enable **Trust the server certificate** for a self-signed or
 private-CA server. PostgreSQL decimals, dates and timestamps use their exact server
 text; other columns in the same result keep their integer, boolean or float values.
 Multi-statement PostgreSQL batches use text for every column (including `t`/`f`
-for booleans). Connection passwords stay in the Rust host and are never passed to script kernels. SQL Server
+for booleans). SQL scripts keep connection passwords in the Rust host. A script with a generated data context receives its connection password in memory for that run only; it is never written to the generated files, settings or logs. SQL Server
 connections can opt in to trusting a self-signed development certificate, and SQL
 Server scripts do not accept the `GO` client-side batch separator; run each batch
 separately. SQL Server statements without a result set show `Statement completed.`
 rather than a rows-affected count. `money` and `smallmoney` are displayed with four
 decimal places; the driver decodes them as floating point, so very large `money`
 values may lose precision.
+
+## Python data contexts (M3.8)
+
+A Python script with a connection header also gets a typed **data context**
+generated from that connection's schema. Tables become model classes, columns
+become typed properties, and foreign keys become relationships. The context is regenerated for every run and when the schema panel is
+refreshed, so editing the database schema is picked up without maintaining model
+files by hand. Model sources are generated into a hidden workspace, never into
+your script.
+
+```python
+# codingpad: connection=northwind
+from sqlalchemy import select
+from codingpad_data import Customer, DataContext
+
+context = DataContext.connect()
+context.session.scalars(select(Customer)).all()
+```
+
+Python models use SQLAlchemy 2.0 `Mapped[]` annotations and `relationship()`.
+The kernel installs SQLAlchemy on first use. basedpyright sees the generated
+models, so column, table and relationship completions work while you edit.
+Passwords stay in the OS vault and are read only while a run or schema refresh
+needs them; generated files contain only the schema, never a password.
 
 ## Secrets
 

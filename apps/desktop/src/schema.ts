@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
-export type SchemaColumn = { name: string; dataType: string; references: { schema: string; table: string; column: string }[] };
+export type SchemaColumn = { name: string; dataType: string; primaryKey?: boolean; references: { schema: string; table: string; column: string }[] };
 export type SchemaTable = { schema: string; name: string; columns: SchemaColumn[] };
 export type ConnectionSchema = { kind: "sqlite" | "postgres" | "sqlserver"; tables: SchemaTable[] };
 

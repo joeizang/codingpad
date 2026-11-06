@@ -8,7 +8,7 @@ function Table({ table }: { table: SchemaTable }) {
   return <div className="schema-table">
     <button aria-expanded={open} onClick={() => setOpen(!open)}>{open ? "▾" : "▸"} {table.schema}.{table.name} ({table.columns.length})</button>
     {open && <ul>{table.columns.slice(0, limit).map((column) => <li key={column.name}>
-      <span>{column.name}</span> <code>{column.dataType || "untyped"}</code>
+      <span>{column.name}</span>{column.primaryKey && <strong> PK</strong>} <code>{column.dataType || "untyped"}</code>
       {column.references.map((key, index) => <div key={index}>→ {key.schema}.{key.table}.{key.column}</div>)}
     </li>)}{limit < table.columns.length && <li><button onClick={() => setLimit(limit + PAGE)}>More columns</button></li>}</ul>}
   </div>;

@@ -107,6 +107,26 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(value, 42)
         self.assertEqual(codingpad.cache(outer, lambda: 99), 42)
 
+    def test_database_context_requires_an_attached_connection(self):
+        codingpad._set_database_connection(None)
+        with self.assertRaisesRegex(RuntimeError, "No database connection is attached"):
+            codingpad._connect_data_context()
+
+    def test_database_connection_is_cleared_after_each_run(self):
+        codingpad._set_database_connection({"kind": "sqlite", "path": ":memory:"})
+        codingpad._end()
+        with self.assertRaisesRegex(RuntimeError, "No database connection is attached"):
+            codingpad._connect_data_context()
+
+    def test_sqlalchemy_state_is_not_shown_as_a_column(self):
+        class Record:
+            def __init__(self):
+                self._sa_instance_state = object()
+                self.name = "Ada"
+
+        node = codingpad._tree([Record()])
+        self.assertEqual([column["name"] for column in node["columns"]], ["name"])
+
     def test_dump_is_still_text_outside_the_app(self):
         self.assertIsNone(codingpad._sink)
         value = {"name": "Ada", "scores": [1, 2]}

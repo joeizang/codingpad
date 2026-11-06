@@ -435,6 +435,12 @@ generated models, so column, table and relationship completions work while you
 edit. Passwords stay in the OS vault and are read only while a run or schema
 refresh needs them; generated files contain only the schema, never a password.
 
+PostgreSQL C# `interval` and `interval[]` columns map to `TimeSpan` and
+`TimeSpan[]`. [Intervals containing months or years cannot be read as a fixed duration](https://www.npgsql.org/doc/types/datetime.html)
+and raise an error. Columns without a supported EF mapping are omitted from the
+generated class, with a comment naming the column, so unavailable data cannot
+appear as a real `null` value.
+
 ## Secrets
 
 Click **Secrets…** to add, update or remove named secrets. Values are stored in

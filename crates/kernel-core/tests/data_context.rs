@@ -301,14 +301,28 @@ async fn postgres_live_types_work_through_generated_models() {
         false,
     )
     .await;
-    let setup = "-- codingpad: connection=live\nDROP TABLE IF EXISTS codingpad_dc_test; CREATE TABLE codingpad_dc_test (id uuid PRIMARY KEY, span interval, addr inet, t timetz); INSERT INTO codingpad_dc_test VALUES ('00000000-0000-0000-0000-000000000001', '1 day', '127.0.0.1', '12:00:00+00');";
+    let setup = "-- codingpad: connection=live\nDROP TABLE IF EXISTS codingpad_dc_month; DROP TABLE IF EXISTS codingpad_dc_other; DROP TABLE IF EXISTS codingpad_dc_test; CREATE TABLE codingpad_dc_test (id uuid PRIMARY KEY, span interval, spans interval[], addr inet, t timetz, points point[], oid oid); INSERT INTO codingpad_dc_test VALUES ('00000000-0000-0000-0000-000000000001', '1 day 1 hour 0.000001 seconds', ARRAY['1 hour'::interval, '-1 day'::interval], '127.0.0.1', '12:00:00+00', ARRAY[point(1,2)], 42); CREATE TABLE codingpad_dc_other (id int PRIMARY KEY); INSERT INTO codingpad_dc_other VALUES (1); CREATE TABLE codingpad_dc_month (id int PRIMARY KEY, span interval); INSERT INTO codingpad_dc_month VALUES (1, '1 month');";
     manager.run("setup", setup, None).await.unwrap();
     let context = manager.data_context("live").await.unwrap();
     let supervisor = Supervisor::default();
     let result = run_result(
         &supervisor,
         Language::Csharp,
-        "foreach (var row in new DataContext().CodingpadDcTests) Console.WriteLine(row.Addr);\n",
+        r#"var context = new DataContext();
+Console.WriteLine(context.CodingpadDcOthers.Single().Id);
+var row = context.CodingpadDcTests.Single();
+Console.WriteLine(row.Addr);
+Console.WriteLine(row.Span == TimeSpan.FromDays(1) + TimeSpan.FromHours(1) + TimeSpan.FromTicks(10));
+Console.WriteLine(row.Spans!.SequenceEqual(new[] { TimeSpan.FromHours(1), TimeSpan.FromDays(-1) }));
+Console.WriteLine(typeof(CodingpadDcTest).GetProperty("Points") is null);
+Console.WriteLine(typeof(CodingpadDcTest).GetProperty("Oid") is null);
+try
+{
+    _ = context.CodingpadDcMonths.Single();
+    throw new Exception("Month intervals must not be approximated as days");
+}
+catch (InvalidCastException) { Console.WriteLine("month interval rejected"); }
+"#,
         DataContextRun {
             source: context.csharp,
             connection: context.connection,
@@ -319,14 +333,25 @@ async fn postgres_live_types_work_through_generated_models() {
     manager
         .run(
             "cleanup",
-            "-- codingpad: connection=live\nDROP TABLE IF EXISTS codingpad_dc_test;",
+            "-- codingpad: connection=live\nDROP TABLE IF EXISTS codingpad_dc_month; DROP TABLE IF EXISTS codingpad_dc_other; DROP TABLE IF EXISTS codingpad_dc_test;",
             None,
         )
         .await
         .unwrap();
     let (ok, events) = result.expect("Postgres data context run failed");
     assert!(ok, "{events:?}");
-    assert_eq!(stdout(&events).trim(), "127.0.0.1");
+    assert_eq!(
+        stdout(&events).lines().collect::<Vec<_>>(),
+        [
+            "1",
+            "127.0.0.1",
+            "True",
+            "True",
+            "True",
+            "True",
+            "month interval rejected"
+        ]
+    );
 }
 
 #[tokio::test]

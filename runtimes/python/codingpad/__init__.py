@@ -390,6 +390,7 @@ def _start_database(connection):
             module=mssql_python,
             creator=lambda: mssql_python.connect(connection_string),
             paramstyle="qmark",
+            use_setinputsizes=False,
             future=True,
         )
         # pyodbc's optional output-converter hook is not available on this driver.

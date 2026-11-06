@@ -247,11 +247,9 @@ fn shape(schema: &Schema) -> Vec<TableShape> {
                 used_properties.get_mut(&parent).expect("parent properties"),
             );
             let remote_columns = if child == parent {
-                tables[parent_index]
-                    .columns
+                members
                     .iter()
-                    .filter(|column| column.primary_key)
-                    .map(|column| column.name.clone())
+                    .map(|(_, _, target)| target.clone())
                     .collect()
             } else {
                 Vec::new()
@@ -354,6 +352,23 @@ fn python_models(tables: &[TableShape], kind: crate::databases::DatabaseKind) ->
     out.push_str("        return str(value) if value is not None else None\n\n");
     out.push_str("    def process_result_value(self, value, dialect):\n");
     out.push_str("        return _uuid.UUID(str(value)) if value is not None else None\n\n\n");
+    out.push_str("class _PostgresMoney(_sa.types.TypeDecorator):\n");
+    out.push_str("    impl = _sa.Text\n");
+    out.push_str("    cache_ok = True\n\n");
+    out.push_str("    def process_result_value(self, value, dialect):\n");
+    out.push_str("        return str(value) if value is not None else None\n\n\n");
+    out.push_str("class _PostgresArrayText(_sa.types.TypeDecorator):\n");
+    out.push_str("    impl = _sa.Text\n");
+    out.push_str("    cache_ok = True\n\n");
+    out.push_str("    def process_result_value(self, value, dialect):\n");
+    out.push_str("        if value is None or not isinstance(value, str):\n");
+    out.push_str("            return value\n");
+    out.push_str("        if value.startswith('{') and value.endswith('}'):\n");
+    out.push_str("            inner = value[1:-1]\n");
+    out.push_str(
+        "            return [item.strip('\"') for item in inner.split(',')] if inner else []\n",
+    );
+    out.push_str("        return value\n\n\n");
     out.push_str("class Base(_orm.DeclarativeBase):\n    pass\n\n\n");
     for table in tables {
         out.push_str("class ");
@@ -526,6 +541,9 @@ fn python_column(
     let (python, sqlalchemy) = match kind.as_str() {
         "smallint" | "integer" | "bigint" | "int" | "int2" | "int4" | "int8" | "serial"
         | "bigserial" | "smallserial" | "tinyint" | "oid" => ("int", "_sa.Integer"),
+        "money" | "smallmoney" if database_kind == DatabaseKind::Postgres => {
+            ("str", "_PostgresMoney")
+        }
         "numeric" | "decimal" | "money" | "smallmoney" | "number" => {
             ("_decimal.Decimal", "_sa.Numeric")
         }
@@ -587,10 +605,14 @@ fn python_column(
         _ => ("_typing.Any", "_sa.Text"),
     };
     let (python, sqlalchemy) = if array {
-        (
-            format!("list[{python}]"),
-            format!("_sa.ARRAY({sqlalchemy})"),
-        )
+        if python == "_typing.Any" {
+            ("list[str]".to_owned(), "_PostgresArrayText".to_owned())
+        } else {
+            (
+                format!("list[{python}]"),
+                format!("_sa.ARRAY({sqlalchemy})"),
+            )
+        }
     } else {
         (python.to_owned(), sqlalchemy.to_owned())
     };
@@ -654,9 +676,12 @@ fn csharp_models(tables: &[TableShape], kind: crate::databases::DatabaseKind) ->
          using System.Net;\n\
          using System.Net.NetworkInformation;\n\
          using System.Text.Json;\n\
-         using Microsoft.EntityFrameworkCore;\n\n\
-         namespace CodingPad.Data;\n\n",
+         using Microsoft.EntityFrameworkCore;\n\n",
     );
+    if kind == DatabaseKind::Postgres {
+        out.push_str("using NpgsqlTypes;\n");
+    }
+    out.push_str("namespace CodingPad.Data;\n\n");
     for table in tables {
         out.push_str(&format!("public sealed class {}\n{{\n", table.class_name));
         for column in &table.columns {
@@ -968,6 +993,7 @@ fn csharp_column(column: &ColumnShape, kind: crate::databases::DatabaseKind) -> 
         "date" => "DateOnly",
         "time" | "time without time zone" => "TimeOnly",
         "time with time zone" | "timetz" => "DateTimeOffset",
+        "interval" if kind == DatabaseKind::Postgres => "NpgsqlInterval",
         "interval" => "TimeSpan",
         "timestamp" if kind == DatabaseKind::SqlServer => "byte[]",
         "timestamp"
@@ -977,8 +1003,11 @@ fn csharp_column(column: &ColumnShape, kind: crate::databases::DatabaseKind) -> 
         | "smalldatetime" => "DateTime",
         "timestamptz" | "timestamp with time zone" | "datetimeoffset" => "DateTimeOffset",
         "uuid" | "uniqueidentifier" => "Guid",
-        "inet" | "cidr" => "IPAddress",
+        "inet" => "IPAddress",
+        "cidr" if kind == DatabaseKind::Postgres => "NpgsqlCidr",
+        "cidr" => "IPAddress",
         "macaddr" | "macaddr8" => "PhysicalAddress",
+        "oid" => "uint",
         "json" | "jsonb" if kind == DatabaseKind::Postgres => "JsonDocument",
         "json" | "jsonb" => "string",
         _ => "string",
@@ -1055,6 +1084,32 @@ fn reserved_class_names() -> BTreeSet<&'static str> {
         "JsonDocument",
         "JsonElement",
         "JsonSerializer",
+        "Array",
+        "Tuple",
+        "ValueTuple",
+        "Nullable",
+        "Lazy",
+        "Span",
+        "Memory",
+        "ReadOnlySpan",
+        "ReadOnlyMemory",
+        "IList",
+        "IDictionary",
+        "IReadOnlyList",
+        "IReadOnlyDictionary",
+        "IAsyncEnumerable",
+        "IAsyncDisposable",
+        "IDisposable",
+        "IComparable",
+        "IEquatable",
+        "IFormattable",
+        "IConvertible",
+        "IServiceScope",
+        "ILogger",
+        "IConfiguration",
+        "HttpRequest",
+        "HttpResponse",
+        "HttpContext",
         "List",
         "Dictionary",
         "HashSet",
@@ -1126,6 +1181,12 @@ fn plural_snake(class_name: &str) -> String {
         "person" => "people".into(),
         "mouse" => "mice".into(),
         _ if snake.ends_with('s') => format!("{snake}_items"),
+        _ if snake.ends_with('y')
+            && snake.len() > 1
+            && "aeiou".contains(snake.chars().nth(snake.len() - 2).unwrap()) =>
+        {
+            format!("{snake}s")
+        }
         _ if snake.ends_with('y') => format!("{}ies", &snake[..snake.len() - 1]),
         _ => format!("{snake}s"),
     }
@@ -1571,6 +1632,87 @@ mod tests {
     }
 
     #[test]
+    fn self_reference_to_a_unique_non_primary_key_uses_the_referenced_column() {
+        use crate::databases::DatabaseKind;
+        let mut manager = column("manager_code", "TEXT", false);
+        manager.references = vec![reference("employees", "code", "main", "manager", 1)];
+        let schema = Schema {
+            kind: DatabaseKind::Sqlite,
+            tables: vec![table(
+                "employees",
+                "main",
+                vec![
+                    column("id", "INTEGER", true),
+                    column("code", "TEXT", false),
+                    manager,
+                ],
+            )],
+        };
+        let generated = generate(&schema);
+        assert!(generated.python.contains("remote_side=[code]"));
+    }
+
+    #[test]
+    fn postgres_money_and_enum_arrays_do_not_silently_corrupt_values() {
+        use crate::databases::DatabaseKind;
+        let schema = Schema {
+            kind: DatabaseKind::Postgres,
+            tables: vec![table(
+                "things",
+                "public",
+                vec![
+                    column("id", "integer", true),
+                    column("price", "money", false),
+                    column("moods", "mood[]", false),
+                ],
+            )],
+        };
+        let generated = generate(&schema);
+        assert!(generated.python.contains("_PostgresMoney"));
+        assert!(generated.python.contains("_PostgresArrayText"));
+        assert!(generated.python.contains("list[str]"));
+    }
+
+    #[test]
+    fn postgres_interval_cidr_and_oid_use_npgsql_types() {
+        use crate::databases::DatabaseKind;
+        let schema = Schema {
+            kind: DatabaseKind::Postgres,
+            tables: vec![table(
+                "things",
+                "public",
+                vec![
+                    column("id", "integer", true),
+                    column("span", "interval", false),
+                    column("net", "cidr", false),
+                    column("oid", "oid", false),
+                ],
+            )],
+        };
+        let generated = generate(&schema);
+        assert!(generated.csharp.contains("using NpgsqlTypes;"));
+        assert!(generated.csharp.contains("public NpgsqlInterval? Span"));
+        assert!(generated.csharp.contains("public NpgsqlCidr? Net"));
+        assert!(generated.csharp.contains("public uint? Oid"));
+    }
+
+    #[test]
+    fn array_and_tuple_are_reserved_and_arrays_pluralises_correctly() {
+        use crate::databases::DatabaseKind;
+        let schema = Schema {
+            kind: DatabaseKind::Sqlite,
+            tables: vec![
+                table("arrays", "main", vec![column("id", "INTEGER", true)]),
+                table("tuples", "main", vec![column("id", "INTEGER", true)]),
+            ],
+        };
+        let generated = generate(&schema);
+        assert!(generated.csharp.contains("public sealed class Array2"));
+        assert!(generated.csharp.contains("public sealed class Tuple2"));
+        assert!(generated.csharp.contains("public DbSet<Array2> Array2s"));
+    }
+
+    #[test]
     fn two_children_pointing_at_one_parent_get_distinct_collections() {
         use crate::databases::DatabaseKind;
         let mut order_customer = column("customer_id", "INTEGER", false);
@@ -1690,7 +1832,7 @@ mod tests {
         assert!(generated.python.contains("_pg.INET"));
         assert!(generated.python.contains("_pg.CIDR"));
         assert!(generated.python.contains("_pg.MACADDR"));
-        assert!(generated.csharp.contains("public TimeSpan? Span"));
+        assert!(generated.csharp.contains("public NpgsqlInterval? Span"));
         assert!(generated.csharp.contains("public IPAddress? Addr"));
         assert!(generated.csharp.contains("public PhysicalAddress? Mac"));
     }

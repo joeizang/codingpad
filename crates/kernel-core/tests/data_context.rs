@@ -337,7 +337,7 @@ async fn postgres_live_types_work_through_generated_models() {
         false,
     )
     .await;
-    let setup = "-- codingpad: connection=live\nDROP TABLE IF EXISTS codingpad_dc_kinds; DROP TABLE IF EXISTS codingpad_dc_oids; DROP TABLE IF EXISTS codingpad_dc_shapes; DROP TABLE IF EXISTS codingpad_dc_month; DROP TABLE IF EXISTS codingpad_dc_other; DROP TABLE IF EXISTS codingpad_dc_test; DROP FUNCTION IF EXISTS codingpad_dc_next(); DROP SEQUENCE IF EXISTS codingpad_dc_seq; DROP TYPE IF EXISTS codingpad_dc_mood; DROP TYPE IF EXISTS \"Codingpad Odd\"; DROP SCHEMA IF EXISTS codingpad_dc_s CASCADE; CREATE TABLE codingpad_dc_test (id uuid PRIMARY KEY, span interval, spans interval[], addr inet, t timetz, points point[], oid oid); INSERT INTO codingpad_dc_test VALUES ('00000000-0000-0000-0000-000000000001', '1 day 1 hour 0.000001 seconds', ARRAY['1 hour'::interval, '-1 day'::interval], '127.0.0.1', '12:00:00+00', ARRAY[point(1,2)], 42); CREATE TABLE codingpad_dc_other (id int PRIMARY KEY); INSERT INTO codingpad_dc_other VALUES (1); CREATE TABLE codingpad_dc_month (id int PRIMARY KEY, span interval); INSERT INTO codingpad_dc_month VALUES (1, '1 month'); CREATE TYPE codingpad_dc_mood AS ENUM ('ok', 'sad'); CREATE TYPE \"Codingpad Odd\" AS ENUM ('a b', 'c'); CREATE SCHEMA codingpad_dc_s; CREATE TYPE codingpad_dc_s.smood AS ENUM ('x', 'y'); CREATE SEQUENCE codingpad_dc_seq START 700; CREATE FUNCTION codingpad_dc_next() RETURNS int LANGUAGE sql AS 'SELECT nextval(''codingpad_dc_seq'')::int'; CREATE TABLE codingpad_dc_kinds (id int PRIMARY KEY DEFAULT codingpad_dc_next(), mood codingpad_dc_mood, odd \"Codingpad Odd\", moods codingpad_dc_mood[], smood codingpad_dc_s.smood, smoods codingpad_dc_s.smood[], doc xml, price money, prices money[], stamp timestamptz NOT NULL DEFAULT now(), at timestamp, d date, t2 time, span interval, spans interval[]); INSERT INTO codingpad_dc_kinds (id, mood, moods) VALUES (1, 'sad', ARRAY['sad']::codingpad_dc_mood[]); CREATE TABLE codingpad_dc_oids (id oid PRIMARY KEY, refs oid[], label text); INSERT INTO codingpad_dc_oids VALUES (42, ARRAY[1,2]::oid[], 'answer'); CREATE TABLE codingpad_dc_shapes (points point[]);";
+    let setup = "-- codingpad: connection=live\nDROP TABLE IF EXISTS codingpad_dc_kinds; DROP TABLE IF EXISTS codingpad_dc_oids; DROP TABLE IF EXISTS codingpad_dc_shapes; DROP TABLE IF EXISTS codingpad_dc_month; DROP TABLE IF EXISTS codingpad_dc_other; DROP TABLE IF EXISTS codingpad_dc_test; DROP FUNCTION IF EXISTS codingpad_dc_next(); DROP SEQUENCE IF EXISTS codingpad_dc_seq; DROP TYPE IF EXISTS codingpad_dc_mood; DROP TYPE IF EXISTS \"Codingpad Odd\"; DROP SCHEMA IF EXISTS codingpad_dc_s CASCADE; CREATE TABLE codingpad_dc_test (id uuid PRIMARY KEY, span interval, spans interval[], addr inet, t timetz, points point[], oid oid); INSERT INTO codingpad_dc_test VALUES ('00000000-0000-0000-0000-000000000001', '1 day 1 hour 0.000001 seconds', ARRAY['1 hour'::interval, '-1 day'::interval], '127.0.0.1', '12:00:00+00', ARRAY[point(1,2)], 42); CREATE TABLE codingpad_dc_other (id int PRIMARY KEY); INSERT INTO codingpad_dc_other VALUES (1); CREATE TABLE codingpad_dc_month (id int PRIMARY KEY, span interval); INSERT INTO codingpad_dc_month VALUES (1, '1 month'); CREATE TYPE codingpad_dc_mood AS ENUM ('ok', 'sad'); CREATE TYPE \"Codingpad Odd\" AS ENUM ('a b', 'c'); CREATE SCHEMA codingpad_dc_s; CREATE TYPE codingpad_dc_s.smood AS ENUM ('x', 'y'); CREATE SEQUENCE codingpad_dc_seq START 700; CREATE FUNCTION codingpad_dc_next() RETURNS int LANGUAGE sql AS 'SELECT nextval(''codingpad_dc_seq'')::int'; CREATE TABLE codingpad_dc_kinds (id int PRIMARY KEY DEFAULT codingpad_dc_next(), mood codingpad_dc_mood, odd \"Codingpad Odd\", moods codingpad_dc_mood[], smood codingpad_dc_s.smood, smoods codingpad_dc_s.smood[], doc xml, price money, prices money[], stamp timestamptz NOT NULL DEFAULT now(), at timestamp, d date, t2 time, span interval, spans interval[], odds \"Codingpad Odd\"[], doubled int GENERATED ALWAYS AS (id * 2) STORED); INSERT INTO codingpad_dc_kinds (id, mood, moods) VALUES (1, 'sad', ARRAY['sad']::codingpad_dc_mood[]); CREATE TABLE codingpad_dc_oids (id oid PRIMARY KEY, refs oid[], label text); INSERT INTO codingpad_dc_oids VALUES (42, ARRAY[1,2]::oid[], 'answer'); CREATE TABLE codingpad_dc_shapes (points point[]);";
     manager.run("setup", setup, None).await.unwrap();
     let context = manager.data_context("live").await.unwrap();
     let supervisor = Supervisor::default();
@@ -400,6 +400,16 @@ fresh.CodingpadDcOids.Add(new CodingpadDcOid { Id = 43, Refs = new uint[] { 7 },
 fresh.SaveChanges();
 Console.WriteLine(new DataContext().CodingpadDcOids.Single(x => x.Id == 43).Label);
 Console.WriteLine(typeof(DataContext).GetProperties().Any(property => property.Name.Contains("Shape")));
+
+// Quoted enum array and a stored generated column.
+var quoted = new CodingpadDcKind { Id = 9, Odds = new[] { "a b", "c" } };
+fresh.Add(quoted);
+fresh.SaveChanges();
+Console.WriteLine(quoted.Doubled);
+Console.WriteLine(new DataContext().CodingpadDcKinds.Count(x => x.Odds!.Contains(odd)));
+quoted.Odds = new[] { "c" };
+fresh.SaveChanges();
+Console.WriteLine(string.Join(",", new DataContext().CodingpadDcKinds.Single(x => x.Id == 9).Odds!));
 "#,
         DataContextRun {
             source: context.csharp,
@@ -444,6 +454,9 @@ Console.WriteLine(typeof(DataContext).GetProperties().Any(property => property.N
             "1,2",
             "added",
             "False",
+            "18",
+            "1",
+            "c",
         ]
     );
     assert!(

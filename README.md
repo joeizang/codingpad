@@ -444,7 +444,9 @@ columns without a supported EF mapping are omitted from the generated class,
 with a comment naming the column, so unavailable data cannot appear as a real
 `null` value. A table left with no columns is omitted too. Columns with a
 database default or generated value are left out of an insert when you don't set
-them, so setting one to `null` also takes the default.
+them, so setting one to `null` also takes the default. PostgreSQL `timestamp` columns
+(without time zone) take a local or unspecified `DateTime` in C#; Npgsql rejects
+a `DateTime` with `Kind=Utc` there, so use a `timestamptz` column for UTC values.
 
 ## Secrets
 

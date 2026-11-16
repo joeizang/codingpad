@@ -849,6 +849,7 @@ export default function App() {
                 compileDiagnostics={compileDiagnostics}
                 toolchainVersion={toolchainVersion}
                 sqlSchema={schemaState.schema}
+                dataRevision={schemaRevision}
                 source={active.source}
                 onDiagnostics={setIntelligence}
                 onChange={(source) =>

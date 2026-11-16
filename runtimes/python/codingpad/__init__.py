@@ -1,6 +1,7 @@
 """The built-in CodingPad helpers. No third-party dependencies."""
 
 import base64
+from contextlib import closing
 import math
 import threading
 import os
@@ -123,13 +124,58 @@ class _Database:
 
     def query(self, sql, parameters=()):
         """Execute SQL and return rows as dictionaries suitable for dump()."""
-        cursor = self._open().cursor()
+        connection = self._open()
+        cursor = connection.cursor()
         try:
-            cursor.execute(sql, parameters) if parameters else cursor.execute(sql)
-            if cursor.description is None:
-                return _DatabaseRows([], [])
-            columns = [column[0] for column in cursor.description]
-            rows = cursor.fetchmany(_MAX_DATABASE_ROWS + 1)
+            streamed = False
+            if self._config["settings"]["kind"] == "postgres":
+                import psycopg
+                try:
+                    # A regular psycopg cursor buffers the entire server result
+                    # during execute, before fetchmany can enforce the cap.
+                    with closing(cursor.stream(sql, parameters or None)) as stream:
+                        rows = list(islice(stream, _MAX_DATABASE_ROWS + 1))
+                        # Finishing the statement matters for INSERT/UPDATE ...
+                        # RETURNING: cancelling at the cap can roll back writes.
+                        # Discard later rows rather than keeping them in memory.
+                        for _ in stream:
+                            pass
+                    streamed = True
+                except psycopg.errors.SyntaxError as error:
+                    # stream() uses the extended protocol, which rejects
+                    # several statements in one string before running any of
+                    # them. Fall back to the buffered path, which allows them.
+                    if "multiple commands" not in str(error):
+                        raise
+                except psycopg.ProgrammingError as error:
+                    # Statements without a result (DDL, SET). Covered by the
+                    # live test in tests/python/test_postgres_stream.py.
+                    if str(error) != "the operation in stream() didn't produce a result":
+                        raise
+                    return _DatabaseRows([], [])
+            if streamed:
+                if cursor.description is None:
+                    # Psycopg's streaming API discards the metadata for zero
+                    # rows. Describe an unnamed prepared statement without
+                    # executing the user's SQL a second time.
+                    with psycopg.ClientCursor(connection) as formatter:
+                        query = formatter.mogrify(sql, parameters) if parameters else sql
+                    with connection.lock:
+                        prepared = connection.pgconn.prepare(b"", query.encode(connection.info.encoding))
+                        if prepared.status != psycopg.pq.ExecStatus.COMMAND_OK:
+                            raise psycopg.ProgrammingError(prepared.error_message.decode(connection.info.encoding))
+                        described = connection.pgconn.describe_prepared(b"")
+                        if described.status != psycopg.pq.ExecStatus.COMMAND_OK:
+                            raise psycopg.ProgrammingError(described.error_message.decode(connection.info.encoding))
+                        columns = [described.fname(i).decode(connection.info.encoding) for i in range(described.nfields)]
+                else:
+                    columns = [column[0] for column in cursor.description]
+            else:
+                cursor.execute(sql, parameters) if parameters else cursor.execute(sql)
+                if cursor.description is None:
+                    return _DatabaseRows([], [])
+                columns = [column[0] for column in cursor.description]
+                rows = cursor.fetchmany(_MAX_DATABASE_ROWS + 1)
             return _DatabaseRows(columns, rows[:_MAX_DATABASE_ROWS], len(rows) > _MAX_DATABASE_ROWS)
         finally:
             cursor.close()
@@ -288,8 +334,138 @@ def _begin(sink=None, update_sink=None, run_id=None):
     _registry.reset(run_id)
 
 
+_database_session = None
+_database_engine = None
+_database_connection = None
+
+
+def _set_database_connection(connection):
+    global _database_connection
+    _database_connection = dict(connection or {})
+
+
+def _connect_data_context():
+    if not _database_connection:
+        raise RuntimeError(
+            "No database connection is attached. Add one in Connections… and name it in the script header."
+        )
+    return _start_database(_database_connection)
+
+
+def _start_database(connection):
+    """Open the attached connection for generated SQLAlchemy models."""
+    global _database_session, _database_engine
+    try:
+        from sqlalchemy import create_engine
+        from sqlalchemy.engine import URL
+        from sqlalchemy.orm import sessionmaker
+    except ImportError as error:
+        raise RuntimeError(
+            "SQLAlchemy is not available in this Python environment. Run the script again; CodingPad prepares it for attached connections."
+        ) from error
+    kind = str(connection.get("kind") or "").lower()
+    tls = str(connection.get("tls") or "prefer")
+    trust = bool(connection.get("trustServerCertificate"))
+    if kind == "sqlite":
+        url = URL.create("sqlite", database=str(connection.get("path") or ""))
+        engine = create_engine(url, future=True)
+    elif kind == "postgres":
+        # match the Rust and Level 2 paths: verify the certificate unless the
+        # user explicitly trusts the server. `require` alone does not verify.
+        sslmode = "disable" if tls == "disable" else ("verify-full" if not trust else tls)
+        query = {"sslmode": sslmode}
+        if sslmode == "verify-full":
+            query["sslrootcert"] = "system"
+        def postgres_url():
+            return URL.create(
+                "postgresql+psycopg",
+                username=connection.get("user"),
+                password=connection.get("password"),
+                host=connection.get("host") or "localhost",
+                port=connection.get("port") or 5432,
+                database=connection.get("database"),
+                query=query,
+            )
+
+        engine = create_engine(postgres_url(), future=True)
+        if sslmode == "verify-full" and tls == "prefer":
+            # Prefer permits plaintext only when the server explicitly reports
+            # that it does not support TLS; certificate failures never downgrade.
+            try:
+                with engine.connect():
+                    pass
+            except Exception as error:
+                if "server does not support SSL" not in str(error):
+                    engine.dispose()
+                    raise
+                query["sslmode"] = "disable"
+                query.pop("sslrootcert", None)
+                engine.dispose()
+                engine = create_engine(postgres_url(), future=True)
+    elif kind == "sqlserver":
+        try:
+            import mssql_python
+        except ImportError as error:
+            raise RuntimeError(
+                "The SQL Server driver is not available in this Python environment. Run the script again; CodingPad prepares it for attached connections."
+            ) from error
+
+        def quote(value):
+            return "{" + str(value or "").replace("}", "}}") + "}"
+
+        encrypt = "Optional" if tls == "disable" else "Mandatory"
+        connection_string = ";".join(
+            [
+                "Server="
+                + quote(
+                    str(connection.get("host") or "localhost")
+                    + ","
+                    + str(connection.get("port") or 1433)
+                ),
+                "Database=" + quote(connection.get("database")),
+                "UID=" + quote(connection.get("user")),
+                "PWD=" + quote(connection.get("password")),
+                "Encrypt=" + encrypt,
+                "TrustServerCertificate=" + ("yes" if trust else "no"),
+            ]
+        )
+        if not hasattr(mssql_python, "version"):
+            mssql_python.version = getattr(mssql_python, "__version__", "1.0")
+        engine = create_engine(
+            "mssql+pyodbc://",
+            module=mssql_python,
+            creator=lambda: mssql_python.connect(connection_string),
+            paramstyle="qmark",
+            use_setinputsizes=False,
+            future=True,
+        )
+        # pyodbc's optional output-converter hook is not available on this driver.
+        engine.dialect.on_connect = lambda: None
+    else:
+        raise ValueError(f"Unsupported database kind: {kind or 'none'}")
+    _database_engine = engine
+    _database_session = sessionmaker(
+        bind=_database_engine, expire_on_commit=False
+    )()
+    return _database_session
+
+
 def _end():
     global _sink, _update_sink, _secrets, _secret_errors
+    global _database_session, _database_engine, _database_connection
+    if _database_session is not None:
+        try:
+            _database_session.close()
+        except Exception:
+            pass
+        _database_session = None
+    if _database_engine is not None:
+        try:
+            _database_engine.dispose()
+        except Exception:
+            pass
+        _database_engine = None
+    _database_connection = None
     _sink = None
     _update_sink = None
     _secrets = {}
@@ -382,7 +558,9 @@ def _keys(record):
     if isinstance(record, dict):
         return list(record)
     try:
-        return list(vars(record))
+        return [
+            name for name in vars(record) if not str(name).startswith("_sa_")
+        ]
     except TypeError:
         return []
 
@@ -477,6 +655,12 @@ def _sequence(value, depth, seen, budget, cursor, limit):
 
 
 def _object(value, attributes, depth, seen, budget, cursor, limit):
+    if not isinstance(value, dict):
+        attributes = {
+            name: item
+            for name, item in attributes.items()
+            if not str(name).startswith("_sa_")
+        }
     items = list(attributes.items())
     page = items[cursor : cursor + limit]
     fields = [

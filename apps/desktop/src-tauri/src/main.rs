@@ -6,7 +6,7 @@ use codingpad_kernel_core::{
     secrets::{SecretEntry, SecretOrigin, SecretStore},
     store::{self, FolderEntry, LibrarySettings, ScriptFile},
     toolchains::Toolchains,
-    ExpandResult, KernelEvent, Language, RunResult, Supervisor,
+    DataContextRun, ExpandResult, KernelEvent, Language, RunResult, Supervisor,
 };
 use std::{
     fs,
@@ -219,21 +219,75 @@ async fn install_dotnet(
     Ok(())
 }
 
+fn attached_connection(source: &str) -> Option<String> {
+    store::parse_header(source)?
+        .settings
+        .get("connection")
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+}
+
+async fn generated_data_context(
+    sql: &SqlManager,
+    source: &str,
+    language: Language,
+) -> (Option<DataContextRun>, Option<String>) {
+    let Some(name) = attached_connection(source) else {
+        return (None, None);
+    };
+    let generated =
+        tokio::time::timeout(std::time::Duration::from_secs(8), sql.data_context(&name)).await;
+    match generated {
+        Ok(Ok(generated)) => {
+            let source = match language {
+                Language::Python => generated.python,
+                Language::Csharp => generated.csharp,
+            };
+            (
+                Some(DataContextRun {
+                    source,
+                    connection: generated.connection,
+                }),
+                None,
+            )
+        }
+        Ok(Err(error)) => (None, Some(format!("Data context unavailable: {error}"))),
+        Err(_) => (
+            None,
+            Some("Data context unavailable: schema discovery timed out after 8 seconds.".into()),
+        ),
+    }
+}
+
 #[tauri::command]
 async fn run_script(
     supervisor: State<'_, Supervisor>,
+    sql: State<'_, Arc<SqlManager>>,
     script_id: String,
     source: String,
     language: Option<Language>,
     path: Option<String>,
     on_event: Channel<KernelEvent>,
 ) -> Result<RunResult, String> {
+    let language = language.unwrap_or_default();
+    let (data, data_error) = generated_data_context(sql.inner().as_ref(), &source, language).await;
+    if let Some(error) = data_error {
+        let _ = on_event.send(KernelEvent {
+            method: "stream".into(),
+            params: serde_json::json!({
+                "runId": 0,
+                "stream": "stderr",
+                "text": format!("{error}\n"),
+            }),
+        });
+    }
     supervisor
-        .run_language_at(
+        .run_language_at_with_data(
             &script_id,
             &source,
-            language.unwrap_or_default(),
+            language,
             path.as_deref(),
+            data,
             |event| {
                 let _ = on_event.send(event);
             },
@@ -417,16 +471,14 @@ fn main() {
             app.manage(secrets.clone());
             let connections = Arc::new(ConnectionStore::new(&data_dir));
             app.manage(connections.clone());
-            app.manage(Arc::new(SqlManager::new(
-                connections.clone(),
-                secrets.clone(),
-            )));
+            let sql = Arc::new(SqlManager::new(connections.clone(), secrets.clone()));
+            app.manage(sql.clone());
             app.manage(
                 Supervisor::with_data_dir_and_secrets(data_dir.clone(), secrets)
                     .with_connections(connections),
             );
             app.manage(Toolchains::new(data_dir.clone()));
-            app.manage(LanguageServers::with_data_dir(data_dir));
+            app.manage(LanguageServers::with_data_dir_and_databases(data_dir, sql));
             bench_phase("setup_finished", serde_json::Value::Null);
             Ok(())
         })

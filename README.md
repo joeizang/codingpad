@@ -358,8 +358,9 @@ db.query("SELECT * FROM customers")
 `db.query(sql, parameters)` returns rows as dictionaries and displays them as a
 table. `db.execute(sql, parameters)` executes a statement and returns the
 number of affected rows. Queries return at most 10,000 rows; a truncated dump is
-marked in the results panel. Duplicate column names get unique suffixes such as
-`id_2`. Parameters use the selected driver's syntax (SQLite
+marked in the results panel. PostgreSQL results are streamed; remaining rows
+are consumed and discarded so statements with `RETURNING` finish normally.
+Duplicate column names get unique suffixes such as `id_2`. Parameters use the selected driver's syntax (SQLite
 and SQL Server use `?`, PostgreSQL uses `%s`). CodingPad installs the server
 driver through uv on first use. The connection is closed at the end of each run.
 
@@ -395,13 +396,51 @@ security guarantee. Enable **Trust the server certificate** for a self-signed or
 private-CA server. PostgreSQL decimals, dates and timestamps use their exact server
 text; other columns in the same result keep their integer, boolean or float values.
 Multi-statement PostgreSQL batches use text for every column (including `t`/`f`
-for booleans). Connection passwords stay in the Rust host and are never passed to script kernels. SQL Server
+for booleans). SQL scripts keep connection passwords in the Rust host. A script with a generated data context receives its connection password in memory for that run only; it is never written to the generated files, settings or logs. SQL Server
 connections can opt in to trusting a self-signed development certificate, and SQL
 Server scripts do not accept the `GO` client-side batch separator; run each batch
 separately. SQL Server statements without a result set show `Statement completed.`
 rather than a rows-affected count. `money` and `smallmoney` are displayed with four
 decimal places; the driver decodes them as floating point, so very large `money`
 values may lose precision.
+
+## Data contexts (M3.8/M3.9)
+
+A Python or C# script with a connection header also gets a typed **data context**
+generated from that connection's schema. Tables become model classes, columns
+become typed properties, and foreign keys become relationships or navigation
+properties. The context is regenerated for every run and when the schema panel is
+refreshed, so editing the database schema is picked up without maintaining model
+files by hand. Model sources are generated into a hidden workspace, never into
+your script.
+
+```python
+# codingpad: connection=northwind
+from sqlalchemy import select
+from codingpad_data import Customer, DataContext
+
+context = DataContext.connect()
+context.session.scalars(select(Customer)).all()
+```
+
+```csharp
+// codingpad: connection=northwind
+var context = new DataContext();
+context.Customers.Where(customer => customer.Name.StartsWith("A")).ToList().Dump();
+```
+
+Python models use SQLAlchemy 2.0 `Mapped[]` annotations and `relationship()`;
+C# models use EF Core entity classes and a `DbContext`. The kernel installs the
+language's database packages on first use. basedpyright and Roslyn see the
+generated models, so column, table and relationship completions work while you
+edit. Passwords stay in the OS vault and are read only while a run or schema
+refresh needs them; generated files contain only the schema, never a password.
+
+PostgreSQL C# `interval` and `interval[]` columns map to `TimeSpan` and
+`TimeSpan[]`. [Intervals containing months or years cannot be read as a fixed duration](https://www.npgsql.org/doc/types/datetime.html)
+and raise an error. Columns without a supported EF mapping are omitted from the
+generated class, with a comment naming the column, so unavailable data cannot
+appear as a real `null` value.
 
 ## Secrets
 

@@ -194,21 +194,26 @@ internal sealed class DumpSession(long runId) : IDisposable
         catch (Exception error) { state.Failure ??= error; }
     }
 
-    private object Table(IEnumerable value, int offset, int limit, int depth, Budget budget, HashSet<object> path, string? nodeId = null)
+    private Sequence SequenceFor(IEnumerable value, View view)
     {
-        var sequences = budget.View.Sequences;
+        var sequences = view.Sequences;
         if (!sequences.TryGetValue(value, out var state))
         {
-            if (budget.View.Released) throw new InvalidOperationException("That live preview has been replaced.");
+            if (view.Released) throw new InvalidOperationException("That live preview has been replaced.");
             state = new Sequence(value.GetEnumerator());
-            if (budget.View.Released)
+            if (view.Released)
             {
                 Close(state);
                 throw new InvalidOperationException("That live preview has been replaced.");
             }
             sequences.Add(value, state);
-            views.Add(budget.View);
+            views.Add(view);
         }
+        return state;
+    }
+
+    private static void Fill(Sequence state, int offset, int limit)
+    {
         // Cursors may revisit cached pages but cannot force a long traversal.
         if (offset > state.Values.Count) throw new ArgumentException("Load the preceding sequence page first.");
         while (!state.Finished && state.Values.Count < offset + limit)
@@ -220,13 +225,19 @@ internal sealed class DumpSession(long runId) : IDisposable
             }
             catch (Exception error) { state.Failure = error; Close(state); }
         }
-        // Pick a stable schema from the first value; nested cells remain lazy.
-        if (state.Columns is null)
-        {
-            var first = state.Values.FirstOrDefault();
-            state.Columns = first is not null && !IsScalar(first) && first is not IEnumerable && first is not (Exception or HtmlValue or ImageValue or LiveValue)
-                ? Members(first.GetType()).Take(32).ToArray() : [];
-        }
+    }
+
+    // Pick a stable schema from the first value.
+    private static MemberInfo[] RecordMembers(object? first) =>
+        first is not null && !IsScalar(first) && first is not IEnumerable && first is not (Exception or HtmlValue or ImageValue or LiveValue)
+            ? Members(first.GetType()) : [];
+
+    private object Table(IEnumerable value, int offset, int limit, int depth, Budget budget, HashSet<object> path, string? nodeId = null)
+    {
+        var state = SequenceFor(value, budget.View);
+        Fill(state, offset, limit);
+        // Nested cells remain lazy; the display shows at most 32 columns.
+        state.Columns ??= RecordMembers(state.Values.FirstOrDefault()).Take(32).ToArray();
         var rows = state.Values.Skip(offset).Take(limit).Select(item =>
         {
             if (state.Columns.Length == 0) return new[] { Node(item, depth + 1, budget, path, cell: true) };
@@ -282,6 +293,90 @@ internal sealed class DumpSession(long runId) : IDisposable
     private static bool IsScalar(object value) => value is string or char or bool or byte or sbyte or short or ushort or int or uint or long or ulong or decimal or double or float or Enum or DateTime or DateTimeOffset or TimeSpan or Guid || IsTextual(value);
 
     public bool Contains(string handle) => handles.ContainsKey(handle);
+
+    private const int ExportPage = 1000;
+
+    /// A page of a table dump as plain, untruncated cells for CSV/Excel export.
+    public object ExportRows(string handle, string? cursor, int limit)
+    {
+        var (value, view) = handles[handle];
+        var offset = cursor is null ? 0 : int.Parse(cursor, CultureInfo.InvariantCulture);
+        if (offset < 0) throw new ArgumentException("Cursor must be a nonnegative offset.");
+        limit = Math.Clamp(limit, 1, ExportPage);
+        if (value is DatabaseRows table)
+        {
+            var page = table.Rows.Skip(offset).Take(limit).Select(row => row.Select(ExportCell).ToArray()).ToArray();
+            var end = offset + page.Length;
+            return new
+            {
+                columns = table.Columns,
+                rows = page,
+                next = end < table.Rows.Count ? end.ToString(CultureInfo.InvariantCulture) : null,
+                total = (long?)table.Rows.Count,
+            };
+        }
+        if (value is IEnumerable enumerable && value is not string)
+        {
+            var state = SequenceFor(enumerable, view);
+            Fill(state, offset, limit);
+            var members = RecordMembers(state.Values.FirstOrDefault());
+            var rows = state.Values.Skip(offset).Take(limit).Select(item =>
+            {
+                if (members.Length == 0) return new[] { ExportCell(item) };
+                return members.Select(member =>
+                {
+                    if (item is null || !member.DeclaringType!.IsInstanceOfType(item)) return null;
+                    try { return ExportCell(Read(member, item)); }
+                    catch (TargetInvocationException error) { return ExportCell((error.InnerException ?? error).GetType().Name + ": " + (error.InnerException ?? error).Message); }
+                }).ToArray();
+            }).ToArray();
+            var end = offset + rows.Length;
+            // Unlike the display, an export must not silently end early.
+            if (state.Failure is not null && end == state.Values.Count)
+                throw new InvalidOperationException("The sequence failed after " + end + " rows: " + state.Failure.Message, state.Failure);
+            return new
+            {
+                columns = members.Length == 0 ? new[] { "Value" } : members.Select(member => member.Name).ToArray(),
+                rows,
+                next = end < state.Values.Count || !state.Finished ? end.ToString(CultureInfo.InvariantCulture) : null,
+                total = state.Finished ? (long?)state.Values.Count : null,
+            };
+        }
+        throw new InvalidOperationException("Only table dumps can be exported.");
+    }
+
+    private const long MaxSafeInteger = 9007199254740991;
+
+    private static object? ExportCell(object? value)
+    {
+        switch (value)
+        {
+            case null or DBNull: return null;
+            case bool or string: return value;
+            case char c: return c.ToString();
+            case byte or sbyte or short or ushort or int or uint: return Convert.ToInt64(value, CultureInfo.InvariantCulture);
+            case long number: return Math.Abs((decimal)number) <= MaxSafeInteger ? number : new { n = number.ToString(CultureInfo.InvariantCulture) };
+            case ulong number: return number <= MaxSafeInteger ? number : new { n = number.ToString(CultureInfo.InvariantCulture) };
+            case decimal number: return new { n = number.ToString(CultureInfo.InvariantCulture) };
+            case double number: return double.IsFinite(number) ? number : number.ToString(CultureInfo.InvariantCulture);
+            case float number: return float.IsFinite(number) ? (double)number : number.ToString(CultureInfo.InvariantCulture);
+            case DateTime date: return date.ToString("O", CultureInfo.InvariantCulture);
+            case DateTimeOffset date: return date.ToString("O", CultureInfo.InvariantCulture);
+            case DateOnly date: return date.ToString("O", CultureInfo.InvariantCulture);
+            case TimeOnly time: return time.ToString("O", CultureInfo.InvariantCulture);
+            case TimeSpan span: return span.ToString("c", CultureInfo.InvariantCulture);
+            case byte[] bytes: return "0x" + Convert.ToHexString(bytes).ToLowerInvariant();
+            case Enum or Guid: return value.ToString();
+        }
+        if (IsTextual(value)) return value.ToString();
+        if (value is IEnumerable || !value.GetType().IsDefined(typeof(System.Runtime.CompilerServices.CompilerGeneratedAttribute), false)
+            && value.GetType().GetMethod("ToString", Type.EmptyTypes)?.DeclaringType == typeof(object))
+        {
+            try { return System.Text.Json.JsonSerializer.Serialize(value); }
+            catch (Exception) { }
+        }
+        return value.ToString();
+    }
     public object Expand(string handle, string? cursor, int limit)
     {
         var (value, view) = handles[handle];

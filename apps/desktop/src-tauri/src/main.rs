@@ -2,6 +2,7 @@
 
 use codingpad_kernel_core::{
     databases::{Connection, ConnectionStore, SqlManager, SqlRunResult},
+    export::{export_table, ExportFormat, ExportSummary},
     lsp::{LanguageServers, LspEvent, LspStartResult},
     secrets::{SecretEntry, SecretOrigin, SecretStore},
     store::{self, FolderEntry, LibrarySettings, ScriptFile},
@@ -9,10 +10,11 @@ use codingpad_kernel_core::{
     DataContextRun, ExpandResult, KernelEvent, Language, RunResult, Supervisor,
 };
 use std::{
+    collections::HashMap,
     fs,
     io::Write,
     path::PathBuf,
-    sync::Arc,
+    sync::{atomic::AtomicBool, Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{ipc::Channel, Manager, State};
@@ -308,6 +310,74 @@ async fn expand_node(
         .await
 }
 
+/// Cancellation flags for running exports, by export id.
+#[derive(Default)]
+struct Exports(Mutex<HashMap<String, Arc<AtomicBool>>>);
+
+/// Export every row of a table dump to CSV or Excel. `sql` selects a SQL
+/// script's stored result instead of a kernel's.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn export_table_dump(
+    supervisor: State<'_, Supervisor>,
+    sql_manager: State<'_, Arc<SqlManager>>,
+    exports: State<'_, Exports>,
+    export_id: String,
+    script_id: String,
+    handle: String,
+    sql: bool,
+    format: ExportFormat,
+    path: String,
+    // `{rows, total}`; total is null while a deferred sequence is unfinished.
+    on_progress: Channel<serde_json::Value>,
+) -> Result<ExportSummary, String> {
+    // A cancel can arrive before this command starts; it leaves its flag set.
+    let cancel = exports
+        .0
+        .lock()
+        .unwrap()
+        .entry(export_id.clone())
+        .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+        .clone();
+    let supervisor = supervisor.inner();
+    let sql_manager = sql_manager.inner().clone();
+    let result = export_table(
+        std::path::Path::new(&path),
+        format,
+        |cursor, limit| {
+            let sql_manager = sql_manager.clone();
+            let (script_id, handle) = (script_id.clone(), handle.clone());
+            async move {
+                if sql {
+                    sql_manager.export_page(&script_id, &handle, cursor.as_deref(), limit)
+                } else {
+                    supervisor
+                        .export_page(&script_id, &handle, cursor.as_deref(), limit)
+                        .await
+                }
+            }
+        },
+        &cancel,
+        |rows, total| {
+            let _ = on_progress.send(serde_json::json!({ "rows": rows, "total": total }));
+        },
+    )
+    .await;
+    exports.0.lock().unwrap().remove(&export_id);
+    result
+}
+
+#[tauri::command]
+fn cancel_export(exports: State<'_, Exports>, export_id: String) {
+    exports
+        .0
+        .lock()
+        .unwrap()
+        .entry(export_id)
+        .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 #[tauri::command]
 async fn stop_script(
     supervisor: State<'_, Supervisor>,
@@ -478,6 +548,7 @@ fn main() {
                     .with_connections(connections),
             );
             app.manage(Toolchains::new(data_dir.clone()));
+            app.manage(Exports::default());
             app.manage(LanguageServers::with_data_dir_and_databases(data_dir, sql));
             bench_phase("setup_finished", serde_json::Value::Null);
             Ok(())
@@ -502,6 +573,8 @@ fn main() {
             stop_script,
             reset_script,
             expand_node,
+            export_table_dump,
+            cancel_export,
             close_script,
             begin_language_server_session,
             start_language_server,

@@ -458,6 +458,26 @@ internal static class Program
                         parameters.TryGetProperty("connection", out var databaseClientConfig) && databaseClientConfig.ValueKind == JsonValueKind.Object ? databaseClientConfig : null,
                         cancel ?? new RunCancellation()).GetAwaiter().GetResult();
                 }
+                else if (root.GetProperty("method").GetString() == "export_rows")
+                {
+                    var parameters = root.GetProperty("params");
+                    var handle = parameters.GetProperty("handle").GetString()!;
+                    if (Session is null || !Session.Contains(handle))
+                        Send(new { jsonrpc = "2.0", id, error = new { code = -32001, message = "That table is no longer available. Run the script again." } });
+                    else
+                    {
+                        try
+                        {
+                            var cursor = parameters.TryGetProperty("cursor", out var c) ? c.GetString() : null;
+                            var limit = parameters.TryGetProperty("limit", out var l) && l.ValueKind != JsonValueKind.Null ? l.GetInt32() : 1000;
+                            Send(new { jsonrpc = "2.0", id, result = Session.ExportRows(handle, cursor, limit) });
+                        }
+                        catch (Exception error)
+                        {
+                            Send(new { jsonrpc = "2.0", id, error = new { code = -32603, message = "Could not export this table: " + error.Message } });
+                        }
+                    }
+                }
                 else if (root.GetProperty("method").GetString() == "expand")
                 {
                     var parameters = root.GetProperty("params");

@@ -448,6 +448,34 @@ them, so setting one to `null` also takes the default. PostgreSQL `timestamp` co
 (without time zone) take a local or unspecified `DateTime` in C#; Npgsql rejects
 a `DateTime` with `Kind=Utc` there, so use a `timestamptz` column for UTC values.
 
+## Exporting tables (M3.10)
+
+Every table dump, whether from Python, C# or a SQL script, has **Export CSV** and
+**Export Excel** buttons in its footer. An export writes every row, not just the
+pages you have scrolled to, and never shortens text the way the Results panel does.
+Rows are read in pages by the app and written straight to the file, so the
+interface stays responsive. The footer shows progress and a **Cancel** button.
+A cancelled or failed export leaves no file behind; the file appears only when the
+export finishes.
+
+- Columns: a Python list of records exports every key found in any row, and a C#
+  sequence exports every public property and field of the first item's type.
+  Neither is limited to the 32 columns the Results panel shows.
+- Values: numbers and booleans stay numeric in Excel, and so do exact decimals
+  (`Decimal`, `decimal`, PostgreSQL `numeric`/`money`). Dates and times are ISO
+  8601 text; bytes are `0x…` hex; nested lists and objects are JSON.
+- CSV files are UTF-8 with a byte-order mark, so Excel on Windows reads accents
+  correctly. Fields are not escaped against spreadsheet formulas: a cell starting
+  with `=` is exported as it is.
+- Excel limits: a sheet holds 1,048,575 data rows, so larger tables must use CSV.
+  A cell holds 32,767 characters; longer text is cut, and the footer says how many
+  cells were cut.
+- C# sequences are read to the end, so an endless sequence exports until you
+  cancel. If a sequence throws partway through, the export fails with that error
+  instead of producing a file that ends early. SQL results keep their 10,000-row
+  limit; a truncated result exports those rows.
+- Rerunning or closing the script cancels a running export from that tab.
+
 ## Secrets
 
 Click **Secrets…** to add, update or remove named secrets. Values are stored in

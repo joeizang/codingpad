@@ -3,10 +3,27 @@ import type { DumpNode } from "./protocol";
 
 export type Expand = (handle: string, cursor: string | null) => Promise<DumpNode>;
 
+export type ExportFormat = "csv" | "xlsx";
+export type ExportSummary = { rows: number; shortenedCells: number };
+/** Export every row of a table dump. Resolves to null if no file was chosen. */
+export type ExportTable = (
+  handle: string,
+  format: ExportFormat,
+  onProgress: (rows: number, total: number | null) => void,
+  signal: AbortSignal,
+) => Promise<ExportSummary | null>;
+
+type ExportState =
+  | { status: "idle" }
+  | { status: "running"; rows: number; total: number | null; abort: AbortController }
+  | { status: "done"; summary: ExportSummary; format: ExportFormat }
+  | { status: "failed"; message: string };
+
 type Props = {
   node: DumpNode;
   updates?: Record<string, DumpNode>;
   expand?: Expand;
+  exportTable?: ExportTable;
   onOpenLine?: (line: number) => void;
   onExpandValue?: (node: DumpNode, handle: string) => void;
 };
@@ -15,7 +32,7 @@ const TABLE_ROW_HEIGHT = 27;
 const TABLE_PAGE = 100;
 
 export function DumpTree(props: Props) {
-  const { node, updates, expand, onOpenLine, onExpandValue } = props;
+  const { node, updates, expand, exportTable, onOpenLine, onExpandValue } = props;
   const shown = node.id ? updates?.[node.id] : undefined;
   if (shown && shown !== node) {
     return (
@@ -23,6 +40,7 @@ export function DumpTree(props: Props) {
         node={shown}
         updates={updates}
         expand={expand}
+        exportTable={exportTable}
         onOpenLine={onOpenLine}
       />
     );
@@ -81,6 +99,7 @@ export function DumpTree(props: Props) {
             node={node.node}
             updates={updates}
             expand={expand}
+            exportTable={exportTable}
             onOpenLine={onOpenLine}
             onExpandValue={onExpandValue}
           />
@@ -100,6 +119,7 @@ function CollectionNode({
   node,
   updates,
   expand,
+  exportTable,
   onOpenLine,
   onExpandValue,
 }: Props & { node: Extract<DumpNode, { kind: "list" | "object" }> }) {
@@ -161,6 +181,7 @@ function CollectionNode({
               node={value}
               updates={updates}
               expand={expand}
+              exportTable={exportTable}
               onOpenLine={onOpenLine}
               onExpandValue={onExpandValue}
             />
@@ -183,6 +204,7 @@ function LazyNode({
   node,
   updates,
   expand,
+  exportTable,
   onOpenLine,
   onExpandValue,
 }: Props & { node: Extract<DumpNode, { kind: "lazy" }> }) {
@@ -210,6 +232,7 @@ function LazyNode({
         node={child}
         updates={updates}
         expand={expand}
+        exportTable={exportTable}
         onOpenLine={onOpenLine}
       />
     );
@@ -229,6 +252,7 @@ function TableNode({
   node,
   updates,
   expand,
+  exportTable,
   onOpenLine,
   onExpandValue,
 }: Props & { node: Extract<DumpNode, { kind: "table" }> }) {
@@ -242,6 +266,7 @@ function TableNode({
   const [expanded, setExpanded] = useState<
     { handle: string; node: DumpNode }[]
   >([]);
+  const [exporting, setExporting] = useState<ExportState>({ status: "idle" });
   const requested = useRef(new Set<number>([0]));
   const expandRef = useRef(expand);
   expandRef.current = expand;
@@ -276,6 +301,36 @@ function TableNode({
         });
     }
   }, [first, last, node.handle, node.totalKnown, total]);
+
+  // Cancel a running export when the table goes away (rerun, closed tab).
+  const exportAbort = useRef<AbortController | null>(null);
+  useEffect(() => () => exportAbort.current?.abort(), []);
+
+  async function startExport(format: ExportFormat) {
+    if (!node.handle || !exportTable || exporting.status === "running") return;
+    const abort = new AbortController();
+    exportAbort.current = abort;
+    setExporting({ status: "running", rows: 0, total: node.totalKnown === false ? null : node.total, abort });
+    try {
+      const summary = await exportTable(
+        node.handle,
+        format,
+        (rows, total) =>
+          setExporting((current) =>
+            current.status === "running" && current.abort === abort
+              ? { ...current, rows, total }
+              : current,
+          ),
+        abort.signal,
+      );
+      setExporting(summary ? { status: "done", summary, format } : { status: "idle" });
+    } catch (problem) {
+      setExporting({
+        status: "failed",
+        message: abort.signal.aborted ? "Export cancelled." : String(problem),
+      });
+    }
+  }
 
   const rowCount = Math.max(1, Math.min(total, viewportRows));
   const rowAt = (index: number) => {
@@ -328,6 +383,7 @@ function TableNode({
                       node={cells[columnIndex] ?? { kind: "null" }}
                       updates={updates}
                       expand={expand}
+                      exportTable={exportTable}
                       onOpenLine={onOpenLine}
                       onExpandValue={(value, handle) =>
                         setExpanded((current) =>
@@ -352,6 +408,41 @@ function TableNode({
           {node.truncated && " (results truncated)"}
         </span>
         {error && <span className="value-error">{error}</span>}
+        {node.handle && exportTable && (
+          <span className="table-export" aria-live="polite">
+            {exporting.status === "running" ? (
+              <>
+                <span className="muted">
+                  Exporting {exporting.rows.toLocaleString()}
+                  {exporting.total !== null ? ` of ${exporting.total.toLocaleString()}` : ""} rows…
+                </span>
+                <button onClick={() => exporting.abort.abort()}>Cancel</button>
+              </>
+            ) : (
+              <>
+                {exporting.status === "done" && (
+                  <span className="muted">
+                    Exported {exporting.summary.rows.toLocaleString()}{" "}
+                    {exporting.summary.rows === 1 ? "row" : "rows"}
+                    {exporting.summary.shortenedCells > 0 &&
+                      `; ${exporting.summary.shortenedCells.toLocaleString()} long cells cut to Excel's 32,767-character limit`}
+                  </span>
+                )}
+                {exporting.status === "failed" && (
+                  <span className={exporting.message === "Export cancelled." ? "muted" : "value-error"}>
+                    {exporting.message}
+                  </span>
+                )}
+                <button onClick={() => void startExport("csv")} title="Export every row to a CSV file">
+                  Export CSV
+                </button>
+                <button onClick={() => void startExport("xlsx")} title="Export every row to an Excel workbook">
+                  Export Excel
+                </button>
+              </>
+            )}
+          </span>
+        )}
       </div>
       {expanded.length > 0 && (
         <div className="table-expanded">
@@ -362,6 +453,7 @@ function TableNode({
                 node={value}
                 updates={updates}
                 expand={expand}
+                exportTable={exportTable}
                 onOpenLine={onOpenLine}
                 onExpandValue={onExpandValue}
               />

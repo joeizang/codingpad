@@ -296,3 +296,80 @@ test("truncated database results show a warning", () => {
   render(<DumpTree node={{ kind: "table", type: "DatabaseRows", columns: [{ name: "id" }], rows: [], total: 10000, truncated: true, next: null }} />);
   expect(screen.getByText(/results truncated/)).toBeInTheDocument();
 });
+
+const exportable: DumpNode = {
+  kind: "table",
+  type: "list",
+  columns: [{ name: "name" }, { name: "score" }],
+  rows: tableRows(0, 100),
+  total: 100_000,
+  next: "100",
+  handle: "rows",
+};
+
+test("tables export every row with progress, and report the result", async () => {
+  let report: (rows: number, total: number | null) => void = () => {};
+  let finish: (summary: { rows: number; shortenedCells: number }) => void = () => {};
+  const exportTable = vi.fn(
+    (_handle: string, _format: string, onProgress: typeof report) =>
+      new Promise<{ rows: number; shortenedCells: number }>((resolve) => {
+        report = onProgress;
+        finish = resolve;
+      }),
+  );
+  render(<DumpTree node={exportable} exportTable={exportTable} />);
+  fireEvent.click(screen.getByRole("button", { name: "Export Excel" }));
+  expect(exportTable).toHaveBeenCalledWith("rows", "xlsx", expect.any(Function), expect.any(AbortSignal));
+  expect(await screen.findByText("Exporting 0 of 100,000 rows…")).toBeInTheDocument();
+  report(42_000, 100_000);
+  expect(await screen.findByText("Exporting 42,000 of 100,000 rows…")).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Export CSV" })).not.toBeInTheDocument();
+  finish({ rows: 100_000, shortenedCells: 2 });
+  expect(await screen.findByText(/Exported 100,000 rows; 2 long cells cut/)).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Export CSV" })).toBeInTheDocument();
+});
+
+test("cancelling an export aborts it and says so", async () => {
+  const exportTable = vi.fn(
+    (_handle: string, _format: string, _progress: unknown, signal: AbortSignal) =>
+      new Promise<null>((_, reject) => signal.addEventListener("abort", () => reject(new Error("Export cancelled.")))),
+  );
+  render(<DumpTree node={exportable} exportTable={exportTable} />);
+  fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+  expect(await screen.findByText("Export cancelled.")).toBeInTheDocument();
+  expect(exportTable.mock.calls[0][3].aborted).toBe(true);
+});
+
+test("a failed export shows the error and dismissing the file dialog changes nothing", async () => {
+  const exportTable = vi
+    .fn()
+    .mockResolvedValueOnce(null)
+    .mockRejectedValueOnce("Excel supports at most 1048575 rows. Export this table as CSV instead.");
+  render(<DumpTree node={exportable} exportTable={exportTable} />);
+  fireEvent.click(screen.getByRole("button", { name: "Export Excel" }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Export Excel" })).toBeInTheDocument());
+  expect(screen.queryByText(/Exported/)).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Export Excel" }));
+  expect(await screen.findByText(/at most 1048575 rows/)).toBeInTheDocument();
+});
+
+test("unknown totals show a running count and unmounting cancels the export", async () => {
+  let signal: AbortSignal | undefined;
+  const exportTable = vi.fn((_h: string, _f: string, _p: unknown, abort: AbortSignal) => {
+    signal = abort;
+    return new Promise<null>(() => {});
+  });
+  const { unmount } = render(
+    <DumpTree node={{ ...exportable, totalKnown: false, total: 101 }} exportTable={exportTable} />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
+  expect(await screen.findByText("Exporting 0 rows…")).toBeInTheDocument();
+  unmount();
+  expect(signal?.aborted).toBe(true);
+});
+
+test("tables without an export callback show no export buttons", () => {
+  render(<DumpTree node={exportable} />);
+  expect(screen.queryByRole("button", { name: "Export CSV" })).not.toBeInTheDocument();
+});

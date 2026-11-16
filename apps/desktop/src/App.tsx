@@ -8,7 +8,11 @@ import {
 } from "@tauri-apps/plugin-dialog";
 import CodeEditor, { type EditorHandle } from "./CodeEditor";
 import { ConnectionsDialog } from "./ConnectionsDialog";
-import { DumpTree } from "./DumpTree";
+import {
+  DumpTree,
+  type ExportFormat,
+  type ExportSummary,
+} from "./DumpTree";
 import { uniqueId, type DiagnosticsSummary } from "./lsp";
 import {
   appendOutputBatch,
@@ -428,6 +432,48 @@ export default function App() {
       },
     );
     return result.node;
+  }
+
+  async function exportTable(
+    handle: string,
+    format: ExportFormat,
+    onProgress: (rows: number, total: number | null) => void,
+    signal: AbortSignal,
+  ): Promise<ExportSummary | null> {
+    const scriptId = active.id;
+    const sql = language === "sql";
+    const stem = active.name.replace(/\.[^.]*$/, "") || "table";
+    const selected = await saveDialog({
+      title: format === "csv" ? "Export table to CSV" : "Export table to Excel",
+      defaultPath: `${stem}.${format}`,
+      filters: [
+        format === "csv"
+          ? { name: "CSV", extensions: ["csv"] }
+          : { name: "Excel workbook", extensions: ["xlsx"] },
+      ],
+    });
+    if (typeof selected !== "string" || !selected || signal.aborted) return null;
+    const path = selected.toLowerCase().endsWith(`.${format}`)
+      ? selected
+      : `${selected}.${format}`;
+    const exportId = uniqueId("export");
+    const channel = new Channel<{ rows: number; total: number | null }>();
+    channel.onmessage = (progress) => onProgress(progress.rows, progress.total);
+    const cancel = () => void invoke("cancel_export", { exportId });
+    signal.addEventListener("abort", cancel);
+    try {
+      return await invoke<ExportSummary>("export_table_dump", {
+        exportId,
+        scriptId,
+        handle,
+        sql,
+        format,
+        path,
+        onProgress: channel,
+      });
+    } finally {
+      signal.removeEventListener("abort", cancel);
+    }
   }
 
   function openLine(line: number) {
@@ -929,6 +975,7 @@ export default function App() {
                       node={output.node}
                       updates={active.updates}
                       expand={expandNode}
+                      exportTable={exportTable}
                       onOpenLine={openLine}
                     />
                   </div>

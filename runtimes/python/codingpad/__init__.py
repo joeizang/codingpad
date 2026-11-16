@@ -1,6 +1,7 @@
 """The built-in CodingPad helpers. No third-party dependencies."""
 
 import base64
+import json
 from contextlib import closing
 import math
 import threading
@@ -210,6 +211,7 @@ class _Registry:
         self.by_id = {}
         self.handles = 0
         self.nodes = 0
+        self.export_columns = {}
 
     def _name(self, prefix, number):
         return (
@@ -630,8 +632,8 @@ def _table(value, cursor, limit, budget):
     )
     if isinstance(value, _DatabaseRows) and value.truncated:
         node["truncated"] = True
-    if next_cursor is not None:
-        node["handle"] = _registry.handle(value)
+    # Always paged by handle so the whole table can be exported.
+    node["handle"] = _registry.handle(value)
     return node
 
 
@@ -766,6 +768,64 @@ def _expand(handle, cursor=None, limit=None):
     except (TypeError, ValueError):
         raise ValueError("limit must be an integer") from None
     return _tree(value, cursor=offset, limit=max(1, min(size, _MAX_PAGE)))
+
+
+def _export_cell(value):
+    """A plain, untruncated cell for CSV/Excel export."""
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, int):
+        return value if abs(value) <= 2**53 else {"n": str(value)}
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if type(value).__name__ == "Decimal":
+        return {"n": str(value)} if value.is_finite() else str(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return "0x" + bytes(value).hex()
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat) and type(value).__module__ == "datetime":
+        return isoformat()
+    if isinstance(value, (list, tuple, dict)):
+        try:
+            return json.dumps(value, default=str, ensure_ascii=False)
+        except (TypeError, ValueError):
+            pass
+    return str(value)
+
+
+def _export_rows(handle, cursor=None, limit=None):
+    """Return a page of a table dump as plain cells, for export."""
+    value = _registry.get(handle)
+    if not _is_table(value):
+        raise ValueError("Only table dumps can be exported")
+    try:
+        offset = max(0, int(cursor)) if cursor is not None else 0
+        size = max(1, min(int(limit) if limit is not None else _MAX_PAGE, _MAX_PAGE))
+    except (TypeError, ValueError):
+        raise ValueError("cursor and limit must be integers") from None
+    columns = _registry.export_columns.get(handle)
+    if columns is None:
+        # Unlike the display, export every column of every row.
+        if isinstance(value, _DatabaseRows):
+            columns = list(value.columns)
+        else:
+            seen = {}
+            for item in value:
+                for key in _keys(item):
+                    seen.setdefault(key, None)
+            columns = list(seen)
+        _registry.export_columns[handle] = columns
+    rows = []
+    for item in islice(value, offset, offset + size):
+        fields = item if isinstance(item, dict) else vars(item) if _is_record(item) else {}
+        rows.append([_export_cell(fields.get(key)) for key in columns])
+    end = offset + len(rows)
+    return {
+        "columns": [str(column) for column in columns],
+        "rows": rows,
+        "next": str(end) if end < len(value) else None,
+        "total": len(value),
+    }
 
 
 def dump(value):

@@ -43,6 +43,39 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(node["next"], "100")
         self.assertLess(elapsed, 1.0)
 
+    def test_export_rows_are_plain_untruncated_and_cover_every_column(self):
+        from datetime import date
+        from decimal import Decimal
+        rows = [{"id": index, "text": "x" * 5000} for index in range(150)]
+        rows.append({"id": 150, "late": [1, 2], "when": date(2024, 1, 2), "price": Decimal("1.50"), "blob": b"\x01\xff", "big": 2**60, "nan": float("nan")})
+        table = codingpad._tree(rows)
+        first = codingpad._export_rows(table["handle"], None, 1000)
+        self.assertEqual(first["columns"], ["id", "text", "late", "when", "price", "blob", "big", "nan"])
+        self.assertEqual(first["total"], 151)
+        self.assertIsNone(first["next"])
+        self.assertEqual(len(first["rows"]), 151)
+        self.assertEqual(len(first["rows"][0][1]), 5000, "export text is never cut for display")
+        self.assertEqual(first["rows"][150], [150, None, "[1, 2]", "2024-01-02", {"n": "1.50"}, "0x01ff", {"n": str(2**60)}, "nan"])
+        page = codingpad._export_rows(table["handle"], "100", 20)
+        self.assertEqual(page["rows"][0][0], 100)
+        self.assertEqual(page["next"], "120")
+
+    def test_small_tables_get_a_handle_and_only_tables_export(self):
+        table = codingpad._tree([{"a": 1}])
+        self.assertIsNone(table["next"])
+        self.assertEqual(codingpad._export_rows(table["handle"])["rows"], [[1]])
+        handle = codingpad._registry.handle({"not": "a table"})
+        with self.assertRaises(ValueError):
+            codingpad._export_rows(handle)
+
+    def test_database_rows_export_all_columns_in_order(self):
+        rows = codingpad._DatabaseRows(["id", "id"] + [f"c{i}" for i in range(40)], [tuple(range(42))])
+        table = codingpad._tree(rows)
+        page = codingpad._export_rows(table["handle"])
+        self.assertEqual(len(page["columns"]), 42)
+        self.assertEqual(page["columns"][:2], ["id", "id_2"])
+        self.assertEqual(page["rows"], [list(range(42))])
+
     def test_table_pages_accept_an_arbitrary_cursor(self):
         rows = [{"score": index} for index in range(1000)]
         table = codingpad._tree(rows)

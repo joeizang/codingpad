@@ -135,8 +135,8 @@ impl Directives {
 
     /// Add the packages a generated EF Core data context needs. User packages
     /// win when they already name the same package.
-    pub(crate) fn add_data_packages(&mut self, kind: &str) {
-        for (name, version) in data_packages(kind) {
+    pub(crate) fn add_data_packages(&mut self, kind: &str, source: &str) {
+        for (name, version) in data_packages(kind, source) {
             self.packages
                 .entry(name.to_owned())
                 .or_insert_with(|| version.to_owned());
@@ -282,7 +282,7 @@ impl ShadowProject {
     ) -> Result<Self, String> {
         let mut directives = Directives::parse(source)?;
         if let Some(data) = data {
-            directives.add_data_packages(&data.connection.kind);
+            directives.add_data_packages(&data.connection.kind, &data.csharp);
         }
         let temp = tempfile::tempdir()
             .map_err(|error| format!("Could not create a code-intelligence workspace: {error}"))?;
@@ -428,7 +428,8 @@ fn canonical_property(name: &str) -> Option<&'static str> {
     })
 }
 
-fn data_packages(kind: &str) -> Vec<(&'static str, &'static str)> {
+/// Mirrors `ScriptDirectives.AddDataPackages` in the C# kernel.
+fn data_packages(kind: &str, source: &str) -> Vec<(&'static str, &'static str)> {
     let provider = match kind {
         "postgres" => Some("Npgsql.EntityFrameworkCore.PostgreSQL"),
         "sqlserver" => Some("Microsoft.EntityFrameworkCore.SqlServer"),
@@ -437,6 +438,9 @@ fn data_packages(kind: &str) -> Vec<(&'static str, &'static str)> {
     let mut packages = vec![("Microsoft.EntityFrameworkCore", "10.0.0")];
     if let Some(provider) = provider {
         packages.push((provider, "10.0.0"));
+    }
+    if kind == "postgres" && source.contains(crate::data_context::CSHARP_NODATIME_MARKER) {
+        packages.push(("Npgsql.EntityFrameworkCore.PostgreSQL.NodaTime", "10.0.0"));
     }
     packages
 }
@@ -700,10 +704,29 @@ mod tests {
         assert!(csproj.contains("CodingPadDataContext.cs"));
         assert!(csproj.contains("Microsoft.EntityFrameworkCore"));
         assert!(csproj.contains("Npgsql.EntityFrameworkCore.PostgreSQL"));
+        assert!(!csproj.contains("NodaTime"));
         assert_eq!(
             fs::read_to_string(project.root().join("CodingPadDataContext.cs")).unwrap(),
             data.csharp
         );
+    }
+
+    #[test]
+    fn a_data_context_with_intervals_adds_the_nodatime_package() {
+        let data = crate::data_context::GeneratedContext {
+            csharp:
+                "options.UseNpgsql(builder.ConnectionString, npgsql => npgsql.UseNodaTime());\n"
+                    .into(),
+            connection: crate::data_context::ConnectionInfo {
+                kind: "postgres".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let project =
+            ShadowProject::create("new DataContext();", None, "key", Some(&data)).unwrap();
+        let csproj = fs::read_to_string(project.root().join("CodingPad.Script.csproj")).unwrap();
+        assert!(csproj.contains("Npgsql.EntityFrameworkCore.PostgreSQL.NodaTime"));
     }
 
     #[test]

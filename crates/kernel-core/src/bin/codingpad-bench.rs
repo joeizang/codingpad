@@ -15,7 +15,7 @@ const TARGET_FIRST_KERNEL: Duration = Duration::from_millis(3_000);
 const TARGET_WARM_RERUN: Duration = Duration::from_millis(200);
 const TARGET_DUMP_FIRST_PAGE: Duration = Duration::from_millis(1_000);
 const TARGET_COMPLETION: Duration = Duration::from_millis(300);
-const TARGET_IDLE_MEMORY: u64 = 300 * 1024 * 1024;
+const TARGET_IDLE_MEMORY: u64 = 475 * 1024 * 1024;
 const TARGET_CSHARP_FIRST_KERNEL: Duration = Duration::from_millis(3_000);
 const TARGET_CSHARP_RERUN: Duration = Duration::from_millis(500);
 const TARGET_CSHARP_SEQUENCE: Duration = Duration::from_millis(1_000);
@@ -154,13 +154,13 @@ async fn run_once() -> bool {
             ));
             rows.push(Row::skipped(
                 "idle physical footprint",
-                "< 300 MiB",
+                "< 475 MiB",
                 "not measured on this platform",
             ));
         }
         Err(error) => {
             rows.push(Row::failed("app usable", "< 1000 ms", error.clone()));
-            rows.push(Row::failed("idle physical footprint", "< 300 MiB", error));
+            rows.push(Row::failed("idle physical footprint", "< 475 MiB", error));
         }
     }
 

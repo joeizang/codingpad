@@ -42,13 +42,13 @@ just run    # Open the Tauri application with frontend hot reload
 `just check` checks TypeScript, builds the UI, runs frontend and Python tests,
 checks Rust formatting and Clippy, runs Rust integration tests against real Python
 processes, and builds the desktop executable. No CI is configured (D39). The same
-command is intended for macOS, Linux and Windows; native builds run on their own
-platforms.
+command is intended for Linux and Windows; native builds run on their own
+platforms. macOS support is deferred for now (D62).
 
 [Windows verification results](docs/windows-verification.md) record the native
 build, tests, and desktop smoke check with Python 3.14.7 and Node.js 26.
-[macOS verification results](docs/macos-verification.md) record the milestone
-acceptance runs on Apple silicon, including their open findings.
+[macOS verification results](docs/macos-verification.md) are kept as a historical
+record of earlier acceptance runs on Apple silicon; macOS is not currently verified.
 
 CodingPad checks `PATH`, then the usual `~/.local/bin` and `~/.cargo/bin`
 locations for `uv`, plus `/opt/homebrew/bin` and `/usr/local/bin` on macOS.
@@ -573,7 +573,7 @@ stop **Run**; Python executes regardless.
 ## Performance checks
 
 `just bench` builds the release app and measures the M1 and M2 targets from D38
-on macOS and Linux:
+on Linux:
 
 | Metric | Target |
 |---|---|
@@ -608,6 +608,9 @@ Summed RSS and Linux private memory are printed alongside the gate. Missing
 physical-memory data fails the measurement; it never falls back to RSS. On
 macOS, close other WebKit apps before testing: XPC helpers are attributed by
 comparing their PIDs before and after launch.
+The gate was raised from 300 MiB to 475 MiB on 2026-11-05 (D61); the
+[2026-11-04 performance report](docs/performance/2026-11-04/README.md) predates
+that change.
 
 Python completion warms `os.path.` and times typing `j` followed immediately by
 a completion request, including the document-change call. Both responses must

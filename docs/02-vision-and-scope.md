@@ -26,7 +26,7 @@ Decision numbers (D#) refer to [04-open-questions.md](04-open-questions.md). Ter
 - **Secrets:** OS vault, with `secret("name")` (D23).
 - **CLI:** `cpad run <script>` (D28).
 - **Learners:** built-in samples plus a bundled SQLite sample database (D14).
-- **Platforms:** Windows, macOS and Linux, all equal (D13).
+- **Platforms:** Linux and Windows for now; macOS is deferred (D13, D62).
 - **Distribution:** GitHub Releases, unsigned at first, with an update notice instead of an auto-updater (D29, D30).
 
 ## Milestones (D33, D34)

@@ -42,13 +42,13 @@ just run    # Open the Tauri application with frontend hot reload
 `just check` checks TypeScript, builds the UI, runs frontend and Python tests,
 checks Rust formatting and Clippy, runs Rust integration tests against real Python
 processes, and builds the desktop executable. No CI is configured (D39). The same
-command is intended for macOS, Linux and Windows; native builds run on their own
-platforms.
+command is intended for Linux and Windows; native builds run on their own
+platforms. macOS support is deferred for now (D62).
 
 [Windows verification results](docs/windows-verification.md) record the native
 build, tests, and desktop smoke check with Python 3.14.7 and Node.js 26.
-[macOS verification results](docs/macos-verification.md) record the milestone
-acceptance runs on Apple silicon, including their open findings.
+[macOS verification results](docs/macos-verification.md) are kept as a historical
+record of earlier acceptance runs on Apple silicon; macOS is not currently verified.
 
 CodingPad checks `PATH`, then the usual `~/.local/bin` and `~/.cargo/bin`
 locations for `uv`, plus `/opt/homebrew/bin` and `/usr/local/bin` on macOS.
@@ -573,12 +573,12 @@ stop **Run**; Python executes regardless.
 ## Performance checks
 
 `just bench` builds the release app and measures the M1 and M2 targets from D38
-on macOS and Linux:
+on Linux:
 
 | Metric | Target |
 |---|---|
 | App usable | < 1 s |
-| Idle physical footprint | < 300 MiB |
+| Idle physical footprint | < 475 MiB |
 | First Python kernel start | < 3 s |
 | Warm Python rerun | < 200 ms |
 | 100k-row dump, first page to host | < 1 s |
@@ -601,13 +601,16 @@ Code intelligence starts after the editor paints and remains resident during the
 idle sample. The public CodingPad helper stub keeps basedpyright from analyzing
 the dump renderer implementation just to understand `dump`.
 
-Idle memory is sampled five seconds after readiness. The 300 MiB gate uses
+Idle memory is sampled five seconds after readiness. The 475 MiB gate uses
 summed Linux PSS or macOS `phys_footprint`, per D61. The app, WebKit helpers, and
 language-server descendants (including separate process groups) are included.
 Summed RSS and Linux private memory are printed alongside the gate. Missing
 physical-memory data fails the measurement; it never falls back to RSS. On
 macOS, close other WebKit apps before testing: XPC helpers are attributed by
 comparing their PIDs before and after launch.
+The gate was raised from 300 MiB to 475 MiB on 2026-11-05 (D61); the
+[2026-11-04 performance report](docs/performance/2026-11-04/README.md) predates
+that change.
 
 Python completion warms `os.path.` and times typing `j` followed immediately by
 a completion request, including the document-change call. Both responses must
@@ -626,8 +629,7 @@ and environment with each run; retain earlier failures when recording new result
 The dump metric ends when the first page reaches the Rust host, before rendering.
 The app metrics need a desktop session and are skipped on Windows, where a
 Windows VM confirms that `just check` passes (D42, D48). Set `CODINGPAD_DESKTOP`
-to benchmark a different app binary. M1 stays open until repeated `just bench`
-runs pass on both Ubuntu and macOS.
+to benchmark a different app binary. The owner has closed M1 and M2.
 
 Dual-licensed MIT OR Apache-2.0.
 

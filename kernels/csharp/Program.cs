@@ -59,14 +59,15 @@ internal static class Program
     private static void Error(RunContext context, string type, string message, object[] frames) =>
         Notify(context, "dump", new { runId = context.Id, node = new { kind = "error", type, message, traceback = frames } });
 
-    private static CSharpCompilation Compile(SyntaxTree tree, ScriptDirectives directives, ScriptDependencies dependencies)
+    private static CSharpCompilation Compile(SyntaxTree tree, SyntaxTree? generated, ScriptDirectives directives, ScriptDependencies dependencies)
     {
         var paths = dependencies.CompilePaths.ToArray();
         var names = paths.Select(Path.GetFileNameWithoutExtension).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var references = References.Where(reference => !names.Contains(Path.GetFileNameWithoutExtension(reference.Display)))
             .Concat(paths.Select(path => MetadataReference.CreateFromFile(path)));
+        SyntaxTree[] trees = generated is null ? [directives.Usings, tree] : [directives.Usings, generated, tree];
         return CSharpCompilation.Create("CodingPadScript_" + Guid.NewGuid().ToString("N"),
-            [directives.Usings, tree], references, directives.CompilationOptions);
+            trees, references, directives.CompilationOptions);
     }
 
     private static (
@@ -89,6 +90,7 @@ internal static class Program
     }
 
     private static async Task Run(long id, string source, string? scriptPath,
+        string? dataSource, string? connectionJson,
         IReadOnlyDictionary<string, string> secrets,
         IReadOnlyDictionary<string, string> secretErrors,
         JsonElement? databaseClientConfig,
@@ -119,15 +121,54 @@ internal static class Program
         {
             cancel.ThrowIfCancellationRequested();
             var directives = ScriptDirectives.Parse(source, cancel);
+            SyntaxTree? generated = null;
+            if (!string.IsNullOrWhiteSpace(dataSource))
+            {
+                var kind = "sqlite";
+                if (!string.IsNullOrWhiteSpace(connectionJson))
+                {
+                    using var connection = JsonDocument.Parse(connectionJson);
+                    if (connection.RootElement.TryGetProperty("kind", out var kindValue) && kindValue.ValueKind == JsonValueKind.String)
+                        kind = kindValue.GetString() ?? "sqlite";
+                }
+                directives.AddDataPackages(kind);
+                generated = CSharpSyntaxTree.ParseText(dataSource, directives.ParseOptions, path: "CodingPadDataContext.cs", encoding: Encoding.UTF8, cancellationToken: cancel);
+                ScriptHelpers.DatabaseConnection = connectionJson;
+            }
+            else
+            {
+                ScriptHelpers.DatabaseConnection = null;
+            }
             var directory = scriptPath is null ? Environment.CurrentDirectory : Path.GetDirectoryName(Path.GetFullPath(scriptPath))!;
             var dependencies = await ScriptDependencies.Restore(directives, directory,
                 text => Notify(context, "stream", new { runId = id, stream = "stderr", text }), cancel);
             var tree = CSharpSyntaxTree.ParseText(source, directives.ParseOptions, path: "script.cs", encoding: Encoding.UTF8, cancellationToken: cancel);
-            var compilation = Compile(tree, directives, dependencies);
+            var compilation = Compile(tree, generated, directives, dependencies);
             var last = tree.GetRoot(cancel).ChildNodes().OfType<GlobalStatementSyntax>().LastOrDefault();
+            var diagnostics = compilation.GetDiagnostics(cancel).ToArray();
+            if (generated is not null)
+            {
+                var generatedErrors = diagnostics
+                    .Where(d => d.Severity == DiagnosticSeverity.Error &&
+                        d.Location.GetLineSpan().Path == "CodingPadDataContext.cs")
+                    .ToArray();
+                if (generatedErrors.Length > 0)
+                {
+                    Notify(context, "stream", new
+                    {
+                        runId = id,
+                        stream = "stderr",
+                        text = "Generated C# data context was ignored because it could not compile: " +
+                            string.Join("; ", generatedErrors.Select(d => d.Id + ": " + d.GetMessage())) +
+                            ". DataContext will not be available in this run.\n"
+                    });
+                    compilation = Compile(tree, null, directives, dependencies);
+                    diagnostics = compilation.GetDiagnostics(cancel).ToArray();
+                }
+            }
             // Empty/comment/type-only scripts are useful no-ops. Keep every
             // other diagnostic, and preserve explicit Main programs when present.
-            var errors = compilation.GetDiagnostics(cancel)
+            var errors = diagnostics
                 .Where(d => d.Severity == DiagnosticSeverity.Error && !(last is null && d.Id == "CS5001")).ToArray();
             Notify(context, "diagnostics", new
             {
@@ -216,6 +257,7 @@ internal static class Program
             helpers?.Dispose();
             ScriptHelpers.ClearDatabase();
             ScriptHelpers.ClearSecrets();
+            ScriptHelpers.DatabaseConnection = null;
             cancellation.Request();
             lock (InspectionGate)
             lock (Gate)
@@ -400,8 +442,18 @@ internal static class Program
                 {
                     var parameters = root.GetProperty("params");
                     var secrets = ParseSecrets(parameters);
+                    string? dataSource = null;
+                    string? connectionJson = null;
+                    if (parameters.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Object)
+                    {
+                        if (data.TryGetProperty("source", out var generated) && generated.ValueKind == JsonValueKind.String)
+                            dataSource = generated.GetString();
+                        if (data.TryGetProperty("connection", out var connection) && connection.ValueKind == JsonValueKind.Object)
+                            connectionJson = connection.GetRawText();
+                    }
                     Run(id.Value, parameters.GetProperty("source").GetString()!,
                         parameters.TryGetProperty("path", out var path) ? path.GetString() : null,
+                        dataSource, connectionJson,
                         secrets.Item1, secrets.Item2,
                         parameters.TryGetProperty("connection", out var databaseClientConfig) && databaseClientConfig.ValueKind == JsonValueKind.Object ? databaseClientConfig : null,
                         cancel ?? new RunCancellation()).GetAwaiter().GetResult();

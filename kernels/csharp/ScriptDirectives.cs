@@ -105,6 +105,17 @@ internal sealed class ScriptDirectives
         }
     }
 
+    internal void AddDataPackages(string kind)
+    {
+        Packages.TryAdd("Microsoft.EntityFrameworkCore", "10.0.0");
+        switch (kind)
+        {
+            case "postgres": Packages.TryAdd("Npgsql.EntityFrameworkCore.PostgreSQL", "10.0.0"); break;
+            case "sqlserver": Packages.TryAdd("Microsoft.EntityFrameworkCore.SqlServer", "10.0.0"); break;
+            default: Packages.TryAdd("Microsoft.EntityFrameworkCore.Sqlite", "10.0.0"); break;
+        }
+    }
+
     internal string Get(string name, string fallback) => Properties.GetValueOrDefault(name, fallback);
     internal bool Flag(string name, bool fallback = false) => bool.Parse(Get(name, fallback.ToString()));
     internal CSharpParseOptions ParseOptions => new CSharpParseOptions(

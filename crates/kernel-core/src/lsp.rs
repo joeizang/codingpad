@@ -30,7 +30,10 @@ use tokio::{
 };
 use url::Url;
 
-use crate::{find_uv, roslyn, shadow::ShadowProject, toolchains, RUNTIME};
+use crate::{
+    data_context::GeneratedContext, databases::SqlManager, find_uv, roslyn, shadow::ShadowProject,
+    toolchains, RUNTIME,
+};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -77,6 +80,7 @@ type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 pub struct LanguageServers {
     uv: PathBuf,
     data_dir: Option<PathBuf>,
+    databases: Option<Arc<SqlManager>>,
     servers: Mutex<HashMap<String, Arc<LspServer>>>,
     starts: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     session: Mutex<Option<String>>,
@@ -94,6 +98,7 @@ impl LanguageServers {
         Self {
             uv,
             data_dir: None,
+            databases: None,
             servers: Mutex::new(HashMap::new()),
             starts: Mutex::new(HashMap::new()),
             session: Mutex::new(None),
@@ -107,6 +112,25 @@ impl LanguageServers {
             data_dir: Some(data_dir),
             ..Self::default()
         }
+    }
+
+    /// Generate typed data contexts from this manager's saved connections.
+    pub fn with_data_dir_and_databases(data_dir: PathBuf, databases: Arc<SqlManager>) -> Self {
+        Self {
+            data_dir: Some(data_dir),
+            databases: Some(databases),
+            ..Self::default()
+        }
+    }
+
+    async fn data_context(&self, source: &str) -> Option<GeneratedContext> {
+        let databases = self.databases.as_ref()?;
+        let name = crate::store::parse_header(source)?
+            .settings
+            .get("connection")
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())?;
+        databases.generated_models(&name).await.ok()
     }
 
     fn uv_path(&self) -> PathBuf {
@@ -147,7 +171,12 @@ impl LanguageServers {
                 "The editor session is stale. Reload the tab to restart code intelligence.".into(),
             );
         }
-        let restart_key = dependencies.join("\n");
+        let data = self.data_context(source).await;
+        let restart_key = format!(
+            "{}\n{}",
+            dependencies.join("\n"),
+            data.as_ref().map(|data| data.python.as_str()).unwrap_or("")
+        );
         let existing = self.servers.lock().await.get(script_id).cloned();
         if let Some(existing) = existing {
             if existing.restart_key == restart_key && existing.alive() {
@@ -172,8 +201,12 @@ impl LanguageServers {
             existing.stop().await;
         }
 
-        let workspace = Workspace::Python(PythonWorkspace::create(source)?);
-        let mut command = server_command(&self.uv_path(), &dependencies);
+        let workspace = Workspace::Python(PythonWorkspace::create(source, data.as_ref())?);
+        let mut python_dependencies = dependencies.clone();
+        if data.is_some() {
+            python_dependencies.push("sqlalchemy".into());
+        }
+        let mut command = server_command(&self.uv_path(), &python_dependencies);
         if let Ok(paths) = std::env::join_paths(workspace.extra_paths()) {
             command.env("PYTHONPATH", paths);
         }
@@ -244,10 +277,12 @@ impl LanguageServers {
             return Err("A script id is required".into());
         }
         let directives = crate::shadow::Directives::parse(source)?;
+        let data = self.data_context(source).await;
         let restart_key = format!(
-            "{}\n{}",
+            "{}\n{}\n{}",
             directives.key(),
-            path.map(|p| p.display().to_string()).unwrap_or_default()
+            path.map(|p| p.display().to_string()).unwrap_or_default(),
+            data.as_ref().map(|data| data.csharp.as_str()).unwrap_or("")
         );
         let events: EventSink = Arc::new(emit);
 
@@ -276,7 +311,12 @@ impl LanguageServers {
         }
 
         let project_key = format!("{script_id}\n{restart_key}");
-        let workspace = Workspace::Csharp(ShadowProject::create(source, path, &project_key)?);
+        let workspace = Workspace::Csharp(ShadowProject::create(
+            source,
+            path,
+            &project_key,
+            data.as_ref(),
+        )?);
         let dotnet = toolchains::resolve_dotnet(self.data_dir.as_deref()).await;
         let roslyn = roslyn::find(self.data_dir.as_deref(), &dotnet)?;
         let mut command = roslyn.command();
@@ -899,7 +939,7 @@ struct PythonWorkspace {
 }
 
 impl PythonWorkspace {
-    fn create(source: &str) -> Result<Self, String> {
+    fn create(source: &str, data: Option<&GeneratedContext>) -> Result<Self, String> {
         let directory = tempfile::tempdir()
             .map_err(|error| format!("Could not create a code-intelligence workspace: {error}"))?;
         let root = directory.path().join("workspace");
@@ -919,6 +959,10 @@ impl PythonWorkspace {
             include_str!("../../../runtimes/python/codingpad/__init__.pyi"),
         )
         .map_err(|error| format!("Could not stage CodingPad helper types: {error}"))?;
+        if let Some(data) = data {
+            fs::write(runtime.join("codingpad_data.py"), &data.python)
+                .map_err(|error| format!("Could not stage the generated data context: {error}"))?;
+        }
 
         let script = root.join("script.py");
         fs::write(&script, source).map_err(|error| {
@@ -1492,8 +1536,24 @@ print("hi")
     }
 
     #[test]
+    fn stages_generated_python_models_with_the_runtime() {
+        let data = crate::data_context::GeneratedContext {
+            python: "class DataContext:\n    pass\n".into(),
+            ..Default::default()
+        };
+        let workspace =
+            PythonWorkspace::create("from codingpad_data import DataContext\n", Some(&data))
+                .unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.root.join("runtime/codingpad_data.py")).unwrap(),
+            data.python
+        );
+    }
+
+    #[test]
     fn creates_a_workspace_that_exposes_the_codingpad_runtime() {
-        let workspace = PythonWorkspace::create("from codingpad import dump\ndump(1)").unwrap();
+        let workspace =
+            PythonWorkspace::create("from codingpad import dump\ndump(1)", None).unwrap();
         let config = fs::read_to_string(workspace.root.join("pyrightconfig.json")).unwrap();
         assert!(config.contains("runtime"));
         assert!(workspace

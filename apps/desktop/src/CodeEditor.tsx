@@ -45,6 +45,7 @@ type Props = {
   compileDiagnostics?: CompileDiagnostic[];
   toolchainVersion?: number;
   sqlSchema?: ConnectionSchema;
+  dataRevision?: number;
   source: string;
   onChange: (source: string) => void;
   onRun: () => void;
@@ -110,6 +111,14 @@ const directiveKey = (source: string, language: string) =>
 const supportsCodeIntelligence = (language: string) =>
   language === "python" || language === "csharp";
 
+function attachedConnection(source: string): string {
+  const first = source.split(/\r?\n/, 1)[0] ?? "";
+  const header = first.match(/^\s*(?:#|\/\/|--)\s*codingpad:\s*(.*)$/);
+  if (!header) return "";
+  const setting = header[1].match(/(?:^|\s)connection=(\"[^\"]*\"|'[^']*'|\S+)/);
+  return setting ? setting[1].replace(/^[\"']|[\"']$/g, "") : "";
+}
+
 export default function CodeEditor({
   id,
   language = "python",
@@ -117,6 +126,7 @@ export default function CodeEditor({
   compileDiagnostics = EMPTY_DIAGNOSTICS,
   toolchainVersion = 0,
   sqlSchema,
+  dataRevision = 0,
   source,
   onChange,
   onRun,
@@ -128,6 +138,7 @@ export default function CodeEditor({
   completeSqlRef.current = completeSql;
   const generation = useRef(0);
   const [interactive, setInteractive] = useState(false);
+  const connectionKey = attachedConnection(source);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const lsp = useRef<{ id: string; uri: string; ready: boolean } | null>(null);
   const pendingDiagnostics = useRef<LspDiagnostic[] | null>(null);
@@ -290,7 +301,16 @@ export default function CodeEditor({
       const model = editorRef.current?.getModel();
       if (model) monaco.editor.setModelMarkers(model, "codingpad-lsp", []);
     };
-  }, [id, dependencyKey, toolchainVersion, language, path, interactive]);
+  }, [
+    id,
+    dependencyKey,
+    toolchainVersion,
+    dataRevision,
+    connectionKey,
+    language,
+    path,
+    interactive,
+  ]);
 
   useEffect(
     () => () => {

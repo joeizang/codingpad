@@ -110,7 +110,10 @@ internal sealed class ScriptDirectives
         Packages.TryAdd("Microsoft.EntityFrameworkCore", "10.0.0");
         switch (kind)
         {
-            case "postgres": Packages.TryAdd("Npgsql.EntityFrameworkCore.PostgreSQL", "10.0.0"); break;
+            case "postgres":
+                Packages.TryAdd("Npgsql.EntityFrameworkCore.PostgreSQL", "10.0.0");
+                Packages.TryAdd("Npgsql.EntityFrameworkCore.PostgreSQL.NodaTime", "10.0.0");
+                break;
             case "sqlserver": Packages.TryAdd("Microsoft.EntityFrameworkCore.SqlServer", "10.0.0"); break;
             default: Packages.TryAdd("Microsoft.EntityFrameworkCore.Sqlite", "10.0.0"); break;
         }

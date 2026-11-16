@@ -436,11 +436,17 @@ generated models, so column, table and relationship completions work while you
 edit. Passwords stay in the OS vault and are read only while a run or schema
 refresh needs them; generated files contain only the schema, never a password.
 
-PostgreSQL C# `interval` and `interval[]` columns map to `TimeSpan` and
-`TimeSpan[]`. [Intervals containing months or years cannot be read as a fixed duration](https://www.npgsql.org/doc/types/datetime.html)
-and raise an error. Columns without a supported EF mapping are omitted from the
-generated class, with a comment naming the column, so unavailable data cannot
-appear as a real `null` value.
+PostgreSQL C# `interval` and `interval[]` columns map to `NodaTime.Period` and
+`NodaTime.Period[]`, which keep months and years, so write
+`NodaTime.Period.FromHours(1)` in a filter. Python reads intervals through
+psycopg as `timedelta`, which has no months: `1 month` reads as 30 days. C#
+columns without a supported EF mapping are omitted from the generated class,
+with a comment naming the column, so unavailable data cannot appear as a real
+`null` value. A table left with no columns is omitted too. Columns with a
+database default or generated value are left out of an insert when you don't set
+them, so setting one to `null` also takes the default. PostgreSQL `timestamp` columns
+(without time zone) take a local or unspecified `DateTime` in C#; Npgsql rejects
+a `DateTime` with `Kind=Utc` there, so use a `timestamptz` column for UTC values.
 
 ## Secrets
 

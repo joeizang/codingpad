@@ -127,6 +127,7 @@ class _Database:
         connection = self._open()
         cursor = connection.cursor()
         try:
+            streamed = False
             if self._config["settings"]["kind"] == "postgres":
                 import psycopg
                 try:
@@ -139,10 +140,20 @@ class _Database:
                         # Discard later rows rather than keeping them in memory.
                         for _ in stream:
                             pass
+                    streamed = True
+                except psycopg.errors.SyntaxError as error:
+                    # stream() uses the extended protocol, which rejects
+                    # several statements in one string before running any of
+                    # them. Fall back to the buffered path, which allows them.
+                    if "multiple commands" not in str(error):
+                        raise
                 except psycopg.ProgrammingError as error:
+                    # Statements without a result (DDL, SET). Covered by the
+                    # live test in tests/python/test_postgres_stream.py.
                     if str(error) != "the operation in stream() didn't produce a result":
                         raise
                     return _DatabaseRows([], [])
+            if streamed:
                 if cursor.description is None:
                     # Psycopg's streaming API discards the metadata for zero
                     # rows. Describe an unnamed prepared statement without

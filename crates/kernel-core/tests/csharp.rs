@@ -1815,6 +1815,33 @@ async fn csharp_saved_script_uses_parent_nuget_config_and_recovers_after_restore
 }
 
 #[tokio::test]
+async fn eager_dumps_inline_object_properties() {
+    let supervisor = Supervisor::default().with_eager_dumps();
+    let events = run(
+        &supervisor,
+        "eager",
+        "new { Name = \"Ada\", Score = 10 }.Dump();",
+        true,
+    )
+    .await;
+    let node = dumps(&events)[0];
+    assert_eq!(node["kind"], "object");
+    let field = |name: &str| {
+        node["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|field| field["name"] == name)
+            .unwrap()["value"]
+            .clone()
+    };
+    assert_eq!(field("Name")["kind"], "string");
+    assert_eq!(field("Name")["v"], "Ada");
+    assert_eq!(field("Score")["v"], 10);
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
 async fn csharp_non_finite_numbers_remain_visible_in_dumps() {
     let supervisor = Supervisor::default();
     let events = run(

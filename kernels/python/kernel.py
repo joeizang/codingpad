@@ -536,7 +536,12 @@ def run(request):
             if not isinstance(secrets, dict) or not isinstance(errors, dict):
                 raise ValueError("run params.secrets and secret_errors must be objects")
             codingpad._set_secrets(secrets, errors)
-            codingpad._begin(emit_dump, emit_update, run_id)
+            codingpad._begin(
+                emit_dump,
+                emit_update,
+                run_id,
+                eager=request["params"].get("eager") is True,
+            )
             try:
                 data = request["params"].get("data")
                 if isinstance(data, dict):

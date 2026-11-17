@@ -15,6 +15,7 @@ _update_sink = None
 _registry = None
 _secrets = {}
 _secret_errors = {}
+_eager = False
 
 _MAX_ITEMS = 100
 _MAX_TABLE_ROWS = 100
@@ -22,6 +23,7 @@ _MAX_DATABASE_ROWS = 10_000
 _MAX_TABLE_SAMPLE = 100
 _MAX_COLUMNS = 32
 _MAX_DEPTH = 6
+_MAX_EAGER_DEPTH = 20
 _MAX_NODES = 1000
 _MAX_STRING = 10000
 _MAX_CELL_STRING = 1000
@@ -328,11 +330,12 @@ def live(value=None):
     return Live(value)
 
 
-def _begin(sink=None, update_sink=None, run_id=None):
+def _begin(sink=None, update_sink=None, run_id=None, eager=False):
     """Reset per-run state; called by the kernel before each script."""
-    global _sink, _update_sink
+    global _sink, _update_sink, _eager
     _sink = sink
     _update_sink = update_sink
+    _eager = bool(eager)
     _registry.reset(run_id)
 
 
@@ -453,7 +456,7 @@ def _start_database(connection):
 
 
 def _end():
-    global _sink, _update_sink, _secrets, _secret_errors
+    global _sink, _update_sink, _secrets, _secret_errors, _eager
     global _database_session, _database_engine, _database_connection
     if _database_session is not None:
         try:
@@ -470,6 +473,7 @@ def _end():
     _database_connection = None
     _sink = None
     _update_sink = None
+    _eager = False
     _secrets = {}
     _secret_errors = {}
 
@@ -734,7 +738,7 @@ def _tree(value, *, depth=0, seen=None, budget=None, cursor=0, limit=_MAX_ITEMS)
     seen = set() if seen is None else seen
     if id(value) in seen:
         return _string_node("<circular reference>", budget)
-    if depth >= _MAX_DEPTH or budget[0] <= 0 or budget[1] <= 0:
+    if depth >= (_MAX_EAGER_DEPTH if _eager else _MAX_DEPTH) or budget[0] <= 0 or budget[1] <= 0:
         return _lazy(value)
 
     seen.add(id(value))

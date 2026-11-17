@@ -1,0 +1,17 @@
+[package]
+name = "cpad"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Run CodingPad scripts from the terminal"
+default-run = "cpad"
+
+[dependencies]
+codingpad-kernel-core = { path = "../../crates/kernel-core" }
+dirs = "7"
+dunce = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+
+[dev-dependencies]
+tempfile = "3"

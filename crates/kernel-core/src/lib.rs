@@ -10,6 +10,7 @@ mod roslyn;
 pub mod secrets;
 mod shadow;
 pub mod store;
+pub mod text;
 pub mod toolchains;
 
 use packages::Packages;
@@ -175,6 +176,7 @@ pub struct Supervisor {
     csharp: OnceCell<csharp::Installation>,
     secrets: Option<Arc<SecretStore>>,
     connections: Option<Arc<databases::ConnectionStore>>,
+    eager_dumps: bool,
 }
 
 impl Default for Supervisor {
@@ -227,6 +229,7 @@ impl Supervisor {
             csharp: OnceCell::new(),
             secrets: None,
             connections: None,
+            eager_dumps: false,
         }
     }
 
@@ -241,6 +244,7 @@ impl Supervisor {
             csharp: OnceCell::new(),
             secrets: None,
             connections: None,
+            eager_dumps: false,
         }
     }
 
@@ -263,6 +267,14 @@ impl Supervisor {
     /// Use the same live connection store as the desktop connection editor.
     pub fn with_connections(mut self, connections: Arc<databases::ConnectionStore>) -> Self {
         self.connections = Some(connections);
+        self
+    }
+
+    /// Ask kernels to materialise lazy values inside each dump instead of
+    /// sending expandable placeholders. Text hosts such as `cpad run` cannot
+    /// click a preview, so the desktop keeps the default deferred behaviour.
+    pub fn with_eager_dumps(mut self) -> Self {
+        self.eager_dumps = true;
         self
     }
 
@@ -469,7 +481,7 @@ impl Supervisor {
             *guard = Some(startup?);
         }
         let data = data.map(|data| json!({"source": data.source, "connection": data.connection}));
-        let params = json!({"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection, "data": data});
+        let params = json!({"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection, "data": data, "eager": self.eager_dumps});
         let result = tokio::select! {
             result = guard.as_mut().unwrap().run(params, &mut emit, &mut stop) => result,
             _ = closed.changed() => Err("Script was closed".into()),
@@ -521,7 +533,7 @@ impl Supervisor {
         cursor: Option<&str>,
         limit: Option<u32>,
     ) -> Result<ExpandResult, String> {
-        self.expand_with_timeout(
+        self.expand_within(
             script_id,
             handle,
             cursor,
@@ -529,6 +541,27 @@ impl Supervisor {
             std::time::Duration::from_secs(10),
         )
         .await
+    }
+
+    /// Expand with a caller-chosen timeout. Text hosts use a shorter limit when
+    /// they have an overall post-run budget.
+    pub async fn expand_within(
+        &self,
+        script_id: &str,
+        handle: &str,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+        preview_timeout: std::time::Duration,
+    ) -> Result<ExpandResult, String> {
+        let node = self
+            .call_kernel(
+                script_id,
+                "expand",
+                json!({"handle": handle, "cursor": cursor, "limit": limit}),
+                preview_timeout,
+            )
+            .await?;
+        serde_json::from_value(node).map_err(|e| e.to_string())
     }
 
     /// One page of plain, untruncated cells from a table dump, for export.
@@ -549,25 +582,6 @@ impl Supervisor {
             )
             .await?;
         serde_json::from_value(page).map_err(|e| e.to_string())
-    }
-
-    async fn expand_with_timeout(
-        &self,
-        script_id: &str,
-        handle: &str,
-        cursor: Option<&str>,
-        limit: Option<u32>,
-        preview_timeout: std::time::Duration,
-    ) -> Result<ExpandResult, String> {
-        let node = self
-            .call_kernel(
-                script_id,
-                "expand",
-                json!({"handle": handle, "cursor": cursor, "limit": limit}),
-                preview_timeout,
-            )
-            .await?;
-        serde_json::from_value(node).map_err(|e| e.to_string())
     }
 
     async fn call_kernel(
@@ -659,8 +673,12 @@ impl Kernel {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        // A terminal Ctrl-C must reach only the host; Stop asks the kernel
+        // through the protocol instead of letting .NET die mid-run.
+        #[cfg(unix)]
+        command.process_group(0);
         #[cfg(windows)]
-        command.creation_flags(0x08000000);
+        command.creation_flags(0x08000000 | 0x00000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         let mut child = command
             .spawn()
             .map_err(|e| format!("Could not start C# kernel: {e}"))?;
@@ -681,8 +699,10 @@ impl Kernel {
         emit: &mut (impl FnMut(KernelEvent) + Send),
     ) -> Result<Self, String> {
         let mut discover = Command::new(uv);
+        #[cfg(unix)]
+        discover.process_group(0);
         #[cfg(windows)]
-        discover.creation_flags(0x08000000); // CREATE_NO_WINDOW, also for uv
+        discover.creation_flags(0x08000000 | 0x00000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         discover.kill_on_drop(true);
         let python = discover
             .args(["python", "find", ">=3.10", "--offline", "--no-config"])
@@ -716,8 +736,12 @@ impl Kernel {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        // Keep the kernel out of the terminal's foreground group so Ctrl-C
+        // reaches the host, which then sends a cooperative cancel request.
+        #[cfg(unix)]
+        command.process_group(0);
         #[cfg(windows)]
-        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        command.creation_flags(0x08000000 | 0x00000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         let mut child = command
             .spawn()
             .map_err(|e| format!("Could not start Python: {e}"))?;
@@ -908,8 +932,10 @@ async fn prepare_packages(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
     #[cfg(windows)]
-    command.creation_flags(0x08000000);
+    command.creation_flags(0x08000000 | 0x00000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
     let mut child = command
         .spawn()
         .map_err(|e| format!("Could not prepare Python packages: {e}"))?;
@@ -1201,7 +1227,7 @@ mod tests {
         let handle = nodes[0]["fields"][0]["value"]["handle"].as_str().unwrap();
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            supervisor.expand_with_timeout(
+            supervisor.expand_within(
                 "timeout",
                 handle,
                 None,

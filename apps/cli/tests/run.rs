@@ -70,6 +70,29 @@ fn live_values_stream_and_report_updates() {
 }
 
 #[test]
+fn live_updates_still_report_after_a_held_dump() {
+    let directory = tempdir().unwrap();
+    let data = directory.path().join("data");
+    let script = directory.path().join("live_after_lazy.py");
+    fs::write(
+        &script,
+        "from codingpad import dump, live\nprogress = live(0)\ndump(progress)\n\
+         value = 'leaf'\nfor _ in range(25):\n    value = {'next': value}\n\
+         dump(value)\nprogress.value = 1\n",
+    )
+    .unwrap();
+
+    let output = cpad(&data, &script);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    // The live dump streamed before the deep dump forced later output to be
+    // held; its update must still be reported instead of matching nothing.
+    assert!(text.starts_with("0\n"), "{text}");
+    assert!(text.contains("leaf"), "{text}");
+    assert!(stderr(&output).contains("live: 1"), "{}", stderr(&output));
+}
+
+#[test]
 fn failing_python_script_exits_with_one() {
     let directory = tempdir().unwrap();
     let data = directory.path().join("data");

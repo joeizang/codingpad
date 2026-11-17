@@ -19,7 +19,7 @@ use codingpad_kernel_core::{
 };
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     future::Future,
     io::{self, Write},
@@ -48,6 +48,8 @@ const MIN_EXPANSION_CALL: Duration = Duration::from_millis(250);
 const MAX_HELD_EVENTS: usize = 500;
 /// Live progress lines printed before updates are suppressed.
 const MAX_LIVE_UPDATES: usize = 100;
+/// How long the second Ctrl-C waits for kernels to close before a hard exit.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// The script types `cpad run` understands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -239,8 +241,9 @@ async fn run_sql_script(
 }
 
 /// Ctrl-C stops the active run the same way the desktop's Stop button does.
-/// A second Ctrl-C shuts the kernels down immediately, but still lets the main
-/// task print held output and return exit code 130 instead of orphaning children.
+/// A second Ctrl-C closes the kernels, still letting the main task print held
+/// output and return exit code 130. A third, or a shutdown that stalls, forces
+/// an exit once the kernels have had their chance to close.
 fn watch_interrupt(
     supervisor: Arc<Supervisor>,
     sql: Arc<SqlManager>,
@@ -248,19 +251,31 @@ fn watch_interrupt(
     interrupted: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
-        let mut stopped = false;
+        let mut stage = 0;
         loop {
             if tokio::signal::ctrl_c().await.is_err() {
                 return;
             }
             interrupted.store(true, Ordering::SeqCst);
             sql.stop(&script_id);
-            if stopped {
-                supervisor.shutdown().await;
-                return;
+            match stage {
+                0 => {
+                    stage = 1;
+                    supervisor.stop(&script_id).await;
+                }
+                1 => {
+                    stage = 2;
+                    let shutdown = supervisor.shutdown();
+                    tokio::pin!(shutdown);
+                    tokio::select! {
+                        _ = &mut shutdown => {}
+                        _ = tokio::time::sleep(SHUTDOWN_GRACE) => std::process::exit(130),
+                        _ = tokio::signal::ctrl_c() => std::process::exit(130),
+                    }
+                }
+                // Kernels are closed; a further Ctrl-C must still end the process.
+                _ => std::process::exit(130),
             }
-            stopped = true;
-            supervisor.stop(&script_id).await;
         }
     });
 }
@@ -280,6 +295,9 @@ enum Recorded {
 struct Output {
     events: Vec<Recorded>,
     buffering: bool,
+    /// Dump node ids held in `events`; updates targeting them must be applied
+    /// there, while updates for already printed live values still report now.
+    held_ids: HashSet<String>,
     live_updates: usize,
 }
 
@@ -303,7 +321,7 @@ fn record_event(event: &KernelEvent, path: &Path, output: &mut Output) {
             ) else {
                 return;
             };
-            if output.buffering {
+            if output.buffering && output.held_ids.contains(node_id) {
                 hold(
                     Recorded::Update {
                         node_id: node_id.to_owned(),
@@ -312,6 +330,8 @@ fn record_event(event: &KernelEvent, path: &Path, output: &mut Output) {
                     output,
                 );
             } else {
+                // The live value was already printed (or its dump streamed),
+                // so its update cannot be applied to held output.
                 report_live_update(node, output);
             }
         }
@@ -341,7 +361,12 @@ fn push_dump(mut node: Value, output: &mut Output) {
     }
 }
 
-fn hold(record: Recorded, output: &mut Output) {
+fn hold(mut record: Recorded, output: &mut Output) {
+    match &mut record {
+        Recorded::Dump(node) => collect_ids(node, &mut output.held_ids),
+        Recorded::Update { node, .. } => collect_ids(node, &mut output.held_ids),
+        _ => {}
+    }
     output.events.push(record);
     if output.events.len() < MAX_HELD_EVENTS {
         return;
@@ -353,7 +378,17 @@ fn hold(record: Recorded, output: &mut Output) {
         write_recorded(record);
     }
     output.events.clear();
+    output.held_ids.clear();
     output.buffering = false;
+}
+
+fn collect_ids(node: &mut Value, ids: &mut HashSet<String>) {
+    if let Some(id) = node.get("id").and_then(Value::as_str) {
+        ids.insert(id.to_owned());
+    }
+    for child in child_nodes_mut(node) {
+        collect_ids(child, ids);
+    }
 }
 
 /// A terminal cannot update a live block in place, so report its new value as a

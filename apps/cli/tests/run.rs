@@ -43,7 +43,7 @@ fn python_script_prints_streams_and_dumps_as_text() {
 }
 
 #[test]
-fn live_values_print_their_final_text() {
+fn live_values_stream_and_report_updates() {
     let directory = tempdir().unwrap();
     let data = directory.path().join("data");
     let script = directory.path().join("live.py");
@@ -58,9 +58,15 @@ fn live_values_print_their_final_text() {
 
     let output = cpad(&data, &script);
     assert!(output.status.success(), "stderr: {}", stderr(&output));
-    let text = stdout(&output);
-    assert!(text.contains("\"done\""), "{text}");
-    assert!(!text.contains("starting"), "{text}");
+    // The dump streams immediately; the update is progress on stderr, so a
+    // terminal never has to hold back later output for a live value.
+    assert!(
+        stdout(&output).contains("\"starting\""),
+        "{}",
+        stdout(&output)
+    );
+    let errors = stderr(&output);
+    assert!(errors.contains("live: \"done\""), "{errors}");
 }
 
 #[test]

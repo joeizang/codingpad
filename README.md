@@ -138,10 +138,13 @@ total; use the desktop or CSV export for every row.
 connections, secret names and private toolchains, so the same saved connection
 works in both places. Set `CODINGPAD_DATA_DIR` to use another folder. Exit codes
 are 0 for success, 1 for a script failure, 2 for a usage or script-type error,
-and 130 when Ctrl-C stops the run. Output streams as it is produced. A dump that
-still contains a live value or a value the kernel could not make eager (a node
-budget cut-off) is held until the run finishes, then updated or expanded within
-a 10-second budget and printed in its original position.
+and 130 when Ctrl-C stops the run. Output streams as it is produced. Live values
+print their current value where the dump appears, and later updates are progress
+lines on stderr (`live: 42`), capped at 100 lines. A dump that still contains a
+value the kernel could not make eager (a node budget cut-off) is held until the
+run finishes, expanded within a 10-second budget, and printed in its original
+position. Held output is capped at 500 events; reaching the cap prints the
+previews as they are rather than delaying a long run further.
 
 ## Library and files
 

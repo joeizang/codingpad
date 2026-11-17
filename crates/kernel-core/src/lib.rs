@@ -673,8 +673,12 @@ impl Kernel {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        // A terminal Ctrl-C must reach only the host; Stop asks the kernel
+        // through the protocol instead of letting .NET die mid-run.
+        #[cfg(unix)]
+        command.process_group(0);
         #[cfg(windows)]
-        command.creation_flags(0x08000000);
+        command.creation_flags(0x08000000 | 0x00000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         let mut child = command
             .spawn()
             .map_err(|e| format!("Could not start C# kernel: {e}"))?;
@@ -695,8 +699,10 @@ impl Kernel {
         emit: &mut (impl FnMut(KernelEvent) + Send),
     ) -> Result<Self, String> {
         let mut discover = Command::new(uv);
+        #[cfg(unix)]
+        discover.process_group(0);
         #[cfg(windows)]
-        discover.creation_flags(0x08000000); // CREATE_NO_WINDOW, also for uv
+        discover.creation_flags(0x08000000 | 0x00000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         discover.kill_on_drop(true);
         let python = discover
             .args(["python", "find", ">=3.10", "--offline", "--no-config"])
@@ -730,8 +736,12 @@ impl Kernel {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        // Keep the kernel out of the terminal's foreground group so Ctrl-C
+        // reaches the host, which then sends a cooperative cancel request.
+        #[cfg(unix)]
+        command.process_group(0);
         #[cfg(windows)]
-        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        command.creation_flags(0x08000000 | 0x00000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         let mut child = command
             .spawn()
             .map_err(|e| format!("Could not start Python: {e}"))?;
@@ -922,8 +932,10 @@ async fn prepare_packages(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
     #[cfg(windows)]
-    command.creation_flags(0x08000000);
+    command.creation_flags(0x08000000 | 0x00000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
     let mut child = command
         .spawn()
         .map_err(|e| format!("Could not prepare Python packages: {e}"))?;

@@ -6,9 +6,10 @@
 //!
 //! Kernels normally defer C# properties and deep values as lazy nodes so the
 //! desktop can expand them on click. A terminal cannot click, so the runner
-//! asks kernels for eager dumps. Events stream as they arrive; a dump that still
-//! contains a live value or a lazy node is held back until the run finishes,
-//! then updated or expanded within a bounded time budget, and printed in order.
+//! asks kernels for eager dumps. Events stream as they arrive; live updates are
+//! reported as they happen, and only a dump that still contains a lazy node is
+//! held back. That dump is expanded within a bounded time budget and printed in
+//! its original position.
 
 use codingpad_kernel_core::{
     databases::{ConnectionStore, SqlManager},
@@ -40,6 +41,13 @@ const MAX_EXPANSION_DEPTH: usize = 3;
 const EXPANSION_BUDGET: Duration = Duration::from_secs(10);
 /// One expansion matches the desktop's preview timeout.
 const EXPANSION_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Do not start a call that has almost no budget left: a short timeout would
+/// discard the kernel and be reported as a failure instead of an expired budget.
+const MIN_EXPANSION_CALL: Duration = Duration::from_millis(250);
+/// Bounded output held only when a dump needs post-run expansion.
+const MAX_HELD_EVENTS: usize = 500;
+/// Live progress lines printed before updates are suppressed.
+const MAX_LIVE_UPDATES: usize = 100;
 
 /// The script types `cpad run` understands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,14 +179,16 @@ pub async fn run_file(path: &Path) -> i32 {
         }
     };
 
-    // A dump with a live value or a lazy node was held back. Apply the final
-    // live values, then expand what the kernel could not make eager.
+    // A dump with a lazy node was held back. Apply any buffered live updates,
+    // expand what the kernel could not make eager, then print in order.
     if output.buffering {
         apply_updates(&mut output.events);
         expand_dumps(&supervisor, &script_id, &mut output.events).await;
         for record in &output.events {
             write_recorded(record);
         }
+        output.events.clear();
+        output.buffering = false;
     }
 
     // Close kernels before the process exits; a dropped runtime would
@@ -187,18 +197,20 @@ pub async fn run_file(path: &Path) -> i32 {
     sql.shutdown();
 
     let interrupted = interrupted.load(Ordering::SeqCst);
+    if let Err(message) = &result {
+        if !interrupted {
+            eprintln!("{message}");
+        }
+    }
+    if interrupted {
+        // Ctrl-C during expansion still means the user stopped the run.
+        return 130;
+    }
     match result {
         Ok(outcome) if outcome.ok => 0,
-        Ok(outcome) if outcome.stopped || interrupted => 130,
+        Ok(outcome) if outcome.stopped => 130,
         Ok(_) => 1,
-        Err(message) => {
-            eprintln!("{message}");
-            if interrupted {
-                130
-            } else {
-                1
-            }
-        }
+        Err(_) => 1,
     }
 }
 
@@ -227,7 +239,8 @@ async fn run_sql_script(
 }
 
 /// Ctrl-C stops the active run the same way the desktop's Stop button does.
-/// A second Ctrl-C exits immediately in case a script refuses to stop.
+/// A second Ctrl-C shuts the kernels down immediately, but still lets the main
+/// task print held output and return exit code 130 instead of orphaning children.
 fn watch_interrupt(
     supervisor: Arc<Supervisor>,
     sql: Arc<SqlManager>,
@@ -241,11 +254,12 @@ fn watch_interrupt(
                 return;
             }
             interrupted.store(true, Ordering::SeqCst);
+            sql.stop(&script_id);
             if stopped {
-                std::process::exit(130);
+                supervisor.shutdown().await;
+                return;
             }
             stopped = true;
-            sql.stop(&script_id);
             supervisor.stop(&script_id).await;
         }
     });
@@ -259,12 +273,14 @@ enum Recorded {
     Update { node_id: String, node: Value },
 }
 
-/// Streamed events go straight to the terminal. Once one event needs
-/// post-run work, later events are held so output order is preserved.
+/// Streamed events go straight to the terminal. Once a dump needs post-run
+/// expansion, later events are held so output order is preserved. The holder is
+/// bounded: reaching the cap flushes what is held without further expansion.
 #[derive(Default)]
 struct Output {
     events: Vec<Recorded>,
     buffering: bool,
+    live_updates: usize,
 }
 
 fn record_event(event: &KernelEvent, path: &Path, output: &mut Output) {
@@ -281,17 +297,22 @@ fn record_event(event: &KernelEvent, path: &Path, output: &mut Output) {
         }
         "dump" => push_dump(event.params["node"].clone(), output),
         "dump_update" => {
-            if let (Some(node_id), Some(node)) = (
+            let (Some(node_id), Some(node)) = (
                 event.params["nodeId"].as_str(),
                 event.params.get("node").filter(|node| !node.is_null()),
-            ) {
-                emit(
+            ) else {
+                return;
+            };
+            if output.buffering {
+                hold(
                     Recorded::Update {
                         node_id: node_id.to_owned(),
                         node: node.clone(),
                     },
                     output,
                 );
+            } else {
+                report_live_update(node, output);
             }
         }
         "diagnostics" => {
@@ -305,19 +326,50 @@ fn record_event(event: &KernelEvent, path: &Path, output: &mut Output) {
 
 fn emit(record: Recorded, output: &mut Output) {
     if output.buffering {
-        output.events.push(record);
+        hold(record, output);
     } else {
         write_recorded(&record);
     }
 }
 
 fn push_dump(mut node: Value, output: &mut Output) {
-    if output.buffering || needs_post_processing(&mut node) {
+    if output.buffering || needs_expansion(&mut node) {
         output.buffering = true;
-        output.events.push(Recorded::Dump(node));
+        hold(Recorded::Dump(node), output);
     } else {
         write_recorded(&Recorded::Dump(node));
     }
+}
+
+fn hold(record: Recorded, output: &mut Output) {
+    output.events.push(record);
+    if output.events.len() < MAX_HELD_EVENTS {
+        return;
+    }
+    // A long stream after an expandable dump must not grow without bound.
+    // Print the held previews as they are and go back to streaming.
+    eprintln!("Output buffer full; printing held values without further expansion.");
+    for record in &output.events {
+        write_recorded(record);
+    }
+    output.events.clear();
+    output.buffering = false;
+}
+
+/// A terminal cannot update a live block in place, so report its new value as a
+/// progress line on stderr. The initial dump was already printed on stdout.
+fn report_live_update(node: &Value, output: &mut Output) {
+    if output.live_updates >= MAX_LIVE_UPDATES {
+        if output.live_updates == MAX_LIVE_UPDATES {
+            eprintln!("Further live updates suppressed.");
+            output.live_updates += 1;
+        }
+        return;
+    }
+    output.live_updates += 1;
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(stderr, "live: {}", render_dump(node));
+    let _ = stderr.flush();
 }
 
 fn diagnostics_text(diagnostics: &Value, path: &Path) -> Option<String> {
@@ -375,15 +427,12 @@ fn child_nodes_mut(node: &mut Value) -> Vec<&mut Value> {
     children
 }
 
-fn needs_post_processing(node: &mut Value) -> bool {
-    if matches!(
-        node.get("kind").and_then(Value::as_str),
-        Some("lazy" | "live")
-    ) {
+fn needs_expansion(node: &mut Value) -> bool {
+    if node.get("kind").and_then(Value::as_str) == Some("lazy") {
         return true;
     }
     for child in child_nodes_mut(node) {
-        if needs_post_processing(child) {
+        if needs_expansion(child) {
             return true;
         }
     }
@@ -427,6 +476,8 @@ struct ExpandState {
     remaining: usize,
     expanded: usize,
     failed: bool,
+    timed_out: bool,
+    limit_reached: bool,
 }
 
 impl ExpandState {
@@ -436,12 +487,18 @@ impl ExpandState {
             remaining: MAX_EXPANSIONS,
             expanded: 0,
             failed: false,
+            timed_out: false,
+            limit_reached: false,
         }
     }
 
     fn out_of_time(&self) -> bool {
         self.deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    fn stopped(&self) -> bool {
+        self.failed || self.timed_out || self.limit_reached
     }
 }
 
@@ -458,7 +515,7 @@ async fn expand_dumps(supervisor: &Supervisor, script_id: &str, output: &mut [Re
     }
     eprintln!("Expanding {lazy} lazy value(s)…");
     let mut state = ExpandState::new();
-    for record in output {
+    for record in output.iter_mut() {
         if let Recorded::Dump(node) = record {
             expand_node(supervisor, script_id, node, 0, &mut state).await;
         }
@@ -466,13 +523,29 @@ async fn expand_dumps(supervisor: &Supervisor, script_id: &str, output: &mut [Re
     if state.expanded > 0 {
         eprintln!("Expanded {} lazy value(s).", state.expanded);
     }
+    let leftover = output
+        .iter_mut()
+        .filter_map(|record| match record {
+            Recorded::Dump(node) => Some(count_lazy(node)),
+            _ => None,
+        })
+        .sum::<usize>();
+    if leftover == 0 {
+        return;
+    }
     if state.failed {
-        eprintln!("An expansion failed; some values stay collapsed.");
-    } else if state.out_of_time() || state.remaining == 0 {
+        eprintln!("An expansion failed; remaining values stay collapsed.");
+    } else if state.timed_out {
         eprintln!(
             "Stopped expanding after {} seconds; remaining values stay collapsed.",
             EXPANSION_BUDGET.as_secs()
         );
+    } else if state.limit_reached {
+        eprintln!(
+            "Stopped after expanding {MAX_EXPANSIONS} values; remaining values stay collapsed."
+        );
+    } else {
+        eprintln!("{leftover} value(s) stay collapsed.");
     }
 }
 
@@ -492,14 +565,18 @@ fn expand_node<'a>(
     state: &'a mut ExpandState,
 ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
-        if depth > MAX_EXPANSION_DEPTH
-            || state.failed
-            || state.remaining == 0
-            || state.out_of_time()
-        {
+        if depth > MAX_EXPANSION_DEPTH || state.stopped() {
             return;
         }
         if node.get("kind").and_then(Value::as_str) == Some("lazy") {
+            if state.out_of_time() {
+                state.timed_out = true;
+                return;
+            }
+            if state.remaining == 0 {
+                state.limit_reached = true;
+                return;
+            }
             let Some(handle) = node
                 .get("handle")
                 .and_then(Value::as_str)
@@ -507,15 +584,16 @@ fn expand_node<'a>(
             else {
                 return;
             };
-            state.remaining -= 1;
-            let timeout = state
+            let remaining = state
                 .deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-                .unwrap_or(EXPANSION_CALL_TIMEOUT)
-                .min(EXPANSION_CALL_TIMEOUT);
-            if timeout.is_zero() {
+                .unwrap_or(EXPANSION_CALL_TIMEOUT);
+            if remaining < MIN_EXPANSION_CALL {
+                state.timed_out = true;
                 return;
             }
+            state.remaining -= 1;
+            let timeout = remaining.min(EXPANSION_CALL_TIMEOUT);
             match supervisor
                 .expand_within(script_id, &handle, None, Some(100), timeout)
                 .await
@@ -525,9 +603,19 @@ fn expand_node<'a>(
                     state.expanded += 1;
                     expand_node(supervisor, script_id, node, depth + 1, state).await;
                 }
-                // A timeout drops the kernel, so further handles would fail too.
+                // Running out of budget drops the kernel; an actual kernel
+                // error leaves time for other handles.
+                Err(_) if state.out_of_time() => state.timed_out = true,
                 Err(_) => state.failed = true,
             }
+            return;
+        }
+        if state.out_of_time() {
+            state.timed_out = true;
+            return;
+        }
+        if state.remaining == 0 {
+            state.limit_reached = true;
             return;
         }
         for child in child_nodes_mut(node) {

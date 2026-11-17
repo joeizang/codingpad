@@ -841,24 +841,7 @@ impl SqlManager {
         cursor: Option<&str>,
         limit: Option<u32>,
     ) -> Result<Value, String> {
-        let belongs = self
-            .script_results
-            .lock()
-            .unwrap()
-            .get(script_id)
-            .is_some_and(|handles| handles.iter().any(|item| item == handle));
-        if !belongs {
-            return Err("That result is no longer available. Run the script again.".into());
-        }
-        let table = self
-            .results
-            .lock()
-            .unwrap()
-            .get(handle)
-            .cloned()
-            .ok_or_else(|| {
-                "That result is no longer available. Run the script again.".to_owned()
-            })?;
+        let table = self.owned_table(script_id, handle)?;
         let offset = match cursor {
             Some(cursor) => cursor
                 .parse::<usize>()
@@ -869,6 +852,59 @@ impl SqlManager {
             .map(|limit| (limit as usize).clamp(1, MAX_PAGE))
             .unwrap_or(DEFAULT_PAGE);
         Ok(table_node(&table, handle, offset, limit))
+    }
+
+    fn owned_table(&self, script_id: &str, handle: &str) -> Result<Arc<TableData>, String> {
+        let belongs = self
+            .script_results
+            .lock()
+            .unwrap()
+            .get(script_id)
+            .is_some_and(|handles| handles.iter().any(|item| item == handle));
+        if !belongs {
+            return Err("That result is no longer available. Run the script again.".into());
+        }
+        self.results
+            .lock()
+            .unwrap()
+            .get(handle)
+            .cloned()
+            .ok_or_else(|| "That result is no longer available. Run the script again.".to_owned())
+    }
+}
+
+impl SqlManager {
+    /// One page of a stored result as plain cells, with full text for cells
+    /// that were cut for display.
+    pub fn export_page(
+        &self,
+        script_id: &str,
+        handle: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<crate::export::ExportPage, String> {
+        let table = self.owned_table(script_id, handle)?;
+        let offset = match cursor {
+            Some(cursor) => cursor
+                .parse::<usize>()
+                .map_err(|_| "cursor must be a non-negative integer".to_owned())?,
+            None => 0,
+        }
+        .min(table.rows.len());
+        let end = (offset + limit.max(1) as usize).min(table.rows.len());
+        Ok(crate::export::ExportPage {
+            columns: table
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
+            rows: table.rows[offset..end]
+                .iter()
+                .map(|row| row.iter().map(crate::export::plain_cell).collect())
+                .collect(),
+            next: (end < table.rows.len()).then(|| end.to_string()),
+            total: Some(table.rows.len() as u64),
+        })
     }
 }
 
@@ -1582,16 +1618,22 @@ fn integer_node(id: &str, value: i64) -> Value {
 fn bounded_text(id: &str, text: String, kind: Option<&str>) -> Value {
     let total = text.chars().count();
     if total > MAX_CELL_TEXT {
-        string_node(
+        let mut node = string_node(
             id.to_owned(),
             text.chars().take(MAX_CELL_TEXT).collect(),
             kind,
             Some(total),
-        )
+        );
+        // Kept on the host for exports; stripped before a page reaches the UI.
+        node[FULL_TEXT] = Value::String(text);
+        node
     } else {
         string_node(id.to_owned(), text, kind, None)
     }
 }
+
+/// Host-only field holding a truncated cell's complete text.
+const FULL_TEXT: &str = "full";
 
 fn pg_cell(
     row: &tokio_postgres::Row,
@@ -1738,33 +1780,9 @@ fn cell_node(value: ValueRef<'_>, row: usize, column: usize) -> Value {
         }
         ValueRef::Real(value) => string_node(id, value.to_string(), None, None),
         ValueRef::Text(value) => {
-            let text = String::from_utf8_lossy(value);
-            let total = text.chars().count();
-            if total > MAX_CELL_TEXT {
-                string_node(
-                    id,
-                    text.chars().take(MAX_CELL_TEXT).collect(),
-                    None,
-                    Some(total),
-                )
-            } else {
-                string_node(id, text.into_owned(), None, None)
-            }
+            bounded_text(&id, String::from_utf8_lossy(value).into_owned(), None)
         }
-        ValueRef::Blob(value) => {
-            let total = 2 + value.len() * 2;
-            let text = hex(value);
-            if text.chars().count() > MAX_CELL_TEXT {
-                string_node(
-                    id,
-                    text.chars().take(MAX_CELL_TEXT).collect(),
-                    Some("blob"),
-                    Some(total),
-                )
-            } else {
-                string_node(id, text, Some("blob"), None)
-            }
-        }
+        ValueRef::Blob(value) => bounded_text(&id, hex(value), Some("blob")),
     }
 }
 
@@ -1793,7 +1811,20 @@ fn hex(bytes: &[u8]) -> String {
 fn table_node(table: &TableData, handle: &str, offset: usize, limit: usize) -> Value {
     let offset = offset.min(table.rows.len());
     let end = (offset + limit).min(table.rows.len());
-    let rows = table.rows[offset..end].to_vec();
+    let rows = table.rows[offset..end]
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|cell| {
+                    let mut cell = cell.clone();
+                    if let Some(object) = cell.as_object_mut() {
+                        object.remove(FULL_TEXT);
+                    }
+                    cell
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     let next = (end < table.rows.len()).then(|| end.to_string());
     let mut node = json!({
         "id": format!("{handle}:{offset}"),
@@ -2123,6 +2154,41 @@ mod tests {
         assert_eq!(cells[1]["truncated"], true);
         assert_eq!(cells[1]["total"], 2000);
         assert_eq!(cells[1]["v"].as_str().unwrap().chars().count(), 1000);
+        assert!(
+            cells[1].get("full").is_none(),
+            "full text stays on the host"
+        );
+        let handle = result.tables[0]["handle"].as_str().unwrap();
+        let page = manager.export_page("sql", handle, None, 1000).unwrap();
+        assert_eq!(page.columns, ["id", "big", "minimum"]);
+        assert_eq!(page.rows[0][0], json!({"n": "9007199254740993"}));
+        assert_eq!(page.rows[0][1].as_str().unwrap().chars().count(), 2000);
+        assert_eq!(page.next, None);
+        assert!(manager.export_page("other", handle, None, 1000).is_err());
+    }
+
+    #[tokio::test]
+    async fn sqlite_results_export_every_row_in_pages() {
+        let (_directory, _connections, _secrets, manager, _database) = setup();
+        let result = manager
+            .run(
+                "sql",
+                "-- codingpad: connection=sample\nWITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 2500) SELECT n FROM t",
+                None,
+            )
+            .await
+            .unwrap();
+        let handle = result.tables[0]["handle"].as_str().unwrap();
+        let first = manager.export_page("sql", handle, None, 1000).unwrap();
+        assert_eq!(first.rows.len(), 1000);
+        assert_eq!(first.next.as_deref(), Some("1000"));
+        assert_eq!(first.total, Some(2500));
+        let last = manager
+            .export_page("sql", handle, Some("2000"), 1000)
+            .unwrap();
+        assert_eq!(last.rows.len(), 500);
+        assert_eq!(last.rows[499][0], json!(2500));
+        assert_eq!(last.next, None);
     }
 
     #[tokio::test]

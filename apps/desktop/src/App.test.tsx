@@ -934,3 +934,45 @@ test("SQL tabs run through the direct connection and render table results", asyn
   expect(screen.getByText("42")).toBeInTheDocument();
   expect(screen.getByText("Finished")).toBeInTheDocument();
 });
+
+test("exporting a SQL result asks for a file and exports through the host", async () => {
+  invoke.mockImplementation(async (command: string, args: { onProgress?: { onmessage: (p: unknown) => void } }) => {
+    if (command === "connection_schema") return { kind: "sqlite", tables: [] };
+    if (command === "run_sql") {
+      return {
+        ok: true,
+        stopped: false,
+        tables: [
+          {
+            id: "sql-1:0",
+            kind: "table",
+            type: "query",
+            columns: [{ name: "answer" }],
+            rows: [[{ id: "sql:r0c0", kind: "primitive", v: 42 }]],
+            total: 1,
+            next: null,
+            handle: "sql-1",
+          },
+        ],
+      };
+    }
+    if (command === "export_table_dump") {
+      args.onProgress?.onmessage({ rows: 1, total: 1 });
+      return { rows: 1, shortenedCells: 0 };
+    }
+    return undefined;
+  });
+  dialog.save.mockResolvedValueOnce("/tmp/answers");
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "New SQL scratch script" }));
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Export CSV" }));
+  expect(await screen.findByText("Exported 1 row")).toBeInTheDocument();
+  expect(dialog.save).toHaveBeenCalledWith(
+    expect.objectContaining({ filters: [{ name: "CSV", extensions: ["csv"] }] }),
+  );
+  expect(invoke).toHaveBeenCalledWith(
+    "export_table_dump",
+    expect.objectContaining({ handle: "sql-1", sql: true, format: "csv", path: "/tmp/answers.csv" }),
+  );
+});

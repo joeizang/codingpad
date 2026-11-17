@@ -543,6 +543,15 @@ footer {
   font-size: 11px;
   border-top: 1px solid #343c48;
 }
+.table-export {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.table-export button {
+  font-size: 11px;
+  padding: 1px 6px;
+}
 .table-expanded {
   border-top: 1px solid #343c48;
   padding: 8px;

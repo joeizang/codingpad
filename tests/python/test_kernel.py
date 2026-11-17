@@ -615,6 +615,20 @@ finally:
         self.assertIsNone(page["next"])
         self.assertEqual(page["rows"][0][1]["v"], 200)
 
+    def test_export_rows_over_the_protocol(self):
+        messages = self.run_script(
+            'rows = [{"name": f"row {i}", "score": i} for i in range(2500)]\ndump(rows)'
+        )
+        table = next(m["params"]["node"] for m in messages if m.get("method") == "dump")
+        page = self.request(
+            "export_rows", {"handle": table["handle"], "cursor": "2000", "limit": 1000}
+        )[-1]["result"]
+        self.assertEqual(page["columns"], ["name", "score"])
+        self.assertEqual(len(page["rows"]), 500)
+        self.assertEqual(page["rows"][0], ["row 2000", 2000])
+        self.assertIsNone(page["next"])
+        self.assertEqual(page["total"], 2500)
+
     def test_large_tables_send_only_the_first_page(self):
         messages = self.run_script(
             'rows = [{"name": f"row {i}", "score": i} for i in range(100000)]\ndump(rows)'

@@ -131,7 +131,7 @@ internal static class Program
                     if (connection.RootElement.TryGetProperty("kind", out var kindValue) && kindValue.ValueKind == JsonValueKind.String)
                         kind = kindValue.GetString() ?? "sqlite";
                 }
-                directives.AddDataPackages(kind);
+                directives.AddDataPackages(kind, dataSource);
                 generated = CSharpSyntaxTree.ParseText(dataSource, directives.ParseOptions, path: "CodingPadDataContext.cs", encoding: Encoding.UTF8, cancellationToken: cancel);
                 ScriptHelpers.DatabaseConnection = connectionJson;
             }

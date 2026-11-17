@@ -58,6 +58,7 @@ struct ColumnShape {
     primary_key: bool,
     identity: bool,
     has_default: bool,
+    computed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -118,6 +119,7 @@ fn sample_schema() -> Schema {
                         primary_key: true,
                         identity: true,
                         has_default: false,
+                        computed: false,
                     },
                     SchemaColumn {
                         name: "name".into(),
@@ -126,6 +128,7 @@ fn sample_schema() -> Schema {
                         primary_key: false,
                         identity: false,
                         has_default: false,
+                        computed: false,
                     },
                 ],
             },
@@ -140,6 +143,7 @@ fn sample_schema() -> Schema {
                         primary_key: true,
                         identity: true,
                         has_default: false,
+                        computed: false,
                     },
                     SchemaColumn {
                         name: "customer_id".into(),
@@ -154,6 +158,7 @@ fn sample_schema() -> Schema {
                         primary_key: false,
                         identity: false,
                         has_default: false,
+                        computed: false,
                     },
                     SchemaColumn {
                         name: "total".into(),
@@ -162,6 +167,7 @@ fn sample_schema() -> Schema {
                         primary_key: false,
                         identity: false,
                         has_default: false,
+                        computed: false,
                     },
                 ],
             },
@@ -184,6 +190,7 @@ fn shape(schema: &Schema) -> Vec<TableShape> {
                 primary_key: column.primary_key,
                 identity: column.identity,
                 has_default: column.has_default,
+                computed: column.computed,
             })
             .collect::<Vec<_>>();
         let no_primary_key = !columns.iter().any(|column| column.primary_key);
@@ -734,6 +741,11 @@ fn python_column_args(
     if column.has_default && !(column.primary_key && column.identity) {
         keywords.push("server_default=_sa.FetchedValue()".to_owned());
     }
+    // Generated and rowversion columns change on every write; read them back
+    // after an UPDATE too.
+    if column.computed {
+        keywords.push("server_onupdate=_sa.FetchedValue()".to_owned());
+    }
     positional
         .into_iter()
         .chain(keywords)
@@ -858,6 +870,7 @@ fn csharp_models(tables: &[TableShape], kind: crate::databases::DatabaseKind) ->
         if tables.iter().any(csharp_has_interval) {
             out.push_str(
                 "        options.UseNpgsql(builder.ConnectionString, npgsql => npgsql.UseNodaTime());\n",
+                // Contains CSHARP_NODATIME_MARKER, which selects the NodaTime package.
             );
         } else {
             out.push_str("        options.UseNpgsql(builder.ConnectionString);\n");
@@ -938,7 +951,12 @@ fn csharp_models(tables: &[TableShape], kind: crate::databases::DatabaseKind) ->
                     cs_string(column.data_type.trim())
                 ));
             }
-            if column.has_default && !(column.primary_key && column.identity) && !keys.is_empty() {
+            if column.computed && !keys.is_empty() {
+                configuration.push_str(".ValueGeneratedOnAddOrUpdate()");
+            } else if column.has_default
+                && !(column.primary_key && column.identity)
+                && !keys.is_empty()
+            {
                 configuration.push_str(".ValueGeneratedOnAdd()");
             }
             if !configuration.is_empty() {
@@ -1053,6 +1071,11 @@ fn csharp_mapped(table: &TableShape, kind: crate::databases::DatabaseKind) -> bo
         .iter()
         .any(|column| !csharp_ignored(column, kind) || column_used(table, &column.name))
 }
+
+/// Generated C# that contains this needs the Npgsql NodaTime plugin package.
+/// The C# kernel (`ScriptDirectives.AddDataPackages`) and the shadow project
+/// both check for it.
+pub(crate) const CSHARP_NODATIME_MARKER: &str = "UseNodaTime()";
 
 fn csharp_has_interval(table: &TableShape) -> bool {
     table
@@ -1666,6 +1689,7 @@ mod tests {
             primary_key: false,
             identity: false,
             has_default: false,
+            computed: false,
         });
         let first = generate(&schema);
         let second = generate(&schema);
@@ -1691,6 +1715,7 @@ mod tests {
             primary_key,
             identity: false,
             has_default: false,
+            computed: false,
         }
     }
 
@@ -2056,6 +2081,30 @@ mod tests {
     }
 
     #[test]
+    fn computed_columns_are_read_back_after_inserts_and_updates() {
+        use crate::databases::DatabaseKind;
+        let mut total = column("total", "integer", false);
+        total.has_default = true;
+        total.computed = true;
+        let schema = Schema {
+            kind: DatabaseKind::Postgres,
+            tables: vec![table(
+                "orders",
+                "public",
+                vec![column("id", "integer", true), total],
+            )],
+        };
+        let generated = generate(&schema);
+        assert!(generated
+            .python
+            .contains("server_default=_sa.FetchedValue(), server_onupdate=_sa.FetchedValue()"));
+        assert!(generated.csharp.contains(
+            "entity.Property(e => e.Total).HasColumnName(\"total\").ValueGeneratedOnAddOrUpdate();"
+        ));
+        assert!(!generated.csharp.contains(".ValueGeneratedOnAdd()"));
+    }
+
+    #[test]
     fn postgres_types_without_a_text_cast_name_their_type_on_parameters() {
         use crate::databases::DatabaseKind;
         let schema = Schema {
@@ -2351,6 +2400,7 @@ mod tests {
                             primary_key: true,
                             identity: true,
                             has_default: false,
+                            computed: false,
                         },
                         SchemaColumn {
                             name: "b".into(),
@@ -2359,6 +2409,7 @@ mod tests {
                             primary_key: true,
                             identity: true,
                             has_default: false,
+                            computed: false,
                         },
                     ],
                 },
@@ -2373,6 +2424,7 @@ mod tests {
                             primary_key: true,
                             identity: true,
                             has_default: false,
+                            computed: false,
                         },
                         SchemaColumn {
                             name: "parent_a".into(),
@@ -2387,6 +2439,7 @@ mod tests {
                             primary_key: false,
                             identity: false,
                             has_default: false,
+                            computed: false,
                         },
                         SchemaColumn {
                             name: "parent_b".into(),
@@ -2401,6 +2454,7 @@ mod tests {
                             primary_key: false,
                             identity: false,
                             has_default: false,
+                            computed: false,
                         },
                     ],
                 },

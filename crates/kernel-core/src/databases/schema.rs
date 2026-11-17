@@ -28,6 +28,10 @@ pub struct SchemaColumn {
     /// The database fills this column when an insert leaves it out.
     #[serde(default)]
     pub has_default: bool,
+    /// The database computes this column on every write (generated, computed or
+    /// rowversion); it is read back after inserts and updates, never written.
+    #[serde(default)]
+    pub computed: bool,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct ForeignKey {
@@ -48,7 +52,8 @@ SELECT n.nspname::text, t.relname::text, a.attname::text,
        CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_constraint p WHERE p.conrelid=t.oid AND p.contype='p' AND a.attnum=ANY(p.conkey)) THEN '1' ELSE '0' END,
        COALESCE(f.conname,''), COALESCE(array_position(f.conkey,a.attnum),0)::text,
        CASE WHEN a.attidentity <> '' OR pg_get_expr(ad.adbin, ad.adrelid) LIKE 'nextval%' THEN '1' ELSE '0' END,
-       CASE WHEN ad.adbin IS NOT NULL OR a.attidentity <> '' THEN '1' ELSE '0' END
+       CASE WHEN ad.adbin IS NOT NULL OR a.attidentity <> '' THEN '1' ELSE '0' END,
+       CASE WHEN a.attgenerated <> '' THEN '1' ELSE '0' END
 FROM pg_catalog.pg_class t
 JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace
 JOIN pg_catalog.pg_attribute a ON a.attrelid=t.oid AND a.attnum>0 AND NOT a.attisdropped
@@ -68,7 +73,8 @@ SELECT s.name,t.name,c.name,
        CASE WHEN EXISTS (SELECT 1 FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id=ic.object_id AND i.index_id=ic.index_id WHERE i.is_primary_key=1 AND ic.object_id=t.object_id AND ic.column_id=c.column_id) THEN '1' ELSE '0' END,
        COALESCE(fk.name,''), CAST(COALESCE(f.constraint_column_id,0) AS varchar(10)),
        CASE WHEN c.is_identity = 1 THEN '1' ELSE '0' END,
-       CASE WHEN c.default_object_id <> 0 OR c.is_identity = 1 OR c.is_computed = 1 OR ty.name = 'timestamp' THEN '1' ELSE '0' END
+       CASE WHEN c.default_object_id <> 0 OR c.is_identity = 1 OR c.is_computed = 1 OR ty.name = 'timestamp' THEN '1' ELSE '0' END,
+       CASE WHEN c.is_computed = 1 OR ty.name = 'timestamp' THEN '1' ELSE '0' END
 FROM sys.objects t JOIN sys.schemas s ON s.schema_id=t.schema_id
 JOIN sys.columns c ON c.object_id=t.object_id
 JOIN sys.types ty ON ty.user_type_id=c.user_type_id
@@ -81,7 +87,7 @@ WHERE t.type IN ('U','V') AND t.is_ms_shipped=0
 ORDER BY s.name,t.name,c.column_id
 "#;
 
-type CatalogRow = [Option<String>; 12];
+type CatalogRow = [Option<String>; 13];
 
 fn is_primary_key(value: &str) -> bool {
     matches!(
@@ -92,7 +98,7 @@ fn is_primary_key(value: &str) -> bool {
 
 fn assemble(kind: DatabaseKind, rows: Vec<CatalogRow>) -> Schema {
     let mut tables = BTreeMap::<(String, String), SchemaTable>::new();
-    for [schema, table, column, data_type, target_schema, target_table, target_column, primary_key, constraint, ordinal, identity, has_default] in
+    for [schema, table, column, data_type, target_schema, target_table, target_column, primary_key, constraint, ordinal, identity, has_default, computed] in
         rows
     {
         let schema = schema.unwrap_or_default();
@@ -117,6 +123,7 @@ fn assemble(kind: DatabaseKind, rows: Vec<CatalogRow>) -> Schema {
                     primary_key: primary_key.as_deref().is_some_and(is_primary_key),
                     identity: identity.as_deref().is_some_and(is_primary_key),
                     has_default: has_default.as_deref().is_some_and(is_primary_key),
+                    computed: computed.as_deref().is_some_and(is_primary_key),
                 });
                 table.columns.len() - 1
             });
@@ -270,7 +277,7 @@ fn sqlite_schema(path: &str) -> Result<Schema, String> {
         for (name, object_type) in names {
             let object = (|| -> rusqlite::Result<SchemaTable> {
                 let mut columns = db.prepare(
-                    "SELECT name,type,pk,dflt_value IS NOT NULL OR hidden IN (2,3) FROM pragma_table_xinfo(?1) WHERE hidden != 1 ORDER BY cid",
+                    "SELECT name,type,pk,dflt_value IS NOT NULL OR hidden IN (2,3),hidden IN (2,3) FROM pragma_table_xinfo(?1) WHERE hidden != 1 ORDER BY cid",
                 )?;
                 let mut columns = columns
                     .query_map([&name], |r| {
@@ -283,6 +290,7 @@ fn sqlite_schema(path: &str) -> Result<Schema, String> {
                             references: vec![],
                             primary_key,
                             has_default: r.get::<_, i64>(3)? != 0,
+                            computed: r.get::<_, i64>(4)? != 0,
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -452,6 +460,7 @@ mod tests {
                     Some("1".into()),
                     Some("0".into()),
                     Some("1".into()),
+                    Some("1".into()),
                 ]
             };
             let schema = assemble(
@@ -463,6 +472,7 @@ mod tests {
             assert_eq!(schema.tables[0].columns[0].references.len(), 2);
             assert!(schema.tables[0].columns[0].primary_key);
             assert!(schema.tables[0].columns[0].has_default);
+            assert!(schema.tables[0].columns[0].computed);
         }
     }
 }

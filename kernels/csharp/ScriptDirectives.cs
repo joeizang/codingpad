@@ -105,14 +105,17 @@ internal sealed class ScriptDirectives
         }
     }
 
-    internal void AddDataPackages(string kind)
+    /// Mirrors data_packages in crates/kernel-core/src/shadow.rs.
+    internal void AddDataPackages(string kind, string source)
     {
         Packages.TryAdd("Microsoft.EntityFrameworkCore", "10.0.0");
         switch (kind)
         {
             case "postgres":
                 Packages.TryAdd("Npgsql.EntityFrameworkCore.PostgreSQL", "10.0.0");
-                Packages.TryAdd("Npgsql.EntityFrameworkCore.PostgreSQL.NodaTime", "10.0.0");
+                // Only contexts with interval columns call UseNodaTime().
+                if (source.Contains("UseNodaTime()", StringComparison.Ordinal))
+                    Packages.TryAdd("Npgsql.EntityFrameworkCore.PostgreSQL.NodaTime", "10.0.0");
                 break;
             case "sqlserver": Packages.TryAdd("Microsoft.EntityFrameworkCore.SqlServer", "10.0.0"); break;
             default: Packages.TryAdd("Microsoft.EntityFrameworkCore.Sqlite", "10.0.0"); break;

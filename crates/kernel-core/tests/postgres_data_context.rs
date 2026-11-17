@@ -54,7 +54,7 @@ INSERT INTO codingpad_array_test VALUES
 (2, '{}', '{}', '{}', NULL, '{}'), (3, NULL, NULL, NULL, NULL, NULL);
 CREATE SEQUENCE codingpad_seq START 700;
 CREATE FUNCTION codingpad_next() RETURNS int LANGUAGE sql AS 'SELECT nextval(''codingpad_seq'')::int';
-CREATE TABLE codingpad_kinds_test (id int PRIMARY KEY DEFAULT codingpad_next(), mood codingpad_mood, odd "Odd Mood", doc xml, docs xml[], stamp timestamptz NOT NULL DEFAULT now(), doubled int GENERATED ALWAYS AS (id * 2) STORED);
+CREATE TABLE codingpad_kinds_test (id int PRIMARY KEY DEFAULT codingpad_next(), mood codingpad_mood, odd "Odd Mood", doc xml, docs xml[], stamp timestamptz NOT NULL DEFAULT now(), doubled int GENERATED ALWAYS AS (id * 2) STORED, doc_length int GENERATED ALWAYS AS (length(doc::text)) STORED);
 "#;
     manager.run("setup", setup, None).await.unwrap();
     let context = manager.data_context("live").await.unwrap();
@@ -94,6 +94,12 @@ context.session.flush()
 assert added.id == 700, added.id
 assert added.stamp is not None
 assert added.doubled == 1400, added.doubled
+assert added.doc_length == 4, added.doc_length
+added.doc = '<abc/>'
+context.session.flush()
+assert added.doc_length == 6, added.doc_length
+added.doc = '<a/>'
+context.session.flush()
 explicit = Kinds(id=5)
 context.session.add(explicit)
 context.session.flush()

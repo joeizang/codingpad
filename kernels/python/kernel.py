@@ -627,7 +627,7 @@ def run(request):
     send({"id": run_id, "result": {"ok": ok}})
 
 
-def expand(request):
+def expand(request, export=False):
     params = request["params"]
     handle = params.get("handle")
     if not isinstance(handle, str):
@@ -639,7 +639,10 @@ def expand(request):
     if limit is not None and not isinstance(limit, int):
         raise ValueError("params.limit must be an integer or null")
     try:
-        node = codingpad._expand(handle, cursor, limit)
+        if export:
+            page = codingpad._export_rows(handle, cursor, limit)
+        else:
+            node = codingpad._expand(handle, cursor, limit)
     except KeyError:
         send(
             {
@@ -658,12 +661,14 @@ def expand(request):
                 "id": request["id"],
                 "error": {
                     "code": -32603,
-                    "message": f"Could not expand this value: {type(error).__name__}",
+                    "message": f"Could not export this table: {type(error).__name__}: {error}"
+                    if export
+                    else f"Could not expand this value: {type(error).__name__}",
                 },
             }
         )
         return
-    send({"id": request["id"], "result": {"node": node}})
+    send({"id": request["id"], "result": page if export else {"node": node}})
 
 
 def main():
@@ -714,7 +719,7 @@ def main():
             ):
                 raise ValueError("Expected a JSON-RPC request with an integer id")
             method = request.get("method")
-            if method not in {"run", "expand"}:
+            if method not in {"run", "expand", "export_rows"}:
                 send(
                     {
                         "id": request["id"],
@@ -745,8 +750,8 @@ def main():
                     )
             else:
                 if not isinstance(params, dict):
-                    raise ValueError("expand requires params")
-                expand(request)
+                    raise ValueError(f"{method} requires params")
+                expand(request, export=method == "export_rows")
         except (ValueError, TypeError) as error:
             send(
                 {

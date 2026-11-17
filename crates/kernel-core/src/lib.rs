@@ -2,6 +2,7 @@
 mod csharp;
 pub mod data_context;
 pub mod databases;
+pub mod export;
 pub mod installer;
 pub mod lsp;
 mod packages;
@@ -530,6 +531,26 @@ impl Supervisor {
         .await
     }
 
+    /// One page of plain, untruncated cells from a table dump, for export.
+    pub async fn export_page(
+        &self,
+        script_id: &str,
+        handle: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<export::ExportPage, String> {
+        let page = self
+            .call_kernel(
+                script_id,
+                "export_rows",
+                json!({"handle": handle, "cursor": cursor, "limit": limit}),
+                // A page runs script code (getters, iterators), as a preview does.
+                std::time::Duration::from_secs(30),
+            )
+            .await?;
+        serde_json::from_value(page).map_err(|e| e.to_string())
+    }
+
     async fn expand_with_timeout(
         &self,
         script_id: &str,
@@ -538,6 +559,24 @@ impl Supervisor {
         limit: Option<u32>,
         preview_timeout: std::time::Duration,
     ) -> Result<ExpandResult, String> {
+        let node = self
+            .call_kernel(
+                script_id,
+                "expand",
+                json!({"handle": handle, "cursor": cursor, "limit": limit}),
+                preview_timeout,
+            )
+            .await?;
+        serde_json::from_value(node).map_err(|e| e.to_string())
+    }
+
+    async fn call_kernel(
+        &self,
+        script_id: &str,
+        method: &str,
+        params: Value,
+        preview_timeout: std::time::Duration,
+    ) -> Result<Value, String> {
         let slot = {
             let kernels = self.kernels.lock().await;
             kernels.get(script_id).cloned()
@@ -566,11 +605,11 @@ impl Supervisor {
                 _ = closed.changed() => Err(CallError::Transport(unavailable())),
                 _ = stop.changed() => Err(CallError::Transport("Preview stopped; the kernel and cache were cleared. Run the script again.".into())),
                 _ = tokio::time::sleep(preview_timeout) => Err(CallError::Transport("Preview timed out; the kernel and cache were cleared. Run the script again.".into())),
-                result = kernel.request("expand", json!({"handle": handle, "cursor": cursor, "limit": limit})) => result,
+                result = kernel.request(method, params) => result,
             }
         };
         match outcome {
-            Ok(node) => serde_json::from_value(node).map_err(|e| e.to_string()),
+            Ok(value) => Ok(value),
             Err(CallError::Kernel(message)) => Err(message),
             Err(CallError::Transport(message)) => {
                 // The kernel died or answered with garbage. Drop it so the next

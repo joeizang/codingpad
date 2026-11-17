@@ -1,8 +1,8 @@
-# M3 close verification — 16 November 2026
+# M3 close verification — 16–17 November 2026
 
-The M3 close gate (#48), run on Linux. Per D62 the platforms are Linux and
-Windows; macOS is deferred and was not run. The Windows VM check and the owner's
-sign-off are still outstanding (see [Still to do](#still-to-do)).
+The M3 close gate (#48), run on Linux and in the Windows VM. Per D62 the
+platforms are Linux and Windows; macOS is deferred and was not run. The owner's
+sign-off is still outstanding (see [Still to do](#still-to-do)).
 
 Code under test: master `7d44a60` (all of M3.0–M3.9 and M3.11 merged), plus
 the `vault` test added with this record. M3.10 export (#93) and the
@@ -31,9 +31,9 @@ in those PRs and are summarised [below](#open-m3-prs).
 | #48 item | Linux result |
 |---|---|
 | SQL, `db` client and data context paths against real SQLite, PostgreSQL and SQL Server | **Pass**: every live test below |
-| Vault-backed secrets work | **Pass** on Linux; Windows still to do; macOS deferred (D62) |
+| Vault-backed secrets work | **Pass** on Linux and Windows; macOS deferred (D62). See [Windows](#windows) for a VM-only caveat |
 | `just bench` still passes | **Not clean**: C# completion fails 0/3, see [findings](#findings) |
-| `just check` passes in a Windows VM | Still to do (owner) |
+| `just check` passes in a Windows VM | **Pass**, see [Windows](#windows) |
 
 ### Databases
 
@@ -91,6 +91,55 @@ Three sequential release-build repetitions, warm OS caches, desktop in normal us
 | 100k-item `IEnumerable`, first page to host | < 1000 ms | 352.9 ms | 288.3 ms | 271.0 ms | 3/3 |
 | C# completion | < 300 ms | not measured **FAIL** | not measured **FAIL** | not measured **FAIL** | 0/3 |
 
+## Windows
+
+Run on 17 November 2026 in the local Windows 11 Pro 24H2 VM (build 26100), as
+the interactive user `joseph`. The code was master `7d44a60` with #91, #93 and
+#94 merged on top, which is the tree M3 will close with. The live database tests
+reached the Linux host's PostgreSQL 17 and SQL Server 2022 containers through
+QEMU's NAT address `10.0.2.2`.
+
+| Component | Version |
+|---|---|
+| Node.js / npm | 26.13.0 / 11.20.0 |
+| Rust / Cargo | 1.99.1, x86_64-pc-windows-msvc |
+| .NET SDK | 10.0.403 |
+| Python | 3.14.7 (uv 0.13.6) |
+| just | 1.59.0 |
+| WebView2 | 157.0.4341.46 |
+
+`just check` passed in full, on both a 4-vCPU/8 GiB run (75 min, cold caches)
+and an 8-vCPU/16 GiB run (11.6 min, warm caches):
+
+| Check | Result |
+|---|---|
+| Locked frontend install, TypeScript and Vite build | Passed |
+| Frontend tests | 98 passed |
+| Python tests | 62 run, OK (2 Unix-only skipped) |
+| .NET kernel tests | 24 passed |
+| `cargo fmt --check`, workspace Clippy with warnings denied | Passed |
+| Rust unit and integration tests | All passed, including the 4 export tests and `stop_and_close_cancel_package_preparation` (#92) |
+| Tauri debug build without an installer bundle | Passed |
+
+| Live test | Result |
+|---|---|
+| SQL Server and PostgreSQL round trip and cancel | 2 passed |
+| Data contexts on SQLite, PostgreSQL and SQL Server, both languages | 8 passed |
+| PostgreSQL enum arrays (Python) | 1 passed |
+| Real-vault round trip (Credential Manager) into both kernels | Passed on the 4-vCPU boot; see below |
+
+**Vault caveat (VM environment, not CodingPad).** After the VM was resized to
+8 vCPUs and 16 GiB, Windows logged Credential Guard auto-enablement
+(LsaSrv 6156) and started LSASS as a protected process. Earlier boots logged
+neither. From then on, Windows refused every persistent credential for the
+password-less `joseph` account with `ERROR_NO_SUCH_LOGON_SESSION` (1312). A
+direct `CredWriteW` from PowerShell failed the same way with both enterprise and
+local-machine persistence; only session persistence worked. Signing out and in
+again did not help. CodingPad handled it as designed: the vault was reported
+unavailable, nothing was changed, and session-only storage was offered. The same
+test binary passed against Credential Manager on the earlier boot. Giving the VM
+account a password, or turning LSA protection off in the VM, should restore it.
+
 ## Findings
 
 1. **C# completion cannot be measured on this machine (environment, not a code
@@ -108,8 +157,12 @@ Three sequential release-build repetitions, warm OS caches, desktop in normal us
    and 983 ms against 1 s). Idle memory passes with 7 MiB to spare against the
    475 MiB limit (D61).
 3. **A flaky test in `just check`.** `supervisor::stop_and_close_cancel_package_preparation`
-   times out intermittently in full workspace runs, including on plain master,
-   and passes alone (#92).
+   times out intermittently in full Linux workspace runs, including on plain
+   master, and passes alone (#92). It passed in both Windows runs.
+4. **Persistent Credential Manager entries can be refused** for a password-less
+   Windows account once LSA protection is on (see [Windows](#windows)). That's
+   an environment limit that CodingPad already reports clearly. Real users'
+   accounts normally have a password or PIN.
 
 ## Open M3 PRs
 
@@ -120,8 +173,8 @@ Three sequential release-build repetitions, warm OS caches, desktop in normal us
 
 ## Still to do
 
-- [ ] Windows VM: `just check` (function only, D42).
-- [ ] Windows VM: `cargo test -p codingpad-kernel-core --test vault -- --ignored` (Credential Manager).
+- [x] Windows VM: `just check` (function only, D42).
+- [x] Windows VM: `cargo test -p codingpad-kernel-core --test vault -- --ignored` (Credential Manager), on the 4-vCPU boot.
 - [ ] Linux: rerun `just bench` after updating Roslyn (finding 1).
 - [ ] Merge #91 and #93.
 - [ ] Owner sign-off.

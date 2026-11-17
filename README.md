@@ -45,7 +45,7 @@ processes, and builds the desktop executable. No CI is configured (D39). The sam
 command is intended for Linux and Windows; native builds run on their own
 platforms. macOS support is deferred for now (D62).
 
-[M3 verification results](docs/m3-verification.md) record the Linux database,
+[M3 verification results](docs/m3-verification.md) record the Linux and Windows database,
 vault and benchmark runs for the M3 close.
 [Windows verification results](docs/windows-verification.md) record the native
 build, tests, and desktop smoke check with Python 3.14.7 and Node.js 26.

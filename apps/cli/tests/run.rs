@@ -155,4 +155,11 @@ fn usage_errors_exit_with_two() {
     let output = cpad(&data, &script);
     assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
     assert!(stderr(&output).contains(".py, .cs or .sql"));
+
+    // The type check comes before opening the file, so a missing unknown path
+    // is still a usage error rather than "Could not open".
+    let missing = directory.path().join("missing.txt");
+    let output = cpad(&data, &missing);
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
+    assert!(stderr(&output).contains(".py, .cs or .sql"));
 }

@@ -94,11 +94,12 @@ internal static class Program
         IReadOnlyDictionary<string, string> secrets,
         IReadOnlyDictionary<string, string> secretErrors,
         JsonElement? databaseClientConfig,
+        bool eager,
         RunCancellation cancellation)
     {
         var cancel = cancellation.Token;
         Session?.Dispose();
-        var session = Session = new DumpSession(id);
+        var session = Session = new DumpSession(id, eager);
         var context = new RunContext(id);
         session.Update = (nodeId, value) =>
         {
@@ -456,6 +457,7 @@ internal static class Program
                         dataSource, connectionJson,
                         secrets.Item1, secrets.Item2,
                         parameters.TryGetProperty("connection", out var databaseClientConfig) && databaseClientConfig.ValueKind == JsonValueKind.Object ? databaseClientConfig : null,
+                        parameters.TryGetProperty("eager", out var eager) && eager.ValueKind == JsonValueKind.True,
                         cancel ?? new RunCancellation()).GetAwaiter().GetResult();
                 }
                 else if (root.GetProperty("method").GetString() == "export_rows")

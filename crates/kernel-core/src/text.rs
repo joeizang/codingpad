@@ -138,6 +138,11 @@ fn render(node: &Value, depth: usize, out: &mut String) {
         out.push_str(&text);
         return;
     }
+    render_block(node, depth, out);
+}
+
+/// Render a value that `inline` rejected, without asking `inline` again.
+fn render_block(node: &Value, depth: usize, out: &mut String) {
     match kind(node) {
         "list" => render_list(node, depth, out),
         "object" => render_object(node, depth, out),
@@ -148,7 +153,7 @@ fn render(node: &Value, depth: usize, out: &mut String) {
             Some(inner) => render(inner, depth, out),
             None => out.push_str("<live>"),
         },
-        _ => out.push_str(&inline(node, depth).unwrap_or_else(|| "…".into())),
+        _ => out.push('…'),
     }
 }
 
@@ -188,22 +193,24 @@ fn render_object(node: &Value, depth: usize, out: &mut String) {
         out.push_str(as_text(field, "name").unwrap_or("?"));
         out.push(':');
         match field.get("value") {
-            Some(value) if inline(value, depth + 1).is_some() => {
-                out.push(' ');
-                render(value, depth + 1, out);
-            }
-            // Lists and objects keep their bracket beside the label so their
-            // entries line up under it; tables and tracebacks read better
-            // below the label with every line indented further.
-            Some(value) if matches!(kind(value), "list" | "object") => {
-                out.push(' ');
-                render(value, depth + 1, out);
-            }
-            Some(value) => {
-                out.push('\n');
-                indent(depth + 2, out);
-                render(value, depth + 2, out);
-            }
+            Some(value) => match inline(value, depth + 1) {
+                Some(text) => {
+                    out.push(' ');
+                    out.push_str(&text);
+                }
+                // Lists and objects keep their bracket beside the label so their
+                // entries line up under it; tables and tracebacks read better
+                // below the label with every line indented further.
+                None if matches!(kind(value), "list" | "object") => {
+                    out.push(' ');
+                    render_block(value, depth + 1, out);
+                }
+                None => {
+                    out.push('\n');
+                    indent(depth + 2, out);
+                    render_block(value, depth + 2, out);
+                }
+            },
             None => out.push_str(" None"),
         }
     }

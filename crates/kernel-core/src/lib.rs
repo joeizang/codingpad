@@ -176,6 +176,7 @@ pub struct Supervisor {
     csharp: OnceCell<csharp::Installation>,
     secrets: Option<Arc<SecretStore>>,
     connections: Option<Arc<databases::ConnectionStore>>,
+    eager_dumps: bool,
 }
 
 impl Default for Supervisor {
@@ -228,6 +229,7 @@ impl Supervisor {
             csharp: OnceCell::new(),
             secrets: None,
             connections: None,
+            eager_dumps: false,
         }
     }
 
@@ -242,6 +244,7 @@ impl Supervisor {
             csharp: OnceCell::new(),
             secrets: None,
             connections: None,
+            eager_dumps: false,
         }
     }
 
@@ -264,6 +267,14 @@ impl Supervisor {
     /// Use the same live connection store as the desktop connection editor.
     pub fn with_connections(mut self, connections: Arc<databases::ConnectionStore>) -> Self {
         self.connections = Some(connections);
+        self
+    }
+
+    /// Ask kernels to materialise lazy values inside each dump instead of
+    /// sending expandable placeholders. Text hosts such as `cpad run` cannot
+    /// click a preview, so the desktop keeps the default deferred behaviour.
+    pub fn with_eager_dumps(mut self) -> Self {
+        self.eager_dumps = true;
         self
     }
 
@@ -470,7 +481,7 @@ impl Supervisor {
             *guard = Some(startup?);
         }
         let data = data.map(|data| json!({"source": data.source, "connection": data.connection}));
-        let params = json!({"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection, "data": data});
+        let params = json!({"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection, "data": data, "eager": self.eager_dumps});
         let result = tokio::select! {
             result = guard.as_mut().unwrap().run(params, &mut emit, &mut stop) => result,
             _ = closed.changed() => Err("Script was closed".into()),
@@ -522,7 +533,7 @@ impl Supervisor {
         cursor: Option<&str>,
         limit: Option<u32>,
     ) -> Result<ExpandResult, String> {
-        self.expand_with_timeout(
+        self.expand_within(
             script_id,
             handle,
             cursor,
@@ -530,6 +541,27 @@ impl Supervisor {
             std::time::Duration::from_secs(10),
         )
         .await
+    }
+
+    /// Expand with a caller-chosen timeout. Text hosts use a shorter limit when
+    /// they have an overall post-run budget.
+    pub async fn expand_within(
+        &self,
+        script_id: &str,
+        handle: &str,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+        preview_timeout: std::time::Duration,
+    ) -> Result<ExpandResult, String> {
+        let node = self
+            .call_kernel(
+                script_id,
+                "expand",
+                json!({"handle": handle, "cursor": cursor, "limit": limit}),
+                preview_timeout,
+            )
+            .await?;
+        serde_json::from_value(node).map_err(|e| e.to_string())
     }
 
     /// One page of plain, untruncated cells from a table dump, for export.
@@ -550,25 +582,6 @@ impl Supervisor {
             )
             .await?;
         serde_json::from_value(page).map_err(|e| e.to_string())
-    }
-
-    async fn expand_with_timeout(
-        &self,
-        script_id: &str,
-        handle: &str,
-        cursor: Option<&str>,
-        limit: Option<u32>,
-        preview_timeout: std::time::Duration,
-    ) -> Result<ExpandResult, String> {
-        let node = self
-            .call_kernel(
-                script_id,
-                "expand",
-                json!({"handle": handle, "cursor": cursor, "limit": limit}),
-                preview_timeout,
-            )
-            .await?;
-        serde_json::from_value(node).map_err(|e| e.to_string())
     }
 
     async fn call_kernel(
@@ -1202,7 +1215,7 @@ mod tests {
         let handle = nodes[0]["fields"][0]["value"]["handle"].as_str().unwrap();
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            supervisor.expand_with_timeout(
+            supervisor.expand_within(
                 "timeout",
                 handle,
                 None,

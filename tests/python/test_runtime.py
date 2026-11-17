@@ -160,6 +160,26 @@ class RuntimeTests(unittest.TestCase):
         node = codingpad._tree([Record()])
         self.assertEqual([column["name"] for column in node["columns"]], ["name"])
 
+    def test_eager_mode_renders_values_deeper_than_the_display_limit(self):
+        codingpad._begin(None, None, eager=True)
+        value = {"leaf": 1}
+        for _ in range(10):
+            value = {"next": value}
+        node = codingpad._tree(value)
+        depth = 0
+        while node["kind"] == "object":
+            child = next(
+                (field["value"] for field in node["fields"] if field["name"] == "next"),
+                None,
+            )
+            if child is None:
+                node = node["fields"][0]["value"]
+                break
+            node = child
+            depth += 1
+        self.assertEqual(node["kind"], "primitive")
+        self.assertGreater(depth, 6)
+
     def test_dump_is_still_text_outside_the_app(self):
         self.assertIsNone(codingpad._sink)
         value = {"name": "Ada", "scores": [1, 2]}

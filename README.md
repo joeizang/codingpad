@@ -129,17 +129,19 @@ cargo run --locked -p cpad -- run hello.py
 `cargo build --locked -p cpad` produces `target/debug/cpad` (`target/release/cpad`
 with `--release`). Python `.py` and C# `.cs` scripts use the app's warm kernels;
 a `.sql` script runs directly through the connection named in its header. Dumps
-print as text: short values stay on one line, tables are aligned, and lazy values
-(C# properties and deep Python values) are expanded after the run. A table larger
-than its first 100-row page prints how many rows are shown and the total; use the
-desktop or CSV export for every row.
+print as text: short values stay on one line, tables are aligned, and C# properties
+and deep Python values are materialised in the kernel so they appear inline. A
+table larger than its first 100-row page prints how many rows are shown and the
+total; use the desktop or CSV export for every row.
 
 `cpad run` uses the app's data folder (`io.github.joeizang.codingpad`) for
 connections, secret names and private toolchains, so the same saved connection
 works in both places. Set `CODINGPAD_DATA_DIR` to use another folder. Exit codes
 are 0 for success, 1 for a script failure, 2 for a usage or script-type error,
-and 130 when Ctrl-C stops the run. Output is written in its original order once
-the run finishes, because lazy values need an idle kernel to expand.
+and 130 when Ctrl-C stops the run. Output streams as it is produced. A dump that
+still contains a live value or a value the kernel could not make eager (a node
+budget cut-off) is held until the run finishes, then updated or expanded within
+a 10-second budget and printed in its original position.
 
 ## Library and files
 

@@ -6,8 +6,11 @@ using CodingPad;
 
 // One registry per run. Retains script objects (and their collectible assembly)
 // only while the result can still be expanded.
-internal sealed class DumpSession(long runId) : IDisposable
+internal sealed class DumpSession(long runId, bool eager) : IDisposable
 {
+    private const int DefaultDepth = 6;
+    private const int EagerDepth = 20;
+    private int DepthLimit => eager ? EagerDepth : DefaultDepth;
     private readonly Dictionary<string, (object Value, View View)> handles = [];
     private readonly HashSet<View> views = [];
     private readonly Dictionary<string, (View Owner, View Current)> liveViews = [];
@@ -87,7 +90,7 @@ internal sealed class DumpSession(long runId) : IDisposable
     private object Node(object? value, int depth, Budget budget, HashSet<object> path, bool cell = false, string? nodeId = null)
     {
         var id = nodeId ?? Id();
-        if (value is not null && !IsScalar(value) && (depth >= 6 || budget.Remaining <= 1))
+        if (value is not null && !IsScalar(value) && (depth >= DepthLimit || budget.Remaining <= 1))
             return Lazy(value, budget.View, id);
         budget.Remaining--;
         if (value is null) return new { id, kind = "null" };
@@ -102,7 +105,7 @@ internal sealed class DumpSession(long runId) : IDisposable
             return new { id, kind = "string", v = text[..Math.Min(text.Length, limit)], type = value.GetType().ToString(), truncated = text.Length > limit, total = text.Length };
         }
         if (value is Exception exception) return Error(exception, budget, id);
-        if (cell && !IsScalar(value)) return Lazy(value, budget.View, id);
+        if (cell && !IsScalar(value) && !eager) return Lazy(value, budget.View, id);
         if (value is HtmlValue html)
         {
             var length = Math.Min(html.Html.Length, Math.Max(0, budget.Characters));
@@ -138,7 +141,12 @@ internal sealed class DumpSession(long runId) : IDisposable
             finally { path.Remove(live); }
         }
         if (value is DatabaseRows databaseRows) return DatabaseTable(databaseRows, 0, PageSize, depth, budget, path, id);
-        if (value is PropertyValue) return Lazy(value, budget.View, id);
+        if (value is PropertyValue property)
+        {
+            if (!eager) return Lazy(value, budget.View, id);
+            try { return Node(property.Read(), depth, budget, path, cell, id); }
+            catch (Exception error) { return Error(error, budget, id); }
+        }
         if (!path.Add(value)) return new { id, kind = "string", v = "<cycle>", type = value.GetType().ToString() };
         try
         {
@@ -149,8 +157,9 @@ internal sealed class DumpSession(long runId) : IDisposable
         finally { path.Remove(value); }
     }
 
-    // Do not invoke ToString, indexers, static members or property getters when
-    // discovering an object. A property gets its own explicit lazy handle.
+    // Do not invoke ToString, indexers or static members when discovering an
+    // object. A property gets its own explicit lazy handle unless the host
+    // asked for eager text dumps.
     private static MemberInfo[] Members(Type type) => type.GetMembers(BindingFlags.Instance | BindingFlags.Public)
         .Where(member => member is FieldInfo || member is PropertyInfo { GetMethod.IsPublic: true } property && property.GetIndexParameters().Length == 0)
         .OrderBy(member => member.Name, StringComparer.Ordinal).ToArray();

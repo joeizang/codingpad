@@ -27,6 +27,13 @@ Python exposes them through `secret("name")`, C# through `Secret("name")`. They
 are never written to stdout/stderr or included in dumps unless a script chooses
 to do so.
 
+`params.eager` is an optional boolean for hosts without an expand gesture, such
+as `cpad run`. When true, kernels materialise values they would otherwise leave
+lazy: C# properties are read during the dump (a getter failure becomes an error
+node), non-scalar table cells are inspected, and Python's depth limit rises from
+six to twenty levels. Cycle detection, node budgets, table pages and path
+expansion are unchanged. The desktop omits the flag and keeps deferred dumps.
+
 A new globals dictionary includes `dump`, `cache`, `__name__ = "__main__"`, a virtual
 `__file__` and a copy of builtins. Imported modules remain cached in the process.
 The script is registered as `__main__` for dataclasses and other module-aware

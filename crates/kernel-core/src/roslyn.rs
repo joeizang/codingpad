@@ -77,8 +77,10 @@ pub(crate) fn find(data_dir: Option<&Path>, dotnet: &Path) -> Result<Roslyn, Str
                         .is_some_and(|name| name.starts_with("ms-dotnettools.csharp"))
                 })
                 .collect();
-            installed.sort();
-            for extension in installed.into_iter().rev() {
+            // Newest first. Compare versions numerically: as text,
+            // "csharp-2.160.4" sorts after "csharp-11.9.41".
+            installed.sort_by_key(|path| std::cmp::Reverse(extension_version(path)));
+            for extension in installed {
                 candidates.extend(server_files(&extension.join(".roslyn")));
             }
         }
@@ -89,6 +91,22 @@ pub(crate) fn find(data_dir: Option<&Path>, dotnet: &Path) -> Result<Roslyn, Str
         }
     }
     Err("The Roslyn language server was not found. Install the C# extension in VS Code, or set CODINGPAD_ROSLYN_LSP to Microsoft.CodeAnalysis.LanguageServer.".to_owned())
+}
+
+/// The version in a VS Code extension folder name such as
+/// `ms-dotnettools.csharp-11.9.41-linux-x64`, as numbers for ordering.
+fn extension_version(path: &Path) -> Vec<u64> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("ms-dotnettools.csharp-"))
+        .and_then(|rest| rest.split('-').next())
+        .map(|version| {
+            version
+                .split('.')
+                .map(|part| part.parse().unwrap_or(0))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn server_files(directory: &Path) -> Vec<PathBuf> {
@@ -152,6 +170,27 @@ mod tests {
             .collect();
         assert!(args.contains(&"--stdio".to_owned()));
         assert!(args.contains(&"--autoLoadProjects".to_owned()));
+    }
+
+    #[test]
+    fn extension_versions_order_numerically() {
+        let mut folders = [
+            "ms-dotnettools.csharp-2.160.4-linux-x64",
+            "ms-dotnettools.csharp-11.9.41-linux-x64",
+            "ms-dotnettools.csharp-11.10.2-win32-x64",
+            "ms-dotnettools.csharp-unexpected",
+        ]
+        .map(PathBuf::from);
+        folders.sort_by_key(|path| std::cmp::Reverse(extension_version(path)));
+        assert_eq!(
+            folders.map(|path| path.to_string_lossy().into_owned()),
+            [
+                "ms-dotnettools.csharp-11.10.2-win32-x64",
+                "ms-dotnettools.csharp-11.9.41-linux-x64",
+                "ms-dotnettools.csharp-2.160.4-linux-x64",
+                "ms-dotnettools.csharp-unexpected",
+            ]
+        );
     }
 
     #[test]

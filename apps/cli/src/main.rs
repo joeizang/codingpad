@@ -1,0 +1,63 @@
+use std::{env, path::PathBuf, process::ExitCode};
+
+const USAGE: &str = "\
+Usage: cpad run <script>
+
+Run a CodingPad script from the terminal and print its dumps as text.
+Supports Python (.py), C# (.cs) and SQL (.sql) scripts. A SQL script needs a
+\"-- codingpad: connection=<name>\" header.
+
+Environment:
+  CODINGPAD_DATA_DIR  Override the CodingPad data folder (connections, secrets
+                      and private toolchains).
+
+Exit codes: 0 success, 1 script failure, 2 usage or script type error,
+            130 stopped by Ctrl-C.
+";
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let mut args = env::args_os().skip(1);
+    let Some(command) = args.next() else {
+        eprint!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    match command.to_str() {
+        Some("run") => {
+            let Some(script) = args.next() else {
+                eprintln!("cpad run needs a script path.\n");
+                eprint!("{USAGE}");
+                return ExitCode::from(2);
+            };
+            if args.next().is_some() {
+                eprintln!("cpad run takes one script at a time.\n");
+                eprint!("{USAGE}");
+                return ExitCode::from(2);
+            }
+            ExitCode::from(run(PathBuf::from(script)).await as u8)
+        }
+        Some("-h" | "--help" | "help") => {
+            print!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        Some("-V" | "--version" | "version") => {
+            println!("cpad {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        Some(other) => {
+            eprintln!("Unknown command \"{other}\".\n");
+            eprint!("{USAGE}");
+            ExitCode::from(2)
+        }
+        None => {
+            // A non-UTF-8 command can never be a valid command name.
+            eprintln!("Unknown command {:?}.\n", command);
+            eprint!("{USAGE}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+async fn run(script: PathBuf) -> i32 {
+    cpad::run_file(&script).await
+}

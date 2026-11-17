@@ -10,6 +10,7 @@ mod roslyn;
 pub mod secrets;
 mod shadow;
 pub mod store;
+pub mod text;
 pub mod toolchains;
 
 use packages::Packages;

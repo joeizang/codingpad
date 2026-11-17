@@ -5,9 +5,10 @@ platforms are Linux and Windows; macOS is deferred and was not run. The owner's
 sign-off is still outstanding (see [Still to do](#still-to-do)).
 
 Code under test: master `7d44a60` (all of M3.0–M3.9 and M3.11 merged), plus
-the `vault` test added with this record. M3.10 export (#93) and the
-data-context follow-ups (#91) were open PRs. Their own live runs are recorded
-in those PRs and are summarised [below](#open-m3-prs).
+the `vault` test added with this record. M3.10 export (#93), the data-context
+follow-ups (#91) and the Roslyn discovery fix (#95) were merged during the close
+and are summarised [below](#m3-prs-merged-during-the-close). The Windows run
+tested the tree with all of them merged.
 
 ## Environment
 
@@ -28,11 +29,11 @@ in those PRs and are summarised [below](#open-m3-prs).
 
 ## Scope items
 
-| #48 item | Linux result |
+| #48 item | Result |
 |---|---|
 | SQL, `db` client and data context paths against real SQLite, PostgreSQL and SQL Server | **Pass**: every live test below |
-| Vault-backed secrets work | **Pass** on Linux and Windows; macOS deferred (D62). See [Windows](#windows) for a VM-only caveat |
-| `just bench` still passes | **Not clean**: C# completion fails 0/3, see [findings](#findings) |
+| Vault-backed secrets work | **Pass** on Linux and Windows; macOS deferred (D62) |
+| `just bench` still passes | **Every target passes on Linux**, but idle memory and app usable sit at their limits and fail an occasional repetition (#96); see [`just bench`](#just-bench) |
 | `just check` passes in a Windows VM | **Pass**, see [Windows](#windows) |
 
 ### Databases
@@ -72,11 +73,12 @@ Linux against Secret Service:
 cargo test -p codingpad-kernel-core --test vault -- --ignored
 ```
 
-Run the same command in the Windows VM to cover Credential Manager.
+It also passed against Credential Manager on Windows (see [Windows](#windows)).
 
 ### `just bench`
 
-Three sequential release-build repetitions, warm OS caches, desktop in normal use:
+**First run, 16 November**: three sequential release-build repetitions, warm OS
+caches, desktop in normal use. C# completion could not be measured (finding 1):
 
 | Metric | Target | Run 1 | Run 2 | Run 3 | Passed |
 |---|---|---|---|---|---|
@@ -90,6 +92,28 @@ Three sequential release-build repetitions, warm OS caches, desktop in normal us
 | Warm C# rerun after an edit | < 500 ms | 41.0 ms | 38.5 ms | 37.7 ms | 3/3 |
 | 100k-item `IEnumerable`, first page to host | < 1000 ms | 352.9 ms | 288.3 ms | 271.0 ms | 3/3 |
 | C# completion | < 300 ms | not measured **FAIL** | not measured **FAIL** | not measured **FAIL** | 0/3 |
+
+**Final run, 17 November**, after updating the C# extension to 11.9.41 and
+fixing CodingPad's Roslyn discovery (#95), with no `CODINGPAD_ROSLYN_LSP`
+override. The Windows VM was paused so the host was quiet:
+
+| Metric | Target | Run 1 | Run 2 | Run 3 | Passed |
+|---|---|---|---|---|---|
+| App usable | < 1000 ms | 1001.5 ms **FAIL** | 978.9 ms | 986.8 ms | 2/3 |
+| Idle physical footprint | < 475 MiB | 466.6 MiB | 478.0 MiB **FAIL** | 469.1 MiB | 2/3 |
+| First Python kernel start | < 3000 ms | 51.7 ms | 49.7 ms | 54.9 ms | 3/3 |
+| Warm Python rerun | < 200 ms | 0.7 ms | 0.6 ms | 1.9 ms | 3/3 |
+| 100k-row dump, first page to host | < 1000 ms | 1.3 ms | 0.9 ms | 1.5 ms | 3/3 |
+| Python completion | < 300 ms | 248.9 ms | 253.3 ms | 249.7 ms | 3/3 |
+| First C# kernel start | < 3000 ms | 1179.9 ms | 1148.0 ms | 1156.9 ms | 3/3 |
+| Warm C# rerun after an edit | < 500 ms | 37.1 ms | 37.5 ms | 37.1 ms | 3/3 |
+| 100k-item `IEnumerable`, first page to host | < 1000 ms | 280.8 ms | 305.6 ms | 278.1 ms | 3/3 |
+| C# completion | < 300 ms | 36.0 ms | 52.2 ms | 42.3 ms | 3/3 |
+
+Across all 15 quiet-host repetitions on 17 November, app usable ranged
+947–1003 ms and idle memory 457–484 MiB. The memory spread is bimodal and comes
+entirely from the desktop host process, which idles at either ~81 MiB or
+~98 MiB (#96).
 
 ## Windows
 
@@ -126,55 +150,51 @@ and an 8-vCPU/16 GiB run (11.6 min, warm caches):
 | SQL Server and PostgreSQL round trip and cancel | 2 passed |
 | Data contexts on SQLite, PostgreSQL and SQL Server, both languages | 8 passed |
 | PostgreSQL enum arrays (Python) | 1 passed |
-| Real-vault round trip (Credential Manager) into both kernels | Passed on the 4-vCPU boot; see below |
+| Real-vault round trip (Credential Manager) into both kernels | Passed; see below |
 
-**Vault caveat (VM environment, not CodingPad).** After the VM was resized to
-8 vCPUs and 16 GiB, Windows logged Credential Guard auto-enablement
-(LsaSrv 6156) and started LSASS as a protected process. Earlier boots logged
-neither. From then on, Windows refused every persistent credential for the
-password-less `joseph` account with `ERROR_NO_SUCH_LOGON_SESSION` (1312). A
-direct `CredWriteW` from PowerShell failed the same way with both enterprise and
-local-machine persistence; only session persistence worked. Signing out and in
-again did not help. CodingPad handled it as designed: the vault was reported
-unavailable, nothing was changed, and session-only storage was offered. The same
-test binary passed against Credential Manager on the earlier boot. Giving the VM
-account a password, or turning LSA protection off in the VM, should restore it.
+**How to run the vault test on Windows.** Start it from the signed-in user's
+desktop (for example Win+R or a terminal), not from a scheduled task. On the
+resized VM, a scheduled task registered with the user's interactive principal
+had no credential set: `CredWriteW` failed with `ERROR_NO_SUCH_LOGON_SESSION`
+(1312) for enterprise and local-machine persistence, even when called directly
+from PowerShell, while the same call from the desktop session succeeded.
+Turning LSA protection off made no difference, and it was restored afterwards.
+Run from the desktop, the vault round trip passed (4.7 s). CodingPad itself
+behaved correctly in the failing context: it reported the vault as unavailable,
+changed nothing, and offered session-only storage.
 
 ## Findings
 
-1. **C# completion cannot be measured on this machine (environment, not a code
-   regression).** Roslyn answers completion requests but never offers the
-   `Dump` helper within the 90 s warm-up, and reports only syntax errors. That
-   matches Roslyn failing to load the shadow project and treating the script as
-   a loose file. The same failure happens at `fb2dfb2`, the commit the
-   2026-11-04 benchmark passed on (25–30 ms then), so M3 did not cause it. What
-   changed in between: the system .NET SDK was upgraded on 2026-11-11, while
-   Roslyn still comes from the September C# extension (2.160.4). Suggested
-   next step: update the VS Code C# extension (or point `CODINGPAD_ROSLYN_LSP` at a
-   current server) and rerun `just bench`. If it still fails, open an issue.
-2. **The first repetition is slower.** App usable (1.63 s) and Python completion
-   (370 ms) failed only on run 1. Runs 2 and 3 passed with little margin (978 ms
-   and 983 ms against 1 s). Idle memory passes with 7 MiB to spare against the
-   475 MiB limit (D61).
+1. **C# completion: fixed (#95).** After the system .NET SDK upgrade on
+   2026-11-11, Roslyn from the September C# extension (2.160.4) stopped loading
+   the shadow project, so completion never offered `Dump`. The same failure
+   reproduced at `fb2dfb2`, so M3 didn't cause it. Updating the extension to
+   11.9.41 was not enough on its own: CodingPad sorted extension folders as
+   text and kept choosing 2.160.4. #95 orders them by version, and C# completion
+   now measures 36–52 ms.
+2. **Idle memory and app usable sit at their limits (#96).** On a quiet host,
+   app usable ranged 947–1003 ms against 1 s. Idle memory ranged 457–484 MiB
+   against 475 MiB, because the desktop host process idles at either ~81 MiB
+   or ~98 MiB after the benchmark's warm-up work. Launched on its own, it stays
+   at ~81 MiB. With the Windows VM running alongside, app usable reached 1.16 s.
 3. **A flaky test in `just check`.** `supervisor::stop_and_close_cancel_package_preparation`
    times out intermittently in full Linux workspace runs, including on plain
    master, and passes alone (#92). It passed in both Windows runs.
-4. **Persistent Credential Manager entries can be refused** for a password-less
-   Windows account once LSA protection is on (see [Windows](#windows)). That's
-   an environment limit that CodingPad already reports clearly. Real users'
-   accounts normally have a password or PIN.
+4. **Run the Windows vault test from the desktop session.** In a scheduled
+   task, Windows gave the process no credential set (see [Windows](#windows)).
 
-## Open M3 PRs
+## M3 PRs merged during the close
 
 | PR | What its live runs showed |
 |---|---|
 | #91 (#90): generated columns, conditional NodaTime | All 9 data-context live tests pass on Postgres 17, SQL Server 2022 and SQLite, including generated columns read back after updates |
 | #93 (#46): CSV/Excel export | 100k rows export completely to CSV and XLSX from Python (0.81 s) and C# (0.60 s); cancel, failure and SQL export paths covered |
+| #95: Roslyn discovery picks the newest C# extension | C# completion 36–52 ms in `just bench` |
 
 ## Still to do
 
 - [x] Windows VM: `just check` (function only, D42).
-- [x] Windows VM: `cargo test -p codingpad-kernel-core --test vault -- --ignored` (Credential Manager), on the 4-vCPU boot.
-- [ ] Linux: rerun `just bench` after updating Roslyn (finding 1).
-- [ ] Merge #91 and #93.
-- [ ] Owner sign-off.
+- [x] Windows VM: `cargo test -p codingpad-kernel-core --test vault -- --ignored` (Credential Manager).
+- [x] Linux: rerun `just bench` after updating Roslyn (finding 1, #95).
+- [x] Merge #91, #93 and #95.
+- [ ] Owner sign-off, including whether the benchmark margins in #96 block M3.

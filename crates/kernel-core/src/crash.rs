@@ -22,12 +22,16 @@ pub const NEW_ISSUE_URL: &str = "https://github.com/joeizang/codingpad/issues/ne
 /// The crash file left behind by a panic, relative to the app data folder.
 pub const PENDING_FILE: &str = "pending-crash.json";
 
-/// Long error text is cut here so a report stays readable and a link stays
-/// usable in a browser.
+/// Long error text is cut here so a report stays readable.
 const MAX_MESSAGE: usize = 2_000;
 const MAX_LOCATION: usize = 300;
 const MAX_BACKTRACE: usize = 4_000;
 const MAX_TITLE: usize = 80;
+
+/// Browsers and servers disagree about long request lines; stay well under the
+/// smallest common limit. A report that would be longer drops its backtrace,
+/// then keeps only a short message, rather than producing an unusable link.
+const MAX_URL: usize = 7_000;
 
 /// The error details a report may carry. Nothing else is included.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +123,25 @@ pub fn environment(version: &str) -> CrashEnvironment {
 /// shows the link and the user decides whether to submit it.
 pub fn report(details: &CrashDetails, environment: &CrashEnvironment) -> CrashReport {
     let details = details.clone().normalized();
+    let report = compose(&details, environment);
+    if report.url.len() <= MAX_URL {
+        return report;
+    }
+    // The backtrace is the longest part. The message and position still
+    // identify the crash, so drop it before giving up on the link.
+    let mut shorter = details.clone();
+    shorter.backtrace = None;
+    let report = compose(&shorter, environment);
+    if report.url.len() <= MAX_URL {
+        return report;
+    }
+    // An unusually long or non-ASCII message: keep a readable prefix.
+    shorter.message = limited(&shorter.message, 300);
+    compose(&shorter, environment)
+}
+
+/// Lay out one issue with exactly the details it is given.
+fn compose(details: &CrashDetails, environment: &CrashEnvironment) -> CrashReport {
     let title = format!(
         "Crash report: {}",
         limited(first_line(&details.message), MAX_TITLE)
@@ -307,6 +330,24 @@ mod tests {
         assert!(report.title.chars().count() <= MAX_TITLE + "Crash report: ".len());
         assert!(report.body.contains('…'));
         assert!(report.body.chars().count() < 9_000);
+    }
+
+    #[test]
+    fn a_report_too_long_for_a_link_drops_the_backtrace_first() {
+        let details = CrashDetails::new("boom", Some("a.rs:1:1".into()), Some("z\n".repeat(3_000)));
+        let report = report(&details, &build());
+        assert!(report.url.len() <= MAX_URL);
+        assert!(report.body.contains("boom"));
+        assert!(report.body.contains("a.rs:1:1"));
+        assert!(!report.body.contains("z\nz\n"));
+    }
+
+    #[test]
+    fn a_non_ascii_message_is_shortened_to_fit() {
+        let details = CrashDetails::new("é".repeat(2_000), None, None);
+        let report = report(&details, &build());
+        assert!(report.url.len() <= MAX_URL);
+        assert!(report.body.contains('é'));
     }
 
     #[test]

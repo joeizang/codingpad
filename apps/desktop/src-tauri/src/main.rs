@@ -507,7 +507,7 @@ fn main() {
             let secrets = Arc::new(SecretStore::new(&data_dir));
             app.manage(secrets.clone());
             let connections = Arc::new(ConnectionStore::new(&data_dir));
-            if let Err(error) = samples::prepare(&data_dir, &connections) {
+            if let Err(error) = samples::ensure_database(&data_dir) {
                 eprintln!("CodingPad could not prepare the sample database: {error}");
             }
             app.manage(connections.clone());

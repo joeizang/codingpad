@@ -1,4 +1,4 @@
-// codingpad: connection=sample
+// codingpad: connection=codingpad-sample
 
 // Query the sample database
 

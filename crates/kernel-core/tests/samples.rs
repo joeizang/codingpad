@@ -17,7 +17,7 @@ use tokio::time::timeout;
 
 fn manager(directory: &std::path::Path) -> (Arc<ConnectionStore>, SqlManager) {
     let connections = Arc::new(ConnectionStore::new(directory));
-    samples::prepare(directory, &connections).expect("prepare the sample database");
+    samples::ensure_database(directory).expect("prepare the sample database");
     let sql = SqlManager::new(connections.clone(), Arc::new(SecretStore::new(directory)));
     (connections, sql)
 }
@@ -29,6 +29,7 @@ fn every_sample_is_listed_with_runnable_source() {
         samples.len() >= 30,
         "expected about 10 samples per language"
     );
+    let mut ids = std::collections::HashSet::new();
     for language in [
         SampleLanguage::Python,
         SampleLanguage::Csharp,
@@ -47,6 +48,17 @@ fn every_sample_is_listed_with_runnable_source() {
             "{} has no source",
             sample.id
         );
+        assert!(
+            ids.insert(sample.id.clone()),
+            "duplicate sample id {}",
+            sample.id
+        );
+        let expected = match sample.language {
+            SampleLanguage::Python => ".py",
+            SampleLanguage::Csharp => ".cs",
+            SampleLanguage::Sql => ".sql",
+        };
+        assert!(sample.name.ends_with(expected), "{}", sample.name);
     }
 }
 
@@ -60,7 +72,7 @@ async fn sql_samples_run_against_the_bundled_database() {
     {
         let result = timeout(
             Duration::from_secs(30),
-            sql.run(sample.id, sample.source, None),
+            sql.run(&sample.id, sample.source, None),
         )
         .await
         .unwrap_or_else(|_| panic!("{} timed out", sample.id))
@@ -98,7 +110,7 @@ async fn every_sample_runs_end_to_end() {
             sample
                 .source
                 .to_ascii_lowercase()
-                .contains("connection=sample")
+                .contains("connection=codingpad-sample")
         });
         let script_id = format!("{expected:?}-samples");
         for sample in scripts {
@@ -129,7 +141,7 @@ async fn every_sample_runs_end_to_end() {
     {
         let result = timeout(
             Duration::from_secs(30),
-            sql.run(sample.id, sample.source, None),
+            sql.run(&sample.id, sample.source, None),
         )
         .await
         .unwrap_or_else(|_| panic!("{} timed out", sample.id))

@@ -13,6 +13,7 @@ import {
 type SidebarProps = {
   settings: LibrarySettings | null;
   samples: Sample[];
+  samplesError?: string;
   activePath?: string;
   activeSample?: string;
   refresh: number;
@@ -187,6 +188,7 @@ function SampleGroup({
 export function Sidebar({
   settings,
   samples,
+  samplesError,
   activePath,
   activeSample,
   refresh,
@@ -208,10 +210,16 @@ export function Sidebar({
           {error}
         </div>
       )}
-      {samples.length > 0 && (
+      {(samples.length > 0 || samplesError) && (
         <section className="sidebar-section">
           <h2>Samples</h2>
-          <div className="tree-status">Opening one makes an unsaved copy.</div>
+          {samplesError ? (
+            <div className="tree-error" role="alert">
+              {samplesError}
+            </div>
+          ) : (
+            <div className="tree-status">Opening one makes an unsaved copy.</div>
+          )}
           {groupSamples(samples).map((group) => (
             <SampleGroup
               key={group.language}

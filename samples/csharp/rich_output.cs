@@ -6,7 +6,7 @@ progress.Dump();
 new HtmlValue(
     "<h2>Daily summary</h2>"
     + "<p><strong>Orders:</strong> 10</p>"
-    + "<p><strong>Revenue:</strong> &pound;412.50</p>"
+    + "<p><strong>Revenue:</strong> &pound;625.00</p>"
     + "<ul><li>Coffee</li><li>Tea</li><li>Equipment</li></ul>"
 ).Dump();
 

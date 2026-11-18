@@ -1,4 +1,4 @@
--- codingpad: connection=sample
+-- codingpad: connection=codingpad-sample
 
 -- Monthly sales
 

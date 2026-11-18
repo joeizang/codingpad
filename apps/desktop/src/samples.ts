@@ -10,8 +10,14 @@ export type Sample = {
 
 export const SAMPLE_LANGUAGES: SampleLanguage[] = ["python", "csharp", "sql"];
 
-export function sampleLanguageLabel(language: SampleLanguage): string {
-  return language === "csharp" ? "C#" : language === "python" ? "Python" : "SQL";
+export function languageLabel(language: string): string {
+  return language === "csharp"
+    ? "C#"
+    : language === "python"
+      ? "Python"
+      : language === "sql"
+        ? "SQL"
+        : "Text";
 }
 
 export function groupSamples(samples: Sample[]): Array<{
@@ -21,7 +27,7 @@ export function groupSamples(samples: Sample[]): Array<{
 }> {
   return SAMPLE_LANGUAGES.map((language) => ({
     language,
-    label: sampleLanguageLabel(language),
+    label: languageLabel(language),
     samples: samples.filter((sample) => sample.language === language),
   })).filter((group) => group.samples.length > 0);
 }

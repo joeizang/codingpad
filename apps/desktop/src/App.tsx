@@ -34,7 +34,7 @@ import {
   type LibrarySettings,
   type ScriptFile,
 } from "./library";
-import type { Sample } from "./samples";
+import { languageLabel, type Sample } from "./samples";
 
 const SAMPLE = `from codingpad import dump
 
@@ -55,7 +55,7 @@ await Task.Delay(10);
 Enumerable.Range(1, 10).Sum();
 `;
 
-const SQL_SAMPLE = `-- codingpad: connection=sample
+const SQL_SAMPLE = `-- codingpad: connection=codingpad-sample
 
 SELECT 1 AS answer;
 `;
@@ -74,9 +74,6 @@ const scriptLanguage = (script: Script) => {
   if (/\.sql$/i.test(name)) return "sql";
   return "plaintext";
 };
-
-const languageLabel = (language: string) =>
-  language === "csharp" ? "C#" : language === "python" ? "Python" : language === "sql" ? "SQL" : "Text";
 
 type Script = {
   id: string;
@@ -132,6 +129,7 @@ export default function App() {
   });
   const [settings, setSettings] = useState<LibrarySettings | null>(null);
   const [samples, setSamples] = useState<Sample[]>([]);
+  const [samplesError, setSamplesError] = useState<string | undefined>();
   const [libraryError, setLibraryError] = useState<string | undefined>();
   const [refresh, setRefresh] = useState(0);
   const counter = useRef(1);
@@ -168,10 +166,13 @@ export default function App() {
     let cancelled = false;
     invoke<Sample[]>("list_samples")
       .then((loaded) => {
-        if (!cancelled && Array.isArray(loaded)) setSamples(loaded);
+        if (!cancelled && Array.isArray(loaded)) {
+          setSamples(loaded);
+          setSamplesError(undefined);
+        }
       })
       .catch((error) => {
-        if (!cancelled) setLibraryError(String(error));
+        if (!cancelled) setSamplesError(String(error));
       });
     return () => {
       cancelled = true;
@@ -895,6 +896,7 @@ export default function App() {
         <Sidebar
           settings={settings}
           samples={samples}
+          samplesError={samplesError}
           activePath={active.path}
           activeSample={active.sample}
           refresh={refresh}

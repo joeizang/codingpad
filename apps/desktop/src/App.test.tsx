@@ -123,9 +123,11 @@ test("Run renders streamed text, structured dumps and completion", async () => {
 });
 
 test("startup failure is visible and Run becomes available again", async () => {
-  invoke.mockRejectedValue(
-    "uv was not found. Install uv and restart CodingPad.",
-  );
+  invoke.mockImplementation(async (command: string) => {
+    if (command === "run_script")
+      throw "uv was not found. Install uv and restart CodingPad.";
+    return undefined;
+  });
   render(<App />);
   fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
   expect(await screen.findByRole("alert")).toHaveTextContent(
@@ -798,6 +800,21 @@ test("samples open as unsaved copies and keep their original source", async () =
   expect(screen.getByLabelText("Code")).toHaveValue("print('my copy')");
 });
 
+test("a failed sample list is reported in the Samples section", async () => {
+  invoke.mockImplementation(async (command: string) => {
+    if (command === "load_library_settings")
+      return { libraryPath: "/library", pinnedFolders: [] };
+    if (command === "list_folder") return [];
+    if (command === "list_samples") throw "Could not list samples";
+    return undefined;
+  });
+  render(<App />);
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Could not list samples",
+  );
+  expect(screen.getByRole("heading", { name: "Samples" })).toBeInTheDocument();
+});
+
 test("a failed refresh shows an error but keeps the last tree", async () => {
   let listings = 0;
   invoke.mockImplementation(async (command, args) => {
@@ -965,7 +982,7 @@ test("SQL tabs run through the direct connection and render table results", asyn
   expect(
     invoke.mock.calls.filter(([command]) => command === "run_sql"),
   ).toHaveLength(1);
-  expect(invoke).toHaveBeenCalledWith("connection_schema", { name: "sample" });
+  expect(invoke).toHaveBeenCalledWith("connection_schema", { name: "codingpad-sample" });
   expect(await screen.findByRole("button", { name: /main.sample_table/ })).toBeInTheDocument();
   expect(screen.getByText("42")).toBeInTheDocument();
   expect(screen.getByText("Finished")).toBeInTheDocument();

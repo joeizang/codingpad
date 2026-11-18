@@ -172,7 +172,10 @@ pub fn ensure_database(data_dir: &Path) -> Result<PathBuf, String> {
         .and_then(|()| temp.as_file().sync_all())
         .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
     match temp.persist_noclobber(&path) {
-        Ok(_) => Ok(path),
+        Ok(_) => {
+            remove_old_databases(&directory);
+            Ok(path)
+        }
         // Another app or `cpad` process created the file first.
         Err(_) if path.exists() => Ok(path),
         Err(error) => Err(format!(
@@ -181,6 +184,37 @@ pub fn ensure_database(data_dir: &Path) -> Result<PathBuf, String> {
             error.error
         )),
     }
+}
+
+/// Remove databases from earlier bundled versions after a new version has
+/// been written. Failures are ignored: another process may still have an old
+/// file open, especially on Windows.
+fn remove_old_databases(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == SAMPLE_DATABASE_FILE || !is_versioned_database(&name) {
+            continue;
+        }
+        let path = entry.path();
+        if fs::remove_file(&path).is_ok() {
+            for suffix in ["-journal", "-wal", "-shm"] {
+                let _ = fs::remove_file(directory.join(format!("{name}{suffix}")));
+            }
+        }
+    }
+}
+
+fn is_versioned_database(name: &str) -> bool {
+    let Some(version) = name
+        .strip_prefix("sample-v")
+        .and_then(|rest| rest.strip_suffix(".sqlite"))
+    else {
+        return false;
+    };
+    !version.is_empty() && version.chars().all(|character| character.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -235,6 +269,29 @@ mod tests {
                 .join(format!("{SAMPLE_DATABASE_FILE}{suffix}"))
                 .exists());
         }
+    }
+
+    #[test]
+    fn old_bundled_versions_are_removed_after_a_new_one_is_written() {
+        let directory = tempfile::tempdir().unwrap();
+        let samples = directory.path().join("samples");
+        fs::create_dir_all(&samples).unwrap();
+        for name in [
+            "sample-v2.sqlite",
+            "sample-v2.sqlite-wal",
+            "sample-v10.sqlite",
+            "notes.sqlite",
+            "sample-v2.backup",
+        ] {
+            fs::write(samples.join(name), b"old").unwrap();
+        }
+        ensure_database(directory.path()).unwrap();
+        assert!(!samples.join("sample-v2.sqlite").exists());
+        assert!(!samples.join("sample-v2.sqlite-wal").exists());
+        assert!(!samples.join("sample-v10.sqlite").exists());
+        assert!(samples.join(SAMPLE_DATABASE_FILE).exists());
+        assert!(samples.join("notes.sqlite").exists());
+        assert!(samples.join("sample-v2.backup").exists());
     }
 
     #[test]

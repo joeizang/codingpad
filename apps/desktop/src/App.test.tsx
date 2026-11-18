@@ -251,7 +251,8 @@ test("many stream fragments flush once per animation frame and at completion", a
     if (
       command === "load_library_settings" ||
       command === "list_samples" ||
-      command === "check_for_update"
+      command === "check_for_update" ||
+      command === "take_pending_crash"
     )
       return Promise.resolve(undefined);
     channel = args.onEvent;
@@ -401,7 +402,8 @@ test("live updates share the animation-frame batch instead of re-rendering each"
     if (
       command === "load_library_settings" ||
       command === "list_samples" ||
-      command === "check_for_update"
+      command === "check_for_update" ||
+      command === "take_pending_crash"
     )
       return Promise.resolve(undefined);
     channel = args.onEvent;

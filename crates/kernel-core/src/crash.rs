@@ -240,7 +240,7 @@ pub fn install_panic_hook(data_dir: PathBuf) {
 mod tests {
     use super::*;
 
-    fn environment() -> CrashEnvironment {
+    fn build() -> CrashEnvironment {
         CrashEnvironment {
             version: "0.1.0".into(),
             platform: "linux".into(),
@@ -258,12 +258,9 @@ mod tests {
 
     #[test]
     fn a_report_holds_the_version_platform_and_error_only() {
-        let details = CrashDetails::new(
-            "index out of bounds",
-            Some("src/main.rs:42:9".into()),
-            None,
-        );
-        let report = report(&details, &environment());
+        let details =
+            CrashDetails::new("index out of bounds", Some("src/main.rs:42:9".into()), None);
+        let report = report(&details, &build());
         assert!(report.url.starts_with(NEW_ISSUE_URL));
         let query = query(&report);
         assert_eq!(query["labels"], "bug");
@@ -281,7 +278,7 @@ mod tests {
         // The builder only sees the details it is given. A secret that lives in
         // a script, a connection or the vault is nowhere in its input.
         let details = CrashDetails::new("the window could not be created", None, None);
-        let report = report(&details, &environment());
+        let report = report(&details, &build());
         let everything = format!("{}\n{}", report.title, report.body);
         for absent in [
             "def main(",
@@ -290,7 +287,10 @@ mod tests {
             "secret(",
             "SELECT * FROM",
         ] {
-            assert!(!everything.contains(absent), "{absent} leaked into {everything}");
+            assert!(
+                !everything.contains(absent),
+                "{absent} leaked into {everything}"
+            );
         }
     }
 
@@ -302,7 +302,7 @@ mod tests {
             Some(format!("{}:1:1", "y".repeat(1_000))),
             Some("z".repeat(9_000)),
         );
-        let report = report(&details, &environment());
+        let report = report(&details, &build());
         assert_eq!(report.title, "Crash report: first line");
         assert!(report.title.chars().count() <= MAX_TITLE + "Crash report: ".len());
         assert!(report.body.contains('…'));
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn an_empty_message_still_reads_sensibly() {
-        let report = report(&CrashDetails::default(), &environment());
+        let report = report(&CrashDetails::default(), &build());
         assert!(report.title.contains("unexpected error"));
         assert!(report.body.contains("unexpected error"));
     }
@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn backticks_in_the_error_cannot_break_the_code_block() {
         let details = CrashDetails::new("a ``` fence", None, None);
-        let report = report(&details, &environment());
+        let report = report(&details, &build());
         assert!(report.body.contains("````\na ``` fence\n````"));
     }
 
@@ -351,6 +351,9 @@ mod tests {
 
     #[test]
     fn the_environment_line_names_the_platform_and_arch() {
-        assert_eq!(environment("0.1.0").platform_line(), "linux (x86_64)");
+        assert_eq!(
+            super::environment("0.1.0").platform_line(),
+            "linux (x86_64)"
+        );
     }
 }

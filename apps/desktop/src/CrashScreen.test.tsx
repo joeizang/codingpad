@@ -63,7 +63,7 @@ test("technical details sit behind a summary", () => {
     />,
   );
   expect(screen.getByText("Technical details").tagName).toBe("SUMMARY");
-  const details = screen.getByText("main.rs:42:9").closest("details");
+  const details = screen.getByText(/main\.rs:42:9/).closest("details");
   expect(details).not.toBeNull();
 });
 

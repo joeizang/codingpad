@@ -14,9 +14,9 @@ Results.
 ## Install a build (M4.5)
 
 Releases are published on GitHub Releases as installers built locally on their
-own platform (D29, D39): an AppImage, a `.deb` and an `.rpm` on Linux, an NSIS
-setup on Windows, and a `.dmg` on macOS. Early builds are unsigned (D30), and
-macOS installers are deferred for now (D62).
+own platform (D29, D39): an AppImage, a `.deb` and an `.rpm` on Linux, and an
+NSIS setup on Windows. Early builds are unsigned (D30). macOS installers are
+deferred (D62), so no `.dmg` is published yet.
 
 Build the installer for the machine you are on:
 
@@ -25,13 +25,16 @@ just bundle
 ```
 
 The installers land in `target/release/bundle/` (`appimage/`, `deb/`, `rpm/`,
-`nsis/`, `dmg/`). The app embeds its Python and C# kernels, so an installer is
+`nsis/`). The app embeds its Python and C# kernels, so an installer is
 self-contained; it does not include Python, the .NET SDK or `uv`. A first run
 offers **Install uv and run** or **Install .NET and run** when a toolchain is
 missing, or uses one you already have.
 
-`packaging/app-icon.png` is the icon source. Regenerate the platform icons with
-`npm --prefix apps/desktop run tauri -- icon packaging/app-icon.png`.
+`packaging/app-icon.png` is the icon source. Regenerate the desktop icons with
+`npm --prefix apps/desktop run tauri -- icon packaging/app-icon.png`. Keep
+`32x32.png`, `128x128.png`, `128x128@2x.png`, `icon.png` and `icon.ico`; delete
+the `Square*`/`StoreLogo` files, `64x64.png`, `icon.icns` and the `android/` and
+`ios/` folders that the generator also writes.
 
 ### Linux
 
@@ -41,9 +44,9 @@ missing, or uses one you already have.
 
 Use the version and architecture of the file you downloaded. The `.deb` and
 `.rpm` install for all users; the AppImage is a single file and needs no install.
-The AppImage uses the system WebKitGTK rather than bundling it, so a minimal
-system may also need `libwebkit2gtk-4.1-0` and `libgtk-3-0` (Debian/Ubuntu) or
-`webkit2gtk4.1` and `gtk3` (Fedora).
+The AppImage bundles WebKitGTK and GTK, so it runs on a minimal system; the
+`.deb` and `.rpm` list those system packages as dependencies and let your package
+manager install them.
 
 ### Windows
 
@@ -53,18 +56,13 @@ The setup installs for the current user and needs no administrator rights, and
 it installs the WebView2 runtime when it is missing (which needs an internet
 connection).
 
-### macOS
-
-Open the `.dmg`, drag CodingPad to Applications, and launch it from there. The
-build is unsigned, so the first launch is blocked: open **System Settings →
-Privacy & Security** and choose **Open Anyway** for CodingPad, or Control-click
-the app and choose **Open**. Later launches start normally.
-
 ### First launch
 
-CodingPad has no auto-updater (D29). It makes one GitHub release check per
-launch and otherwise stays offline; to update, install the newest build over the
-current one. The library is created at `Documents/CodingPad` on first launch.
+CodingPad sends no telemetry. Its network use is limited to the release check and
+the toolchain or package downloads you trigger, such as **Install uv and run**,
+**Install .NET and run**, and the language servers and packages a script needs.
+There is no auto-updater (D29): see [Update notice](#update-notice-m43), and
+install the newest build over the current one to update.
 
 ## Develop locally
 

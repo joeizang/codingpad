@@ -8,6 +8,7 @@ import {
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import App from "./App";
 import type { KernelEvent } from "./protocol";
+import { resetUpdateCheckForTests } from "./updates";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({
@@ -69,6 +70,7 @@ vi.mock("./CodeEditor", () => ({
 }));
 beforeEach(() => {
   invoke.mockReset();
+  resetUpdateCheckForTests();
   dialog.open.mockReset();
   dialog.save.mockReset();
   dialog.ask.mockReset();

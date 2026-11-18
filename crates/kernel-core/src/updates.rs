@@ -12,7 +12,7 @@
 //! only release pages under this repository are ever linked.
 
 use serde::Serialize;
-use std::time::Duration;
+use std::{cmp::Ordering, time::Duration};
 
 /// The newest published release, excluding drafts and pre-releases.
 pub const RELEASES_URL: &str = "https://api.github.com/repos/joeizang/codingpad/releases/latest";
@@ -34,23 +34,93 @@ pub struct UpdateNotice {
 }
 
 /// A numeric `major.minor.patch` version. Missing parts count as zero.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Version(u64, u64, u64);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Version {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    /// Only the running build can carry a pre-release suffix. It ranks below
+    /// the same numbers without one, as semantic versioning does.
+    prerelease: bool,
+}
+
+impl Ord for Version {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.major, self.minor, self.patch)
+            .cmp(&(other.major, other.minor, other.patch))
+            // `other.` reversed: a final release outranks its pre-releases.
+            .then_with(|| other.prerelease.cmp(&self.prerelease))
+    }
+}
+
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 impl Version {
-    /// Parse `0.2`, `v0.2.0` and similar tags. Anything carrying a pre-release
-    /// or build suffix, extra parts, or words is not a plain release and is
-    /// ignored, so a `0.2.0-beta` tag never offers a beta as an update.
-    fn parse(text: &str) -> Option<Self> {
-        let mut parts = trim_tag(text.trim()).split('.');
-        let major = parts.next()?.parse().ok()?;
-        let minor = parts.next().unwrap_or("0").parse().ok()?;
-        let patch = parts.next().unwrap_or("0").parse().ok()?;
-        if parts.next().is_some() {
+    /// A published release tag: plain numbers only. Pre-release, build and
+    /// unusual tags are ignored, so a beta is never offered as an update.
+    fn parse_release(text: &str) -> Option<Self> {
+        let (major, minor, patch) = parse_core(text)?;
+        Some(Self {
+            major,
+            minor,
+            patch,
+            prerelease: false,
+        })
+    }
+
+    /// The running build. A `-suffix` makes it a pre-release, so the final
+    /// release is still offered (`0.2.0-beta < 0.2.0`); `+metadata` does not
+    /// change the order.
+    fn parse_build(text: &str) -> Option<Self> {
+        let text = text.trim();
+        if text.contains(char::is_whitespace) {
             return None;
         }
-        Some(Self(major, minor, patch))
+        let (core, suffix) = match text.find(['-', '+']) {
+            Some(index) if index + 1 < text.len() => (&text[..index], Some(&text[index..])),
+            // A marker with nothing after it is not a version.
+            Some(_) => return None,
+            None => (text, None),
+        };
+        let (major, minor, patch) = parse_core(core)?;
+        Some(Self {
+            major,
+            minor,
+            patch,
+            prerelease: matches!(suffix, Some(suffix) if suffix.starts_with('-')),
+        })
     }
+}
+
+/// Split `0.2`, `v0.2.0` and similar tags into numbers.
+fn parse_core(text: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = trim_tag(text.trim()).split('.');
+    let major = parse_number(parts.next()?)?;
+    let minor = match parts.next() {
+        Some(part) => parse_number(part)?,
+        None => 0,
+    };
+    let patch = match parts.next() {
+        Some(part) => parse_number(part)?,
+        None => 0,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// Digits and nothing else. `u64::from_str` alone also accepts a leading `+`,
+/// which would let `v+1.0.0` pass for a plain release.
+fn parse_number(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
 }
 
 /// Drop a single leading `v` from a release tag.
@@ -63,7 +133,7 @@ fn trim_tag(tag: &str) -> &str {
 /// Read a GitHub release payload. `None` covers a current or older build, a
 /// payload that is not a release notice, and anything malformed.
 fn notice_from_release(current_version: &str, payload: &str) -> Option<UpdateNotice> {
-    let current = Version::parse(current_version)?;
+    let current = Version::parse_build(current_version)?;
     let release: serde_json::Value = serde_json::from_str(payload).ok()?;
     if release.get("draft").and_then(serde_json::Value::as_bool) == Some(true)
         || release
@@ -74,7 +144,7 @@ fn notice_from_release(current_version: &str, payload: &str) -> Option<UpdateNot
         return None;
     }
     let tag = release.get("tag_name")?.as_str()?.trim();
-    if Version::parse(tag)? <= current {
+    if Version::parse_release(tag)? <= current {
         return None;
     }
     let url = release.get("html_url")?.as_str()?;
@@ -186,8 +256,39 @@ mod tests {
             "nightly",
             "v0.2.0.1",
             "v0..1",
+            "v+1.0.0",
+            "0.+2.0",
         ] {
             assert_eq!(notice_from_release("0.1.0", &release(tag, PAGE)), None);
+        }
+    }
+
+    #[test]
+    fn a_pre_release_build_is_offered_the_final_release() {
+        // `0.2.0-beta.1` is older than `0.2.0`, so beta builds are not stranded.
+        let notice = notice_from_release("0.2.0-beta.1", &release("v0.2.0", PAGE)).unwrap();
+        assert_eq!(notice.version, "0.2.0");
+        // Pre-release tags are still never offered as updates.
+        assert_eq!(
+            notice_from_release("0.2.0-beta.1", &release("v0.2.0-beta.2", PAGE)),
+            None
+        );
+    }
+
+    #[test]
+    fn build_metadata_does_not_change_the_order() {
+        assert_eq!(
+            notice_from_release("0.2.0+build.5", &release("v0.2.0", PAGE)),
+            None
+        );
+        let notice = notice_from_release("0.1.0+build.5", &release("v0.2.0", PAGE)).unwrap();
+        assert_eq!(notice.version, "0.2.0");
+    }
+
+    #[test]
+    fn malformed_running_versions_are_ignored() {
+        for current in ["", "nightly", "0.2.0-", "0.2.0+", "0.2 .0", "v0.2.0.1"] {
+            assert_eq!(notice_from_release(current, &release("v0.9.0", PAGE)), None);
         }
     }
 

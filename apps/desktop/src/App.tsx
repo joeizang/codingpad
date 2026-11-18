@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
@@ -7,7 +7,7 @@ import {
   save as saveDialog,
 } from "@tauri-apps/plugin-dialog";
 import CodeEditor, { type EditorHandle } from "./CodeEditor";
-import { ConnectionsDialog } from "./ConnectionsDialog";
+import { ConnectionsDialog, type Connection } from "./ConnectionsDialog";
 import {
   DumpTree,
   type ExportFormat,
@@ -22,17 +22,23 @@ import {
   type KernelEvent,
   type Output,
 } from "./protocol";
+import {
+  NewScriptMenu,
+  SAMPLE_CONNECTION,
+  type ScriptLanguage,
+} from "./NewScriptMenu";
 import { SecretsDialog } from "./SecretsDialog";
 import { SchemaPanel } from "./SchemaPanel";
 import { UpdateNotice } from "./UpdateNotice";
 import { useAvailableUpdate } from "./updates";
 import { useConnectionSchema } from "./schema";
-import { Sidebar } from "./Sidebar";
+import { ConnectionList, Sidebar } from "./Sidebar";
 import {
   headerSummary,
   joinPath,
   parentPath,
   parseHeader,
+  scriptPackages,
   type LibrarySettings,
   type ScriptFile,
 } from "./library";
@@ -92,6 +98,8 @@ type Script = {
   controlling?: boolean;
   error?: string;
   missingToolchain?: "uv" | "dotnet";
+  /** How long the last finished run took, measured from the click. */
+  elapsed?: number;
   compilation?: { source: string; diagnostics: CompileDiagnostic[] };
 };
 function intelligenceLabel(summary: DiagnosticsSummary): string {
@@ -106,10 +114,32 @@ function intelligenceLabel(summary: DiagnosticsSummary): string {
   return parts.length ? parts.join(" · ") : "No type problems";
 }
 
-const newScript = (number: number, language = "python"): Script => ({
+const HEADER_COMMENT: Record<ScriptLanguage, string> = {
+  python: "#",
+  csharp: "//",
+  sql: "--",
+};
+
+/** Starter text for a new tab, with a header line when a connection is attached. */
+function starterSource(language: ScriptLanguage, connection?: string): string {
+  const starter =
+    language === "csharp" ? CSHARP_SAMPLE : language === "sql" ? SQL_SAMPLE : SAMPLE;
+  if (!connection) return starter;
+  const header = `${HEADER_COMMENT[language]} codingpad: connection=${connection}`;
+  // The SQL starter already carries a header for the sample database; replace it.
+  return parseHeader(starter)
+    ? starter.replace(/^[^\n]*/, header)
+    : `${header}\n\n${starter}`;
+}
+
+const newScript = (
+  number: number,
+  language: ScriptLanguage = "python",
+  connection?: string,
+): Script => ({
   id: uniqueId("scratch"),
   name: `Scratch ${number}.${language === "csharp" ? "cs" : language === "sql" ? "sql" : "py"}`,
-  source: language === "csharp" ? CSHARP_SAMPLE : language === "sql" ? SQL_SAMPLE : SAMPLE,
+  source: starterSource(language, connection),
   dirty: false,
   output: [],
   running: false,
@@ -119,6 +149,34 @@ const newScript = (number: number, language = "python"): Script => ({
 });
 
 const EMPTY_DIAGNOSTICS: CompileDiagnostic[] = [];
+
+const SPLIT_KEY = "codingpad.editorSplit";
+const LAST_CONNECTION_KEY = "codingpad.lastConnection";
+const clampSplit = (value: number) => Math.min(0.85, Math.max(0.2, value));
+
+// Browser storage can be unavailable; these are conveniences, never required.
+function readStored(key: string): string | null {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+function writeStored(key: string, value: string) {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // Keep working without remembering.
+  }
+}
+
+function formatElapsed(ms: number): string {
+  return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(ms < 10_000 ? 2 : 1)} s`;
+}
+
+function plural(count: number, word: string): string {
+  return `${count} ${word}${count === 1 ? "" : "s"}`;
+}
 
 export default function App() {
   const [scripts, setScripts] = useState<Script[]>(() => [newScript(1)]);
@@ -139,6 +197,19 @@ export default function App() {
   const [closing, setClosing] = useState(false);
   const [secretsOpen, setSecretsOpen] = useState(false);
   const [connectionsOpen, setConnectionsOpen] = useState(false);
+  const [connections, setConnections] = useState<Connection[]>([]);
+  const [connectionsRevision, setConnectionsRevision] = useState(0);
+  const [newScriptOpen, setNewScriptOpen] = useState(false);
+  const newScriptButton = useRef<HTMLButtonElement>(null);
+  const [lastConnection, setLastConnection] = useState(
+    () => readStored(LAST_CONNECTION_KEY) ?? undefined,
+  );
+  const [cursor, setCursor] = useState({ line: 1, column: 1 });
+  const [split, setSplit] = useState(() => {
+    const stored = Number(readStored(SPLIT_KEY));
+    return stored ? clampSplit(stored) : 0.58;
+  });
+  const workspace = useRef<HTMLDivElement>(null);
   const [installProgress, setInstallProgress] = useState<string | null>(null);
   const installingToolchain = useRef(false);
   const [toolchainVersion, setToolchainVersion] = useState(0);
@@ -180,6 +251,19 @@ export default function App() {
       cancelled = true;
     };
   }, []);
+  useEffect(() => {
+    let cancelled = false;
+    invoke<Connection[]>("list_connections")
+      .then((loaded) => {
+        if (!cancelled && Array.isArray(loaded)) setConnections(loaded);
+      })
+      .catch(() => {
+        // The sidebar list is a convenience; the Connections dialog reports errors.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [connectionsRevision]);
   useEffect(
     () => () => {
       for (const frame of frames.current.values()) cancelAnimationFrame(frame);
@@ -228,6 +312,7 @@ export default function App() {
     const version = (generation.current.get(script.id) ?? 0) + 1;
     generation.current.set(script.id, version);
     cancelFrame(script.id);
+    const started = performance.now();
     update(script.id, (item) => ({
       ...item,
       output: [],
@@ -238,6 +323,7 @@ export default function App() {
       updates: {},
       compilation: undefined,
       error: undefined,
+      elapsed: undefined,
     }));
     const pending: KernelEvent[] = [];
     const flush = () => {
@@ -309,7 +395,12 @@ export default function App() {
     } finally {
       flush();
       running.current.delete(script.id);
-      update(script.id, (item) => ({ ...item, running: false }));
+      const elapsed = performance.now() - started;
+      update(script.id, (item) =>
+        item.version === version
+          ? { ...item, running: false, elapsed }
+          : { ...item, running: false },
+      );
     }
   }
 
@@ -317,6 +408,7 @@ export default function App() {
     running.current.add(script.id);
     const version = (generation.current.get(script.id) ?? 0) + 1;
     generation.current.set(script.id, version);
+    const started = performance.now();
     update(script.id, (item) => ({
       ...item,
       output: [],
@@ -327,6 +419,7 @@ export default function App() {
       updates: {},
       compilation: undefined,
       error: undefined,
+      elapsed: undefined,
     }));
     try {
       await invoke("begin_sql_run", { scriptId: script.id });
@@ -358,7 +451,12 @@ export default function App() {
       }));
     } finally {
       running.current.delete(script.id);
-      update(script.id, (item) => ({ ...item, running: false }));
+      const elapsed = performance.now() - started;
+      update(script.id, (item) =>
+        item.version === version
+          ? { ...item, running: false, elapsed }
+          : { ...item, running: false },
+      );
     }
   }
 
@@ -504,10 +602,41 @@ export default function App() {
     current.focus();
   }
 
-  function addScript(language = "python") {
-    const script = newScript(++counter.current, language);
+  function addScript(language: ScriptLanguage, connection?: string) {
+    const script = newScript(++counter.current, language, connection);
     setScripts((all) => [...all, script]);
     setActiveId(script.id);
+    setNewScriptOpen(false);
+    if (connection) {
+      setLastConnection(connection);
+      writeStored(LAST_CONNECTION_KEY, connection);
+    }
+  }
+
+  function resizeTo(next: number) {
+    const value = clampSplit(next);
+    setSplit(value);
+    writeStored(SPLIT_KEY, value.toFixed(3));
+  }
+
+  function startResize(event: ReactPointerEvent<HTMLDivElement>) {
+    const area = workspace.current;
+    if (!area) return;
+    event.preventDefault();
+    const handle = event.currentTarget;
+    handle.setPointerCapture?.(event.pointerId);
+    const move = (moved: PointerEvent) => {
+      const rect = area.getBoundingClientRect();
+      if (rect.height > 0) resizeTo((moved.clientY - rect.top) / rect.height);
+    };
+    const stop = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", stop);
+      handle.removeEventListener("pointercancel", stop);
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", stop);
+    handle.addEventListener("pointercancel", stop);
   }
 
   async function closeScript(script: Script) {
@@ -777,63 +906,104 @@ export default function App() {
         event.preventDefault();
         saveActive.current();
       }
+      if (
+        (event.metaKey || event.ctrlKey) &&
+        !event.shiftKey &&
+        !event.altKey &&
+        event.key.toLowerCase() === "n"
+      ) {
+        event.preventDefault();
+        setNewScriptOpen(true);
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
+  const packages = language === "python" ? scriptPackages(active.source) : [];
+  const otherHeader = activeHeader
+    ? headerSummary({
+        ...activeHeader,
+        settings: Object.fromEntries(
+          Object.entries(activeHeader.settings).filter(([key]) => key !== "connection"),
+        ),
+      })
+    : "";
+  const attached = connections.find((item) => item.name === connectionName);
+  const dumpCount = active.output.filter((output) => output.kind === "dump").length;
+  const runState = active.running
+    ? "running"
+    : active.error || active.status === "Script error"
+      ? "failed"
+      : "idle";
+  const diagnostics = intelligenceLabel(intelligence);
+  const runDisabled =
+    !runnable || active.running || active.controlling || installProgress !== null;
+
   return (
     <main className="app">
-      <header className="toolbar">
+      <header className="topbar">
         <div className="brand">
-          <span className="brand-mark">c.</span>
+          <span className="brand-mark" aria-hidden>
+            c.
+          </span>
           <strong>CodingPad</strong>
-          <span className="language">{languageLabel(language)}</span>
         </div>
+        <nav className="tabs" aria-label="Open scripts">
+          {scripts.map((script) => {
+            const scriptLang = scriptLanguage(script);
+            return (
+              <div
+                className={`tab ${script.id === activeId ? "active" : ""}`}
+                key={script.id}
+              >
+                <button
+                  className="tab-open"
+                  aria-current={script.id === activeId ? "page" : undefined}
+                  title={script.path}
+                  onClick={() => setActiveId(script.id)}
+                >
+                  <span className="language-chip" aria-hidden>
+                    {scriptLang === "csharp"
+                      ? "C#"
+                      : scriptLang === "sql"
+                        ? "SQL"
+                        : scriptLang === "python"
+                          ? "PY"
+                          : "TXT"}
+                  </span>
+                  {script.name}
+                  {script.dirty && (
+                    <span className="dirty-dot" aria-hidden />
+                  )}
+                  {script.running && <span className="tab-running"> · running</span>}
+                </button>
+                {scripts.length > 1 && (
+                  <button
+                    className="tab-close"
+                    aria-label={`Close ${script.name}`}
+                    disabled={script.running || script.controlling || closing}
+                    onClick={() => void closeScript(script)}
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
+            );
+          })}
+          <button
+            ref={newScriptButton}
+            className={`new-script-button ${newScriptOpen ? "open" : ""}`}
+            aria-label="New script"
+            aria-haspopup="dialog"
+            aria-expanded={newScriptOpen}
+            title="New script (Ctrl+N)"
+            onClick={() => setNewScriptOpen((open) => !open)}
+          >
+            +
+          </button>
+        </nav>
         <div className="run-controls">
-          <button
-            className="control-button"
-            aria-label="Save"
-            onClick={() => void saveScript(active)}
-          >
-            Save
-          </button>
-          <button
-            className="control-button"
-            aria-label="Save as"
-            onClick={() => void saveScript(active, true)}
-          >
-            Save as…
-          </button>
-          <button
-            className="control-button"
-            aria-label="Connections"
-            onClick={() => setConnectionsOpen(true)}
-          >
-            Connections…
-          </button>
-          <button
-            className="control-button"
-            aria-label="Secrets"
-            onClick={() => setSecretsOpen(true)}
-          >
-            Secrets…
-          </button>
-          <button
-            className="run-button"
-            disabled={
-              !runnable ||
-              active.running ||
-              active.controlling ||
-              installProgress !== null
-            }
-            title={
-              runnable ? undefined : "Only Python, C# and SQL scripts run in this build"
-            }
-            onClick={() => void runScript(active)}
-          >
-            {active.running ? "Running…" : "▶ Run"}
-          </button>
           <button
             className="control-button"
             disabled={!active.running || active.controlling}
@@ -848,54 +1018,66 @@ export default function App() {
           >
             Reset
           </button>
+          <button
+            className="run-button"
+            disabled={runDisabled}
+            title={
+              runnable ? undefined : "Only Python, C# and SQL scripts run in this build"
+            }
+            onClick={() => void runScript(active)}
+          >
+            {active.running ? "Running…" : "▶ Run"}
+            <kbd aria-hidden>Ctrl ↵</kbd>
+          </button>
         </div>
       </header>
+      <NewScriptMenu
+        open={newScriptOpen}
+        anchor={newScriptButton}
+        lastConnection={lastConnection}
+        onCreate={addScript}
+        onClose={() => setNewScriptOpen(false)}
+      />
       {availableUpdate && <UpdateNotice update={availableUpdate} />}
-      <nav className="tabs" aria-label="Open scripts">
-        {scripts.map((script) => (
-          <div
-            className={`tab ${script.id === activeId ? "active" : ""}`}
-            key={script.id}
-          >
-            <button
-              aria-current={script.id === activeId ? "page" : undefined}
-              title={script.path}
-              onClick={() => setActiveId(script.id)}
-            >
-              {script.name}
-              {script.dirty && (
-                <span className="dirty-dot" aria-hidden>
-                  {" "}
-                  •
+      <div className="context-strip">
+        <div className="context-sidebar" />
+        <span className="context-item">
+          Language <b>{languageLabel(language)}</b>
+        </span>
+        <span className="context-item">
+          Connection{" "}
+          {connectionName ? (
+            <>
+              <b>{connectionName}</b>
+              {(attached || connectionName === SAMPLE_CONNECTION) && (
+                <span className="context-detail">
+                  {attached ? attached.kind : "sample"}
                 </span>
               )}
-              {script.running ? " · running" : ""}
-            </button>
-            {scripts.length > 1 && (
-              <button
-                aria-label={`Close ${script.name}`}
-                disabled={script.running || script.controlling || closing}
-                onClick={() => void closeScript(script)}
-              >
-                ×
-              </button>
-            )}
-          </div>
-        ))}
-        <button
-          className="add-tab"
-          aria-label="New scratch script"
-          onClick={() => addScript()}
-        >
-          +
-        </button>
-        <button className="add-tab" aria-label="New C# scratch script" onClick={() => addScript("csharp")}>
-          + C#
-        </button>
-        <button className="add-tab" aria-label="New SQL scratch script" onClick={() => addScript("sql")}>
-          + SQL
-        </button>
-      </nav>
+            </>
+          ) : (
+            <span className="context-detail">None</span>
+          )}
+        </span>
+        {packages.length > 0 && (
+          <span className="context-item" title={packages.join(", ")}>
+            Packages <b>{packages.join(", ")}</b>
+          </span>
+        )}
+        {otherHeader && (
+          <span className="context-item" title={activeHeader?.line}>
+            Header <b>{otherHeader}</b>
+          </span>
+        )}
+        <div className="context-actions">
+          <button aria-label="Save" onClick={() => void saveScript(active)}>
+            Save
+          </button>
+          <button aria-label="Save as" onClick={() => void saveScript(active, true)}>
+            Save as…
+          </button>
+        </div>
+      </div>
       <div className="main-area">
         <Sidebar
           settings={settings}
@@ -911,32 +1093,31 @@ export default function App() {
           onAddPinned={() => void addPinnedFolder()}
           onRemovePinned={(path) => void removePinnedFolder(path)}
           error={libraryError}
+          top={
+            connectionName && (
+              <SchemaPanel
+                key={connectionName}
+                name={connectionName}
+                {...schemaState}
+                onRefresh={() => setSchemaRevision((value) => value + 1)}
+              />
+            )
+          }
+          bottom={
+            <ConnectionList
+              connections={connections}
+              attached={connectionName}
+              onManage={() => setConnectionsOpen(true)}
+              onSecrets={() => setSecretsOpen(true)}
+            />
+          }
         />
-        {connectionName && <SchemaPanel key={connectionName} name={connectionName} {...schemaState} onRefresh={() => setSchemaRevision((value) => value + 1)} />}
-        <div className="workspace">
-          <section className="editor-pane" aria-label={`${languageLabel(language)} editor`}>
-            <div className="pane-heading">
-              <span>EDITOR</span>
-              <span className="pane-heading-right">
-                <span
-                  className={`intelligence ${
-                    intelligence.message
-                      ? ""
-                      : intelligence.errors
-                        ? "error"
-                        : intelligence.warnings
-                          ? "warning"
-                          : ""
-                  }`}
-                  role="status"
-                  aria-live="polite"
-                  title={intelligenceLabel(intelligence)}
-                >
-                  {intelligenceLabel(intelligence)}
-                </span>
-                <span>Ctrl / ⌘ + Enter to run · Ctrl / ⌘ + S to save</span>
-              </span>
-            </div>
+        <div className="workspace" ref={workspace}>
+          <section
+            className="editor-pane"
+            aria-label={`${languageLabel(language)} editor`}
+            style={{ flexBasis: `${split * 100}%` }}
+          >
             <div className="editor">
               <CodeEditor
                 key={`${active.id}:${language}`}
@@ -949,6 +1130,7 @@ export default function App() {
                 dataRevision={schemaRevision}
                 source={active.source}
                 onDiagnostics={setIntelligence}
+                onCursor={(line, column) => setCursor({ line, column })}
                 onChange={(source) =>
                   update(active.id, (script) => ({
                     ...script,
@@ -963,10 +1145,37 @@ export default function App() {
               />
             </div>
           </section>
+          <div
+            className="splitter"
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="Resize editor and results"
+            aria-valuemin={20}
+            aria-valuemax={85}
+            aria-valuenow={Math.round(split * 100)}
+            tabIndex={0}
+            onPointerDown={startResize}
+            onDoubleClick={() => resizeTo(0.58)}
+            onKeyDown={(event) => {
+              if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+                event.preventDefault();
+                resizeTo(split + (event.key === "ArrowUp" ? -0.05 : 0.05));
+              }
+            }}
+          />
           <section className="results-pane" aria-label="Results">
-            <div className="pane-heading">
-              <span>RESULTS</span>
-              <span role="status">{active.status}</span>
+            <div className="results-heading">
+              <h2>Results</h2>
+              <span className={`run-status ${runState}`} role="status">
+                {active.status}
+              </span>
+              {!active.running && (dumpCount > 0 || active.elapsed !== undefined) && (
+                <span className="results-meta">
+                  {dumpCount > 0 && plural(dumpCount, "value")}
+                  {dumpCount > 0 && active.elapsed !== undefined && ", "}
+                  {active.elapsed !== undefined && `took ${formatElapsed(active.elapsed)}`}
+                </span>
+              )}
             </div>
             <div className="results" aria-busy={active.running || installProgress !== null}>
               {installProgress && <p role="status">{installProgress}</p>}
@@ -1006,7 +1215,7 @@ export default function App() {
                 <div className="empty">
                   {active.running
                     ? "Waiting for output…"
-                    : "Run your script to see printed output and values here."}
+                    : "Run your script with Ctrl+Enter to see printed output and values here."}
                 </div>
               )}
               {active.output.map((output) =>
@@ -1038,21 +1247,54 @@ export default function App() {
       </div>
       <ConnectionsDialog
         open={connectionsOpen}
-        onClose={() => { setConnectionsOpen(false); setSchemaRevision((value) => value + 1); }}
+        onClose={() => {
+          setConnectionsOpen(false);
+          setSchemaRevision((value) => value + 1);
+          setConnectionsRevision((value) => value + 1);
+        }}
       />
       <SecretsDialog open={secretsOpen} onClose={() => setSecretsOpen(false)} />
-      <footer>
+      <footer className="statusbar">
+        <span className={`state ${runState}`}>
+          {active.running ? "running" : runState === "failed" ? "failed" : "ready"}
+        </span>
         <span>
+          Ln {cursor.line}, Col {cursor.column}
+        </span>
+        {active.path && <span>{active.dirty ? "Unsaved changes" : "Saved"}</span>}
+        <span className="save-state" title={active.path}>
           {active.path
             ? active.path
             : active.sample
               ? `${active.name} · Sample copy · Not saved to the library`
               : `${active.name} · Not saved to the library`}
         </span>
-        <span>
-          {activeHeader
-            ? `Header: ${headerSummary(activeHeader) || activeHeader.line}`
-            : `${languageLabel(language)} · Library and files`}
+        <span className="statusbar-right">
+          <span
+            className={`intelligence ${
+              intelligence.message
+                ? ""
+                : intelligence.errors
+                  ? "error"
+                  : intelligence.warnings
+                    ? "warning"
+                    : ""
+            }`}
+            role="status"
+            aria-live="polite"
+            title={diagnostics}
+          >
+            {diagnostics}
+          </span>
+          <span>
+            <kbd>Ctrl N</kbd> new
+          </span>
+          <span>
+            <kbd>Ctrl S</kbd> save
+          </span>
+          <span>
+            <kbd>Ctrl ↵</kbd> run
+          </span>
         </span>
       </footer>
     </main>

@@ -93,3 +93,19 @@ export function headerSummary(header: ScriptHeader | null): string {
     .map(([key, value]) => (value ? `${key}=${value}` : key))
     .join(" · ");
 }
+
+/** Requirements from a Python script's inline metadata block (PEP 723). */
+export function scriptPackages(source: string): string[] {
+  const block = /^# \/\/\/ script\s*$([\s\S]*?)^# \/\/\/\s*$/m.exec(source);
+  if (!block) return [];
+  const toml = block[1]
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^#( |$)/, ""))
+    .join("\n");
+  // Extras like "pandas[excel]" contain brackets, so the list ends at a line-final "]".
+  const list = /^dependencies\s*=\s*\[([\s\S]*?)\]\s*$/m.exec(toml);
+  if (!list) return [];
+  return [...list[1].matchAll(/"([^"]+)"|'([^']+)'/g)].map((match) =>
+    (match[1] ?? match[2]).trim(),
+  );
+}

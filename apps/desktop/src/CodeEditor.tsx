@@ -32,6 +32,40 @@ import {
 // Bundle Monaco and its worker locally; no CDN or runtime network dependency.
 self.MonacoEnvironment = { getWorker: () => new EditorWorker() };
 
+// Matches the app's dark tokens in styles.css so the editor and chrome read as one surface.
+monaco.editor.defineTheme?.("codingpad-dark", {
+  base: "vs-dark",
+  inherit: true,
+  rules: [
+    { token: "comment", foreground: "6b7581", fontStyle: "italic" },
+    { token: "keyword", foreground: "c49bea" },
+    { token: "string", foreground: "b9d6ac" },
+    { token: "number", foreground: "e2b85e" },
+    { token: "type", foreground: "8fb4e8" },
+    { token: "type.identifier", foreground: "8fb4e8" },
+  ],
+  colors: {
+    "editor.background": "#15181c",
+    "editor.foreground": "#dfe3e8",
+    "editor.lineHighlightBackground": "#1b2026",
+    "editor.lineHighlightBorder": "#00000000",
+    "editorLineNumber.foreground": "#5b6571",
+    "editorLineNumber.activeForeground": "#dfe3e8",
+    "editorCursor.foreground": "#b9d6ac",
+    "editor.selectionBackground": "#2f3d4d",
+    "editorIndentGuide.background1": "#22272e",
+    "editorWidget.background": "#22272e",
+    "editorWidget.border": "#39414b",
+    "editorSuggestWidget.background": "#22272e",
+    "editorSuggestWidget.border": "#39414b",
+    "editorSuggestWidget.selectedBackground": "#2b323b",
+    "editorHoverWidget.background": "#22272e",
+    "editorHoverWidget.border": "#39414b",
+    "scrollbarSlider.background": "#2a303880",
+    "scrollbarSlider.hoverBackground": "#39414b",
+  },
+});
+
 export type EditorHandle = {
   revealLineInCenter: (line: number) => void;
   setPosition: (position: { lineNumber: number; column: number }) => void;
@@ -50,6 +84,7 @@ type Props = {
   onChange: (source: string) => void;
   onRun: () => void;
   onMount?: (editor: EditorHandle) => void;
+  onCursor?: (line: number, column: number) => void;
   onDiagnostics?: (summary: DiagnosticsSummary) => void;
 };
 
@@ -131,8 +166,11 @@ export default function CodeEditor({
   onChange,
   onRun,
   onMount,
+  onCursor,
   onDiagnostics,
 }: Props) {
+  const onCursorRef = useRef(onCursor);
+  onCursorRef.current = onCursor;
   const completeSql = useMemo(() => createSqlCompletions(sqlSchema), [sqlSchema]);
   const completeSqlRef = useRef(completeSql);
   completeSqlRef.current = completeSql;
@@ -325,11 +363,16 @@ export default function CodeEditor({
     <Editor
       path={`${id}.${language === "csharp" ? "cs" : language === "python" ? "py" : language === "sql" ? "sql" : "txt"}`}
       language={language}
-      theme="vs-dark"
+      theme="codingpad-dark"
       value={source}
       onChange={(value) => onChange(value ?? "")}
       onMount={(editor) => {
         editorRef.current = editor;
+        const position = editor.getPosition?.();
+        if (position) onCursorRef.current?.(position.lineNumber, position.column);
+        editor.onDidChangeCursorPosition?.((event) =>
+          onCursorRef.current?.(event.position.lineNumber, event.position.column),
+        );
         const reportReady = () => {
           // Readiness means the mounted editor can receive input, with its run
           // command and completion/hover providers installed, after a paint.
@@ -510,7 +553,10 @@ export default function CodeEditor({
       }}
       options={{
         fontSize: 14,
-        fontFamily: "'SFMono-Regular', Consolas, monospace",
+        fontFamily: "'JetBrains Mono Variable', 'Cascadia Mono', Consolas, 'DejaVu Sans Mono', monospace",
+        fontLigatures: false,
+        lineHeight: 24,
+        renderLineHighlight: "line",
         minimap: { enabled: false },
         automaticLayout: true,
         scrollBeyondLastLine: false,

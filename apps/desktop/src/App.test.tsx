@@ -75,7 +75,15 @@ beforeEach(() => {
   dialog.save.mockReset();
   dialog.ask.mockReset();
   dialog.ask.mockResolvedValue(true);
+  localStorage.clear();
 });
+
+/** Opens the new-script panel and creates a script in `language`. */
+function createScript(language: "Python" | "C#" | "SQL" = "Python") {
+  fireEvent.click(screen.getByRole("button", { name: "New script" }));
+  fireEvent.click(screen.getByRole("radio", { name: language }));
+  fireEvent.click(screen.getByRole("button", { name: /^Create / }));
+}
 
 test("a newer release shows a notice linking to its page", async () => {
   invoke.mockImplementation(async (command) => {
@@ -196,7 +204,7 @@ test("tabs preserve source and close their kernel", async () => {
   fireEvent.change(screen.getByLabelText("Code"), {
     target: { value: "a = 1" },
   });
-  fireEvent.click(screen.getByRole("button", { name: "New scratch script" }));
+  createScript();
   expect(screen.getByLabelText("Code")).not.toHaveValue("a = 1");
   fireEvent.click(screen.getByRole("button", { name: "Scratch 1.py" }));
   expect(screen.getByLabelText("Code")).toHaveValue("a = 1");
@@ -249,7 +257,8 @@ test("many stream fragments flush once per animation frame and at completion", a
     if (
       command === "load_library_settings" ||
       command === "list_samples" ||
-      command === "check_for_update"
+      command === "check_for_update" ||
+      command === "list_connections"
     )
       return Promise.resolve(undefined);
     channel = args.onEvent;
@@ -399,7 +408,8 @@ test("live updates share the animation-frame batch instead of re-rendering each"
     if (
       command === "load_library_settings" ||
       command === "list_samples" ||
-      command === "check_for_update"
+      command === "check_for_update" ||
+      command === "list_connections"
     )
       return Promise.resolve(undefined);
     channel = args.onEvent;
@@ -560,12 +570,12 @@ test("opens a library script and preserves its header when saving", async () => 
   await waitFor(() =>
     expect(screen.getByLabelText("Code")).toHaveValue(source),
   );
-  expect(screen.getByText(/Header: connection=northwind/)).toBeInTheDocument();
+  expect(screen.getByText("northwind", { selector: ".context-item b" })).toBeInTheDocument();
 
   fireEvent.change(screen.getByLabelText("Code"), {
     target: { value: "# codingpad: connection=other\nprint(1)\n" },
   });
-  expect(screen.getByText(/Header: connection=other/)).toBeInTheDocument();
+  expect(screen.getByText("other", { selector: ".context-item b" })).toBeInTheDocument();
 
   const edited = "# codingpad: connection=other\nprint(2)\n";
   fireEvent.change(screen.getByLabelText("Code"), { target: { value: edited } });
@@ -692,7 +702,7 @@ test("closing a dirty tab asks first and keeps it when cancelled", async () => {
   fireEvent.change(screen.getByLabelText("Code"), {
     target: { value: "a = 1" },
   });
-  fireEvent.click(screen.getByRole("button", { name: "New scratch script" }));
+  createScript();
   fireEvent.click(screen.getByRole("button", { name: "Close Scratch 1.py" }));
   await waitFor(() =>
     expect(dialog.ask).toHaveBeenCalledWith(
@@ -954,7 +964,7 @@ test("missing .NET offers one-click SDK installation and reruns the latest sourc
     }
   });
   render(<App />);
-  fireEvent.click(screen.getByRole("button", { name: "New C# scratch script" }));
+  createScript("C#");
   fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
   fireEvent.click(await screen.findByRole("button", { name: "Install .NET and run" }));
   expect(screen.getByRole("button", { name: "Installing .NET…" })).toBeDisabled();
@@ -1000,7 +1010,7 @@ test("C# scratch runs with compiler diagnostics and clears stale diagnostics on 
     return { ok: false };
   });
   render(<App />);
-  fireEvent.click(screen.getByRole("button", { name: "New C# scratch script" }));
+  createScript("C#");
   expect(screen.getByRole("region", { name: "C# editor" })).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
   await screen.findByText("Script error");
@@ -1034,7 +1044,7 @@ test("SQL tabs run through the direct connection and render table results", asyn
     return undefined;
   });
   render(<App />);
-  fireEvent.click(screen.getByRole("button", { name: "New SQL scratch script" }));
+  createScript("SQL");
   fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
   await waitFor(() =>
     expect(screen.getByRole("button", { name: "▶ Run" })).toBeEnabled(),
@@ -1077,7 +1087,7 @@ test("exporting a SQL result asks for a file and exports through the host", asyn
   });
   dialog.save.mockResolvedValueOnce("/tmp/answers");
   render(<App />);
-  fireEvent.click(screen.getByRole("button", { name: "New SQL scratch script" }));
+  createScript("SQL");
   fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
   fireEvent.click(await screen.findByRole("button", { name: "Export CSV" }));
   expect(await screen.findByText("Exported 1 row")).toBeInTheDocument();
@@ -1088,4 +1098,29 @@ test("exporting a SQL result asks for a file and exports through the host", asyn
     "export_table_dump",
     expect.objectContaining({ handle: "sql-1", sql: true, format: "csv", path: "/tmp/answers.csv" }),
   );
+});
+
+test("a new script attached to a connection starts with its header line", async () => {
+  invoke.mockImplementation(async (command: string) =>
+    command === "list_connections" ? [{ id: "1", name: "shop", kind: "postgres" }] : undefined,
+  );
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "New script" }));
+  fireEvent.keyDown(screen.getByRole("dialog", { name: "New script" }), { key: "c" });
+  fireEvent.click(await screen.findByRole("button", { name: /^shop/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Create C# script on shop" }));
+  expect(screen.queryByRole("dialog", { name: "New script" })).not.toBeInTheDocument();
+  expect((screen.getByLabelText("Code") as HTMLTextAreaElement).value).toMatch(
+    /^\/\/ codingpad: connection=shop\n\nConsole.WriteLine/,
+  );
+  expect(screen.getByText("shop", { selector: ".context-item b" })).toBeInTheDocument();
+  expect(invoke).toHaveBeenCalledWith("connection_schema", { name: "shop" });
+});
+
+test("Ctrl+N opens the new-script panel", () => {
+  invoke.mockResolvedValue(undefined);
+  render(<App />);
+  fireEvent.keyDown(window, { key: "n", ctrlKey: true });
+  expect(screen.getByRole("dialog", { name: "New script" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "New script" })).toHaveAttribute("aria-expanded", "true");
 });

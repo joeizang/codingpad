@@ -7,6 +7,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import App from "./App";
+import { resetPendingCrashForTests } from "./crash";
 import type { KernelEvent } from "./protocol";
 import { resetUpdateCheckForTests } from "./updates";
 
@@ -71,6 +72,7 @@ vi.mock("./CodeEditor", () => ({
 beforeEach(() => {
   invoke.mockReset();
   resetUpdateCheckForTests();
+  resetPendingCrashForTests();
   dialog.open.mockReset();
   dialog.save.mockReset();
   dialog.ask.mockReset();

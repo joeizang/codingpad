@@ -224,6 +224,32 @@ This is the only request CodingPad makes on its own (D29, D31), and it never
 downloads or installs anything. To update, download the newest installer from
 GitHub Releases and install it over the current build.
 
+## Report a crash (M4.4)
+
+CodingPad has no telemetry (D31). When the interface hits an unexpected error,
+or a panic from an earlier launch left a crash record, CodingPad shows a crash
+screen with **Report on GitHub**. The button opens a pre-filled issue in the
+system browser; nothing is submitted until you review it there and press
+Submit. Nothing is sent automatically.
+
+The issue holds the app version, the platform and the error details: the
+message, the position and a backtrace when one exists. Scripts, connection
+details and secrets are never read for a report, and long details are cut so the
+link stays usable. The crash screen shows the same text before you click.
+
+A panic is written to `pending-crash.json` in the app data folder and offered on
+the next launch, because the process that panicked may be gone before it can
+draw anything. To see the screen on purpose, start CodingPad once with
+`CODINGPAD_FORCE_CRASH=1`; it crashes, and the next launch offers the button:
+
+```sh
+CODINGPAD_FORCE_CRASH=1 target/debug/codingpad-desktop
+target/debug/codingpad-desktop
+```
+
+On Windows PowerShell, set `$env:CODINGPAD_FORCE_CRASH = "1"` for the first
+command, then clear it with `Remove-Item Env:CODINGPAD_FORCE_CRASH`.
+
 ## C# scripts (M2.3)
 
 Click **+ C#** or open a `.cs` file. CodingPad finds `dotnet` on `PATH`, in

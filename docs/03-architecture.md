@@ -13,7 +13,7 @@ Decision numbers (D#) refer to [04-open-questions.md](04-open-questions.md). Ter
 ┌───────────────┴──────────────── Rust core ──────────────────────────────┐
 │  script store (library + pinned folders) · script header parser          │
 │  kernel supervisor · language-server multiplexer · toolchain manager     │
-│  shadow-project manager · secrets (OS vault) · release checker           │
+│  shadow-project manager · secrets (OS vault) · release and crash reports │
 └──────▲──────────────▲──────────────▲──────────────▲─────────────▲───────┘
        │      CodingPad kernel protocol (JSON-RPC over stdio)      │ SQL
   ┌────┴───┐     ┌────┴───┐     ┌────┴───┐     ┌────┴───┐     ┌───┴────┐

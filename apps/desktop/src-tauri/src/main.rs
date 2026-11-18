@@ -2,6 +2,7 @@
 
 use codingpad_kernel_core::{
     attached_data_context,
+    crash::{self, CrashDetails, CrashEnvironment},
     databases::{Connection, ConnectionStore, SqlManager, SqlRunResult},
     export::{export_table, ExportFormat, ExportSummary},
     lsp::{LanguageServers, LspEvent, LspStartResult},
@@ -208,6 +209,32 @@ fn vault_available(secrets: State<'_, Arc<SecretStore>>) -> Option<bool> {
 #[tauri::command]
 async fn check_for_update(app: tauri::AppHandle) -> Option<UpdateNotice> {
     updates::check(&app.package_info().version.to_string()).await
+}
+
+/// The version and platform shown in the crash screen and the issue.
+#[tauri::command]
+fn crash_environment(app: tauri::AppHandle) -> CrashEnvironment {
+    crash::environment(&app.package_info().version.to_string())
+}
+
+/// The pre-filled issue. Building it sends nothing (D31); the crash screen
+/// opens it in the browser only after the user clicks Report on GitHub.
+#[tauri::command]
+fn crash_report_url(app: tauri::AppHandle, details: CrashDetails) -> String {
+    crash::report(
+        &details,
+        &crash::environment(&app.package_info().version.to_string()),
+    )
+    .url
+}
+
+/// A crash left by an earlier panic, offered once on the next launch.
+#[tauri::command]
+fn take_pending_crash(app: tauri::AppHandle) -> Option<CrashDetails> {
+    app.path()
+        .app_data_dir()
+        .ok()
+        .and_then(|directory| crash::take_pending(&directory))
 }
 
 #[tauri::command]
@@ -513,6 +540,14 @@ fn main() {
         .setup(|app| {
             bench_phase("setup_started", serde_json::Value::Null);
             let data_dir = app.path().app_data_dir()?;
+            // Record panics for the next launch. The crashing process may be
+            // gone before it can show anything.
+            crash::install_panic_hook(data_dir.clone());
+            // Acceptance aid for D31: crash on purpose, then relaunch to see the
+            // Report on GitHub button.
+            if std::env::var_os("CODINGPAD_FORCE_CRASH").is_some() {
+                panic!("CodingPad was asked to crash (CODINGPAD_FORCE_CRASH).");
+            }
             let secrets = Arc::new(SecretStore::new(&data_dir));
             app.manage(secrets.clone());
             let connections = Arc::new(ConnectionStore::new(&data_dir));
@@ -548,6 +583,9 @@ fn main() {
             list_secrets,
             vault_available,
             check_for_update,
+            crash_environment,
+            crash_report_url,
+            take_pending_crash,
             install_uv,
             install_dotnet,
             run_script,

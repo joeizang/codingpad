@@ -15,6 +15,16 @@ fn cpad(data_dir: &Path, script: &Path) -> Output {
         .expect("could not start cpad")
 }
 
+fn cpad_html(data_dir: &Path, script: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_cpad"))
+        .arg("run")
+        .arg("--html")
+        .arg(script)
+        .env("CODINGPAD_DATA_DIR", data_dir)
+        .output()
+        .expect("could not start cpad")
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -90,6 +100,90 @@ fn live_updates_still_report_after_a_held_dump() {
     assert!(text.starts_with("0\n"), "{text}");
     assert!(text.contains("leaf"), "{text}");
     assert!(stderr(&output).contains("live: 1"), "{}", stderr(&output));
+}
+
+#[test]
+fn cache_runs_a_factory_once_for_the_same_key() {
+    let directory = tempdir().unwrap();
+    let data = directory.path().join("data");
+    let script = directory.path().join("cache.py");
+    fs::write(
+        &script,
+        concat!(
+            "from codingpad import cache, dump\n",
+            "calls = []\n",
+            "def build():\n",
+            "    calls.append(1)\n",
+            "    return 42\n",
+            "first = cache('answer', build)\n",
+            "second = cache('answer', build)\n",
+            "dump({'first': first, 'second': second, 'calls': len(calls)})\n",
+        ),
+    )
+    .unwrap();
+
+    let output = cpad(&data, &script);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("calls: 1"), "{text}");
+    assert!(text.contains("first: 42"), "{text}");
+    assert!(text.contains("second: 42"), "{text}");
+}
+
+#[test]
+fn html_output_is_one_page_with_escaped_streams_and_structured_dumps() {
+    let directory = tempdir().unwrap();
+    let data = directory.path().join("data");
+    let script = directory.path().join("report.py");
+    fs::write(
+        &script,
+        "print('hello <b>world</b>')\n\
+         dump({'name': 'Ada', 'score': 10})\n\
+         dump([1, 2, 3])\n",
+    )
+    .unwrap();
+
+    let output = cpad_html(&data, &script);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let page = stdout(&output);
+    assert!(page.starts_with("<!doctype html>"), "{page}");
+    assert!(page.ends_with("</html>\n"), "{page}");
+    // Streams keep their text but never inject markup.
+    assert!(page.contains("hello &lt;b&gt;world&lt;/b&gt;"), "{page}");
+    assert!(!page.contains("hello <b>world</b>"), "{page}");
+    // Dumps keep their structure rather than becoming plain text.
+    assert!(page.contains("<dl class=\"object\">"), "{page}");
+    assert!(page.contains("<dt>name</dt>"), "{page}");
+    assert!(page.contains("<ul class=\"list\">"), "{page}");
+    // The page is standalone: no script or network access is allowed.
+    assert!(page.contains("default-src 'none'"), "{page}");
+}
+
+#[test]
+fn cache_runs_a_factory_once_per_key() {
+    let directory = tempdir().unwrap();
+    let data = directory.path().join("data");
+    let script = directory.path().join("cached.py");
+    fs::write(
+        &script,
+        concat!(
+            "from codingpad import cache\n",
+            "calls = []\n",
+            "def make():\n",
+            "    calls.append(1)\n",
+            "    return 'made'\n",
+            "print(cache('key', make))\n",
+            "print(cache('key', make))\n",
+            "print(len(calls))\n",
+        ),
+    )
+    .unwrap();
+
+    let output = cpad(&data, &script);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("made\nmade\n"), "{text}");
+    assert!(text.contains("\n1\n"), "{text}");
 }
 
 #[test]
@@ -175,6 +269,60 @@ fn sql_script_runs_through_its_connection_and_prints_tables() {
 }
 
 #[test]
+fn connection_header_and_cache_work_like_the_app() {
+    let directory = tempdir().unwrap();
+    let data = directory.path().join("data");
+    let database = directory.path().join("sample.db");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(
+        data.join("connections.json"),
+        serde_json::to_string(&json!([{
+            "id": "sample-id",
+            "name": "sample",
+            "kind": "sqlite",
+            "path": database.to_string_lossy(),
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    // Create the schema first: the generated models come from the schema that
+    // exists when the run starts.
+    let setup = directory.path().join("setup.sql");
+    fs::write(
+        &setup,
+        "-- codingpad: connection=sample\n\
+         CREATE TABLE people (name TEXT, score INTEGER);\n\
+         INSERT INTO people VALUES ('Ada', 10), ('Grace', 20);\n",
+    )
+    .unwrap();
+    let output = cpad(&data, &setup);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let script = directory.path().join("people.py");
+    fs::write(
+        &script,
+        concat!(
+            "# codingpad: connection=sample\n",
+            "from sqlalchemy import select\n",
+            "people = context.session.scalars(select(context.Person)).all()\n",
+            "print([person.name for person in people])\n",
+            "print(db.query('SELECT count(*) AS total FROM people'))\n",
+            "first = cache('answer', lambda: object())\n",
+            "second = cache('answer', lambda: object())\n",
+            "print(first is second)\n",
+        ),
+    )
+    .unwrap();
+
+    let output = cpad(&data, &script);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("['Ada', 'Grace']"), "{text}");
+    assert!(text.contains("{'total': 2}"), "{text}");
+    assert!(text.contains("True"), "{text}");
+}
+
+#[test]
 fn usage_errors_exit_with_two() {
     let directory = tempdir().unwrap();
     let data = directory.path().join("data");
@@ -191,4 +339,13 @@ fn usage_errors_exit_with_two() {
     let output = cpad(&data, &missing);
     assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
     assert!(stderr(&output).contains(".py, .cs or .sql"));
+
+    // An unknown option is a usage error too.
+    let output = Command::new(env!("CARGO_BIN_EXE_cpad"))
+        .args(["run", "--nope", "hello.py"])
+        .env("CODINGPAD_DATA_DIR", &data)
+        .output()
+        .expect("could not start cpad");
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
+    assert!(stderr(&output).contains("Unknown option"));
 }

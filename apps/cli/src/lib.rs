@@ -10,9 +10,14 @@
 //! reported as they happen, and only a dump that still contains a lazy node is
 //! held back. That dump is expanded within a bounded time budget and printed in
 //! its original position.
+//!
+//! `--html` changes the shape of the output, not the run: every event is held
+//! until the script finishes so live updates can replace their dumps in place,
+//! then one standalone page is printed.
 
 use codingpad_kernel_core::{
     databases::{ConnectionStore, SqlManager},
+    html,
     secrets::SecretStore,
     text::render_dump,
     KernelEvent, Language, Supervisor,
@@ -59,6 +64,16 @@ pub enum ScriptLanguage {
     Sql,
 }
 
+/// How the run prints its dumps (D28).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// Readable plain text on stdout, streamed as the script runs.
+    #[default]
+    Text,
+    /// One standalone HTML page on stdout, written when the run finishes.
+    Html,
+}
+
 /// Where CodingPad keeps connections, secret names and private toolchains.
 ///
 /// This is the desktop's Tauri `app_data_dir` (`io.github.joeizang.codingpad`),
@@ -96,11 +111,16 @@ pub fn language_for(path: &Path) -> Result<ScriptLanguage, String> {
     }
 }
 
+/// Run one script and return the process exit code, printing dumps as text.
+pub async fn run_file(path: &Path) -> i32 {
+    run_file_with_format(path, OutputFormat::Text).await
+}
+
 /// Run one script and return the process exit code.
 ///
 /// Successful runs return 0, script failures return 1, stopped runs (including
 /// Ctrl-C) return 130, and usage or script-type errors return 2.
-pub async fn run_file(path: &Path) -> i32 {
+pub async fn run_file_with_format(path: &Path, format: OutputFormat) -> i32 {
     // Check the type before touching the disk: `cpad run notes.txt` is a usage
     // error even when that file does not exist.
     let language = match language_for(path) {
@@ -153,21 +173,33 @@ pub async fn run_file(path: &Path) -> i32 {
         interrupted.clone(),
     );
 
-    let mut output = Output::default();
+    let title = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let mut output = Output::new(format, title);
     let result = match language {
         ScriptLanguage::Python | ScriptLanguage::Csharp => {
             let kernel_language = match language {
                 ScriptLanguage::Python => Language::Python,
                 _ => Language::Csharp,
             };
+            // A header connection behaves as it does in the app: models and a
+            // `db` client backed by the vault password.
+            let (data, data_error) =
+                codingpad_kernel_core::attached_data_context(&sql, &source, kernel_language).await;
+            if let Some(error) = data_error {
+                emit(Recorded::Stderr(format!("{error}\n")), &mut output);
+            }
             // The user's path keeps diagnostics short and clickable.
             let script = path;
             supervisor
-                .run_language_at(
+                .run_language_at_with_data(
                     &script_id,
                     &source,
                     kernel_language,
                     Some(&script_id),
+                    data,
                     |event| record_event(&event, script, &mut output),
                 )
                 .await
@@ -182,15 +214,12 @@ pub async fn run_file(path: &Path) -> i32 {
     };
 
     // A dump with a lazy node was held back. Apply any buffered live updates,
-    // expand what the kernel could not make eager, then print in order.
+    // expand what the kernel could not make eager, then print in order. HTML
+    // holds every event, so the same pass produces the finished page.
     if output.buffering {
         apply_updates(&mut output.events);
         expand_dumps(&supervisor, &script_id, &mut output.events).await;
-        for record in &output.events {
-            write_recorded(record);
-        }
-        output.events.clear();
-        output.buffering = false;
+        flush(&mut output);
     }
 
     // Close kernels before the process exits; a dropped runtime would
@@ -291,14 +320,38 @@ enum Recorded {
 /// Streamed events go straight to the terminal. Once a dump needs post-run
 /// expansion, later events are held so output order is preserved. The holder is
 /// bounded: reaching the cap flushes what is held without further expansion.
-#[derive(Default)]
+///
+/// HTML output always holds its events: live updates replace their dumps in
+/// place, and the page is printed once the run finishes. The bounded holder
+/// still applies, so a very long run flushes finished blocks into `body`
+/// instead of growing without bound.
 struct Output {
+    format: OutputFormat,
+    /// Script title used for the HTML page.
+    title: String,
     events: Vec<Recorded>,
     buffering: bool,
     /// Dump node ids held in `events`; updates targeting them must be applied
     /// there, while updates for already printed live values still report now.
     held_ids: HashSet<String>,
     live_updates: usize,
+    /// HTML blocks flushed before the run finished.
+    body: String,
+}
+
+impl Output {
+    fn new(format: OutputFormat, title: String) -> Self {
+        Self {
+            format,
+            title,
+            events: Vec::new(),
+            // HTML cannot update a printed block, so it holds everything.
+            buffering: format == OutputFormat::Html,
+            held_ids: HashSet::new(),
+            live_updates: 0,
+            body: String::new(),
+        }
+    }
 }
 
 fn record_event(event: &KernelEvent, path: &Path, output: &mut Output) {
@@ -372,14 +425,27 @@ fn hold(mut record: Recorded, output: &mut Output) {
         return;
     }
     // A long stream after an expandable dump must not grow without bound.
-    // Print the held previews as they are and go back to streaming.
-    eprintln!("Output buffer full; printing held values without further expansion.");
-    for record in &output.events {
-        write_recorded(record);
+    // Print the held previews as they are and go back to streaming. HTML keeps
+    // buffering so the page order stays intact, but finished blocks are safe.
+    match output.format {
+        OutputFormat::Text => {
+            eprintln!("Output buffer full; printing held values without further expansion.");
+            for record in &output.events {
+                write_recorded(record);
+            }
+            output.buffering = false;
+        }
+        OutputFormat::Html => {
+            eprintln!("Output buffer full; continuing without further expansion.");
+            let events = std::mem::take(&mut output.events);
+            for record in &events {
+                write_recorded_html(record, &mut output.body);
+            }
+            output.buffering = true;
+        }
     }
     output.events.clear();
     output.held_ids.clear();
-    output.buffering = false;
 }
 
 fn collect_ids(node: &mut Value, ids: &mut HashSet<String>) {
@@ -393,7 +459,11 @@ fn collect_ids(node: &mut Value, ids: &mut HashSet<String>) {
 
 /// A terminal cannot update a live block in place, so report its new value as a
 /// progress line on stderr. The initial dump was already printed on stdout.
+/// HTML output replaces live blocks in place, so a flushed block is left as is.
 fn report_live_update(node: &Value, output: &mut Output) {
+    if output.format == OutputFormat::Html {
+        return;
+    }
     if output.live_updates >= MAX_LIVE_UPDATES {
         if output.live_updates == MAX_LIVE_UPDATES {
             eprintln!("Further live updates suppressed.");
@@ -657,6 +727,49 @@ fn expand_node<'a>(
             expand_node(supervisor, script_id, child, depth, state).await;
         }
     })
+}
+
+/// Print held events in their original order: text streams to the terminal, or
+/// one finished HTML page is written to stdout.
+fn flush(output: &mut Output) {
+    match output.format {
+        OutputFormat::Text => {
+            for record in &output.events {
+                write_recorded(record);
+            }
+        }
+        OutputFormat::Html => {
+            for record in &output.events {
+                write_recorded_html(record, &mut output.body);
+            }
+            let page = html::document(&output.title, &output.body);
+            let mut stdout = io::stdout().lock();
+            let _ = stdout.write_all(page.as_bytes());
+            let _ = stdout.flush();
+        }
+    }
+    output.events.clear();
+    output.held_ids.clear();
+    output.buffering = false;
+}
+
+fn write_recorded_html(record: &Recorded, body: &mut String) {
+    match record {
+        Recorded::Stdout(text) if !text.is_empty() => {
+            body.push_str(&html::stream_block("stdout", text));
+        }
+        Recorded::Stderr(text) if !text.is_empty() => {
+            body.push_str(&html::stream_block("stderr", text));
+        }
+        Recorded::Stdout(_) | Recorded::Stderr(_) => {}
+        Recorded::Dump(node) => {
+            body.push_str("<section class=\"dump\">");
+            body.push_str(&html::render_dump(node));
+            body.push_str("</section>\n");
+        }
+        // Updates were folded into the dumps before this pass.
+        Recorded::Update { .. } => {}
+    }
 }
 
 fn write_recorded(record: &Recorded) {

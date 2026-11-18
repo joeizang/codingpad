@@ -1,13 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use codingpad_kernel_core::{
+    attached_data_context,
     databases::{Connection, ConnectionStore, SqlManager, SqlRunResult},
     export::{export_table, ExportFormat, ExportSummary},
     lsp::{LanguageServers, LspEvent, LspStartResult},
     secrets::{SecretEntry, SecretOrigin, SecretStore},
     store::{self, FolderEntry, LibrarySettings, ScriptFile},
     toolchains::Toolchains,
-    DataContextRun, ExpandResult, KernelEvent, Language, RunResult, Supervisor,
+    ExpandResult, KernelEvent, Language, RunResult, Supervisor,
 };
 use std::{
     collections::HashMap,
@@ -221,46 +222,6 @@ async fn install_dotnet(
     Ok(())
 }
 
-fn attached_connection(source: &str) -> Option<String> {
-    store::parse_header(source)?
-        .settings
-        .get("connection")
-        .map(|name| name.trim().to_owned())
-        .filter(|name| !name.is_empty())
-}
-
-async fn generated_data_context(
-    sql: &SqlManager,
-    source: &str,
-    language: Language,
-) -> (Option<DataContextRun>, Option<String>) {
-    let Some(name) = attached_connection(source) else {
-        return (None, None);
-    };
-    let generated =
-        tokio::time::timeout(std::time::Duration::from_secs(8), sql.data_context(&name)).await;
-    match generated {
-        Ok(Ok(generated)) => {
-            let source = match language {
-                Language::Python => generated.python,
-                Language::Csharp => generated.csharp,
-            };
-            (
-                Some(DataContextRun {
-                    source,
-                    connection: generated.connection,
-                }),
-                None,
-            )
-        }
-        Ok(Err(error)) => (None, Some(format!("Data context unavailable: {error}"))),
-        Err(_) => (
-            None,
-            Some("Data context unavailable: schema discovery timed out after 8 seconds.".into()),
-        ),
-    }
-}
-
 #[tauri::command]
 async fn run_script(
     supervisor: State<'_, Supervisor>,
@@ -272,7 +233,7 @@ async fn run_script(
     on_event: Channel<KernelEvent>,
 ) -> Result<RunResult, String> {
     let language = language.unwrap_or_default();
-    let (data, data_error) = generated_data_context(sql.inner().as_ref(), &source, language).await;
+    let (data, data_error) = attached_data_context(sql.inner().as_ref(), &source, language).await;
     if let Some(error) = data_error {
         let _ = on_event.send(KernelEvent {
             method: "stream".into(),

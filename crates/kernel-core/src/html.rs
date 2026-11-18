@@ -91,11 +91,21 @@ fn strip_navigation_markup(markup: &str) -> Cow<'_, str> {
         let name_len = name.chars().take_while(char::is_ascii_alphabetic).count();
         let navigation = matches!(&name[..name_len], "meta" | "base");
         if navigation {
-            if let Some(end) = markup[start..].find('>') {
-                out.push_str(&markup[copied..start]);
-                copied = start + end + 1;
-                index = copied;
-                continue;
+            match markup[start..].find('>') {
+                Some(end) => {
+                    out.push_str(&markup[copied..start]);
+                    copied = start + end + 1;
+                    index = copied;
+                    continue;
+                }
+                None => {
+                    // An unclosed tag is completed by the browser with the
+                    // wrapper markup that follows, so drop the rest of the
+                    // script's markup rather than letting it become a tag.
+                    out.push_str(&markup[copied..start]);
+                    copied = markup.len();
+                    break;
+                }
             }
         }
         index = start + 1;
@@ -409,6 +419,17 @@ mod tests {
         }));
         assert!(!html.contains("http-equiv"), "{html}");
         assert!(!html.contains("<base"), "{html}");
+        assert!(html.contains("<b>ok</b>"), "{html}");
+    }
+
+    #[test]
+    fn unclosed_navigation_tags_drop_the_rest_of_the_markup() {
+        let html = render_dump(&json!({
+            "kind":"html",
+            "html":"<b>ok</b><meta http-equiv=\"refresh\" content=\"0;url=https://example.com\""
+        }));
+        assert!(!html.contains("http-equiv"), "{html}");
+        assert!(!html.contains("example.com"), "{html}");
         assert!(html.contains("<b>ok</b>"), "{html}");
     }
 

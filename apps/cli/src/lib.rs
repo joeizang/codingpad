@@ -232,11 +232,11 @@ pub async fn run_file_with_format(path: &Path, format: OutputFormat) -> i32 {
         Recorder::Html(report) => {
             // Keep the collected events in the report while expanding, so a
             // forced exit can still write a page with the current previews.
-            let mut events = report
+            let (mut events, updates) = report
                 .lock()
-                .map(|report| report.events.clone())
+                .map(|report| (report.events.clone(), report.updates.clone()))
                 .unwrap_or_default();
-            apply_updates(&mut events);
+            apply_update_map(&mut events, &updates);
             expand_dumps(&supervisor, &script_id, &mut events).await;
             // Write under the report lock so a forced exit either writes the
             // previews first or waits and finds the finished page already out.
@@ -375,9 +375,14 @@ struct Output {
 /// Every event of one HTML run. Unlike the text holder nothing is printed
 /// before the end: all dumps are kept so live updates can replace them in
 /// place, and a forced exit can still render the report.
+///
+/// Live updates are folded into `updates` as they arrive, keeping only the
+/// latest node per id. A progress value updated 100k times therefore costs one
+/// entry, not 100k `Recorded::Update` records.
 struct HtmlReport {
     title: String,
     events: Vec<Recorded>,
+    updates: HashMap<String, Value>,
     written: bool,
 }
 
@@ -386,6 +391,7 @@ impl HtmlReport {
         Self {
             title,
             events: Vec::new(),
+            updates: HashMap::new(),
             written: false,
         }
     }
@@ -445,7 +451,18 @@ fn record_event_html(event: &KernelEvent, path: &Path, report: &Arc<Mutex<HtmlRe
             };
             push_html(report, record);
         }
-        "dump" => push_html(report, Recorded::Dump(event.params["node"].clone())),
+        "dump" => {
+            let node = event.params["node"].clone();
+            // A runtime error arrives as a dump, not as stderr. Mirror its
+            // one-line summary to the terminal so a failed run explains itself
+            // without opening the saved page.
+            if node.get("kind").and_then(Value::as_str) == Some("error") {
+                let kind = node.get("type").and_then(Value::as_str).unwrap_or("Error");
+                let message = node.get("message").and_then(Value::as_str).unwrap_or("");
+                write_terminal_stderr(&format!("{kind}: {message}\n"));
+            }
+            push_html(report, Recorded::Dump(node));
+        }
         "dump_update" => {
             let (Some(node_id), Some(node)) = (
                 event.params["nodeId"].as_str(),
@@ -453,13 +470,11 @@ fn record_event_html(event: &KernelEvent, path: &Path, report: &Arc<Mutex<HtmlRe
             ) else {
                 return;
             };
-            push_html(
-                report,
-                Recorded::Update {
-                    node_id: node_id.to_owned(),
-                    node: node.clone(),
-                },
-            );
+            // Keep only the latest node per id: a live value updated 100k
+            // times must not keep 100k copies until the run ends.
+            if let Ok(mut report) = report.lock() {
+                report.updates.insert(node_id.to_owned(), node.clone());
+            }
         }
         "diagnostics" => {
             if let Some(text) = diagnostics_text(&event.params["diagnostics"], path) {
@@ -660,12 +675,18 @@ fn apply_updates(output: &mut [Recorded]) {
             _ => None,
         })
         .collect();
+    apply_update_map(output, &updates);
+}
+
+/// Fold a map of the latest node per live id into the held dumps. HTML keeps
+/// its updates in a map instead of `Recorded::Update` records.
+fn apply_update_map(output: &mut [Recorded], updates: &HashMap<String, Value>) {
     if updates.is_empty() {
         return;
     }
     for record in output {
         if let Recorded::Dump(node) = record {
-            replace_updates(node, &updates);
+            replace_updates(node, updates);
         }
     }
 }
@@ -859,7 +880,8 @@ fn flush_html_report(report: &Arc<Mutex<HtmlReport>>) {
     report.written = true;
     let title = report.title.clone();
     let mut events = std::mem::take(&mut report.events);
-    apply_updates(&mut events);
+    let updates = std::mem::take(&mut report.updates);
+    apply_update_map(&mut events, &updates);
     write_html_page(&title, &events);
 }
 
@@ -870,6 +892,10 @@ fn write_html_page(title: &str, events: &[Recorded]) {
     let mut body = String::new();
     let mut index = 0;
     while index < events.len() {
+        if matches!(&events[index], Recorded::Update { .. }) {
+            index += 1;
+            continue;
+        }
         if matches!(&events[index], Recorded::Stdout(_) | Recorded::Stderr(_)) {
             let stderr = matches!(&events[index], Recorded::Stderr(_));
             let mut text = String::new();
@@ -877,6 +903,10 @@ fn write_html_page(title: &str, events: &[Recorded]) {
                 match &events[index] {
                     Recorded::Stderr(chunk) if stderr => text.push_str(chunk),
                     Recorded::Stdout(chunk) if !stderr => text.push_str(chunk),
+                    // Updates are folded into their dumps before this pass;
+                    // skip them so a live value between prints cannot split
+                    // the surrounding stream block.
+                    Recorded::Update { .. } => {}
                     _ => break,
                 }
                 index += 1;

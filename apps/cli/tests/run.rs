@@ -187,6 +187,57 @@ fn html_compile_errors_also_reach_the_terminal() {
 }
 
 #[test]
+fn html_runtime_errors_also_reach_the_terminal() {
+    let directory = tempdir().unwrap();
+    let data = directory.path().join("data");
+    let script = directory.path().join("boom.py");
+    fs::write(&script, "raise ValueError('boom')\n").unwrap();
+
+    let output = cpad_html(&data, &script);
+    assert_eq!(output.status.code(), Some(1), "stderr: {}", stderr(&output));
+    // A runtime error arrives as a dump, not stderr: mirror its summary so the
+    // terminal explains the failure while the page keeps the full traceback.
+    let errors = stderr(&output);
+    assert!(errors.contains("ValueError: boom"), "{errors}");
+    let page = stdout(&output);
+    assert!(page.contains("ValueError"), "{page}");
+    assert!(page.contains("boom"), "{page}");
+}
+
+#[test]
+fn html_live_updates_replace_dumps_and_keep_streams_together() {
+    let directory = tempdir().unwrap();
+    let data = directory.path().join("data");
+    let script = directory.path().join("live_report.py");
+    fs::write(
+        &script,
+        concat!(
+            "from codingpad import dump, live\n",
+            "status = live('starting')\n",
+            "dump(status)\n",
+            "for i in range(600):\n",
+            "    print(i)\n",
+            "    status.value = i\n",
+        ),
+    )
+    .unwrap();
+
+    let output = cpad_html(&data, &script);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let page = stdout(&output);
+    // The page holds the final value, not the initial preview, even though the
+    // text holder would have overflowed its 500-event cap long before.
+    assert!(!page.contains("starting"), "{page}");
+    assert!(
+        page.contains("<span class=\"number\">599</span>"),
+        "{page}"
+    );
+    // Updates between prints must not split the surrounding stream: every
+    // stdout read shares one block.
+    assert_eq!(page.matches("class=\"stream stdout\"").count(), 1, "{page}");
+}
+
+#[test]
 fn cache_keeps_keys_independent() {
     let directory = tempdir().unwrap();
     let data = directory.path().join("data");

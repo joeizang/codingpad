@@ -157,6 +157,9 @@ pub async fn run_file_with_format(path: &Path, format: OutputFormat) -> i32 {
 
     let secrets = Arc::new(SecretStore::new(&data_directory));
     let connections = Arc::new(ConnectionStore::new(&data_directory));
+    if let Err(error) = codingpad_kernel_core::samples::ensure_database(&data_directory) {
+        eprintln!("cpad could not prepare the sample database: {error}");
+    }
     let sql = Arc::new(SqlManager::new(connections.clone(), secrets.clone()));
     let supervisor = Arc::new(
         Supervisor::with_data_dir_and_secrets(data_directory, secrets)

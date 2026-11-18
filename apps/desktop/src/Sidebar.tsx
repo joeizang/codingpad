@@ -5,12 +5,20 @@ import {
   type FolderEntry,
   type LibrarySettings,
 } from "./library";
+import {
+  groupSamples,
+  type Sample,
+} from "./samples";
 
 type SidebarProps = {
   settings: LibrarySettings | null;
+  samples: Sample[];
+  samplesError?: string;
   activePath?: string;
+  activeSample?: string;
   refresh: number;
   onOpen: (path: string) => void;
+  onOpenSample: (sample: Sample) => void;
   onOpenFile: () => void;
   onChangeLibrary: () => void;
   onAddPinned: () => void;
@@ -131,11 +139,61 @@ function FolderBranch({
   );
 }
 
+function SampleGroup({
+  label,
+  samples,
+  activeSample,
+  defaultOpen,
+  onOpen,
+}: {
+  label: string;
+  samples: Sample[];
+  activeSample?: string;
+  defaultOpen: boolean;
+  onOpen: (sample: Sample) => void;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className="sample-group">
+      <button
+        className="sample-heading"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span className="tree-caret">{open ? "▾" : "▸"}</span>
+        {label}
+        <span className="sample-count">{samples.length}</span>
+      </button>
+      {open && (
+        <ul className="tree">
+          {samples.map((sample) => (
+            <li key={sample.id}>
+              <button
+                className={`tree-file ${sample.id === activeSample ? "active" : ""}`}
+                aria-current={sample.id === activeSample ? "page" : undefined}
+                title={`${sample.title} · ${sample.name}`}
+                onClick={() => onOpen(sample)}
+              >
+                {sample.title}
+                <span className="sample-file">{sample.name}</span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 export function Sidebar({
   settings,
+  samples,
+  samplesError,
   activePath,
+  activeSample,
   refresh,
   onOpen,
+  onOpenSample,
   onOpenFile,
   onChangeLibrary,
   onAddPinned,
@@ -151,6 +209,28 @@ export function Sidebar({
         <div className="sidebar-error">
           {error}
         </div>
+      )}
+      {(samples.length > 0 || samplesError) && (
+        <section className="sidebar-section">
+          <h2>Samples</h2>
+          {samplesError ? (
+            <div className="tree-error" role="alert">
+              {samplesError}
+            </div>
+          ) : (
+            <div className="tree-status">Opening one makes an unsaved copy.</div>
+          )}
+          {groupSamples(samples).map((group) => (
+            <SampleGroup
+              key={group.language}
+              label={group.label}
+              samples={group.samples}
+              activeSample={activeSample}
+              defaultOpen={group.language === "python"}
+              onOpen={onOpenSample}
+            />
+          ))}
+        </section>
       )}
       {!settings ? (
         <div className="tree-status">Loading library…</div>

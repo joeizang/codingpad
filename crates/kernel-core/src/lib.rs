@@ -9,6 +9,7 @@ pub mod installer;
 pub mod lsp;
 mod packages;
 mod roslyn;
+pub mod samples;
 pub mod secrets;
 mod shadow;
 pub mod store;

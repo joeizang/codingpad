@@ -134,6 +134,7 @@ impl Connection {
 
 pub struct ConnectionStore {
     path: PathBuf,
+    sample: Connection,
     connections: Mutex<Vec<Connection>>,
 }
 
@@ -146,6 +147,7 @@ impl ConnectionStore {
             .unwrap_or_default();
         Self {
             path,
+            sample: crate::samples::connection(data_dir),
             connections: Mutex::new(connections),
         }
     }
@@ -155,6 +157,9 @@ impl ConnectionStore {
     }
 
     pub fn get(&self, id: &str) -> Option<Connection> {
+        if id == self.sample.id {
+            return Some(self.sample.clone());
+        }
         self.connections
             .lock()
             .unwrap()
@@ -164,6 +169,9 @@ impl ConnectionStore {
     }
 
     pub fn by_name(&self, name: &str) -> Option<Connection> {
+        if name == self.sample.name {
+            return Some(self.sample.clone());
+        }
         self.connections
             .lock()
             .unwrap()
@@ -175,6 +183,12 @@ impl ConnectionStore {
     pub fn save(&self, mut connection: Connection) -> Result<Connection, String> {
         connection.name = connection.name.trim().to_owned();
         connection.path = connection.path.map(|path| path.trim().to_owned());
+        if connection.name == crate::samples::SAMPLE_CONNECTION {
+            return Err(format!(
+                "\"{}\" is reserved for the built-in sample database",
+                connection.name
+            ));
+        }
         if connection.kind == DatabaseKind::Sqlite {
             connection.secret = None;
         }

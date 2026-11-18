@@ -202,7 +202,7 @@ export function ConnectionsDialog({ open, onClose }: ConnectionsDialogProps) {
         </header>
         <p className="modal-note">
           A SQL script names its connection in its first line, for example{" "}
-          <code>-- codingpad: connection=sample</code>.
+          <code>-- codingpad: connection=northwind</code>.
         </p>
         <div className="secret-list" aria-label="Saved connections">
           {connections.length === 0 ? (

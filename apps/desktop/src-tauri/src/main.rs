@@ -5,6 +5,7 @@ use codingpad_kernel_core::{
     databases::{Connection, ConnectionStore, SqlManager, SqlRunResult},
     export::{export_table, ExportFormat, ExportSummary},
     lsp::{LanguageServers, LspEvent, LspStartResult},
+    samples::{self, Sample},
     secrets::{SecretEntry, SecretOrigin, SecretStore},
     store::{self, FolderEntry, LibrarySettings, ScriptFile},
     toolchains::Toolchains,
@@ -59,6 +60,11 @@ fn bench_phase(phase: &str, detail: serde_json::Value) {
 #[tauri::command]
 fn list_connections(connections: State<'_, Arc<ConnectionStore>>) -> Vec<Connection> {
     connections.list()
+}
+
+#[tauri::command]
+fn list_samples() -> Vec<Sample> {
+    samples::all()
 }
 
 #[tauri::command]
@@ -501,6 +507,9 @@ fn main() {
             let secrets = Arc::new(SecretStore::new(&data_dir));
             app.manage(secrets.clone());
             let connections = Arc::new(ConnectionStore::new(&data_dir));
+            if let Err(error) = samples::ensure_database(&data_dir) {
+                eprintln!("CodingPad could not prepare the sample database: {error}");
+            }
             app.manage(connections.clone());
             let sql = Arc::new(SqlManager::new(connections.clone(), secrets.clone()));
             app.manage(sql.clone());
@@ -517,6 +526,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             ui_ready,
             list_connections,
+            list_samples,
             save_connection,
             delete_connection,
             test_connection,

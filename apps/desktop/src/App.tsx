@@ -34,6 +34,7 @@ import {
   type LibrarySettings,
   type ScriptFile,
 } from "./library";
+import { languageLabel, type Sample } from "./samples";
 
 const SAMPLE = `from codingpad import dump
 
@@ -54,7 +55,7 @@ await Task.Delay(10);
 Enumerable.Range(1, 10).Sum();
 `;
 
-const SQL_SAMPLE = `-- codingpad: connection=sample
+const SQL_SAMPLE = `-- codingpad: connection=codingpad-sample
 
 SELECT 1 AS answer;
 `;
@@ -74,13 +75,11 @@ const scriptLanguage = (script: Script) => {
   return "plaintext";
 };
 
-const languageLabel = (language: string) =>
-  language === "csharp" ? "C#" : language === "python" ? "Python" : language === "sql" ? "SQL" : "Text";
-
 type Script = {
   id: string;
   name: string;
   path?: string;
+  sample?: string;
   source: string;
   dirty: boolean;
   output: Output[];
@@ -129,6 +128,8 @@ export default function App() {
     warnings: 0,
   });
   const [settings, setSettings] = useState<LibrarySettings | null>(null);
+  const [samples, setSamples] = useState<Sample[]>([]);
+  const [samplesError, setSamplesError] = useState<string | undefined>();
   const [libraryError, setLibraryError] = useState<string | undefined>();
   const [refresh, setRefresh] = useState(0);
   const counter = useRef(1);
@@ -160,6 +161,22 @@ export default function App() {
         }
       })
       .catch((error) => setLibraryError(String(error)));
+  }, []);
+  useEffect(() => {
+    let cancelled = false;
+    invoke<Sample[]>("list_samples")
+      .then((loaded) => {
+        if (!cancelled && Array.isArray(loaded)) {
+          setSamples(loaded);
+          setSamplesError(undefined);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) setSamplesError(String(error));
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
   useEffect(
     () => () => {
@@ -571,6 +588,31 @@ export default function App() {
     if (typeof selected === "string") await openPath(selected);
   }
 
+  function openSample(sample: Sample) {
+    const existing = scriptsRef.current.find(
+      (script) => script.sample === sample.id,
+    );
+    if (existing) {
+      setActiveId(existing.id);
+      return;
+    }
+    const script: Script = {
+      id: uniqueId("sample"),
+      name: sample.name,
+      sample: sample.id,
+      source: sample.source,
+      dirty: false,
+      output: [],
+      running: false,
+      status: "Ready",
+      version: 0,
+      updates: {},
+    };
+    scriptsRef.current = [...scriptsRef.current, script];
+    setScripts((all) => [...all, script]);
+    setActiveId(script.id);
+  }
+
   async function saveScript(script: Script, saveAs = false) {
     // Capture the text that is actually written: the user may keep typing while
     // the dialog is open or the write is in progress.
@@ -620,6 +662,7 @@ export default function App() {
               ...item,
               path: saved.path,
               name: saved.name,
+              sample: undefined,
               dirty: item.source !== source,
               error: undefined,
             }
@@ -852,9 +895,13 @@ export default function App() {
       <div className="main-area">
         <Sidebar
           settings={settings}
+          samples={samples}
+          samplesError={samplesError}
           activePath={active.path}
+          activeSample={active.sample}
           refresh={refresh}
           onOpen={(path) => void openPath(path)}
+          onOpenSample={openSample}
           onOpenFile={() => void openFile()}
           onChangeLibrary={() => void changeLibrary()}
           onAddPinned={() => void addPinnedFolder()}
@@ -994,7 +1041,9 @@ export default function App() {
         <span>
           {active.path
             ? active.path
-            : `${active.name} · Not saved to the library`}
+            : active.sample
+              ? `${active.name} · Sample copy · Not saved to the library`
+              : `${active.name} · Not saved to the library`}
         </span>
         <span>
           {activeHeader

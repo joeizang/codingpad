@@ -2,12 +2,14 @@
 //!
 //! A crash never sends anything. CodingPad prepares a GitHub issue carrying the
 //! app version, the platform and the error details, and the user reviews and
-//! submits it in the browser. Scripts, connection details and secrets are never
-//! read on this path: the report is built only from the values passed in here.
+//! submits it in the browser. Scripts and connection details are never read on
+//! this path. The user's home folder and credential-shaped values are redacted,
+//! and the backtrace stays on the local crash screen rather than in a public
+//! issue.
 //!
-//! An unexpected panic is written to a small file in the app data folder so the
-//! next launch can offer the same report, because the process that panicked may
-//! be gone before it can draw anything.
+//! A fatal panic is written to a small file in the app data folder so the next
+//! launch can offer the same report, because the process that panicked may be
+//! gone before it can draw anything. A clean exit discards that file.
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -27,6 +29,24 @@ const MAX_MESSAGE: usize = 2_000;
 const MAX_LOCATION: usize = 300;
 const MAX_BACKTRACE: usize = 4_000;
 const MAX_TITLE: usize = 80;
+/// The shortest message a report keeps when the link would otherwise be too long.
+const MAX_FALLBACK_MESSAGE: usize = 300;
+
+/// Keys whose assigned value never belongs in a public issue.
+const SECRET_KEYS: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "token",
+    "secret",
+    "api_key",
+    "apikey",
+    "access_key",
+    "accesskey",
+    "private_key",
+    "connection_string",
+    "connectionstring",
+];
 
 /// Browsers and servers disagree about long request lines; stay well under the
 /// smallest common limit. A report that would be longer drops its backtrace,
@@ -84,9 +104,8 @@ impl CrashDetails {
     }
 }
 
-/// A reviewed issue, ready to open in the browser.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// A reviewed issue, ready to open in the browser. Only the URL leaves Rust.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CrashReport {
     pub title: String,
     pub body: String,
@@ -122,22 +141,29 @@ pub fn environment(version: &str) -> CrashEnvironment {
 /// Build the pre-filled issue. Nothing here opens a connection: the caller
 /// shows the link and the user decides whether to submit it.
 pub fn report(details: &CrashDetails, environment: &CrashEnvironment) -> CrashReport {
-    let details = details.clone().normalized();
+    let home = dirs::home_dir();
+    report_with_home(details, environment, home.as_deref())
+}
+
+/// Build a report without the parts that could identify the user's account or
+/// carry a credential. The backtrace stays on the local crash screen: it is the
+/// most likely place for source paths and production values to leak.
+fn report_with_home(
+    details: &CrashDetails,
+    environment: &CrashEnvironment,
+    home: Option<&Path>,
+) -> CrashReport {
+    let mut details = details.clone().normalized();
+    details.message = redact(&details.message, home);
+    details.location = details.location.as_deref().map(|place| redact(place, home));
+    details.backtrace = None;
     let report = compose(&details, environment);
     if report.url.len() <= MAX_URL {
         return report;
     }
-    // The backtrace is the longest part. The message and position still
-    // identify the crash, so drop it before giving up on the link.
-    let mut shorter = details.clone();
-    shorter.backtrace = None;
-    let report = compose(&shorter, environment);
-    if report.url.len() <= MAX_URL {
-        return report;
-    }
     // An unusually long or non-ASCII message: keep a readable prefix.
-    shorter.message = limited(&shorter.message, 300);
-    compose(&shorter, environment)
+    details.message = limited(&details.message, MAX_FALLBACK_MESSAGE);
+    compose(&details, environment)
 }
 
 /// Lay out one issue with exactly the details it is given.
@@ -167,8 +193,8 @@ fn compose(details: &CrashDetails, environment: &CrashEnvironment) -> CrashRepor
     }
     body.push_str(
         "\n_CodingPad sent nothing automatically. This report holds only the app \
-         version, the platform and the error details above: no scripts, connection \
-         details or secrets._\n",
+         version, the platform and the error details above. Review it before \
+         submitting and remove anything you would not want public._\n",
     );
     let mut url = url::Url::parse(NEW_ISSUE_URL).expect("the issue form URL is valid");
     url.query_pairs_mut()
@@ -209,6 +235,146 @@ fn code_block(text: &str) -> String {
     format!("{fence}\n{}\n{fence}", text.trim_end())
 }
 
+/// Remove the user's home folder and credential-shaped values from text that
+/// may reach a public issue. This is best effort: the crash screen still asks
+/// the user to review the issue before submitting.
+fn redact(text: &str, home: Option<&Path>) -> String {
+    let mut text = text.to_owned();
+    if let Some(home) = home {
+        let home = home.to_string_lossy();
+        if !home.is_empty() {
+            text = text.replace(home.as_ref(), "~");
+            if home.contains('\\') {
+                text = text.replace(&home.replace('\\', "/"), "~");
+            }
+        }
+    }
+    let text = redact_url_userinfo(&text);
+    redact_assignments(&text)
+}
+
+/// `scheme://user:pass@host` becomes `scheme://[redacted]@host`.
+fn redact_url_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(index) = rest.find("://") {
+        out.push_str(&rest[..index + 3]);
+        rest = &rest[index + 3..];
+        let end = rest
+            .find(|character: char| {
+                character.is_whitespace()
+                    || matches!(
+                        character,
+                        '/' | '?' | '#' | '"' | '\'' | ')' | ']' | '}' | ','
+                    )
+            })
+            .unwrap_or(rest.len());
+        let authority = &rest[..end];
+        if let Some(at) = authority.rfind('@') {
+            out.push_str("[redacted]");
+            out.push_str(&authority[at..]);
+        } else {
+            out.push_str(authority);
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `Password=hunter2`, `token: abc` and similar assignments keep their key but
+/// lose their value.
+fn redact_assignments(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_alphabetic() {
+            index += next_char_len(text, index);
+            continue;
+        }
+        if index > 0 {
+            let previous = bytes[index - 1];
+            if previous.is_ascii_alphanumeric() || previous == b'_' {
+                index += next_char_len(text, index);
+                continue;
+            }
+        }
+        let mut after_key = None;
+        for key in SECRET_KEYS {
+            let Some(part) = text.get(index..index + key.len()) else {
+                continue;
+            };
+            if !part.eq_ignore_ascii_case(key) {
+                continue;
+            }
+            let end = index + key.len();
+            let boundary =
+                end == bytes.len() || (!bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_');
+            if boundary {
+                after_key = Some(end);
+                break;
+            }
+        }
+        let Some(mut cursor) = after_key else {
+            index += next_char_len(text, index);
+            continue;
+        };
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor == bytes.len() || !matches!(bytes[cursor], b'=' | b':') {
+            index = cursor.max(index + 1);
+            continue;
+        }
+        cursor += 1;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        let quote = bytes
+            .get(cursor)
+            .copied()
+            .filter(|byte| matches!(byte, b'"' | b'\''));
+        if quote.is_some() {
+            cursor += 1;
+        }
+        let value_start = cursor;
+        while cursor < bytes.len() {
+            let byte = bytes[cursor];
+            let ends = match quote {
+                Some(quote) => byte == quote,
+                None => {
+                    byte.is_ascii_whitespace()
+                        || matches!(byte, b',' | b';' | b'&' | b')' | b']' | b'}' | b'?' | b'#')
+                }
+            };
+            if ends {
+                break;
+            }
+            cursor += 1;
+        }
+        if cursor > value_start {
+            out.push_str(&text[copied..value_start]);
+            out.push_str("[redacted]");
+            copied = cursor;
+            index = cursor;
+        } else {
+            index = value_start;
+        }
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// The byte length of the character at `index`, or one for a broken index.
+fn next_char_len(text: &str, index: usize) -> usize {
+    text.get(index..)
+        .and_then(|rest| rest.chars().next())
+        .map(char::len_utf8)
+        .unwrap_or(1)
+}
+
 /// Write the crash a panic just caused, for the next launch to offer.
 pub fn write_pending(data_dir: &Path, details: &CrashDetails) -> std::io::Result<()> {
     fs::create_dir_all(data_dir)?;
@@ -228,6 +394,19 @@ pub fn take_pending(data_dir: &Path) -> Option<CrashDetails> {
         .map(CrashDetails::normalized)
 }
 
+/// Forget a recorded crash after a clean exit. A panic caught by a worker does
+/// not kill the app, so its record must not greet the next launch.
+pub fn clear_pending(data_dir: &Path) {
+    let _ = fs::remove_file(data_dir.join(PENDING_FILE));
+}
+
+/// The desktop app data folder Tauri uses, available before the app is built so
+/// a panic in the builder is recorded too. Mirrors `app.path().app_data_dir()`
+/// on desktop, where the config sets no directory override.
+pub fn default_data_dir(identifier: &str) -> Option<PathBuf> {
+    dirs::data_dir().map(|directory| directory.join(identifier))
+}
+
 /// A message from a panic payload, or a readable fallback.
 fn panic_message(payload: &(dyn Any + Send)) -> String {
     if let Some(text) = payload.downcast_ref::<&str>() {
@@ -239,21 +418,24 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
     }
 }
 
-/// Save every panic for the next launch, then let the normal hook print it.
-/// Installed once, after the app data folder is known.
+/// Save a fatal panic for the next launch, then let the normal hook print it.
+/// Panics on worker threads are usually caught by the runtime and the app keeps
+/// running, so they are not recorded as crashes.
 pub fn install_panic_hook(data_dir: PathBuf) {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let location = info
-            .location()
-            .map(|place| format!("{}:{}:{}", place.file(), place.line(), place.column()));
-        let details = CrashDetails::new(
-            panic_message(info.payload()),
-            location,
-            Some(std::backtrace::Backtrace::force_capture().to_string()),
-        );
-        if let Err(error) = write_pending(&data_dir, &details) {
-            eprintln!("CodingPad could not save the crash details: {error}");
+        if std::thread::current().name() == Some("main") {
+            let location = info
+                .location()
+                .map(|place| format!("{}:{}:{}", place.file(), place.line(), place.column()));
+            let details = CrashDetails::new(
+                panic_message(info.payload()),
+                location,
+                Some(std::backtrace::Backtrace::force_capture().to_string()),
+            );
+            if let Err(error) = write_pending(&data_dir, &details) {
+                eprintln!("CodingPad could not save the crash details: {error}");
+            }
         }
         previous(info);
     }));
@@ -263,7 +445,7 @@ pub fn install_panic_hook(data_dir: PathBuf) {
 mod tests {
     use super::*;
 
-    fn build() -> CrashEnvironment {
+    fn linux_environment() -> CrashEnvironment {
         CrashEnvironment {
             version: "0.1.0".into(),
             platform: "linux".into(),
@@ -283,7 +465,7 @@ mod tests {
     fn a_report_holds_the_version_platform_and_error_only() {
         let details =
             CrashDetails::new("index out of bounds", Some("src/main.rs:42:9".into()), None);
-        let report = report(&details, &build());
+        let report = report(&details, &linux_environment());
         assert!(report.url.starts_with(NEW_ISSUE_URL));
         let query = query(&report);
         assert_eq!(query["labels"], "bug");
@@ -301,7 +483,7 @@ mod tests {
         // The builder only sees the details it is given. A secret that lives in
         // a script, a connection or the vault is nowhere in its input.
         let details = CrashDetails::new("the window could not be created", None, None);
-        let report = report(&details, &build());
+        let report = report(&details, &linux_environment());
         let everything = format!("{}\n{}", report.title, report.body);
         for absent in [
             "def main(",
@@ -325,7 +507,7 @@ mod tests {
             Some(format!("{}:1:1", "y".repeat(1_000))),
             Some("z".repeat(9_000)),
         );
-        let report = report(&details, &build());
+        let report = report(&details, &linux_environment());
         assert_eq!(report.title, "Crash report: first line");
         assert!(report.title.chars().count() <= MAX_TITLE + "Crash report: ".len());
         assert!(report.body.contains('…'));
@@ -333,9 +515,9 @@ mod tests {
     }
 
     #[test]
-    fn a_report_too_long_for_a_link_drops_the_backtrace_first() {
+    fn a_report_stays_within_a_usable_link() {
         let details = CrashDetails::new("boom", Some("a.rs:1:1".into()), Some("z\n".repeat(3_000)));
-        let report = report(&details, &build());
+        let report = report(&details, &linux_environment());
         assert!(report.url.len() <= MAX_URL);
         assert!(report.body.contains("boom"));
         assert!(report.body.contains("a.rs:1:1"));
@@ -343,16 +525,56 @@ mod tests {
     }
 
     #[test]
+    fn the_home_folder_and_credentials_never_reach_the_issue() {
+        let details = CrashDetails::new(
+            "connect postgres://admin:hunter2@db.local/shop failed at /home/ada/apps/src/pool.rs:9",
+            None,
+            None,
+        );
+        let report = report_with_home(&details, &linux_environment(), Some(Path::new("/home/ada")));
+        assert!(!report.body.contains("/home/ada"));
+        assert!(report.body.contains("~/apps/src/pool.rs:9"));
+        assert!(!report.body.contains("hunter2"));
+        assert!(report.body.contains("postgres://[redacted]@db.local/shop"));
+    }
+
+    #[test]
+    fn credential_assignments_lose_their_values() {
+        let details = CrashDetails::new(
+            "connect failed: Server=db;Password=hunter2;User Id=sa token: abc123",
+            None,
+            None,
+        );
+        let report = report(&details, &linux_environment());
+        assert!(!report.body.contains("hunter2"));
+        assert!(!report.body.contains("abc123"));
+        assert!(report.body.contains("Password=[redacted]"));
+        assert!(report.body.contains("token: [redacted]"));
+    }
+
+    #[test]
+    fn a_backtrace_stays_on_the_local_crash_screen() {
+        let details = CrashDetails::new(
+            "boom",
+            None,
+            Some("at /home/ada/.cargo/registry/src/crash.rs:1:1".into()),
+        );
+        let report = report_with_home(&details, &linux_environment(), Some(Path::new("/home/ada")));
+        assert!(!report.body.contains("Backtrace"));
+        assert!(!report.body.contains(".cargo/registry"));
+    }
+
+    #[test]
     fn a_non_ascii_message_is_shortened_to_fit() {
         let details = CrashDetails::new("é".repeat(2_000), None, None);
-        let report = report(&details, &build());
+        let report = report(&details, &linux_environment());
         assert!(report.url.len() <= MAX_URL);
         assert!(report.body.contains('é'));
     }
 
     #[test]
     fn an_empty_message_still_reads_sensibly() {
-        let report = report(&CrashDetails::default(), &build());
+        let report = report(&CrashDetails::default(), &linux_environment());
         assert!(report.title.contains("unexpected error"));
         assert!(report.body.contains("unexpected error"));
     }
@@ -360,7 +582,7 @@ mod tests {
     #[test]
     fn backticks_in_the_error_cannot_break_the_code_block() {
         let details = CrashDetails::new("a ``` fence", None, None);
-        let report = report(&details, &build());
+        let report = report(&details, &linux_environment());
         assert!(report.body.contains("````\na ``` fence\n````"));
     }
 

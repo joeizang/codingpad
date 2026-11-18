@@ -40,6 +40,20 @@ _Avoid_: Helper library, SDK, runtime
 A hidden project CodingPad keeps behind a script so that a language's tools can build it and understand it. The user never edits it.
 _Avoid_: Hidden project, workspace
 
+### Problems
+
+**Crash**:
+An unexpected error that stops the interface or ends CodingPad. CodingPad never sends anything about a crash on its own.
+_Avoid_: Failure, panic, exception
+
+**Crash report**:
+A GitHub issue CodingPad prepares with the app version, the platform and the error details, for the user to review and submit.
+_Avoid_: Bug report, telemetry, error log
+
+**Pending crash**:
+A crash recorded by an earlier launch and offered for reporting on the next one.
+_Avoid_: Saved crash, crash log
+
 ### Output
 
 **Dump**:

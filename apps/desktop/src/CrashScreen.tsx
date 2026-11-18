@@ -1,7 +1,11 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { useCrashEnvironment, type CrashDetails } from "./crash";
+import {
+  isIssueUrl,
+  useCrashEnvironment,
+  type CrashDetails,
+} from "./crash";
 
 /**
  * The crash screen. Nothing leaves the machine until the user presses Report on
@@ -25,7 +29,10 @@ export function CrashScreen({
     setOpening(true);
     setError(undefined);
     try {
-      const url = await invoke<string>("crash_report_url", { details });
+      const url = await invoke<unknown>("crash_report_url", { details });
+      if (!isIssueUrl(url)) {
+        throw new Error("CodingPad prepared an unexpected report link.");
+      }
       await openUrl(url);
     } catch (failure) {
       setError(`Could not open the report: ${String(failure)}`);

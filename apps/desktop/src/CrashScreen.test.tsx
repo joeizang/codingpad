@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, expect, test, vi } from "vitest";
 import { CrashScreen } from "./CrashScreen";
+import { resetPendingCrashForTests } from "./crash";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
@@ -12,6 +13,7 @@ const ISSUE =
 
 beforeEach(() => {
   invoke.mockReset();
+  resetPendingCrashForTests();
   openUrl.mockReset();
   openUrl.mockResolvedValue(undefined);
   invoke.mockImplementation(async (command: string) => {
@@ -54,6 +56,19 @@ test("a browser that cannot open shows why", async () => {
   expect(await screen.findByRole("alert")).toHaveTextContent(
     "Could not open the report",
   );
+});
+
+test("a report link outside this repository is never opened", async () => {
+  invoke.mockImplementation(async (command: string) => {
+    if (command === "crash_report_url") return "https://example.com/report";
+    return undefined;
+  });
+  render(<CrashScreen details={{ message: "boom" }} />);
+  fireEvent.click(screen.getByRole("button", { name: "Report on GitHub" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "unexpected report link",
+  );
+  expect(openUrl).not.toHaveBeenCalled();
 });
 
 test("technical details sit behind a summary", () => {

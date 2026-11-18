@@ -808,12 +808,12 @@ footer {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
-.crash-environment {
-  color: #7f8a9c !important;
-  font-size: 11px !important;
+.crash .crash-environment {
+  color: #7f8a9c;
+  font-size: 11px;
 }
-.crash-error {
-  color: #ffb4a8 !important;
+.crash .crash-error {
+  color: #ffb4a8;
 }
 .crash-actions {
   display: flex;

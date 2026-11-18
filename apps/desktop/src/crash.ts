@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useState } from "react";
+import { resetOncePerLaunchForTests, useOncePerLaunch } from "./oncePerLaunch";
 
 /**
  * The error details a crash report may carry. CodingPad never reads scripts,
@@ -17,6 +17,10 @@ export type CrashEnvironment = {
   platform: string;
   arch: string;
 };
+
+/** Only issue forms in this repository are ever opened. */
+export const NEW_ISSUE_PREFIX =
+  "https://github.com/joeizang/codingpad/issues/";
 
 /** Accept only a well-formed crash from the Rust side. */
 export function isCrashDetails(value: unknown): value is CrashDetails {
@@ -44,6 +48,11 @@ export function isCrashEnvironment(value: unknown): value is CrashEnvironment {
   );
 }
 
+/** Accept only a pre-filled issue in this repository. */
+export function isIssueUrl(value: unknown): value is string {
+  return typeof value === "string" && value.startsWith(NEW_ISSUE_PREFIX);
+}
+
 /** The error details of a value an error boundary caught. */
 export function crashDetailsFrom(error: unknown): CrashDetails {
   if (error instanceof Error) {
@@ -59,57 +68,21 @@ export function crashDetailsFrom(error: unknown): CrashDetails {
 }
 
 /**
- * One shared read per launch. StrictMode mounts effects twice in development;
- * taking the pending crash is destructive, so the second mount must join the
- * first rather than look again and find nothing. Tests forget it between cases.
- */
-let pendingRequest: Promise<unknown> | undefined;
-
-function requestPendingCrash(): Promise<unknown> {
-  pendingRequest ??= Promise.resolve(invoke<unknown>("take_pending_crash"));
-  return pendingRequest;
-}
-
-/** Forget the shared read so each test starts clean. Tests only. */
-export function resetPendingCrashForTests(): void {
-  pendingRequest = undefined;
-}
-
-/**
- * A crash left by an earlier panic, offered once on the next launch. A failed
- * read leaves the app exactly as it was.
+ * A crash left by an earlier panic, offered once on the next launch. Dismissing
+ * it only hides the screen; the record was already taken.
  */
 export function usePendingCrash(): [CrashDetails | null, () => void] {
-  const [pending, setPending] = useState<CrashDetails | null>(null);
-  useEffect(() => {
-    let current = true;
-    void requestPendingCrash().then(
-      (found) => {
-        if (current && isCrashDetails(found)) setPending(found);
-      },
-      () => {},
-    );
-    return () => {
-      current = false;
-    };
-  }, []);
-  return [pending, () => setPending(null)];
+  const pending = useOncePerLaunch("take_pending_crash", isCrashDetails);
+  const [dismissed, setDismissed] = useState(false);
+  return [dismissed ? null : pending, () => setDismissed(true)];
 }
 
 /** The running build, for the crash screen. A failure shows no line. */
 export function useCrashEnvironment(): CrashEnvironment | null {
-  const [environment, setEnvironment] = useState<CrashEnvironment | null>(null);
-  useEffect(() => {
-    let current = true;
-    void Promise.resolve(invoke<unknown>("crash_environment")).then(
-      (found) => {
-        if (current && isCrashEnvironment(found)) setEnvironment(found);
-      },
-      () => {},
-    );
-    return () => {
-      current = false;
-    };
-  }, []);
-  return environment;
+  return useOncePerLaunch("crash_environment", isCrashEnvironment);
+}
+
+/** Forget the shared reads so each test starts clean. Tests only. */
+export function resetPendingCrashForTests(): void {
+  resetOncePerLaunchForTests();
 }

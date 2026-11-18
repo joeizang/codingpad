@@ -3,6 +3,7 @@ import { beforeEach, expect, test, vi } from "vitest";
 import {
   crashDetailsFrom,
   isCrashDetails,
+  isIssueUrl,
   resetPendingCrashForTests,
   usePendingCrash,
 } from "./crash";
@@ -70,6 +71,17 @@ test("only a message with optional strings is a crash", () => {
   expect(isCrashDetails({ message: 42 })).toBe(false);
   expect(isCrashDetails({ message: "boom", backtrace: 3 })).toBe(false);
   expect(isCrashDetails(null)).toBe(false);
+});
+
+test("only issue forms in this repository are accepted", () => {
+  const issue =
+    "https://github.com/joeizang/codingpad/issues/new?title=Crash+report";
+  expect(isIssueUrl(issue)).toBe(true);
+  expect(isIssueUrl("https://example.com/issues/new")).toBe(false);
+  expect(
+    isIssueUrl("https://github.com/someone/codingpad/issues/new"),
+  ).toBe(false);
+  expect(isIssueUrl(null)).toBe(false);
 });
 
 test("an error becomes the details a report needs", () => {

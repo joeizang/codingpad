@@ -19,6 +19,13 @@ run:
     npm --prefix apps/desktop ci
     npm --prefix apps/desktop run tauri -- dev
 
+# Build the installer for this platform (D29, D39). Output lands under
+# target/release/bundle: appimage/, deb/ and rpm/ on Linux, nsis/ on Windows,
+# dmg/ on macOS. Run this on each platform; nothing is cross-built.
+bundle:
+    npm --prefix apps/desktop ci
+    npm --prefix apps/desktop run tauri -- build
+
 # Measure the M1 and M2 speed targets (D38, D48, D55). Needs a desktop session; Windows skips app metrics.
 bench:
     npm --prefix apps/desktop ci

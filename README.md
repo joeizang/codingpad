@@ -11,6 +11,56 @@ in-memory Roslyn compilation, console output, rich `.Dump()` trees and deferred
 enumerable tables, top-level `await`, and compiler diagnostics in the editor and
 Results.
 
+## Install a build (M4.5)
+
+Releases are published on GitHub Releases as installers built locally on their
+own platform (D29, D39): an AppImage, a `.deb` and an `.rpm` on Linux, an NSIS
+setup on Windows, and a `.dmg` on macOS. Early builds are unsigned (D30), and
+macOS installers are deferred for now (D62).
+
+Build the installer for the machine you are on:
+
+```sh
+just bundle
+```
+
+The installers land in `target/release/bundle/` (`appimage/`, `deb/`, `rpm/`,
+`nsis/`, `dmg/`). The app embeds its Python and C# kernels, so an installer is
+self-contained; it does not include Python, the .NET SDK or `uv`. A first run
+offers **Install uv and run** or **Install .NET and run** when a toolchain is
+missing, or uses one you already have.
+
+`packaging/app-icon.png` is the icon source. Regenerate the platform icons with
+`npm --prefix apps/desktop run tauri -- icon packaging/app-icon.png`.
+
+### Linux
+
+- **AppImage**: `chmod +x CodingPad_0.1.0_amd64.AppImage`, then run the file.
+- **Debian/Ubuntu**: `sudo apt install ./CodingPad_0.1.0_amd64.deb`
+- **Fedora/RHEL**: `sudo dnf install ./CodingPad-0.1.0-1.x86_64.rpm`
+
+Use the version and architecture of the file you downloaded. The `.deb` and
+`.rpm` install for all users; the AppImage is a single file and needs no install.
+
+### Windows
+
+Run `CodingPad_0.1.0_x64-setup.exe`. The build is unsigned, so SmartScreen may
+show **Windows protected your PC**: choose **More info**, then **Run anyway**.
+The setup installs for the current user and needs no administrator rights.
+
+### macOS
+
+Open the `.dmg`, drag CodingPad to Applications, and launch it from there. The
+build is unsigned, so the first launch is blocked: open **System Settings →
+Privacy & Security** and choose **Open Anyway** for CodingPad, or Control-click
+the app and choose **Open**. Later launches start normally.
+
+### First launch
+
+CodingPad has no auto-updater (D29). It makes one GitHub release check per
+launch and otherwise stays offline; to update, install the newest build over the
+current one. The library is created at `Documents/CodingPad` on first launch.
+
 ## Develop locally
 
 Install:
@@ -37,6 +87,7 @@ From the repository root:
 ```sh
 just check  # Install locked frontend dependencies; build and test every component
 just run    # Open the Tauri application with frontend hot reload
+just bundle # Build this platform's installer (see Install a build)
 ```
 
 `just check` checks TypeScript, builds the UI, runs frontend and Python tests,

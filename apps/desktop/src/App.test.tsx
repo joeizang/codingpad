@@ -87,7 +87,8 @@ test("type diagnostics are shown without disabling Run", async () => {
 });
 
 test("Run renders streamed text, structured dumps and completion", async () => {
-  invoke.mockImplementation(async (_command, args) => {
+  invoke.mockImplementation(async (command, args) => {
+    if (command !== "run_script") return undefined;
     args.onEvent.onmessage({
       method: "stream",
       params: { runId: 1, stream: "stdout", text: "Hello!\n" },
@@ -191,7 +192,8 @@ test("many stream fragments flush once per animation frame and at completion", a
   let channel!: { onmessage: (event: KernelEvent) => void };
   let finish!: (value: { ok: boolean }) => void;
   invoke.mockImplementation((command, args) => {
-    if (command === "load_library_settings") return Promise.resolve(undefined);
+    if (command === "load_library_settings" || command === "list_samples")
+      return Promise.resolve(undefined);
     channel = args.onEvent;
     return new Promise((resolve) => {
       finish = resolve;
@@ -224,7 +226,8 @@ test("many stream fragments flush once per animation frame and at completion", a
 
 test("collapsed dump stays attached to its output when old blocks are dropped", async () => {
   let channel!: { onmessage: (event: KernelEvent) => void };
-  invoke.mockImplementation(async (_command, args) => {
+  invoke.mockImplementation(async (command, args) => {
+    if (command !== "run_script") return undefined;
     channel = args.onEvent;
     for (let index = 0; index < 500; index++) {
       channel.onmessage({
@@ -265,7 +268,7 @@ test("collapsed dump stays attached to its output when old blocks are dropped", 
 test("late events from an earlier run cannot contaminate a rerun", async () => {
   const channels: { onmessage: (event: KernelEvent) => void }[] = [];
   invoke.mockImplementation(async (command, args) => {
-    if (command === "load_library_settings") return undefined;
+    if (command !== "run_script") return undefined;
     channels.push(args.onEvent);
     return { ok: true };
   });
@@ -293,7 +296,8 @@ test("late events from an earlier run cannot contaminate a rerun", async () => {
 });
 
 test("live dump updates replace their inner block and keep the badge", async () => {
-  invoke.mockImplementation(async (_command, args) => {
+  invoke.mockImplementation(async (command, args) => {
+    if (command !== "run_script") return undefined;
     args.onEvent.onmessage({
       method: "dump",
       params: {
@@ -334,7 +338,8 @@ test("live updates share the animation-frame batch instead of re-rendering each"
   let channel!: { onmessage: (event: KernelEvent) => void };
   let finish!: (value: { ok: boolean }) => void;
   invoke.mockImplementation((command, args) => {
-    if (command === "load_library_settings") return Promise.resolve(undefined);
+    if (command === "load_library_settings" || command === "list_samples")
+      return Promise.resolve(undefined);
     channel = args.onEvent;
     return new Promise((resolve) => {
       finish = resolve;
@@ -760,6 +765,37 @@ test("saving refreshes the tree without collapsing an expanded folder", async ()
     "aria-expanded",
     "true",
   );
+});
+
+test("samples open as unsaved copies and keep their original source", async () => {
+  invoke.mockImplementation(async (command: string) => {
+    if (command === "load_library_settings")
+      return { libraryPath: "/library", pinnedFolders: [] };
+    if (command === "list_folder") return [];
+    if (command === "list_samples")
+      return [
+        {
+          id: "python/hello",
+          name: "hello.py",
+          title: "Hello, world!",
+          language: "python",
+          source: "print('from the sample')",
+        },
+      ];
+    return undefined;
+  });
+  render(<App />);
+  fireEvent.click(
+    await screen.findByRole("button", { name: /^Hello, world!/ }),
+  );
+  expect(screen.getByLabelText("Code")).toHaveValue("print('from the sample')");
+  expect(screen.getByText(/Sample copy/)).toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("Code"), {
+    target: { value: "print('my copy')" },
+  });
+  // Reopening the sample focuses the existing copy instead of discarding edits.
+  fireEvent.click(screen.getByRole("button", { name: /^Hello, world!/ }));
+  expect(screen.getByLabelText("Code")).toHaveValue("print('my copy')");
 });
 
 test("a failed refresh shows an error but keeps the last tree", async () => {

@@ -228,10 +228,7 @@ fn html_live_updates_replace_dumps_and_keep_streams_together() {
     // The page holds the final value, not the initial preview, even though the
     // text holder would have overflowed its 500-event cap long before.
     assert!(!page.contains("starting"), "{page}");
-    assert!(
-        page.contains("<span class=\"number\">599</span>"),
-        "{page}"
-    );
+    assert!(page.contains("<span class=\"number\">599</span>"), "{page}");
     // Updates between prints must not split the surrounding stream: every
     // stdout read shares one block.
     assert_eq!(page.matches("class=\"stream stdout\"").count(), 1, "{page}");

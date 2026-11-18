@@ -23,7 +23,9 @@ Decision numbers (D#) refer to [04-open-questions.md](04-open-questions.md). Ter
    each kernel imports its language's `codingpad` runtime library └──────┘
 ```
 
-`cpad run` (D28) reuses the Rust core and kernels without the window.
+`cpad run` (D28) reuses the Rust core and kernels without the window. It reads
+the script header's connection and vault secrets like the app, and prints dumps
+as text or, with `--html`, as one standalone page.
 
 ## Decisions at a glance
 | Area | Decision | Ref |

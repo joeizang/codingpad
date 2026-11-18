@@ -2,7 +2,9 @@
 mod csharp;
 pub mod data_context;
 pub mod databases;
+mod dump;
 pub mod export;
+pub mod html;
 pub mod installer;
 pub mod lsp;
 mod packages;
@@ -148,6 +150,55 @@ pub struct ExpandResult {
 pub struct DataContextRun {
     pub source: String,
     pub connection: crate::data_context::ConnectionInfo,
+}
+
+/// The connection named by a script's `codingpad:` header, if any.
+pub fn attached_connection(source: &str) -> Option<String> {
+    store::parse_header(source)?
+        .settings
+        .get("connection")
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+}
+
+/// How long schema discovery may take before a run starts without models.
+const DATA_CONTEXT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Build the typed models and connection details for a script's header
+/// connection. Kernels receive the result as their `db` client; a failure is
+/// reported as a message and the script still runs without models.
+pub async fn attached_data_context(
+    sql: &databases::SqlManager,
+    source: &str,
+    language: Language,
+) -> (Option<DataContextRun>, Option<String>) {
+    let Some(name) = attached_connection(source) else {
+        return (None, None);
+    };
+    let generated = tokio::time::timeout(DATA_CONTEXT_TIMEOUT, sql.data_context(&name)).await;
+    match generated {
+        Ok(Ok(generated)) => {
+            let source = match language {
+                Language::Python => generated.python,
+                Language::Csharp => generated.csharp,
+            };
+            (
+                Some(DataContextRun {
+                    source,
+                    connection: generated.connection,
+                }),
+                None,
+            )
+        }
+        Ok(Err(error)) => (None, Some(format!("Data context unavailable: {error}"))),
+        Err(_) => (
+            None,
+            Some(format!(
+                "Data context unavailable: schema discovery timed out after {} seconds.",
+                DATA_CONTEXT_TIMEOUT.as_secs()
+            )),
+        ),
+    }
 }
 
 struct Slot {

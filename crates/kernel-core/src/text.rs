@@ -6,12 +6,11 @@
 //! tables and tracebacks use one line per entry. A page larger than the kernel
 //! sent is marked with its total, so text output never pretends to be complete.
 
+use crate::dump::{as_text, has_more, kind, primitive, row_count, MAX_DEPTH};
 use serde_json::Value;
 
 /// Longest compact rendering kept on one line.
 const INLINE_LIMIT: usize = 72;
-/// A safety net for malformed input; real trees stop at six levels.
-const MAX_DEPTH: usize = 32;
 
 /// Render one dump node as plain text, without a trailing newline.
 ///
@@ -21,25 +20,6 @@ pub fn render_dump(node: &Value) -> String {
     let mut out = String::new();
     render(node, 0, &mut out);
     out
-}
-
-fn kind(node: &Value) -> &str {
-    node.get("kind").and_then(Value::as_str).unwrap_or("null")
-}
-
-fn as_text<'a>(node: &'a Value, key: &str) -> Option<&'a str> {
-    node.get(key).and_then(Value::as_str)
-}
-
-fn primitive(node: &Value) -> String {
-    match node.get("v") {
-        Some(Value::Bool(true)) => "True".into(),
-        Some(Value::Bool(false)) => "False".into(),
-        Some(Value::Number(number)) => number.to_string(),
-        Some(Value::String(text)) => text.clone(),
-        Some(value) => value.to_string(),
-        None => "None".into(),
-    }
 }
 
 fn string_node(node: &Value) -> String {
@@ -60,14 +40,6 @@ fn image_text(node: &Value) -> String {
         Some(name) => format!("[image {name}, {mime}]"),
         None => format!("[image, {mime}]"),
     }
-}
-
-fn has_more(node: &Value, shown: usize) -> bool {
-    node.get("next").and_then(Value::as_str).is_some()
-        || node
-            .get("total")
-            .and_then(Value::as_u64)
-            .is_some_and(|total| total > shown as u64)
 }
 
 /// One-line form, or `None` when the value needs a block.
@@ -325,30 +297,6 @@ fn render_table(node: &Value, depth: usize, out: &mut String) {
     out.push('\n');
     indent(depth, out);
     out.push_str(&row_count(node, rows.len()));
-}
-
-fn row_count(node: &Value, shown: usize) -> String {
-    let total = node
-        .get("total")
-        .and_then(Value::as_u64)
-        .unwrap_or(shown as u64);
-    let mut text = if node.get("totalKnown").and_then(Value::as_bool) == Some(false) {
-        // C# uses one placeholder row until enumeration finishes.
-        let known = if node.get("next").and_then(Value::as_str).is_some() {
-            shown
-        } else {
-            shown.min(total.saturating_sub(1) as usize)
-        };
-        format!("({known}+ rows)")
-    } else if total > shown as u64 {
-        format!("({shown} of {total} rows)")
-    } else {
-        format!("({total} rows)")
-    };
-    if node.get("truncated").and_then(Value::as_bool) == Some(true) {
-        text.push_str(" (results truncated)");
-    }
-    text
 }
 
 fn render_error(node: &Value, depth: usize, out: &mut String) {

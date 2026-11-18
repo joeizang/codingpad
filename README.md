@@ -118,7 +118,7 @@ the greeting, a table of records, rendered markup, a live value that changes to
 `done`, and `42`. Edit and rerun to replace the previous output. New scratch tabs
 keep independent source and results; closing a tab terminates its Python process.
 
-## Run from the terminal (M4.0)
+## Run from the terminal (M4.1)
 
 `cpad run` runs a saved script with the same kernels as the app, without a window:
 
@@ -136,15 +136,27 @@ total; use the desktop or CSV export for every row.
 
 `cpad run` uses the app's data folder (`io.github.joeizang.codingpad`) for
 connections, secret names and private toolchains, so the same saved connection
-works in both places. Set `CODINGPAD_DATA_DIR` to use another folder. Exit codes
-are 0 for success, 1 for a script failure, 2 for a usage or script-type error,
-and 130 when Ctrl-C stops the run. Output streams as it is produced. Live values
-print their current value where the dump appears, and later updates are progress
-lines on stderr (`live: 42`), capped at 100 lines. A dump that still contains a
-value the kernel could not make eager (a node budget cut-off) is held until the
-run finishes, expanded within a 10-second budget, and printed in its original
+works in both places. Set `CODINGPAD_DATA_DIR` to use another folder. A script
+with a `codingpad: connection=<name>` header gets the same `db` client and typed
+data context as the app, and `secret()` reads the same vault values. `cache()`
+reuses a value for the same key within that run; each `cpad run` starts a fresh
+kernel, so values do not survive between invocations. Exit codes are 0 for
+success, 1 for a script failure, 2 for a usage or script-type error, and 130 when
+Ctrl-C stops the run. Output streams as it is produced. Live values print their
+current value where the dump appears, and later updates are progress lines on
+stderr (`live: 42`), capped at 100 lines. A dump that still contains a value the
+kernel could not make eager (a node budget cut-off) is held until the run
+finishes, expanded within a 10-second budget, and printed in its original
 position. Held output is capped at 500 events; reaching the cap prints the
 previews as they are rather than delaying a long run further.
+
+`cpad run --html report.py > report.html` writes one standalone page instead of
+text. Tables stay tables, object fields become description lists and tracebacks
+keep their frames. Strings and streams are escaped; only `html` dump nodes pass
+markup through, and `<meta>`/`<base>` navigation tags are removed from them. The
+page's strict Content Security Policy blocks scripts, frames, forms and network
+access. HTML output waits for the run to finish so live values replace their
+dumps in place.
 
 ## Library and files
 

@@ -23,15 +23,12 @@ export function isAvailableUpdate(value: unknown): value is AvailableUpdate {
 /**
  * One shared request per launch. React StrictMode runs effects twice in
  * development, so the second run joins the first instead of asking GitHub
- * again. The cache is dropped once the answer arrives; a later mount in this
- * process (in practice only a test) starts a fresh check.
+ * again. Tests forget the shared check between cases.
  */
 let pending: Promise<unknown> | undefined;
 
 function requestUpdate(): Promise<unknown> {
-  pending ??= invoke<unknown>("check_for_update").finally(() => {
-    pending = undefined;
-  });
+  pending ??= invoke<unknown>("check_for_update");
   return pending;
 }
 

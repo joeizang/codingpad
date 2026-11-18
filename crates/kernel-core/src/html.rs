@@ -3,10 +3,13 @@
 //! `render_dump` turns one node into semantic markup: tables stay tables, object
 //! fields become a description list and tracebacks keep their frames. Every
 //! value is escaped except `html` nodes, whose markup is the script's output.
-//! The page carries a strict Content Security Policy, so scripts inside that
-//! markup cannot run even though the file opens outside the app's sandbox.
+//! The page carries a strict Content Security Policy, and navigation tags are
+//! stripped from `html` nodes so a saved report cannot redirect the browser or
+//! submit a form.
 
+use crate::dump::{as_text, has_more, kind, primitive, row_count, MAX_DEPTH};
 use serde_json::Value;
+use std::borrow::Cow;
 
 const PAGE_STYLE: &str = "\
 :root { color-scheme: light dark; }
@@ -69,6 +72,41 @@ pub fn escape(text: &str) -> String {
     out
 }
 
+/// Remove `<meta>` and `<base>` tags from script-provided markup.
+///
+/// A `<meta http-equiv="refresh">` navigates the whole standalone page, which
+/// the Content Security Policy cannot stop; a `<base>` tag would rewrite every
+/// relative link. Scripts, frames and forms are already blocked by the policy.
+fn strip_navigation_markup(markup: &str) -> Cow<'_, str> {
+    let lower = markup.to_ascii_lowercase();
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut index = 0;
+    while let Some(offset) = lower[index..].find('<') {
+        let start = index + offset;
+        let mut name = lower[start + 1..].trim_start();
+        if let Some(rest) = name.strip_prefix('/') {
+            name = rest.trim_start();
+        }
+        let name_len = name.chars().take_while(char::is_ascii_alphabetic).count();
+        let navigation = matches!(&name[..name_len], "meta" | "base");
+        if navigation {
+            if let Some(end) = markup[start..].find('>') {
+                out.push_str(&markup[copied..start]);
+                copied = start + end + 1;
+                index = copied;
+                continue;
+            }
+        }
+        index = start + 1;
+    }
+    if copied == 0 {
+        return Cow::Borrowed(markup);
+    }
+    out.push_str(&markup[copied..]);
+    Cow::Owned(out)
+}
+
 /// Wrap rendered blocks in a complete, self-contained page.
 pub fn document(title: &str, body: &str) -> String {
     let title = escape(title);
@@ -79,7 +117,8 @@ pub fn document(title: &str, body: &str) -> String {
          <meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
          <meta http-equiv=\"Content-Security-Policy\" \
-         content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'\">\n\
+         content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'; \
+         form-action 'none'; base-uri 'none'\">\n\
          <title>{title}</title>\n\
          <style>\n{PAGE_STYLE}</style>\n\
          </head>\n\
@@ -104,35 +143,8 @@ pub fn stream_block(stream: &str, text: &str) -> String {
 /// Render one dump node without a trailing newline.
 pub fn render_dump(node: &Value) -> String {
     let mut out = String::new();
-    render(node, &mut out);
+    render(node, 0, &mut out);
     out
-}
-
-fn kind(node: &Value) -> &str {
-    node.get("kind").and_then(Value::as_str).unwrap_or("null")
-}
-
-fn as_text<'a>(node: &'a Value, key: &str) -> Option<&'a str> {
-    node.get(key).and_then(Value::as_str)
-}
-
-fn primitive(node: &Value) -> String {
-    match node.get("v") {
-        Some(Value::Bool(true)) => "True".into(),
-        Some(Value::Bool(false)) => "False".into(),
-        Some(Value::Number(number)) => number.to_string(),
-        Some(Value::String(text)) => text.clone(),
-        Some(value) => value.to_string(),
-        None => "None".into(),
-    }
-}
-
-fn has_more(node: &Value, shown: usize) -> bool {
-    node.get("next").and_then(Value::as_str).is_some()
-        || node
-            .get("total")
-            .and_then(Value::as_u64)
-            .is_some_and(|total| total > shown as u64)
 }
 
 fn more_text(node: &Value, shown: usize) -> String {
@@ -142,31 +154,11 @@ fn more_text(node: &Value, shown: usize) -> String {
     }
 }
 
-fn row_count(node: &Value, shown: usize) -> String {
-    let total = node
-        .get("total")
-        .and_then(Value::as_u64)
-        .unwrap_or(shown as u64);
-    let mut text = if node.get("totalKnown").and_then(Value::as_bool) == Some(false) {
-        // C# uses one placeholder row until enumeration finishes.
-        let known = if node.get("next").and_then(Value::as_str).is_some() {
-            shown
-        } else {
-            shown.min(total.saturating_sub(1) as usize)
-        };
-        format!("({known}+ rows)")
-    } else if total > shown as u64 {
-        format!("({shown} of {total} rows)")
-    } else {
-        format!("({total} rows)")
-    };
-    if node.get("truncated").and_then(Value::as_bool) == Some(true) {
-        text.push_str(" (results truncated)");
+fn render(node: &Value, depth: usize, out: &mut String) {
+    if depth > MAX_DEPTH {
+        out.push_str("<span class=\"unknown\">…</span>");
+        return;
     }
-    text
-}
-
-fn render(node: &Value, out: &mut String) {
     match kind(node) {
         "null" => out.push_str("<span class=\"null\">None</span>"),
         "primitive" => {
@@ -201,20 +193,22 @@ fn render(node: &Value, out: &mut String) {
         "image" => render_image(node, out),
         "html" => {
             out.push_str("<div class=\"html\">");
-            out.push_str(as_text(node, "html").unwrap_or(""));
+            out.push_str(&strip_navigation_markup(
+                as_text(node, "html").unwrap_or(""),
+            ));
             out.push_str("</div>");
         }
         "live" => {
             out.push_str("<div class=\"live\"><span class=\"badge\">live</span>");
             match node.get("node") {
-                Some(inner) => render(inner, out),
+                Some(inner) => render(inner, depth + 1, out),
                 None => out.push_str("<span class=\"lazy\">&lt;live&gt;</span>"),
             }
             out.push_str("</div>");
         }
-        "list" => render_list(node, out),
-        "object" => render_object(node, out),
-        "table" => render_table(node, out),
+        "list" => render_list(node, depth, out),
+        "object" => render_object(node, depth, out),
+        "table" => render_table(node, depth, out),
         "error" => render_error(node, out),
         other => out.push_str(&format!(
             "<span class=\"unknown\">&lt;{}&gt;</span>",
@@ -240,7 +234,7 @@ fn render_image(node: &Value, out: &mut String) {
     out.push_str("</figure>");
 }
 
-fn render_list(node: &Value, out: &mut String) {
+fn render_list(node: &Value, depth: usize, out: &mut String) {
     let items = node
         .get("items")
         .and_then(Value::as_array)
@@ -249,7 +243,7 @@ fn render_list(node: &Value, out: &mut String) {
     out.push_str("<ul class=\"list\">");
     for item in items {
         out.push_str("<li>");
-        render(item, out);
+        render(item, depth + 1, out);
         out.push_str("</li>");
     }
     if has_more(node, items.len()) {
@@ -261,7 +255,7 @@ fn render_list(node: &Value, out: &mut String) {
     out.push_str("</ul>");
 }
 
-fn render_object(node: &Value, out: &mut String) {
+fn render_object(node: &Value, depth: usize, out: &mut String) {
     let fields = node
         .get("fields")
         .and_then(Value::as_array)
@@ -274,7 +268,7 @@ fn render_object(node: &Value, out: &mut String) {
             escape(as_text(field, "name").unwrap_or("?"))
         ));
         match field.get("value") {
-            Some(value) => render(value, out),
+            Some(value) => render(value, depth + 1, out),
             None => out.push_str("<span class=\"null\">None</span>"),
         }
         out.push_str("</dd>");
@@ -288,7 +282,7 @@ fn render_object(node: &Value, out: &mut String) {
     }
 }
 
-fn render_table(node: &Value, out: &mut String) {
+fn render_table(node: &Value, depth: usize, out: &mut String) {
     let columns: Vec<String> = node
         .get("columns")
         .and_then(Value::as_array)
@@ -325,7 +319,7 @@ fn render_table(node: &Value, out: &mut String) {
         for index in 0..width {
             out.push_str("<td>");
             if let Some(cell) = cells.get(index) {
-                render(cell, out);
+                render(cell, depth + 1, out);
             }
             out.push_str("</td>");
         }
@@ -408,6 +402,17 @@ mod tests {
     }
 
     #[test]
+    fn navigation_tags_in_html_nodes_are_removed() {
+        let html = render_dump(&json!({
+            "kind":"html",
+            "html":"<meta http-equiv=\"refresh\" content=\"0;url=https://example.com\"><base href=\"https://e/\"><b>ok</b>"
+        }));
+        assert!(!html.contains("http-equiv"), "{html}");
+        assert!(!html.contains("<base"), "{html}");
+        assert!(html.contains("<b>ok</b>"), "{html}");
+    }
+
+    #[test]
     fn tables_keep_their_structure_and_row_count() {
         let html = render_dump(&json!({
             "kind":"table",
@@ -460,6 +465,16 @@ mod tests {
     }
 
     #[test]
+    fn deeply_nested_trees_stop_at_the_depth_limit() {
+        let mut node = json!({"kind":"null"});
+        for _ in 0..40 {
+            node = json!({"kind":"list","items":[node],"total":1});
+        }
+        let html = render_dump(&node);
+        assert!(html.contains("…"), "{html}");
+    }
+
+    #[test]
     fn the_page_is_complete_and_carries_a_restrictive_policy() {
         let page = document("hello & <world>", &stream_block("stdout", "hi <there>"));
         assert!(page.starts_with("<!doctype html>"), "{page}");
@@ -468,6 +483,8 @@ mod tests {
             "{page}"
         );
         assert!(page.contains("default-src 'none'"), "{page}");
+        assert!(page.contains("form-action 'none'"), "{page}");
+        assert!(page.contains("base-uri 'none'"), "{page}");
         assert!(
             page.contains("<pre class=\"stream stdout\">hi &lt;there&gt;</pre>"),
             "{page}"

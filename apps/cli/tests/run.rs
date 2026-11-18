@@ -137,9 +137,14 @@ fn html_output_is_one_page_with_escaped_streams_and_structured_dumps() {
     let script = directory.path().join("report.py");
     fs::write(
         &script,
-        "print('hello <b>world</b>')\n\
-         dump({'name': 'Ada', 'score': 10})\n\
-         dump([1, 2, 3])\n",
+        concat!(
+            "from codingpad import html\n",
+            "print('hello <b>world</b>')\n",
+            "print('y' * 20000)\n",
+            "dump({'name': 'Ada', 'score': 10})\n",
+            "dump([1, 2, 3])\n",
+            "dump(html('<meta http-equiv=\"refresh\" content=\"0;url=https://example.com\"><b>ok</b>'))\n",
+        ),
     )
     .unwrap();
 
@@ -148,19 +153,41 @@ fn html_output_is_one_page_with_escaped_streams_and_structured_dumps() {
     let page = stdout(&output);
     assert!(page.starts_with("<!doctype html>"), "{page}");
     assert!(page.ends_with("</html>\n"), "{page}");
-    // Streams keep their text but never inject markup.
+    // Streams keep their text but never inject markup, and adjacent chunks
+    // from one stream share a single block.
     assert!(page.contains("hello &lt;b&gt;world&lt;/b&gt;"), "{page}");
     assert!(!page.contains("hello <b>world</b>"), "{page}");
+    assert_eq!(page.matches("class=\"stream stdout\"").count(), 1, "{page}");
     // Dumps keep their structure rather than becoming plain text.
     assert!(page.contains("<dl class=\"object\">"), "{page}");
     assert!(page.contains("<dt>name</dt>"), "{page}");
     assert!(page.contains("<ul class=\"list\">"), "{page}");
-    // The page is standalone: no script or network access is allowed.
+    // HTML dumps keep markup, but navigation tags cannot escape the report.
+    assert!(page.contains("<b>ok</b>"), "{page}");
+    assert!(!page.contains("http-equiv=\"refresh\""), "{page}");
+    // The page is standalone: no script, form or network access is allowed.
     assert!(page.contains("default-src 'none'"), "{page}");
+    assert!(page.contains("form-action 'none'"), "{page}");
+    assert!(page.contains("base-uri 'none'"), "{page}");
 }
 
 #[test]
-fn cache_runs_a_factory_once_per_key() {
+fn html_compile_errors_also_reach_the_terminal() {
+    let directory = tempdir().unwrap();
+    let data = directory.path().join("data");
+    let script = directory.path().join("broken.cs");
+    fs::write(&script, "this is not C#;\n").unwrap();
+
+    let output = cpad_html(&data, &script);
+    assert_eq!(output.status.code(), Some(1), "stderr: {}", stderr(&output));
+    // The page keeps the diagnostics, and the terminal shows why the run failed.
+    let errors = stderr(&output);
+    assert!(errors.contains("CS"), "{errors}");
+    assert!(stdout(&output).contains("CS"), "{}", stdout(&output));
+}
+
+#[test]
+fn cache_keeps_keys_independent() {
     let directory = tempdir().unwrap();
     let data = directory.path().join("data");
     let script = directory.path().join("cached.py");
@@ -168,13 +195,14 @@ fn cache_runs_a_factory_once_per_key() {
         &script,
         concat!(
             "from codingpad import cache\n",
-            "calls = []\n",
-            "def make():\n",
-            "    calls.append(1)\n",
-            "    return 'made'\n",
-            "print(cache('key', make))\n",
-            "print(cache('key', make))\n",
-            "print(len(calls))\n",
+            "calls = {}\n",
+            "def make(key):\n",
+            "    calls[key] = calls.get(key, 0) + 1\n",
+            "    return key.upper()\n",
+            "print(cache('a', lambda: make('a')))\n",
+            "print(cache('b', lambda: make('b')))\n",
+            "print(cache('a', lambda: make('a')))\n",
+            "print(calls)\n",
         ),
     )
     .unwrap();
@@ -182,8 +210,8 @@ fn cache_runs_a_factory_once_per_key() {
     let output = cpad(&data, &script);
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     let text = stdout(&output);
-    assert!(text.contains("made\nmade\n"), "{text}");
-    assert!(text.contains("\n1\n"), "{text}");
+    assert!(text.contains("A\nB\nA\n"), "{text}");
+    assert!(text.contains("{'a': 1, 'b': 1}"), "{text}");
 }
 
 #[test]

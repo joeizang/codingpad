@@ -138,8 +138,9 @@ total; use the desktop or CSV export for every row.
 connections, secret names and private toolchains, so the same saved connection
 works in both places. Set `CODINGPAD_DATA_DIR` to use another folder. A script
 with a `codingpad: connection=<name>` header gets the same `db` client and typed
-data context as the app; `secret()` reads the same vault values and `cache()`
-keeps its results in the warm kernel, exactly as in the app. Exit codes are 0 for
+data context as the app, and `secret()` reads the same vault values. `cache()`
+reuses a value for the same key within that run; each `cpad run` starts a fresh
+kernel, so values do not survive between invocations. Exit codes are 0 for
 success, 1 for a script failure, 2 for a usage or script-type error, and 130 when
 Ctrl-C stops the run. Output streams as it is produced. Live values print their
 current value where the dump appears, and later updates are progress lines on
@@ -152,9 +153,10 @@ previews as they are rather than delaying a long run further.
 `cpad run --html report.py > report.html` writes one standalone page instead of
 text. Tables stay tables, object fields become description lists and tracebacks
 keep their frames. Strings and streams are escaped; only `html` dump nodes pass
-markup through. The page carries a strict Content Security Policy with no scripts
-or network access, so it opens safely outside the app. HTML output waits for the
-run to finish so live values replace their dumps in place.
+markup through, and `<meta>`/`<base>` navigation tags are removed from them. The
+page's strict Content Security Policy blocks scripts, frames, forms and network
+access. HTML output waits for the run to finish so live values replace their
+dumps in place.
 
 ## Library and files
 

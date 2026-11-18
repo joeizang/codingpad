@@ -32,7 +32,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -165,19 +165,24 @@ pub async fn run_file_with_format(path: &Path, format: OutputFormat) -> i32 {
     );
 
     let script_id = absolute.to_string_lossy().into_owned();
+    let title = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let html = (format == OutputFormat::Html).then(|| Arc::new(Mutex::new(HtmlReport::new(title))));
     let interrupted = Arc::new(AtomicBool::new(false));
     watch_interrupt(
         supervisor.clone(),
         sql.clone(),
         script_id.clone(),
         interrupted.clone(),
+        html.clone(),
     );
 
-    let title = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
-    let mut output = Output::new(format, title);
+    let mut recorder = match &html {
+        Some(report) => Recorder::Html(report.clone()),
+        None => Recorder::Text(Output::default()),
+    };
     let result = match language {
         ScriptLanguage::Python | ScriptLanguage::Csharp => {
             let kernel_language = match language {
@@ -189,7 +194,7 @@ pub async fn run_file_with_format(path: &Path, format: OutputFormat) -> i32 {
             let (data, data_error) =
                 codingpad_kernel_core::attached_data_context(&sql, &source, kernel_language).await;
             if let Some(error) = data_error {
-                emit(Recorded::Stderr(format!("{error}\n")), &mut output);
+                recorder.stderr(format!("{error}\n"));
             }
             // The user's path keeps diagnostics short and clickable.
             let script = path;
@@ -200,7 +205,7 @@ pub async fn run_file_with_format(path: &Path, format: OutputFormat) -> i32 {
                     kernel_language,
                     Some(&script_id),
                     data,
-                    |event| record_event(&event, script, &mut output),
+                    |event| recorder.record(&event, script),
                 )
                 .await
                 .map(|result| Outcome {
@@ -209,17 +214,40 @@ pub async fn run_file_with_format(path: &Path, format: OutputFormat) -> i32 {
                 })
         }
         ScriptLanguage::Sql => {
-            run_sql_script(&sql, &script_id, &source, &absolute, &mut output).await
+            run_sql_script(&sql, &script_id, &source, &absolute, &mut recorder).await
         }
     };
 
     // A dump with a lazy node was held back. Apply any buffered live updates,
     // expand what the kernel could not make eager, then print in order. HTML
-    // holds every event, so the same pass produces the finished page.
-    if output.buffering {
-        apply_updates(&mut output.events);
-        expand_dumps(&supervisor, &script_id, &mut output.events).await;
-        flush(&mut output);
+    // collects the whole run, so its page is rendered once here.
+    match &mut recorder {
+        Recorder::Text(output) => {
+            if output.buffering {
+                apply_updates(&mut output.events);
+                expand_dumps(&supervisor, &script_id, &mut output.events).await;
+                flush_text(output);
+            }
+        }
+        Recorder::Html(report) => {
+            // Keep the collected events in the report while expanding, so a
+            // forced exit can still write a page with the current previews.
+            let mut events = report
+                .lock()
+                .map(|report| report.events.clone())
+                .unwrap_or_default();
+            apply_updates(&mut events);
+            expand_dumps(&supervisor, &script_id, &mut events).await;
+            // Write under the report lock so a forced exit either writes the
+            // previews first or waits and finds the finished page already out.
+            if let Ok(mut report) = report.lock() {
+                if !report.written {
+                    let title = report.title.clone();
+                    write_html_page(&title, &events);
+                    report.written = true;
+                }
+            }
+        }
     }
 
     // Close kernels before the process exits; a dropped runtime would
@@ -255,13 +283,13 @@ async fn run_sql_script(
     script_id: &str,
     source: &str,
     path: &Path,
-    output: &mut Output,
+    recorder: &mut Recorder,
 ) -> Result<Outcome, String> {
     let result = sql
         .run(script_id, source, Some(&path.to_string_lossy()))
         .await?;
     for table in &result.tables {
-        push_dump(table.clone(), output);
+        recorder.dump(table.clone());
     }
     Ok(Outcome {
         ok: result.ok,
@@ -278,6 +306,7 @@ fn watch_interrupt(
     sql: Arc<SqlManager>,
     script_id: String,
     interrupted: Arc<AtomicBool>,
+    html: Option<Arc<Mutex<HtmlReport>>>,
 ) {
     tokio::spawn(async move {
         let mut stage = 0;
@@ -298,18 +327,31 @@ fn watch_interrupt(
                     tokio::pin!(shutdown);
                     tokio::select! {
                         _ = &mut shutdown => {}
-                        _ = tokio::time::sleep(SHUTDOWN_GRACE) => std::process::exit(130),
-                        _ = tokio::signal::ctrl_c() => std::process::exit(130),
+                        _ = tokio::time::sleep(SHUTDOWN_GRACE) => {
+                            force_exit(&html);
+                        }
+                        _ = tokio::signal::ctrl_c() => {
+                            force_exit(&html);
+                        }
                     }
                 }
                 // Kernels are closed; a further Ctrl-C must still end the process.
-                _ => std::process::exit(130),
+                _ => force_exit(&html),
             }
         }
     });
 }
 
-#[derive(Debug)]
+/// Write whatever the HTML report has collected, then exit. Text output was
+/// already streamed by the main task, so only HTML needs this last chance.
+fn force_exit(html: &Option<Arc<Mutex<HtmlReport>>>) -> ! {
+    if let Some(report) = html {
+        flush_html_report(report);
+    }
+    std::process::exit(130);
+}
+
+#[derive(Clone, Debug)]
 enum Recorded {
     Stdout(String),
     Stderr(String),
@@ -317,41 +359,122 @@ enum Recorded {
     Update { node_id: String, node: Value },
 }
 
-/// Streamed events go straight to the terminal. Once a dump needs post-run
+/// Text streams go straight to the terminal. Once a dump needs post-run
 /// expansion, later events are held so output order is preserved. The holder is
 /// bounded: reaching the cap flushes what is held without further expansion.
-///
-/// HTML output always holds its events: live updates replace their dumps in
-/// place, and the page is printed once the run finishes. The bounded holder
-/// still applies, so a very long run flushes finished blocks into `body`
-/// instead of growing without bound.
+#[derive(Default)]
 struct Output {
-    format: OutputFormat,
-    /// Script title used for the HTML page.
-    title: String,
     events: Vec<Recorded>,
     buffering: bool,
     /// Dump node ids held in `events`; updates targeting them must be applied
     /// there, while updates for already printed live values still report now.
     held_ids: HashSet<String>,
     live_updates: usize,
-    /// HTML blocks flushed before the run finished.
-    body: String,
 }
 
-impl Output {
-    fn new(format: OutputFormat, title: String) -> Self {
+/// Every event of one HTML run. Unlike the text holder nothing is printed
+/// before the end: all dumps are kept so live updates can replace them in
+/// place, and a forced exit can still render the report.
+struct HtmlReport {
+    title: String,
+    events: Vec<Recorded>,
+    written: bool,
+}
+
+impl HtmlReport {
+    fn new(title: String) -> Self {
         Self {
-            format,
             title,
             events: Vec::new(),
-            // HTML cannot update a printed block, so it holds everything.
-            buffering: format == OutputFormat::Html,
-            held_ids: HashSet::new(),
-            live_updates: 0,
-            body: String::new(),
+            written: false,
         }
     }
+}
+
+/// A run's output destination. HTML gets its own sink because it cannot update
+/// a block that has already been printed, while text streams as it goes.
+enum Recorder {
+    Text(Output),
+    Html(Arc<Mutex<HtmlReport>>),
+}
+
+impl Recorder {
+    fn record(&mut self, event: &KernelEvent, path: &Path) {
+        match self {
+            Recorder::Text(output) => record_event(event, path, output),
+            Recorder::Html(report) => record_event_html(event, path, report),
+        }
+    }
+
+    fn dump(&mut self, node: Value) {
+        match self {
+            Recorder::Text(output) => push_dump(node, output),
+            Recorder::Html(report) => push_html(report, Recorded::Dump(node)),
+        }
+    }
+
+    /// Report a host message. HTML keeps it in the page and also mirrors it to
+    /// the terminal, so a failed run explains itself without opening the file.
+    fn stderr(&mut self, text: String) {
+        match self {
+            Recorder::Text(output) => emit(Recorded::Stderr(text), output),
+            Recorder::Html(report) => {
+                write_terminal_stderr(&text);
+                push_html(report, Recorded::Stderr(text));
+            }
+        }
+    }
+}
+
+fn push_html(report: &Arc<Mutex<HtmlReport>>, record: Recorded) {
+    if let Ok(mut report) = report.lock() {
+        report.events.push(record);
+    }
+}
+
+fn record_event_html(event: &KernelEvent, path: &Path, report: &Arc<Mutex<HtmlReport>>) {
+    match event.method.as_str() {
+        "stream" => {
+            let stderr = event.params["stream"].as_str() == Some("stderr");
+            let text = event.params["text"].as_str().unwrap_or("").to_owned();
+            let record = if stderr {
+                write_terminal_stderr(&text);
+                Recorded::Stderr(text)
+            } else {
+                Recorded::Stdout(text)
+            };
+            push_html(report, record);
+        }
+        "dump" => push_html(report, Recorded::Dump(event.params["node"].clone())),
+        "dump_update" => {
+            let (Some(node_id), Some(node)) = (
+                event.params["nodeId"].as_str(),
+                event.params.get("node").filter(|node| !node.is_null()),
+            ) else {
+                return;
+            };
+            push_html(
+                report,
+                Recorded::Update {
+                    node_id: node_id.to_owned(),
+                    node: node.clone(),
+                },
+            );
+        }
+        "diagnostics" => {
+            if let Some(text) = diagnostics_text(&event.params["diagnostics"], path) {
+                write_terminal_stderr(&text);
+                push_html(report, Recorded::Stderr(text));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn write_terminal_stderr(text: &str) {
+    let mut stderr = io::stderr().lock();
+    let _ = stderr.write_all(text.as_bytes());
+    let _ = stderr.flush();
 }
 
 fn record_event(event: &KernelEvent, path: &Path, output: &mut Output) {
@@ -425,27 +548,16 @@ fn hold(mut record: Recorded, output: &mut Output) {
         return;
     }
     // A long stream after an expandable dump must not grow without bound.
-    // Print the held previews as they are and go back to streaming. HTML keeps
-    // buffering so the page order stays intact, but finished blocks are safe.
-    match output.format {
-        OutputFormat::Text => {
-            eprintln!("Output buffer full; printing held values without further expansion.");
-            for record in &output.events {
-                write_recorded(record);
-            }
-            output.buffering = false;
-        }
-        OutputFormat::Html => {
-            eprintln!("Output buffer full; continuing without further expansion.");
-            let events = std::mem::take(&mut output.events);
-            for record in &events {
-                write_recorded_html(record, &mut output.body);
-            }
-            output.buffering = true;
-        }
+    // Fold in the updates already held, print the previews as they are and go
+    // back to streaming.
+    eprintln!("Output buffer full; printing held values without further expansion.");
+    apply_updates(&mut output.events);
+    for record in &output.events {
+        write_recorded(record);
     }
     output.events.clear();
     output.held_ids.clear();
+    output.buffering = false;
 }
 
 fn collect_ids(node: &mut Value, ids: &mut HashSet<String>) {
@@ -459,11 +571,7 @@ fn collect_ids(node: &mut Value, ids: &mut HashSet<String>) {
 
 /// A terminal cannot update a live block in place, so report its new value as a
 /// progress line on stderr. The initial dump was already printed on stdout.
-/// HTML output replaces live blocks in place, so a flushed block is left as is.
 fn report_live_update(node: &Value, output: &mut Output) {
-    if output.format == OutputFormat::Html {
-        return;
-    }
     if output.live_updates >= MAX_LIVE_UPDATES {
         if output.live_updates == MAX_LIVE_UPDATES {
             eprintln!("Further live updates suppressed.");
@@ -729,47 +837,70 @@ fn expand_node<'a>(
     })
 }
 
-/// Print held events in their original order: text streams to the terminal, or
-/// one finished HTML page is written to stdout.
-fn flush(output: &mut Output) {
-    match output.format {
-        OutputFormat::Text => {
-            for record in &output.events {
-                write_recorded(record);
-            }
-        }
-        OutputFormat::Html => {
-            for record in &output.events {
-                write_recorded_html(record, &mut output.body);
-            }
-            let page = html::document(&output.title, &output.body);
-            let mut stdout = io::stdout().lock();
-            let _ = stdout.write_all(page.as_bytes());
-            let _ = stdout.flush();
-        }
+/// Print held text events in their original order.
+fn flush_text(output: &mut Output) {
+    for record in &output.events {
+        write_recorded(record);
     }
     output.events.clear();
     output.held_ids.clear();
     output.buffering = false;
 }
 
-fn write_recorded_html(record: &Recorded, body: &mut String) {
-    match record {
-        Recorded::Stdout(text) if !text.is_empty() => {
-            body.push_str(&html::stream_block("stdout", text));
+/// Last-chance page for a forced exit: apply the updates collected so far and
+/// write the report without expanding lazy nodes.
+fn flush_html_report(report: &Arc<Mutex<HtmlReport>>) {
+    let Ok(mut report) = report.lock() else {
+        return;
+    };
+    if report.written {
+        return;
+    }
+    report.written = true;
+    let title = report.title.clone();
+    let mut events = std::mem::take(&mut report.events);
+    apply_updates(&mut events);
+    write_html_page(&title, &events);
+}
+
+/// Write one finished page. Adjacent stream reads merge into a single block:
+/// the kernel delivers stdout and stderr as arbitrary pipe-sized chunks, so a
+/// logical line can otherwise be split across boxes.
+fn write_html_page(title: &str, events: &[Recorded]) {
+    let mut body = String::new();
+    let mut index = 0;
+    while index < events.len() {
+        if matches!(&events[index], Recorded::Stdout(_) | Recorded::Stderr(_)) {
+            let stderr = matches!(&events[index], Recorded::Stderr(_));
+            let mut text = String::new();
+            while index < events.len() {
+                match &events[index] {
+                    Recorded::Stderr(chunk) if stderr => text.push_str(chunk),
+                    Recorded::Stdout(chunk) if !stderr => text.push_str(chunk),
+                    _ => break,
+                }
+                index += 1;
+            }
+            if !text.is_empty() {
+                body.push_str(&html::stream_block(
+                    if stderr { "stderr" } else { "stdout" },
+                    &text,
+                ));
+            }
+            continue;
         }
-        Recorded::Stderr(text) if !text.is_empty() => {
-            body.push_str(&html::stream_block("stderr", text));
-        }
-        Recorded::Stdout(_) | Recorded::Stderr(_) => {}
-        Recorded::Dump(node) => {
+        if let Recorded::Dump(node) = &events[index] {
             body.push_str("<section class=\"dump\">");
             body.push_str(&html::render_dump(node));
             body.push_str("</section>\n");
         }
         // Updates were folded into the dumps before this pass.
-        Recorded::Update { .. } => {}
+        index += 1;
     }
+    let page = html::document(title, &body);
+    let mut stdout = io::stdout().lock();
+    let _ = stdout.write_all(page.as_bytes());
+    let _ = stdout.flush();
 }
 
 fn write_recorded(record: &Recorded) {

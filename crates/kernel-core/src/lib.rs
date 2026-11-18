@@ -2,6 +2,7 @@
 mod csharp;
 pub mod data_context;
 pub mod databases;
+mod dump;
 pub mod export;
 pub mod html;
 pub mod installer;

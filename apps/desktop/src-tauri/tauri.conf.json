@@ -26,10 +26,28 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
+    "category": "DeveloperTool",
+    "shortDescription": "A desktop scratchpad for running Python, C# and SQL scripts",
+    "longDescription": "CodingPad runs plain Python, C# and SQL scripts and shows printed text, rich values, tables and HTML in place. It has no telemetry and no auto-updater.",
+    "homepage": "https://github.com/joeizang/codingpad",
+    "publisher": "Joseph Izang",
+    "copyright": "Copyright © 2026 Joseph Izang",
     "icon": [
-      "icons/icon.png",
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
       "icons/icon.ico"
-    ]
+    ],
+    "linux": {
+      "deb": {
+        "section": "devel"
+      }
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
   }
 }

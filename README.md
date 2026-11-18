@@ -11,6 +11,59 @@ in-memory Roslyn compilation, console output, rich `.Dump()` trees and deferred
 enumerable tables, top-level `await`, and compiler diagnostics in the editor and
 Results.
 
+## Install a build (M4.5)
+
+Releases are published on GitHub Releases as installers built locally on their
+own platform (D29, D39): an AppImage, a `.deb` and an `.rpm` on Linux, and an
+NSIS setup on Windows. Early builds are unsigned (D30). macOS installers are
+deferred (D62), so no `.dmg` is published yet.
+
+Build the installer for the machine you are on:
+
+```sh
+just bundle
+```
+
+The installers land in `target/release/bundle/` (`appimage/`, `deb/`, `rpm/`,
+`nsis/`). The app embeds its Python and C# kernels, so an installer is
+self-contained; it does not include Python, the .NET SDK or `uv`. A first run
+offers **Install uv and run** or **Install .NET and run** when a toolchain is
+missing, or uses one you already have.
+
+`packaging/app-icon.png` is the icon source. Regenerate the desktop icons with
+`npm --prefix apps/desktop run tauri -- icon packaging/app-icon.png`. Keep
+`32x32.png`, `128x128.png`, `128x128@2x.png`, `icon.png` and `icon.ico`; delete
+the `Square*`/`StoreLogo` files, `64x64.png`, `icon.icns` and the `android/` and
+`ios/` folders that the generator also writes.
+
+### Linux
+
+- **AppImage**: `chmod +x CodingPad_0.1.0_amd64.AppImage`, then run the file.
+- **Debian/Ubuntu**: `sudo apt install ./CodingPad_0.1.0_amd64.deb`
+- **Fedora/RHEL**: `sudo dnf install ./CodingPad-0.1.0-1.x86_64.rpm`
+
+Use the version and architecture of the file you downloaded. The `.deb` and
+`.rpm` install for all users; the AppImage is a single file and needs no install.
+The AppImage bundles WebKitGTK and GTK, so it runs on a minimal system; the
+`.deb` and `.rpm` list those system packages as dependencies and let your package
+manager install them.
+
+### Windows
+
+Run `CodingPad_0.1.0_x64-setup.exe`. The build is unsigned, so SmartScreen may
+show **Windows protected your PC**: choose **More info**, then **Run anyway**.
+The setup installs for the current user and needs no administrator rights, and
+it installs the WebView2 runtime when it is missing (which needs an internet
+connection).
+
+### First launch
+
+CodingPad sends no telemetry. Its network use is limited to the release check and
+the toolchain or package downloads you trigger, such as **Install uv and run**,
+**Install .NET and run**, and the language servers and packages a script needs.
+There is no auto-updater (D29): see [Update notice](#update-notice-m43), and
+install the newest build over the current one to update.
+
 ## Develop locally
 
 Install:
@@ -37,6 +90,7 @@ From the repository root:
 ```sh
 just check  # Install locked frontend dependencies; build and test every component
 just run    # Open the Tauri application with frontend hot reload
+just bundle # Build this platform's installer (see Install a build)
 ```
 
 `just check` checks TypeScript, builds the UI, runs frontend and Python tests,

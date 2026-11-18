@@ -24,6 +24,8 @@ import {
 } from "./protocol";
 import { SecretsDialog } from "./SecretsDialog";
 import { SchemaPanel } from "./SchemaPanel";
+import { UpdateNotice } from "./UpdateNotice";
+import { useAvailableUpdate } from "./updates";
 import { useConnectionSchema } from "./schema";
 import { Sidebar } from "./Sidebar";
 import {
@@ -190,6 +192,7 @@ export default function App() {
   const active = scripts.find((script) => script.id === activeId)!;
   const language = scriptLanguage(active);
   const runnable = language !== "plaintext";
+  const availableUpdate = useAvailableUpdate();
   const compileDiagnostics = active.compilation?.source === active.source
     ? active.compilation.diagnostics
     : EMPTY_DIAGNOSTICS;
@@ -847,6 +850,7 @@ export default function App() {
           </button>
         </div>
       </header>
+      {availableUpdate && <UpdateNotice update={availableUpdate} />}
       <nav className="tabs" aria-label="Open scripts">
         {scripts.map((script) => (
           <div

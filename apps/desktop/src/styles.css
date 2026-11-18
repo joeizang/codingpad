@@ -79,6 +79,26 @@ button:disabled {
   padding: 9px 20px;
   font-weight: 650;
 }
+.update-notice {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 22px;
+  font-size: 12px;
+  color: #d9e7d0;
+  background: #25311f;
+  border-bottom: 1px solid #3c4a33;
+}
+.update-link {
+  color: #b9d6ac;
+  font-weight: 650;
+  text-underline-offset: 2px;
+}
+.update-link:focus-visible {
+  outline: 2px solid #a7c8ff;
+  outline-offset: 2px;
+}
 .tabs {
   min-height: 42px;
   display: flex;

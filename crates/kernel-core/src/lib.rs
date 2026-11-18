@@ -15,6 +15,7 @@ mod shadow;
 pub mod store;
 pub mod text;
 pub mod toolchains;
+pub mod updates;
 
 use packages::Packages;
 use secrets::{SecretSnapshot, SecretStore};

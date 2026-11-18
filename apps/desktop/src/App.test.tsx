@@ -31,6 +31,7 @@ vi.mock("@tauri-apps/api/window", () => ({
     onCloseRequested: vi.fn().mockResolvedValue(() => {}),
   }),
 }));
+vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 vi.mock("./CodeEditor", () => ({
   default: ({
     source,
@@ -72,6 +73,55 @@ beforeEach(() => {
   dialog.save.mockReset();
   dialog.ask.mockReset();
   dialog.ask.mockResolvedValue(true);
+});
+
+test("a newer release shows a notice linking to its page", async () => {
+  invoke.mockImplementation(async (command) => {
+    if (command === "check_for_update")
+      return {
+        version: "0.2.0",
+        url: "https://github.com/joeizang/codingpad/releases/tag/v0.2.0",
+      };
+    return undefined;
+  });
+  render(<App />);
+  expect(
+    await screen.findByText("CodingPad 0.2.0 is available."),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "View release" })).toHaveAttribute(
+    "href",
+    "https://github.com/joeizang/codingpad/releases/tag/v0.2.0",
+  );
+});
+
+test("a current build shows no notice", async () => {
+  invoke.mockImplementation(async (command) => {
+    if (command === "check_for_update") return null;
+    return undefined;
+  });
+  render(<App />);
+  await waitFor(() =>
+    expect(
+      invoke.mock.calls.filter(([command]) => command === "check_for_update"),
+    ).toHaveLength(1),
+  );
+  expect(screen.queryByText(/is available\./)).not.toBeInTheDocument();
+});
+
+test("a failed update check stays silent and leaves the app working", async () => {
+  invoke.mockImplementation(async (command) => {
+    if (command === "check_for_update") throw new Error("offline");
+    return undefined;
+  });
+  render(<App />);
+  expect(screen.getByRole("button", { name: "▶ Run" })).toBeInTheDocument();
+  await waitFor(() =>
+    expect(
+      invoke.mock.calls.filter(([command]) => command === "check_for_update"),
+    ).toHaveLength(1),
+  );
+  expect(screen.queryByText(/is available\./)).not.toBeInTheDocument();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
 
 test("type diagnostics are shown without disabling Run", async () => {
@@ -194,7 +244,11 @@ test("many stream fragments flush once per animation frame and at completion", a
   let channel!: { onmessage: (event: KernelEvent) => void };
   let finish!: (value: { ok: boolean }) => void;
   invoke.mockImplementation((command, args) => {
-    if (command === "load_library_settings" || command === "list_samples")
+    if (
+      command === "load_library_settings" ||
+      command === "list_samples" ||
+      command === "check_for_update"
+    )
       return Promise.resolve(undefined);
     channel = args.onEvent;
     return new Promise((resolve) => {
@@ -340,7 +394,11 @@ test("live updates share the animation-frame batch instead of re-rendering each"
   let channel!: { onmessage: (event: KernelEvent) => void };
   let finish!: (value: { ok: boolean }) => void;
   invoke.mockImplementation((command, args) => {
-    if (command === "load_library_settings" || command === "list_samples")
+    if (
+      command === "load_library_settings" ||
+      command === "list_samples" ||
+      command === "check_for_update"
+    )
       return Promise.resolve(undefined);
     channel = args.onEvent;
     return new Promise((resolve) => {

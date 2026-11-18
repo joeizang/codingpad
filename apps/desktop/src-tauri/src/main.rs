@@ -9,6 +9,7 @@ use codingpad_kernel_core::{
     secrets::{SecretEntry, SecretOrigin, SecretStore},
     store::{self, FolderEntry, LibrarySettings, ScriptFile},
     toolchains::Toolchains,
+    updates::{self, UpdateNotice},
     ExpandResult, KernelEvent, Language, RunResult, Supervisor,
 };
 use std::{
@@ -200,6 +201,13 @@ fn list_secrets(secrets: State<'_, Arc<SecretStore>>) -> Vec<SecretEntry> {
 fn vault_available(secrets: State<'_, Arc<SecretStore>>) -> Option<bool> {
     secrets.clear_failures();
     secrets.vault_available()
+}
+
+/// The only request CodingPad makes on its own (D29, D31). `None` covers a
+/// current build, an offline machine, and every other failed check.
+#[tauri::command]
+async fn check_for_update(app: tauri::AppHandle) -> Option<UpdateNotice> {
+    updates::check(&app.package_info().version.to_string()).await
 }
 
 #[tauri::command]
@@ -492,6 +500,7 @@ fn main() {
     bench_phase("process_entry", serde_json::Value::Null);
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .on_page_load(|_, payload| {
             bench_phase(
                 match payload.event() {
@@ -538,6 +547,7 @@ fn main() {
             delete_secret,
             list_secrets,
             vault_available,
+            check_for_update,
             install_uv,
             install_dotnet,
             run_script,

@@ -19,9 +19,7 @@ run:
     npm --prefix apps/desktop ci
     npm --prefix apps/desktop run tauri -- dev
 
-# Build the installer for this platform (D29, D39). Output lands under
-# target/release/bundle: appimage/, deb/ and rpm/ on Linux, nsis/ on Windows,
-# dmg/ on macOS. Run this on each platform; nothing is cross-built.
+# Build this platform's installer under target/release/bundle (D29, D39).
 bundle:
     npm --prefix apps/desktop ci
     npm --prefix apps/desktop run tauri -- build

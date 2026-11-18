@@ -224,6 +224,41 @@ This is the only request CodingPad makes on its own (D29, D31), and it never
 downloads or installs anything. To update, download the newest installer from
 GitHub Releases and install it over the current build.
 
+## Report a crash (M4.4)
+
+CodingPad has no telemetry (D31). A fatal panic in the app, or an error that
+stops the interface from drawing, shows a crash screen with **Report on
+GitHub**. The button opens a pre-filled issue in the system browser; nothing is
+submitted until you review it there and press Submit. Nothing is sent
+automatically.
+
+The issue holds the app version, the platform and the error details: the
+message and the position. The crash screen also shows a backtrace locally, but
+that stays out of the issue because it is the likeliest place for source paths
+and production values. The user's home folder becomes `~`, credentials in URLs
+and values after keys such as `password=` or `token=` become `[redacted]`, and
+long details are cut so the link stays usable. Scripts and connection details
+are never read for a report. Review the issue before submitting.
+
+A fatal panic is written to `pending-crash.json` in the app data folder and
+offered on the next launch, because the process that panicked may be gone before
+it can draw anything. Only main-thread panics are recorded, and a clean exit
+discards the file, so a worker panic the app recovered from does not reappear.
+To see the screen on purpose, start a debug build once with
+`CODINGPAD_FORCE_CRASH=1`; it crashes, and the next launch offers the button:
+
+```sh
+CODINGPAD_FORCE_CRASH=1 target/debug/codingpad-desktop
+target/debug/codingpad-desktop
+```
+
+On Windows PowerShell, set `$env:CODINGPAD_FORCE_CRASH = "1"` for the first
+command, then clear it with `Remove-Item Env:CODINGPAD_FORCE_CRASH`.
+
+Event-handler and promise errors keep the app running and do not open the crash
+screen, and `cpad` is a terminal command with its own exit status; neither is
+covered by this report in the 0.1 preview.
+
 ## C# scripts (M2.3)
 
 Click **+ C#** or open a `.cs` file. CodingPad finds `dotnet` on `PATH`, in

@@ -748,3 +748,75 @@ footer {
 .schema-table li { margin: 6px 0; overflow-wrap: anywhere; }
 .schema-table code { color: #a9b9ca; }
 @media (max-width: 800px) { .schema-panel { width: 200px; min-width: 140px; } }
+
+.crash-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(10, 12, 16, 0.78);
+}
+.crash {
+  width: min(680px, 100%);
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  padding: 22px 24px;
+  background: #1d2129;
+  border: 1px solid #3a424f;
+  border-radius: 10px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+}
+.crash h2 {
+  margin: 0 0 10px;
+  font-size: 19px;
+}
+.crash p {
+  color: #aab4c4;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.crash-message {
+  max-height: 180px;
+  overflow: auto;
+  margin: 14px 0;
+  padding: 10px 12px;
+  background: #171a20;
+  border: 1px solid #3a424f;
+  border-radius: 6px;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.crash-technical {
+  margin: 12px 0;
+  color: #aab4c4;
+  font-size: 12px;
+}
+.crash-technical summary {
+  cursor: pointer;
+}
+.crash-technical pre {
+  max-height: 200px;
+  overflow: auto;
+  padding: 10px 12px;
+  background: #171a20;
+  border: 1px solid #3a424f;
+  border-radius: 6px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.crash .crash-environment {
+  color: #7f8a9c;
+  font-size: 11px;
+}
+.crash .crash-error {
+  color: #ffb4a8;
+}
+.crash-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}

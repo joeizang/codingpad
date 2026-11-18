@@ -8,6 +8,8 @@ import {
 } from "@tauri-apps/plugin-dialog";
 import CodeEditor, { type EditorHandle } from "./CodeEditor";
 import { ConnectionsDialog } from "./ConnectionsDialog";
+import { CrashScreen } from "./CrashScreen";
+import { usePendingCrash } from "./crash";
 import {
   DumpTree,
   type ExportFormat,
@@ -139,6 +141,7 @@ export default function App() {
   const [closing, setClosing] = useState(false);
   const [secretsOpen, setSecretsOpen] = useState(false);
   const [connectionsOpen, setConnectionsOpen] = useState(false);
+  const [pendingCrash, dismissPendingCrash] = usePendingCrash();
   const [installProgress, setInstallProgress] = useState<string | null>(null);
   const installingToolchain = useRef(false);
   const [toolchainVersion, setToolchainVersion] = useState(0);
@@ -784,6 +787,9 @@ export default function App() {
 
   return (
     <main className="app">
+      {pendingCrash && (
+        <CrashScreen details={pendingCrash} onDismiss={dismissPendingCrash} />
+      )}
       <header className="toolbar">
         <div className="brand">
           <span className="brand-mark">c.</span>

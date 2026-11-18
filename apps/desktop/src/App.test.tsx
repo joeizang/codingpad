@@ -7,6 +7,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import App from "./App";
+import { resetPendingCrashForTests } from "./crash";
 import type { KernelEvent } from "./protocol";
 import { resetUpdateCheckForTests } from "./updates";
 
@@ -71,6 +72,7 @@ vi.mock("./CodeEditor", () => ({
 beforeEach(() => {
   invoke.mockReset();
   resetUpdateCheckForTests();
+  resetPendingCrashForTests();
   dialog.open.mockReset();
   dialog.save.mockReset();
   dialog.ask.mockReset();
@@ -249,7 +251,8 @@ test("many stream fragments flush once per animation frame and at completion", a
     if (
       command === "load_library_settings" ||
       command === "list_samples" ||
-      command === "check_for_update"
+      command === "check_for_update" ||
+      command === "take_pending_crash"
     )
       return Promise.resolve(undefined);
     channel = args.onEvent;
@@ -399,7 +402,8 @@ test("live updates share the animation-frame batch instead of re-rendering each"
     if (
       command === "load_library_settings" ||
       command === "list_samples" ||
-      command === "check_for_update"
+      command === "check_for_update" ||
+      command === "take_pending_crash"
     )
       return Promise.resolve(undefined);
     channel = args.onEvent;

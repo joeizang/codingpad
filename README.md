@@ -233,7 +233,7 @@ system browser; nothing is submitted until you review it there and press
 Submit. Nothing is sent automatically.
 
 The issue holds the app version, the platform and the error details: the
-message, the position and a backtrace when one exists. Scripts, connection
+message, the position and, when it fits, a backtrace. Scripts, connection
 details and secrets are never read for a report, and long details are cut so the
 link stays usable. The crash screen shows the same text before you click.
 

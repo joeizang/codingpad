@@ -41,12 +41,17 @@ missing, or uses one you already have.
 
 Use the version and architecture of the file you downloaded. The `.deb` and
 `.rpm` install for all users; the AppImage is a single file and needs no install.
+The AppImage uses the system WebKitGTK rather than bundling it, so a minimal
+system may also need `libwebkit2gtk-4.1-0` and `libgtk-3-0` (Debian/Ubuntu) or
+`webkit2gtk4.1` and `gtk3` (Fedora).
 
 ### Windows
 
 Run `CodingPad_0.1.0_x64-setup.exe`. The build is unsigned, so SmartScreen may
 show **Windows protected your PC**: choose **More info**, then **Run anyway**.
-The setup installs for the current user and needs no administrator rights.
+The setup installs for the current user and needs no administrator rights, and
+it installs the WebView2 runtime when it is missing (which needs an internet
+connection).
 
 ### macOS
 

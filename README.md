@@ -145,10 +145,10 @@ their packages through `uv` when Run is pressed.
 
 To run TypeScript, install [Bun](https://bun.com/docs/installation), then choose
 **TypeScript** in the New Script menu or open a `.ts` file. CodingPad looks for
-Bun on `PATH`, in `BUN_INSTALL/bin` or `~/.bun/bin`, and in the usual Homebrew
-locations on macOS. Import `dump` from `codingpad` to display a value in Results.
-The last expression is dumped automatically. Top-level `await` works and the
-kernel runs scripts with type errors.
+Bun on `PATH`, in `BUN_INSTALL/bin` or `~/.bun/bin`. Import `dump` from `codingpad` to
+display a value in Results. The last expression is dumped automatically.
+Top-level `await` works and the kernel runs scripts with type errors. CI installs
+Bun to exercise this path.
 
 If no .NET 10+ runtime is installed, Results offers **Install .NET and run**. One
 click downloads the official `dotnet-install` script pinned to the

@@ -170,7 +170,7 @@ function CollectionNode({
         {node.type}{" "}
         <span className="muted">
           ({rows.length}
-          {next || node.truncated ? ` of ${total}` : ""})
+          {next ? ` of ${total}` : ""})
         </span>
       </summary>
       <div className="tree-fields">

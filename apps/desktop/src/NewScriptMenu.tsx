@@ -11,23 +11,10 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type { Connection } from "./ConnectionsDialog";
 import { baseName } from "./library";
 
-export type ScriptLanguage = "python" | "csharp" | "typescript" | "sql";
+import { SCRIPT_LANGUAGES, scriptLanguageDetails, type ScriptLanguage } from "./scriptLanguages";
 
 /** The bundled database every install has; it is not in the saved connection list. */
 export const SAMPLE_CONNECTION = "codingpad-sample";
-
-const LANGUAGES: {
-  id: ScriptLanguage;
-  chip: string;
-  name: string;
-  detail: string;
-  key: string;
-}[] = [
-  { id: "python", chip: "PY", name: "Python", detail: "Scripts, packages and dumps", key: "P" },
-  { id: "csharp", chip: "C#", name: "C#", detail: "Top-level statements on .NET", key: "C" },
-  { id: "typescript", chip: "TS", name: "TypeScript", detail: "Scripts on Bun", key: "T" },
-  { id: "sql", chip: "SQL", name: "SQL", detail: "Query a connected database", key: "S" },
-];
 
 type Choice = { name: string; detail: string };
 
@@ -63,10 +50,11 @@ export function NewScriptMenu({ open, anchor, lastConnection, onCreate, onClose 
   ];
   const fallback =
     choices.find((choice) => choice.name === lastConnection)?.name ?? choices[0].name;
-  // SQL cannot run without a database, so it always has one picked.
-  const picked = language === "typescript"
-    ? undefined
-    : language === "sql" ? connection ?? fallback : connection;
+  const current = scriptLanguageDetails(language)!;
+  const canAttach = current.connection !== "unavailable";
+  const picked = canAttach
+    ? current.connection === "required" ? connection ?? fallback : connection
+    : undefined;
 
   async function loadConnections() {
     try {
@@ -111,7 +99,6 @@ export function NewScriptMenu({ open, anchor, lastConnection, onCreate, onClose 
 
   if (!open) return null;
 
-  const current = LANGUAGES.find((item) => item.id === language)!;
   const create = () => onCreate(language, picked);
   const close = () => {
     onClose();
@@ -158,7 +145,7 @@ export function NewScriptMenu({ open, anchor, lastConnection, onCreate, onClose 
   function onKeyDown(event: ReactKeyboardEvent) {
     if (event.ctrlKey || event.metaKey || event.altKey) return;
     const key = event.key.toLowerCase();
-    const index = LANGUAGES.findIndex((item) => item.id === language);
+    const index = SCRIPT_LANGUAGES.findIndex((item) => item.id === language);
     if (key === "escape") {
       event.preventDefault();
       close();
@@ -169,10 +156,10 @@ export function NewScriptMenu({ open, anchor, lastConnection, onCreate, onClose 
       create();
     } else if (key === "arrowdown" || key === "arrowup") {
       event.preventDefault();
-      const step = key === "arrowdown" ? 1 : LANGUAGES.length - 1;
-      choose(LANGUAGES[(index + step) % LANGUAGES.length].id);
+      const step = key === "arrowdown" ? 1 : SCRIPT_LANGUAGES.length - 1;
+      choose(SCRIPT_LANGUAGES[(index + step) % SCRIPT_LANGUAGES.length].id);
     } else {
-      const match = LANGUAGES.find((item) => item.key.toLowerCase() === key);
+      const match = SCRIPT_LANGUAGES.find((item) => item.key.toLowerCase() === key);
       if (match) {
         event.preventDefault();
         choose(match.id);
@@ -190,7 +177,7 @@ export function NewScriptMenu({ open, anchor, lastConnection, onCreate, onClose 
       onKeyDown={onKeyDown}
     >
       <div role="radiogroup" aria-label="Language">
-        {LANGUAGES.map((item) => (
+        {SCRIPT_LANGUAGES.map((item) => (
           <button
             key={item.id}
             className="new-script-language"
@@ -210,10 +197,10 @@ export function NewScriptMenu({ open, anchor, lastConnection, onCreate, onClose 
           </button>
         ))}
       </div>
-      {language !== "typescript" && (
+      {canAttach && (
         <div className="new-script-connection" role="group" aria-label="Connection">
           <p>
-            {language === "sql" ? (
+            {current.connection === "required" ? (
               <>
                 <em>SQL runs against a connection.</em> Pick one.
               </>
@@ -226,7 +213,7 @@ export function NewScriptMenu({ open, anchor, lastConnection, onCreate, onClose 
           <div className="connection-choices">
             <button
               aria-pressed={picked === undefined}
-              disabled={language === "sql"}
+              disabled={current.connection === "required"}
               onClick={() => setConnection(undefined)}
             >
               None

@@ -1,8 +1,8 @@
 # Kernel protocol v1
 
 JSON-RPC 2.0 over UTF-8 stdio, one JSON object per line. The Rust supervisor
-writes requests to a kernel process's stdin and reads its stdout. Python and C#
-keep one warm kernel per open script. TypeScript starts a process for each run.
+writes requests to a kernel process's stdin and reads its stdout. Python, C# and
+TypeScript keep one warm kernel per open script.
 The kernel and its runtime are embedded in the Rust build and extracted to a
 private temporary directory for the process lifetime; installed apps do not need
 the source checkout or a registry package. Python starts with `-I -u -X utf8` and adds only
@@ -436,13 +436,24 @@ an AOT compiler. Registry publication is a separate release action.
 ## TypeScript kernel (M5.0)
 
 The Bun kernel sends the same `stream`, `dump`, and `run_finished` notifications
-and run response. The host embeds the kernel and the `codingpad` module. Each run
-starts a fresh Bun process. `run.params.path` supplies the location used for
-relative imports from the editor snapshot. Run does not write to the script file.
+and run response. Each open script keeps a warm Bun process. Each run gets a fresh
+worker in that process. Stop targets the active worker and waits for it to exit.
+If the worker cannot exit within two seconds, the Rust supervisor kills the
+kernel. Reset and Close also discard the process. The `cache()` helper arrives in
+M5.2.
 
-Bun executes TypeScript without type checking and supports top-level `await`.
-Console output and JavaScript writes to `process.stdout` and `process.stderr`
-become stream notifications. The host parses the final top-level expression so
-the kernel can evaluate it once and dump its value. Automatic dumps skip
-`undefined`. The built-in `dump()` emits bounded scalar, array and object
-previews. Syntax and runtime errors produce a stderr notification and `ok: false`.
+The bundled `codingpad` module is available inside each worker. `run.params.path`
+sets the base for file-relative imports from a saved tab. Unsaved tabs resolve
+relative to the kernel's private directory. Run uses the editor snapshot without
+writing to the script file. Versioned auto-install imports and the shadow
+project arrive in M5.3 (D5).
+
+Bun executes TypeScript with top-level `await` and runs scripts with type errors.
+The editor registers TypeScript syntax highlighting. Type diagnostics arrive in
+M5.4. Console output and JavaScript writes to `process.stdout` and
+`process.stderr` become stream notifications. The host identifies the final
+top-level expression, which the worker evaluates once. Automatic dumps skip
+`undefined`. M5.0 limits basic previews to six levels, 100 children per
+container and 1,000 nodes per dump. Built-in values such as dates and maps use
+text previews. Lazy handles and paging arrive in M5.1. Syntax and runtime errors
+produce a stderr notification and `ok: false`.

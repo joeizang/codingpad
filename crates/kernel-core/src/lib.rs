@@ -128,6 +128,12 @@ pub enum Language {
     Typescript,
 }
 
+impl Language {
+    fn supports_connections(self) -> bool {
+        matches!(self, Self::Python | Self::Csharp)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KernelEvent {
@@ -177,7 +183,7 @@ pub async fn attached_data_context(
     source: &str,
     language: Language,
 ) -> (Option<DataContextRun>, Option<String>) {
-    if language == Language::Typescript {
+    if !language.supports_connections() {
         return (None, None);
     }
     let Some(name) = attached_connection(source) else {
@@ -404,7 +410,7 @@ impl Supervisor {
         // Vault prompts block. Resolve values off the async thread and let Stop
         // or Close cancel the wait before the kernel slot lock is taken.
         let secrets = match (&self.secrets, language) {
-            (Some(store), Language::Python | Language::Csharp) => {
+            (Some(store), language) if language.supports_connections() => {
                 let store = Arc::clone(store);
                 let names = referenced_secret_names(source);
                 let snapshot =
@@ -418,12 +424,12 @@ impl Supervisor {
             }
             _ => SecretSnapshot::default(),
         };
-        let connection = if language == Language::Typescript {
-            None
-        } else {
+        let connection = if language.supports_connections() {
             store::parse_header(source)
                 .and_then(|header| header.settings.get("connection").cloned())
                 .filter(|name| !name.trim().is_empty())
+        } else {
+            None
         };
         let connection = match connection {
             Some(name) => {
@@ -549,21 +555,18 @@ impl Supervisor {
             };
             *guard = Some(startup?);
         }
-        let source = match language {
-            Language::Typescript => typescript::instrument(source),
-            _ => source.into(),
+        let final_expression = if language == Language::Typescript {
+            typescript::final_expression(source)
+        } else {
+            None
         };
         let data = data.map(|data| json!({"source": data.source, "connection": data.connection}));
-        let params = json!({"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection, "data": data, "eager": self.eager_dumps});
+        let params = json!({"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection, "data": data, "eager": self.eager_dumps, "finalExpression": final_expression});
         let result = tokio::select! {
             result = guard.as_mut().unwrap().run(params, &mut emit, &mut stop) => result,
             _ = closed.changed() => Err("Script was closed".into()),
         };
-        // TypeScript uses a fresh process per run until warm run control.
-        if language == Language::Typescript
-            || result.as_ref().is_ok_and(|result| result.cache_cleared)
-            || result.is_err()
-        {
+        if result.as_ref().is_ok_and(|result| result.cache_cleared) || result.is_err() {
             *guard = None;
         }
         result

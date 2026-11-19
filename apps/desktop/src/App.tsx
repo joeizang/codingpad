@@ -27,7 +27,6 @@ import {
 import {
   NewScriptMenu,
   SAMPLE_CONNECTION,
-  type ScriptLanguage,
 } from "./NewScriptMenu";
 import { SecretsDialog } from "./SecretsDialog";
 import { SchemaPanel } from "./SchemaPanel";
@@ -44,7 +43,10 @@ import {
   type LibrarySettings,
   type ScriptFile,
 } from "./library";
-import { languageLabel, type Sample } from "./samples";
+import type { Sample } from "./samples";
+import {
+  SCRIPT_LANGUAGES, languageLabel, scriptLanguage, scriptLanguageDetails, type ScriptLanguage,
+} from "./scriptLanguages";
 
 const SAMPLE = `from codingpad import dump
 
@@ -80,21 +82,9 @@ SELECT 1 AS answer;
 `;
 
 const SCRIPT_FILTERS = [
-  { name: "Python", extensions: ["py"] },
-  { name: "C#", extensions: ["cs"] },
-  { name: "TypeScript", extensions: ["ts"] },
-  { name: "SQL", extensions: ["sql"] },
+  ...SCRIPT_LANGUAGES.map(({ name, extension }) => ({ name, extensions: [extension] })),
   { name: "All files", extensions: ["*"] },
 ];
-
-const scriptLanguage = (script: Script) => {
-  const name = script.path ?? script.name;
-  if (/\.py$/i.test(name)) return "python";
-  if (/\.cs$/i.test(name)) return "csharp";
-  if (/\.ts$/i.test(name)) return "typescript";
-  if (/\.sql$/i.test(name)) return "sql";
-  return "plaintext";
-};
 
 type Script = {
   id: string;
@@ -127,25 +117,18 @@ function intelligenceLabel(summary: DiagnosticsSummary): string {
   return parts.length ? parts.join(" · ") : "No type problems";
 }
 
-const HEADER_COMMENT: Record<ScriptLanguage, string> = {
-  python: "#",
-  csharp: "//",
-  typescript: "//",
-  sql: "--",
-};
-
-const SCRIPT_STARTERS: Record<ScriptLanguage, { extension: string; source: string }> = {
-  python: { extension: "py", source: SAMPLE },
-  csharp: { extension: "cs", source: CSHARP_SAMPLE },
-  typescript: { extension: "ts", source: TYPESCRIPT_SAMPLE },
-  sql: { extension: "sql", source: SQL_SAMPLE },
+const SCRIPT_STARTERS: Record<ScriptLanguage, string> = {
+  python: SAMPLE,
+  csharp: CSHARP_SAMPLE,
+  typescript: TYPESCRIPT_SAMPLE,
+  sql: SQL_SAMPLE,
 };
 
 /** Starter text for a new tab, with a header line when a connection is attached. */
 function starterSource(language: ScriptLanguage, connection?: string): string {
-  const starter = SCRIPT_STARTERS[language].source;
+  const starter = SCRIPT_STARTERS[language];
   if (!connection) return starter;
-  const header = `${HEADER_COMMENT[language]} codingpad: connection=${connection}`;
+  const header = `${scriptLanguageDetails(language)!.comment} codingpad: connection=${connection}`;
   // The SQL starter already carries a header for the sample database; replace it.
   return parseHeader(starter)
     ? starter.replace(/^[^\n]*/, header)
@@ -158,7 +141,7 @@ const newScript = (
   connection?: string,
 ): Script => ({
   id: uniqueId("scratch"),
-  name: `Scratch ${number}.${SCRIPT_STARTERS[language].extension}`,
+  name: `Scratch ${number}.${scriptLanguageDetails(language)!.extension}`,
   source: starterSource(language, connection),
   dirty: false,
   output: [],
@@ -303,7 +286,9 @@ export default function App() {
     : EMPTY_DIAGNOSTICS;
   const activeHeader = parseHeader(active.source);
   const connectionName =
-    language === "typescript" ? undefined : activeHeader?.settings.connection || undefined;
+    scriptLanguageDetails(language)?.connection === "unavailable"
+      ? undefined
+      : activeHeader?.settings.connection || undefined;
   const [schemaRevision, setSchemaRevision] = useState(0);
   const schemaState = useConnectionSchema(connectionName, schemaRevision);
   const update = (id: string, change: (script: Script) => Script) =>
@@ -989,7 +974,7 @@ export default function App() {
                   onClick={() => setActiveId(script.id)}
                 >
                   <span className="language-chip" aria-hidden>
-                    {{ csharp: "C#", sql: "SQL", python: "PY", typescript: "TS", plaintext: "TXT" }[scriptLang]}
+                    {scriptLanguageDetails(scriptLang)?.chip ?? "TXT"}
                   </span>
                   {script.name}
                   {script.dirty && (

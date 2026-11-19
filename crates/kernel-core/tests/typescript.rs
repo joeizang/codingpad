@@ -1,7 +1,7 @@
 use codingpad_kernel_core::{KernelEvent, Language, Supervisor};
 use serde_json::Value;
 use std::time::Duration;
-use tokio::time::timeout;
+use tokio::{sync::oneshot, time::timeout};
 
 #[tokio::test]
 async fn typescript_run_streams_await_and_dumps_the_editor_snapshot() {
@@ -14,6 +14,15 @@ async fn typescript_run_streams_await_and_dumps_the_editor_snapshot() {
     )
     .unwrap();
 
+    let saved_path = script.to_str().unwrap();
+    // Windows may normalize the drive letter while resolving file: URLs.
+    let drive_lowercase;
+    let saved_path = if cfg!(windows) && saved_path.as_bytes().get(1) == Some(&b':') {
+        drive_lowercase = saved_path[..1].to_ascii_lowercase() + &saved_path[1..];
+        drive_lowercase.as_str()
+    } else {
+        saved_path
+    };
     let supervisor = Supervisor::default();
     let mut events = Vec::<KernelEvent>::new();
     let source = r#"
@@ -33,14 +42,16 @@ await answer() // final expression
             "scratch",
             source,
             Language::Typescript,
-            script.to_str(),
+            Some(saved_path),
             |event| events.push(event),
         ),
     )
     .await
     .expect("Bun run timed out");
     let result = match result {
-        Err(message) if message.starts_with("Bun was not found.") => {
+        Err(message)
+            if message.starts_with("Bun was not found.") && std::env::var_os("CI").is_none() =>
+        {
             assert!(message.contains("Install Bun"));
             eprintln!("Install Bun to exercise TypeScript execution");
             return;
@@ -94,4 +105,81 @@ await answer() // final expression
             .collect();
         assert_eq!(dumps, expected.into_iter().collect::<Vec<_>>(), "{source}");
     }
+}
+
+#[tokio::test]
+async fn typescript_stop_preserves_kernel_and_clears_script_state() {
+    let supervisor = Supervisor::default();
+    let mut events = Vec::new();
+    let prior = supervisor
+        .run_language(
+            "scratch",
+            "globalThis.prior = true; [process.pid, import.meta.dir, process.cwd()]",
+            Language::Typescript,
+            |event| events.push(event),
+        )
+        .await;
+    let prior = match prior {
+        Err(message)
+            if message.starts_with("Bun was not found.") && std::env::var_os("CI").is_none() =>
+        {
+            return;
+        }
+        result => result.expect("Bun kernel failed"),
+    };
+    assert!(prior.ok, "{events:?}");
+    let scratch = &events[0].params["node"]["items"];
+    let pid = scratch[0]["v"].clone();
+    assert_eq!(scratch[1]["v"], scratch[2]["v"]);
+    assert_ne!(
+        scratch[2]["v"].as_str().unwrap(),
+        std::env::current_dir().unwrap().to_str().unwrap()
+    );
+
+    for pending in ["while (true) {}", "await new Promise(() => {});"] {
+        let (started, wait_for_start) = oneshot::channel();
+        let mut started = Some(started);
+        let source = format!("console.log('waiting'); {pending}");
+        let mut output = Vec::new();
+        let run = supervisor.run_language("scratch", &source, Language::Typescript, |event| {
+            if event.params["text"] == "waiting\n" {
+                started.take().unwrap().send(()).unwrap();
+            }
+            output.push(event);
+        });
+        let stop = async {
+            wait_for_start.await.unwrap();
+            supervisor.stop("scratch").await;
+        };
+        let (result, ()) = timeout(Duration::from_secs(10), async { tokio::join!(run, stop) })
+            .await
+            .expect("Bun Stop timed out");
+        let result = result.expect("Bun kernel failed");
+        assert!(result.stopped && !result.cache_cleared, "{result:?}");
+        assert_eq!(output.first().unwrap().params["text"], "waiting\n");
+        assert_eq!(output.last().unwrap().method, "run_finished");
+    }
+
+    events.clear();
+    let result = supervisor
+        .run_language(
+            "scratch",
+            "[process.pid, globalThis.prior === undefined, new Date(0), new Map([[1, 2]]), new Set([3]), Promise.resolve(4), new (class Example { value = 5 })()]",
+            Language::Typescript,
+            |event| events.push(event),
+        )
+        .await
+        .unwrap();
+    assert!(result.ok, "{events:?}");
+    let items = &events[0].params["node"]["items"];
+    assert_eq!(items[0]["v"], pid);
+    assert_eq!(items[1]["v"], true);
+    for (offset, label) in [(2, "1970"), (3, "Map"), (4, "Set"), (5, "Promise")] {
+        assert!(
+            items[offset]["v"].as_str().unwrap().contains(label),
+            "{items}"
+        );
+    }
+    assert_eq!(items[6]["type"], "Example");
+    assert_eq!(items[6]["fields"][0]["value"]["v"], 5);
 }

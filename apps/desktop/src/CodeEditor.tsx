@@ -6,6 +6,7 @@ import "monaco-editor/languages/definitions/python/register.js";
 import "monaco-editor/languages/definitions/csharp/register.js";
 import "monaco-editor/languages/definitions/sql/register.js";
 import { createSqlCompletions } from "./sqlCompletions";
+import { EDITOR_OPTIONS } from "./editorOptions";
 import type { ConnectionSchema } from "./schema";
 import type { CompileDiagnostic } from "./protocol";
 import EditorWorker from "monaco-editor/editor/editor.worker.js?worker";
@@ -551,21 +552,7 @@ export default function CodeEditor({
         onMount?.(editor);
         reportReady();
       }}
-      options={{
-        fontSize: 14,
-        fontFamily: "'JetBrains Mono Variable', 'Cascadia Mono', Consolas, 'DejaVu Sans Mono', monospace",
-        fontLigatures: false,
-        lineHeight: 24,
-        renderLineHighlight: "line",
-        minimap: { enabled: false },
-        automaticLayout: true,
-        scrollBeyondLastLine: false,
-        padding: { top: 20 },
-        tabSize: 4,
-        quickSuggestions: { other: true, comments: false, strings: false },
-        wordBasedSuggestions: "off",
-        suggestOnTriggerCharacters: true,
-      }}
+      options={EDITOR_OPTIONS}
     />
   );
 }

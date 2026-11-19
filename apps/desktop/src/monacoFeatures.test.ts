@@ -53,3 +53,14 @@ test("word commands edit Monaco's text instead of the hidden textarea", () => {
   instance.trigger("keyboard", "deleteWordRight", null);
   expect(instance.getValue()).toBe("first ");
 });
+
+test("long lines wrap at the editor's width instead of scrolling sideways", async () => {
+  const { EDITOR_OPTIONS } = await import("./editorOptions");
+  const host = document.createElement("div");
+  document.body.append(host);
+  editor = monaco.editor.create(host, { ...EDITOR_OPTIONS, automaticLayout: false, value: "x = 1" });
+  const wrapping = editor.getOption(monaco.editor.EditorOption.wrappingInfo);
+  expect(wrapping.isViewportWrapping).toBe(true);
+  expect(editor.getOption(monaco.editor.EditorOption.wrappingIndent))
+    .toBe(monaco.editor.WrappingIndent.Indent);
+});

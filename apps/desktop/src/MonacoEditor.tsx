@@ -1,5 +1,6 @@
 import { useLayoutEffect, useRef } from "react";
 import * as monaco from "monaco-editor/editor/editor.api.js";
+import "./monacoFeatures";
 
 type Props = {
   path: string;
@@ -30,7 +31,17 @@ export default function MonacoEditor(props: Props) {
       if (!updating.current) latest.current.onChange(editor.getValue());
     });
     latest.current.onMount(editor);
+    // Monaco measures character widths once, at creation. The bundled
+    // editor font loads lazily, so that first reading uses the fallback
+    // font and the caret drifts from the text it draws. Measure again once
+    // the editor font is ready.
+    let disposed = false;
+    const fontSize = options.fontSize ?? 14;
+    document.fonts?.load(`${fontSize}px ${options.fontFamily ?? "monospace"}`)
+      .then(() => { if (!disposed) monaco.editor.remeasureFonts(); })
+      .catch(() => {});
     return () => {
+      disposed = true;
       instance.current = null;
       change.dispose();
       editor.dispose();

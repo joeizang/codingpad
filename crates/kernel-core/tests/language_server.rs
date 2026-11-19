@@ -312,10 +312,14 @@ async fn typescript_code_intelligence_uses_the_shadow_project() {
     }
     let servers = LanguageServers::default();
     let source = r#"import {  } from "codingpad";
-import { dump, cache } from "codingpad";
+import { dump, cache, db as attached, secret as readSecret } from "codingpad";
 const value: number = "not a number";
 dump(value);
 cache("answer", () => 42);
+await attached.query("SELECT 1");
+await db.query("SELECT ?", [secret("name")]);
+const token: string = readSecret("token");
+dump(token);
 "#;
     servers.begin_session("test").await;
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -335,6 +339,14 @@ cache("answer", () => 42);
             .iter()
             .any(|diagnostic| diagnostic["code"] == 2322),
         "expected the assignment type error: {diagnostics:?}"
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic["severity"] == 1)
+            .count(),
+        1,
+        "unexpected helper errors: {diagnostics:?}"
     );
     assert!(
         !diagnostics.iter().any(|diagnostic| diagnostic["message"]
@@ -376,7 +388,7 @@ cache("answer", () => 42);
                     .or_else(|| item["label"]["label"].as_str().map(str::to_owned))
             })
             .collect();
-        if ["dump", "cache"]
+        if ["dump", "cache", "db", "secret"]
             .iter()
             .all(|name| labels.iter().any(|label| label == name))
         {
@@ -384,7 +396,7 @@ cache("answer", () => 42);
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    for name in ["dump", "cache"] {
+    for name in ["dump", "cache", "db", "secret"] {
         assert!(
             labels.iter().any(|label| label == name),
             "missing {name} completion: {labels:?}"

@@ -6,6 +6,7 @@ import { StringDecoder } from "node:string_decoder";
 import { cache, dump, html, image, live, setDumpSink } from "./runtime.ts";
 import { Dumps, type PageRequest } from "./dump.ts";
 import { errorDetails } from "./errors.ts";
+import { databaseSession, type Connection } from "./database.ts";
 import { parentPort, workerData } from "node:worker_threads";
 
 export type Script = {
@@ -13,13 +14,20 @@ export type Script = {
   source: string;
   path: string | null;
   finalExpression: { start: number; end: number; append: boolean } | null;
+  connection: Connection | null;
+  sqlServerDriver: string | null;
+  secrets: Record<string, string>;
+  secret_errors: Record<string, string>;
 };
 
 const port = parentPort!;
 
 const FINAL_DUMP_MODULE = "codingpad:internal";
 
-async function run({ runId, source, path: scriptPath, finalExpression }: Script) {
+async function run({
+  runId, source, path: scriptPath, finalExpression, connection, sqlServerDriver,
+  secrets, secret_errors: secretErrors,
+}: Script) {
   let running = true;
   const notify = (method: string, params: object) => {
     if (running) port.postMessage({ method, params });
@@ -80,6 +88,15 @@ async function run({ runId, source, path: scriptPath, finalExpression }: Script)
   const contents = finalExpression
     ? withFinalDump(source, finalExpression, prefix)
     : source;
+  const database = databaseSession(connection, sqlServerDriver);
+  const { db } = database;
+  const secret = (name: string): string => {
+    if (typeof name !== "string" || !name.trim()) throw new TypeError("A secret name cannot be empty.");
+    if (Object.hasOwn(secretErrors, name)) throw new Error(secretErrors[name]);
+    if (Object.hasOwn(secrets, name)) return secrets[name];
+    throw new Error(`Secret "${name}" was not found. Add it in Secrets… or set it for this session.`);
+  };
+  Object.assign(globalThis, { db, secret });
 
   // Match only the editor snapshot. Bun's runtime onLoad expects a result
   // for every match, so unrelated files must fall through before the hook.
@@ -89,7 +106,7 @@ async function run({ runId, source, path: scriptPath, finalExpression }: Script)
   Bun.plugin({
     name: "CodingPad script",
     setup(builder) {
-      builder.module("codingpad", () => ({ loader: "object", exports: { cache, dump, html, image, live } }));
+      builder.module("codingpad", () => ({ loader: "object", exports: { cache, db, dump, html, image, live, secret } }));
       builder.module(FINAL_DUMP_MODULE, () => ({
         loader: "object",
         exports: { dumpFinal: (value: unknown) => { if (value !== undefined) dump(value); } },
@@ -106,6 +123,12 @@ async function run({ runId, source, path: scriptPath, finalExpression }: Script)
     notify("dump", { node: dumps.error(error) });
   }
   await dumps.finish();
+  try {
+    await database.close();
+  } catch (error) {
+    ok = false;
+    notify("dump", { node: dumps.error(error) });
+  }
   stdout.flush();
   stderr.flush();
   running = false;
@@ -135,4 +158,9 @@ function withFinalDump(source: string, { start, end, append }: NonNullable<Scrip
 }
 
 port.ref();
-await run(workerData as Script);
+// User modules can import workerData. Keep credentials in this run's closure.
+const { connection, secrets, secret_errors: secretErrors, ...script } = workerData as Script;
+delete workerData.connection;
+delete workerData.secrets;
+delete workerData.secret_errors;
+await run({ ...script, connection, secrets, secret_errors: secretErrors });

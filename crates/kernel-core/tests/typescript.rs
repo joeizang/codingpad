@@ -1,5 +1,11 @@
-use codingpad_kernel_core::{KernelEvent, Language, Supervisor};
+use codingpad_kernel_core::{
+    databases::{Connection, ConnectionStore, DatabaseKind, TlsMode},
+    secrets::{SecretStore, Vault},
+    KernelEvent, Language, Supervisor,
+};
 use serde_json::Value;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::{sync::oneshot, time::timeout};
 
@@ -396,6 +402,174 @@ fn rendered_dump<'a>(events: &'a [KernelEvent], node: &'a Value) -> &'a Value {
 
 fn handle(node: &Value) -> &str {
     node["handle"].as_str().unwrap()
+}
+
+#[tokio::test]
+async fn typescript_queries_attached_sqlite_and_reads_current_secrets() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("saved #1.sqlite");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch("CREATE TABLE items (name TEXT); INSERT INTO items VALUES ('Ada');")
+        .unwrap();
+    drop(connection);
+    let connections = Arc::new(ConnectionStore::new(directory.path()));
+    connections
+        .save(Connection {
+            id: String::new(),
+            name: "sample".into(),
+            kind: DatabaseKind::Sqlite,
+            path: Some(path.to_str().unwrap().into()),
+            host: None,
+            port: None,
+            database: None,
+            user: None,
+            secret: None,
+            tls: TlsMode::Prefer,
+            trust_server_certificate: false,
+        })
+        .unwrap();
+    let secrets = Arc::new(SecretStore::new(directory.path()));
+    secrets.set_session("who", "Ada").unwrap();
+    let supervisor =
+        Supervisor::with_data_dir_and_secrets(directory.path().into(), secrets.clone())
+            .with_connections(connections);
+    let Some(events) = run_dump_script(
+        &supervisor,
+        r#"// codingpad: connection=sample
+import { db, secret } from "codingpad";
+await db.query("SELECT name FROM items WHERE name = ?", [secret("who")])
+"#,
+    )
+    .await
+    else {
+        return;
+    };
+    assert_query_table(&events, "name", "Ada");
+
+    secrets.set_session("who", "Grace").unwrap();
+    let events = run_dump_script(
+        &supervisor,
+        r#"
+for (const name of ["missing", "constructor"]) {
+  try { secret(name); } catch (error) { console.log(error.message); }
+}
+try { await db.query("SELECT 1"); } catch (error) { console.log(error.message); }
+secret("who")
+"#,
+    )
+    .await
+    .unwrap();
+    let stdout: String = events
+        .iter()
+        .filter(|event| event.method == "stream" && event.params["stream"] == "stdout")
+        .filter_map(|event| event.params["text"].as_str())
+        .collect();
+    assert!(
+        stdout.contains(r#"Secret "missing" was not found"#),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(r#"Secret "constructor" was not found"#),
+        "{stdout}"
+    );
+    assert!(stdout.contains("No connection is attached"), "{stdout}");
+    assert_eq!(dump_nodes(&events).next().unwrap()["v"], "Grace");
+    supervisor.shutdown().await;
+}
+
+fn assert_query_table(events: &[KernelEvent], column: &str, value: &str) {
+    let table = dump_nodes(events).next().unwrap();
+    assert_eq!(table["kind"], "table", "{table}");
+    assert_eq!(table["columns"][0]["name"], column);
+    assert_eq!(table["rows"][0][0]["v"], value);
+}
+
+struct TestVault(BTreeMap<String, String>);
+
+impl Vault for TestVault {
+    fn get(&self, name: &str) -> Result<Option<String>, String> {
+        Ok(self.0.get(name).cloned())
+    }
+
+    fn set(&self, _: &str, _: &str) -> Result<(), String> {
+        Err("Read-only test vault".into())
+    }
+
+    fn delete(&self, _: &str) -> Result<(), String> {
+        Err("Read-only test vault".into())
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires CODINGPAD_TEST_POSTGRES_* and CODINGPAD_TEST_SQLSERVER_* connection settings"]
+async fn typescript_queries_postgres_and_sql_server_with_vault_passwords() {
+    for (kind, prefix, query) in [
+        (
+            DatabaseKind::Postgres,
+            "POSTGRES",
+            "SELECT $1::text AS name",
+        ),
+        (DatabaseKind::SqlServer, "SQLSERVER", "SELECT @p1 AS name"),
+    ] {
+        let env = |key| {
+            let variable = format!("CODINGPAD_TEST_{prefix}_{key}");
+            std::env::var(&variable).unwrap_or_else(|_| panic!("Set {variable} for this test"))
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let secret_name = "connection:server";
+        let secrets = Arc::new(SecretStore::with_vault(
+            directory.path(),
+            Arc::new(TestVault(BTreeMap::from([(
+                secret_name.into(),
+                env("PASSWORD"),
+            )]))),
+        ));
+        let connections = Arc::new(ConnectionStore::new(directory.path()));
+        connections
+            .save(Connection {
+                id: String::new(),
+                name: "server".into(),
+                kind,
+                path: None,
+                host: Some(env("HOST")),
+                port: Some(env("PORT").parse().unwrap()),
+                database: Some(env("DATABASE")),
+                user: Some(env("USER")),
+                secret: Some(secret_name.into()),
+                tls: TlsMode::Prefer,
+                trust_server_certificate: std::env::var(format!("CODINGPAD_TEST_{prefix}_TRUST"))
+                    .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+            })
+            .unwrap();
+        let supervisor = Supervisor::with_data_dir_and_secrets(directory.path().into(), secrets)
+            .with_connections(connections);
+        let source = format!(
+            r#"// codingpad: connection=server
+import {{ workerData }} from "node:worker_threads";
+const name = "D'Angelo";
+if (workerData.connection || workerData.secrets || workerData.secret_errors) {{
+  throw new Error("Run credentials were exposed via workerData");
+}}
+try {{ secret("{secret_name}"); throw new Error("Reserved secret was exposed"); }}
+catch (error) {{ if (!error.message.includes("was not found")) throw error; }}
+await db.query("{query}", [name])
+"#
+        );
+        let mut events = Vec::new();
+        let result = timeout(
+            Duration::from_secs(60),
+            supervisor.run_language("server", &source, Language::Typescript, |event| {
+                events.push(event)
+            }),
+        )
+        .await
+        .expect("Bun run timed out")
+        .expect("Bun kernel failed");
+        assert!(result.ok, "{prefix}: {events:?}");
+        assert_query_table(&events, "name", "D'Angelo");
+        supervisor.shutdown().await;
+    }
 }
 
 #[tokio::test]

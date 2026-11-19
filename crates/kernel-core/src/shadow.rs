@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 use tempfile::TempDir;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch, Mutex, OnceCell};
 
 use crate::lsp::path_to_uri;
 
@@ -19,6 +19,7 @@ pub struct ShadowProjects {
     typescript: Mutex<HashMap<String, Arc<TypescriptSlot>>>,
     data_dir: Option<PathBuf>,
     bun: Option<PathBuf>,
+    typescript_sql_server: OnceCell<Project>,
     #[cfg(test)]
     pub(crate) registry: Option<String>,
 }
@@ -53,6 +54,28 @@ impl ShadowProjects {
     /// this launch is used without restarting the app.
     fn bun_path(&self) -> PathBuf {
         crate::toolchains::bun_for(self.bun.as_deref(), self.data_dir.as_deref())
+    }
+
+    /// Keep the kernel driver separate from the tab's packages and editor types.
+    pub(crate) async fn typescript_sql_server_driver(
+        &self,
+        notice: impl FnMut(String),
+    ) -> Result<PathBuf, String> {
+        let project = self
+            .typescript_sql_server
+            .get_or_try_init(|| async {
+                Project::prepare(
+                    &self.bun_path(),
+                    Imports::sql_server_driver(),
+                    false,
+                    notice,
+                    #[cfg(test)]
+                    None,
+                )
+                .await
+            })
+            .await?;
+        Ok(project.shadow.root().join("node_modules/mssql/index.js"))
     }
 
     pub(crate) async fn prepare_typescript(

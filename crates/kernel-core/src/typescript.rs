@@ -29,6 +29,7 @@ use tokio::{
 const KERNEL: &str = include_str!("../../../kernels/typescript/kernel.ts");
 const RUN: &str = include_str!("../../../kernels/typescript/run.ts");
 const DUMP: &str = include_str!("../../../kernels/typescript/dump.ts");
+const DATABASE: &str = include_str!("../../../kernels/typescript/database.ts");
 const ERRORS: &str = include_str!("../../../kernels/typescript/errors.ts");
 const RUNTIME: &str = include_str!("../../../runtimes/typescript/codingpad/index.ts");
 const CODINGPAD_TYPES: &str = include_str!("../../../runtimes/typescript/codingpad/index.d.ts");
@@ -44,6 +45,8 @@ pub(crate) fn command(bun: &Path, project: &Project) -> Result<(Command, Arc<Tem
     std::fs::write(files.path().join("runtime.ts"), RUNTIME).map_err(|error| error.to_string())?;
     std::fs::write(files.path().join("run.ts"), RUN).map_err(|error| error.to_string())?;
     std::fs::write(files.path().join("dump.ts"), DUMP).map_err(|error| error.to_string())?;
+    std::fs::write(files.path().join("database.ts"), DATABASE)
+        .map_err(|error| error.to_string())?;
     std::fs::write(files.path().join("errors.ts"), ERRORS).map_err(|error| error.to_string())?;
     let scratch = files.path().join("scratch");
     std::fs::create_dir(&scratch).map_err(|error| error.to_string())?;
@@ -341,6 +344,12 @@ pub(crate) fn parse(source: &str) -> Result<Option<Script>, String> {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Imports(BTreeMap<String, String>);
+
+impl Imports {
+    pub(crate) fn sql_server_driver() -> Self {
+        Self(BTreeMap::from([("mssql".to_owned(), "12.7.16".to_owned())]))
+    }
+}
 
 #[derive(Default)]
 struct Specifiers<'a>(Vec<&'a str>);

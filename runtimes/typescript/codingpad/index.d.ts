@@ -36,3 +36,21 @@ export function live<T>(value: T): Live<T>;
 
 /** Compute a value once per key in this script's warm kernel. */
 export function cache<T>(key: unknown, factory: () => T): T;
+
+type DatabaseParameter = string | number | bigint | boolean | Date | Uint8Array | null;
+
+interface DatabaseClient {
+  /** Run SQL on the attached connection and return its rows. */
+  query(sql: string, parameters?: readonly DatabaseParameter[]): Promise<Record<string, unknown>[]>;
+}
+
+/** The database connection attached to the current run. */
+export const db: DatabaseClient;
+
+/** Read a named secret from the CodingPad vault. */
+export function secret(name: string): string;
+
+declare global {
+  const db: DatabaseClient;
+  function secret(name: string): string;
+}

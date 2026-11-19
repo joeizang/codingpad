@@ -1,7 +1,7 @@
 export const SCRIPT_LANGUAGES = [
   { id: "python", extension: "py", name: "Python", chip: "PY", key: "P", detail: "Scripts, packages and dumps", connection: "optional", comment: "#" },
   { id: "csharp", extension: "cs", name: "C#", chip: "C#", key: "C", detail: "Top-level statements on .NET", connection: "optional", comment: "//" },
-  { id: "typescript", extension: "ts", name: "TypeScript", chip: "TS", key: "T", detail: "Scripts on Bun", connection: "unavailable", comment: "//" },
+  { id: "typescript", extension: "ts", name: "TypeScript", chip: "TS", key: "T", detail: "Scripts on Bun", connection: "optional", comment: "//" },
   { id: "sql", extension: "sql", name: "SQL", chip: "SQL", key: "S", detail: "Query a connected database", connection: "required", comment: "--" },
 ] as const;
 

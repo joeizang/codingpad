@@ -134,12 +134,6 @@ pub enum Language {
     Typescript,
 }
 
-impl Language {
-    fn supports_connections(self) -> bool {
-        matches!(self, Self::Python | Self::Csharp)
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KernelEvent {
@@ -189,7 +183,7 @@ pub async fn attached_data_context(
     source: &str,
     language: Language,
 ) -> (Option<DataContextRun>, Option<String>) {
-    if !language.supports_connections() {
+    if language == Language::Typescript {
         return (None, None);
     }
     let Some(name) = attached_connection(source) else {
@@ -468,10 +462,15 @@ impl Supervisor {
         let mut stop = slot.stop.subscribe();
         // Vault prompts block. Resolve values off the async thread and let Stop
         // or Close cancel the wait before the kernel slot lock is taken.
-        let secrets = match (&self.secrets, language) {
-            (Some(store), language) if language.supports_connections() => {
+        let secrets = match &self.secrets {
+            Some(store) => {
                 let store = Arc::clone(store);
-                let names = referenced_secret_names(source);
+                // Bun's require() can also load scripts that access secret().
+                let names = if language == Language::Typescript && source.contains("require") {
+                    None
+                } else {
+                    referenced_secret_names(source)
+                };
                 let snapshot =
                     tokio::task::spawn_blocking(move || store.snapshot_named(names.as_deref()));
                 tokio::select! {
@@ -483,22 +482,30 @@ impl Supervisor {
             }
             _ => SecretSnapshot::default(),
         };
-        let connection = if language.supports_connections() {
-            store::parse_header(source)
-                .and_then(|header| header.settings.get("connection").cloned())
-                .filter(|name| !name.trim().is_empty())
-        } else {
-            None
-        };
-        let connection = match connection {
+        let connection = match attached_connection(source) {
             Some(name) => {
-                let connection = self
+                let mut connection = self
                     .connections
                     .as_ref()
                     .and_then(|store| store.by_name(&name))
                     .ok_or_else(|| {
                         format!("Connection \"{name}\" was not found. Add it in Connections…")
                     })?;
+                if language == Language::Typescript
+                    && connection.kind == databases::DatabaseKind::Sqlite
+                {
+                    if let Some(path) = connection
+                        .path
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|path| !path.is_empty() && *path != ":memory:")
+                    {
+                        let path = std::path::absolute(path).map_err(|error| {
+                            format!("Could not resolve the SQLite database file: {error}")
+                        })?;
+                        connection.path = Some(path.to_string_lossy().into_owned());
+                    }
+                }
                 let secret = connection
                     .secret
                     .clone()
@@ -587,21 +594,40 @@ impl Supervisor {
                 packages.dependencies.dedup();
             }
         }
-        let typescript_project = if language == Language::Typescript {
-            let prepare = self.shadow_projects.prepare_typescript(script_id, source, typescript_imports, false, |text| {
-                emit(KernelEvent {
-                    method: "stream".into(),
-                    params: json!({"runId": 0, "stream": "stderr", "text": format!("{text}\n")}),
-                });
-            });
-            Some(tokio::select! {
+        let (typescript_project, sql_server_driver) = if language == Language::Typescript {
+            let prepare = async {
+                let mut notice = |text| {
+                    emit(KernelEvent {
+                        method: "stream".into(),
+                        params: json!({"runId": 0, "stream": "stderr", "text": format!("{text}\n")}),
+                    });
+                };
+                let driver = if connection
+                    .as_ref()
+                    .is_some_and(|value| value["settings"]["kind"] == "sqlserver")
+                {
+                    Some(
+                        self.shadow_projects
+                            .typescript_sql_server_driver(&mut notice)
+                            .await?,
+                    )
+                } else {
+                    None
+                };
+                let project = self
+                    .shadow_projects
+                    .prepare_typescript(script_id, source, typescript_imports, false, notice)
+                    .await?;
+                Ok::<_, String>((Some(project), driver))
+            };
+            tokio::select! {
                 biased;
                 _ = closed.changed() => return Err("Script was closed".into()),
                 _ = stop.changed() => return Ok(RunResult { ok: false, stopped: true, cache_cleared: false }),
                 result = prepare => result?,
-            })
+            }
         } else {
-            None
+            (None, None)
         };
         if guard.as_ref().is_some_and(|kernel| {
             kernel.packages != packages
@@ -655,7 +681,7 @@ impl Supervisor {
         }
         let kernel = guard.as_mut().unwrap();
         let data = data.map(|data| json!({"source": data.source, "connection": data.connection}));
-        let params = json!({"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection, "data": data, "eager": self.eager_dumps, "finalExpression": final_expression});
+        let params = json!({"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection, "data": data, "eager": self.eager_dumps, "finalExpression": final_expression, "sqlServerDriver": sql_server_driver});
         let result = tokio::select! {
             result = kernel.run(params, &mut emit, &mut stop) => result,
             _ = closed.changed() => Err("Script was closed".into()),

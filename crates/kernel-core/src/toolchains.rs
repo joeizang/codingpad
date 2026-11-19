@@ -621,19 +621,34 @@ async fn install_private_bun(
     Ok(path)
 }
 
+/// Strict health check for the install path: a probe that times out counts as
+/// unusable so a fresh install can retry.
 pub(crate) async fn bun_runs(path: &Path) -> bool {
+    bun_version(path, Duration::from_secs(10)).await == Some(true)
+}
+
+/// Only a definite failure marks an installed copy broken. A probe that times
+/// out may be a busy machine or an antivirus scan, so the recovery path keeps
+/// the copy instead of downloading it again.
+pub(crate) async fn bun_is_broken(path: &Path) -> bool {
+    bun_version(path, Duration::from_secs(10)).await == Some(false)
+}
+
+/// `Some(true)` started successfully, `Some(false)` definitely failed, and
+/// `None` means the probe timed out.
+async fn bun_version(path: &Path, deadline: Duration) -> Option<bool> {
     if !path.is_file() {
-        return false;
+        return Some(false);
     }
     let mut command = tokio::process::Command::new(path);
     command.arg("--version").kill_on_drop(true);
     #[cfg(windows)]
     command.creation_flags(0x08000000);
-    tokio::time::timeout(Duration::from_secs(10), command.output())
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .is_some_and(|output| output.status.success())
+    match tokio::time::timeout(deadline, command.output()).await {
+        Ok(Ok(output)) => Some(output.status.success()),
+        Ok(Err(_)) => Some(false),
+        Err(_) => None,
+    }
 }
 
 /// Keep learner-facing progress friendly: the script's diagnostic lines include
@@ -992,6 +1007,22 @@ mod tests {
             "a binary that cannot start is rejected"
         );
         assert!(!bun_runs(&directory.path().join("missing-bun")).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_slow_version_probe_is_not_a_definite_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("slow-bun");
+        std::fs::write(&path, "#!/bin/sh\nsleep 60\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            bun_version(&path, Duration::from_millis(100)).await,
+            None,
+            "the recovery path keeps a copy when the probe does not finish"
+        );
     }
 
     #[test]

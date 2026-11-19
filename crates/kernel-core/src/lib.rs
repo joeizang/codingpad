@@ -336,6 +336,18 @@ impl Supervisor {
         }
     }
 
+    /// Resolve the private install through an explicit data folder, without a
+    /// user Bun. Tests use this to exercise the real start path deterministically.
+    #[cfg(test)]
+    fn with_private_bun(data_dir: PathBuf, bun: PathBuf) -> Self {
+        Self {
+            data_dir: Some(data_dir),
+            bun: Some(bun.clone()),
+            shadow_projects: Arc::new(shadow::ShadowProjects::with_bun(bun)),
+            ..Self::default()
+        }
+    }
+
     /// Resolve user tools first, then the app-private installation on each startup.
     pub fn with_data_dir(data_dir: PathBuf) -> Self {
         Self {
@@ -386,12 +398,9 @@ impl Supervisor {
     /// itself no longer runs. A handshake timeout, antivirus scan or temp-file
     /// failure must not force a needless re-download.
     async fn recover_typescript_start_error(&self, bun: &Path, error: String) -> String {
-        if self.bun.is_some() {
-            return error;
-        }
         let private = self.data_dir.as_deref().map(toolchains::private_bun);
         if !private.as_deref().is_some_and(|private| private == bun)
-            || toolchains::bun_runs(bun).await
+            || !toolchains::bun_is_broken(bun).await
         {
             return error;
         }
@@ -1253,12 +1262,9 @@ mod tests {
         let private = toolchains::private_bun(data.path());
         std::fs::create_dir_all(private.parent().unwrap()).unwrap();
         std::fs::write(&private, "not a program").unwrap();
-        // A user-installed Bun wins over the private copy, so only exercise the
-        // private path on machines without one.
-        if toolchains::resolve_bun(data.path()) != private {
-            return;
-        }
-        let supervisor = Supervisor::with_data_dir(data.path().to_path_buf());
+        // Route through the real start path with the private copy, even when
+        // the test machine has its own Bun on PATH.
+        let supervisor = Supervisor::with_private_bun(data.path().to_path_buf(), private.clone());
         let error = supervisor
             .run_language("private-bun", "1 + 1", Language::Typescript, |_| {})
             .await

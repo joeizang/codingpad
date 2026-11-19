@@ -332,10 +332,7 @@ export default function App() {
     ? active.compilation.diagnostics
     : EMPTY_DIAGNOSTICS;
   const activeHeader = parseHeader(active.source);
-  const connectionName =
-    scriptLanguageDetails(language)?.connection === "unavailable"
-      ? undefined
-      : activeHeader?.settings.connection || undefined;
+  const connectionName = runnable ? activeHeader?.settings.connection || undefined : undefined;
   const [schemaRevision, setSchemaRevision] = useState(0);
   const schemaState = useConnectionSchema(connectionName, schemaRevision);
   const update = (id: string, change: (script: Script) => Script) =>

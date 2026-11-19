@@ -1,4 +1,7 @@
-use crate::shadow::ShadowProject;
+use crate::{
+    databases::DatabaseKind,
+    shadow::{ShadowProject, ShadowProjects},
+};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, CallExpression, Expression, ImportExpression, Statement, TSExternalModuleReference,
@@ -29,6 +32,7 @@ use tokio::{
 const KERNEL: &str = include_str!("../../../kernels/typescript/kernel.ts");
 const RUN: &str = include_str!("../../../kernels/typescript/run.ts");
 const DUMP: &str = include_str!("../../../kernels/typescript/dump.ts");
+const DATABASE: &str = include_str!("../../../kernels/typescript/database.ts");
 const ERRORS: &str = include_str!("../../../kernels/typescript/errors.ts");
 const RUNTIME: &str = include_str!("../../../runtimes/typescript/codingpad/index.ts");
 const CODINGPAD_TYPES: &str = include_str!("../../../runtimes/typescript/codingpad/index.d.ts");
@@ -44,6 +48,8 @@ pub(crate) fn command(bun: &Path, project: &Project) -> Result<(Command, Arc<Tem
     std::fs::write(files.path().join("runtime.ts"), RUNTIME).map_err(|error| error.to_string())?;
     std::fs::write(files.path().join("run.ts"), RUN).map_err(|error| error.to_string())?;
     std::fs::write(files.path().join("dump.ts"), DUMP).map_err(|error| error.to_string())?;
+    std::fs::write(files.path().join("database.ts"), DATABASE)
+        .map_err(|error| error.to_string())?;
     std::fs::write(files.path().join("errors.ts"), ERRORS).map_err(|error| error.to_string())?;
     let scratch = files.path().join("scratch");
     std::fs::create_dir(&scratch).map_err(|error| error.to_string())?;
@@ -71,6 +77,38 @@ pub(crate) fn command(bun: &Path, project: &Project) -> Result<(Command, Arc<Tem
 pub(crate) struct Project {
     pub(crate) shadow: ShadowProject,
     pub(crate) imports: Imports,
+}
+
+pub(crate) struct PreparedRun {
+    pub(crate) project: Arc<Project>,
+    pub(crate) sql_server_driver: Option<PathBuf>,
+    pub(crate) final_expression: Option<FinalExpression>,
+}
+
+pub(crate) async fn prepare_run(
+    projects: &ShadowProjects,
+    script_id: &str,
+    source: &str,
+    script: Option<Script>,
+    connection: Option<DatabaseKind>,
+    mut notice: impl FnMut(String),
+) -> Result<PreparedRun, String> {
+    let (imports, final_expression) = script.map_or((None, None), |script| {
+        (Some(script.imports), script.final_expression)
+    });
+    let sql_server_driver = if connection == Some(DatabaseKind::SqlServer) {
+        Some(projects.typescript_sql_server_driver(&mut notice).await?)
+    } else {
+        None
+    };
+    let project = projects
+        .prepare_typescript(script_id, source, imports, false, notice)
+        .await?;
+    Ok(PreparedRun {
+        project,
+        sql_server_driver,
+        final_expression,
+    })
 }
 
 impl Project {
@@ -306,6 +344,7 @@ pub(crate) struct FinalExpression {
 }
 
 pub(crate) struct Script {
+    pub(crate) uses_require: bool,
     pub(crate) imports: Imports,
     pub(crate) final_expression: Option<FinalExpression>,
 }
@@ -320,7 +359,7 @@ pub(crate) fn parse(source: &str) -> Result<Option<Script>, String> {
     }
     let mut imports = Imports::default();
     let mut specifiers = Specifiers::default();
-    specifiers.0.extend(
+    specifiers.modules.extend(
         parsed
             .module_record
             .requested_modules
@@ -328,12 +367,13 @@ pub(crate) fn parse(source: &str) -> Result<Option<Script>, String> {
             .map(|name| name.as_str()),
     );
     specifiers.visit_program(&parsed.program);
-    for specifier in specifiers.0 {
+    for specifier in specifiers.modules {
         if let Some((alias, target)) = versioned_package(specifier)? {
             imports.0.insert(alias.to_owned(), target);
         }
     }
     Ok(Some(Script {
+        uses_require: specifiers.uses_require,
         imports,
         final_expression: final_expression(source, &parsed.program),
     }))
@@ -342,13 +382,22 @@ pub(crate) fn parse(source: &str) -> Result<Option<Script>, String> {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Imports(BTreeMap<String, String>);
 
+impl Imports {
+    pub(crate) fn sql_server_driver() -> Self {
+        Self(BTreeMap::from([("mssql".to_owned(), "12.7.16".to_owned())]))
+    }
+}
+
 #[derive(Default)]
-struct Specifiers<'a>(Vec<&'a str>);
+struct Specifiers<'a> {
+    modules: Vec<&'a str>,
+    uses_require: bool,
+}
 
 impl<'a> Visit<'a> for Specifiers<'a> {
     fn visit_import_expression(&mut self, import: &ImportExpression<'a>) {
         match &import.source {
-            Expression::StringLiteral(source) => self.0.push(source.value.as_str()),
+            Expression::StringLiteral(source) => self.modules.push(source.value.as_str()),
             Expression::TemplateLiteral(template) => self.template(template),
             _ => (),
         }
@@ -356,18 +405,19 @@ impl<'a> Visit<'a> for Specifiers<'a> {
     }
 
     fn visit_ts_import_type(&mut self, import: &TSImportType<'a>) {
-        self.0.push(import.source.value.as_str());
+        self.modules.push(import.source.value.as_str());
         walk::walk_ts_import_type(self, import);
     }
 
     fn visit_ts_external_module_reference(&mut self, import: &TSExternalModuleReference<'a>) {
-        self.0.push(import.expression.value.as_str());
+        self.modules.push(import.expression.value.as_str());
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if matches!(&call.callee, Expression::Identifier(name) if name.name == "require") {
+            self.uses_require = true;
             match call.arguments.as_slice() {
-                [Argument::StringLiteral(source)] => self.0.push(source.value.as_str()),
+                [Argument::StringLiteral(source)] => self.modules.push(source.value.as_str()),
                 [Argument::TemplateLiteral(template)] => self.template(template),
                 _ => (),
             }
@@ -379,7 +429,7 @@ impl<'a> Visit<'a> for Specifiers<'a> {
 impl<'a> Specifiers<'a> {
     fn template(&mut self, template: &TemplateLiteral<'a>) {
         if let [quasi] = template.quasis.as_slice() {
-            self.0
+            self.modules
                 .extend(quasi.value.cooked.as_ref().map(|text| text.as_str()));
         }
     }
@@ -629,6 +679,18 @@ answer + imported
                 .unwrap()
                 .contains("portable npm version"));
         }
+    }
+
+    #[test]
+    fn distinguishes_require_calls_from_comments_and_strings() {
+        let text = "// required\nconst example = 'require(\"helper\")';";
+        assert!(!parse(text).unwrap().unwrap().uses_require);
+        assert!(
+            parse("require (computedPath)")
+                .unwrap()
+                .unwrap()
+                .uses_require
+        );
     }
 
     #[test]

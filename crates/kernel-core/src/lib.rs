@@ -134,12 +134,6 @@ pub enum Language {
     Typescript,
 }
 
-impl Language {
-    fn supports_connections(self) -> bool {
-        matches!(self, Self::Python | Self::Csharp)
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KernelEvent {
@@ -169,6 +163,12 @@ pub struct DataContextRun {
     pub connection: crate::data_context::ConnectionInfo,
 }
 
+#[derive(Serialize)]
+struct RunConnection {
+    settings: databases::Connection,
+    password: Option<String>,
+}
+
 /// The connection named by a script's `codingpad:` header, if any.
 pub fn attached_connection(source: &str) -> Option<String> {
     store::parse_header(source)?
@@ -189,7 +189,7 @@ pub async fn attached_data_context(
     source: &str,
     language: Language,
 ) -> (Option<DataContextRun>, Option<String>) {
-    if !language.supports_connections() {
+    if language == Language::Typescript {
         return (None, None);
     }
     let Some(name) = attached_connection(source) else {
@@ -457,6 +457,11 @@ impl Supervisor {
         if script_id.is_empty() {
             return Err("A script id is required".into());
         }
+        let typescript_script = if language == Language::Typescript {
+            typescript::parse(source)?
+        } else {
+            None
+        };
         let slot = self
             .kernels
             .lock()
@@ -468,10 +473,18 @@ impl Supervisor {
         let mut stop = slot.stop.subscribe();
         // Vault prompts block. Resolve values off the async thread and let Stop
         // or Close cancel the wait before the kernel slot lock is taken.
-        let secrets = match (&self.secrets, language) {
-            (Some(store), language) if language.supports_connections() => {
+        let secrets = match &self.secrets {
+            Some(store) => {
                 let store = Arc::clone(store);
-                let names = referenced_secret_names(source);
+                // Bun's require() can also load scripts that access secret().
+                let names = if typescript_script
+                    .as_ref()
+                    .is_some_and(|script| script.uses_require)
+                {
+                    None
+                } else {
+                    referenced_secret_names(source)
+                };
                 let snapshot =
                     tokio::task::spawn_blocking(move || store.snapshot_named(names.as_deref()));
                 tokio::select! {
@@ -483,22 +496,28 @@ impl Supervisor {
             }
             _ => SecretSnapshot::default(),
         };
-        let connection = if language.supports_connections() {
-            store::parse_header(source)
-                .and_then(|header| header.settings.get("connection").cloned())
-                .filter(|name| !name.trim().is_empty())
-        } else {
-            None
-        };
-        let connection = match connection {
+        let connection = match attached_connection(source) {
             Some(name) => {
-                let connection = self
+                let mut connection = self
                     .connections
                     .as_ref()
                     .and_then(|store| store.by_name(&name))
                     .ok_or_else(|| {
                         format!("Connection \"{name}\" was not found. Add it in Connections…")
                     })?;
+                if connection.kind == databases::DatabaseKind::Sqlite {
+                    if let Some(path) = connection
+                        .path
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|path| !path.is_empty() && *path != ":memory:")
+                    {
+                        let path = std::path::absolute(path).map_err(|error| {
+                            format!("Could not resolve the SQLite database file: {error}")
+                        })?;
+                        connection.path = Some(path.to_string_lossy().into_owned());
+                    }
+                }
                 let secret = connection
                     .secret
                     .clone()
@@ -521,7 +540,10 @@ impl Supervisor {
                 } else {
                     None
                 };
-                Some(json!({"settings": connection, "password": password}))
+                Some(RunConnection {
+                    settings: connection,
+                    password,
+                })
             }
             None => None,
         };
@@ -529,28 +551,20 @@ impl Supervisor {
         if *closed.borrow() {
             return Err("Script was closed".into());
         }
-        let script = if language == Language::Typescript {
-            typescript::parse(source)?
-        } else {
-            None
-        };
-        let (typescript_imports, final_expression) = script.map_or((None, None), |script| {
-            (Some(script.imports), script.final_expression)
-        });
+        let connection_kind = connection
+            .as_ref()
+            .map(|connection| connection.settings.kind);
         let mut packages = if language == Language::Python {
             Packages::parse(source)?
         } else {
             Packages::parse("")?
         };
         if language == Language::Python {
-            if let Some(kind) = connection
-                .as_ref()
-                .and_then(|value| value["settings"]["kind"].as_str())
-            {
+            if let Some(kind) = connection_kind {
                 let driver = match kind {
-                    "postgres" => Some("psycopg[binary]>=3.2,<4"),
-                    "sqlserver" => Some("mssql-python>=1,<2"),
-                    _ => None,
+                    databases::DatabaseKind::Postgres => Some("psycopg[binary]>=3.2,<4"),
+                    databases::DatabaseKind::SqlServer => Some("mssql-python>=1,<2"),
+                    databases::DatabaseKind::Sqlite => None,
                 };
                 if let Some(driver) = driver {
                     packages.dependencies.push(driver.to_owned());
@@ -587,21 +601,33 @@ impl Supervisor {
                 packages.dependencies.dedup();
             }
         }
-        let typescript_project = if language == Language::Typescript {
-            let prepare = self.shadow_projects.prepare_typescript(script_id, source, typescript_imports, false, |text| {
-                emit(KernelEvent {
-                    method: "stream".into(),
-                    params: json!({"runId": 0, "stream": "stderr", "text": format!("{text}\n")}),
-                });
-            });
-            Some(tokio::select! {
+        let (typescript_project, sql_server_driver, final_expression) = if language
+            == Language::Typescript
+        {
+            let prepare = typescript::prepare_run(
+                &self.shadow_projects,
+                script_id,
+                source,
+                typescript_script,
+                connection_kind,
+                |text| {
+                    emit(KernelEvent {
+                        method: "stream".into(),
+                        params: json!({"runId": 0, "stream": "stderr", "text": format!("{text}\n")}),
+                    });
+                },
+            );
+            tokio::select! {
                 biased;
                 _ = closed.changed() => return Err("Script was closed".into()),
                 _ = stop.changed() => return Ok(RunResult { ok: false, stopped: true, cache_cleared: false }),
-                result = prepare => result?,
-            })
+                result = prepare => {
+                    let prepared = result?;
+                    (Some(prepared.project), prepared.sql_server_driver, prepared.final_expression)
+                },
+            }
         } else {
-            None
+            (None, None, None)
         };
         if guard.as_ref().is_some_and(|kernel| {
             kernel.packages != packages
@@ -655,7 +681,7 @@ impl Supervisor {
         }
         let kernel = guard.as_mut().unwrap();
         let data = data.map(|data| json!({"source": data.source, "connection": data.connection}));
-        let params = json!({"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection, "data": data, "eager": self.eager_dumps, "finalExpression": final_expression});
+        let params = json!({"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection, "data": data, "eager": self.eager_dumps, "final_expression": final_expression, "sql_server_driver": sql_server_driver});
         let result = tokio::select! {
             result = kernel.run(params, &mut emit, &mut stop) => result,
             _ = closed.changed() => Err("Script was closed".into()),

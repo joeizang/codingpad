@@ -3,6 +3,37 @@ import { basename, extname } from "node:path";
 import { serialize } from "node:v8";
 import { receiveMessageOnPort, workerData } from "node:worker_threads";
 import type { MessagePort } from "node:worker_threads";
+import type { DatabaseClient } from "./index.d.ts";
+
+let runHelpers: {
+  db: DatabaseClient;
+  secrets: Record<string, string>;
+  secretErrors: Record<string, string>;
+} | undefined;
+
+export function setRunHelpers(helpers: NonNullable<typeof runHelpers>) {
+  runHelpers = helpers;
+}
+
+function attachedDatabase(): DatabaseClient {
+  if (!runHelpers) throw new Error("db is unavailable outside a CodingPad kernel.");
+  return runHelpers.db;
+}
+
+export const db: DatabaseClient = {
+  async query(sql, parameters) { return attachedDatabase().query(sql, parameters); },
+  async execute(sql, parameters) { return attachedDatabase().execute(sql, parameters); },
+};
+
+export function secret(name: string): string {
+  if (typeof name !== "string" || !name.trim()) throw new TypeError("A secret name cannot be empty.");
+  if (runHelpers) {
+    const { secrets, secretErrors } = runHelpers;
+    if (Object.hasOwn(secretErrors, name)) throw new Error(secretErrors[name]);
+    if (Object.hasOwn(secrets, name)) return secrets[name];
+  }
+  throw new Error(`Secret "${name}" was not found. Add it in Secrets… or set it for this session.`);
+}
 
 let sink: ((value: unknown) => void) | undefined;
 

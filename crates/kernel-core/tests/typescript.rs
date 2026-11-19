@@ -1,5 +1,11 @@
-use codingpad_kernel_core::{KernelEvent, Language, Supervisor};
+use codingpad_kernel_core::{
+    databases::{Connection, ConnectionStore, DatabaseKind, TlsMode},
+    secrets::{SecretStore, Vault},
+    KernelEvent, Language, Supervisor,
+};
 use serde_json::Value;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::{sync::oneshot, time::timeout};
 
@@ -396,6 +402,270 @@ fn rendered_dump<'a>(events: &'a [KernelEvent], node: &'a Value) -> &'a Value {
 
 fn handle(node: &Value) -> &str {
     node["handle"].as_str().unwrap()
+}
+
+#[tokio::test]
+async fn typescript_queries_attached_sqlite_and_reads_current_secrets() {
+    let working_directory = std::env::current_dir().unwrap();
+    let directory = tempfile::tempdir_in(&working_directory).unwrap();
+    let path = directory.path().join("saved #1.sqlite");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch("CREATE TABLE items (name TEXT); INSERT INTO items VALUES ('Ada');")
+        .unwrap();
+    drop(connection);
+    let connections = Arc::new(ConnectionStore::new(directory.path()));
+    connections
+        .save(Connection {
+            id: String::new(),
+            name: "sample".into(),
+            kind: DatabaseKind::Sqlite,
+            path: Some(
+                path.strip_prefix(&working_directory)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .into(),
+            ),
+            host: None,
+            port: None,
+            database: None,
+            user: None,
+            secret: None,
+            tls: TlsMode::Prefer,
+            trust_server_certificate: false,
+        })
+        .unwrap();
+    let secrets = Arc::new(SecretStore::new(directory.path()));
+    secrets.set_session("who", "Ada").unwrap();
+    let supervisor =
+        Supervisor::with_data_dir_and_secrets(directory.path().into(), secrets.clone())
+            .with_connections(connections);
+    let Some(events) = run_dump_script(
+        &supervisor,
+        r#"// codingpad: connection=sample
+import { db, secret } from "codingpad";
+await db.query("SELECT name FROM items WHERE name = ?", [secret("who")])
+"#,
+    )
+    .await
+    else {
+        return;
+    };
+    assert_query_table(&events, "name", "Ada");
+
+    let events = run_dump_script(
+        &supervisor,
+        r#"// codingpad: connection=sample
+import { dump } from "codingpad";
+dump(await db.execute("INSERT INTO items VALUES (?)", ["Grace"]));
+dump(await db.query("SELECT 1 AS id, 2 AS id, 3 AS id_2"));
+dump(await db.query("SELECT name FROM items WHERE 1 = 0"));
+const rows = await db.query(`
+  WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM nums WHERE n < 1000000)
+  SELECT CASE WHEN n > 10001 THEN abs(-9223372036854775808) ELSE n END AS n FROM nums
+`);
+if (rows.length !== 10000 || !rows.truncated || rows.columns[0] !== "n") {
+  throw new Error("Database row limit or metadata is wrong");
+}
+rows
+"#,
+    )
+    .await
+    .unwrap();
+    let nodes: Vec<_> = dump_nodes(&events).collect();
+    assert_eq!(nodes[0]["v"], 1);
+    assert_duplicate_query_columns(nodes[1]);
+    assert_eq!(nodes[1]["columns"][2]["name"], "id_2_2");
+    assert_eq!(nodes[1]["rows"][0][2]["v"], 3);
+    assert_empty_query_table(nodes[2], "name");
+    assert_eq!(nodes[3]["total"], 10_000);
+    assert_eq!(nodes[3]["truncated"], true);
+
+    secrets.set_session("who", "Grace").unwrap();
+    let events = run_dump_script(
+        &supervisor,
+        r#"
+for (const name of ["missing", "constructor"]) {
+  try { secret(name); } catch (error) { console.log(error.message); }
+}
+try { await db.query("SELECT 1"); } catch (error) { console.log(error.message); }
+secret("who")
+"#,
+    )
+    .await
+    .unwrap();
+    let stdout: String = events
+        .iter()
+        .filter(|event| event.method == "stream" && event.params["stream"] == "stdout")
+        .filter_map(|event| event.params["text"].as_str())
+        .collect();
+    assert!(
+        stdout.contains(r#"Secret "missing" was not found"#),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(r#"Secret "constructor" was not found"#),
+        "{stdout}"
+    );
+    assert!(stdout.contains("No connection is attached"), "{stdout}");
+    assert_eq!(dump_nodes(&events).next().unwrap()["v"], "Grace");
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn typescript_esm_helper_reads_a_secret_unmentioned_in_the_main_script() {
+    let directory = tempfile::tempdir().unwrap();
+    let helper = directory.path().join("helper.ts");
+    std::fs::write(&helper, r#"export const token = secret("helper-token");"#).unwrap();
+    let url = url::Url::from_file_path(helper).unwrap();
+    let secrets = Arc::new(SecretStore::new(directory.path()));
+    secrets.set_session("helper-token", "from vault").unwrap();
+    let supervisor = Supervisor::with_data_dir_and_secrets(directory.path().into(), secrets);
+    let source = format!("import {{ token }} from {:?};\ntoken", url.as_str());
+    if let Some(events) = run_dump_script(&supervisor, &source).await {
+        assert_eq!(dump_nodes(&events).next().unwrap()["v"], "from vault");
+    }
+    supervisor.shutdown().await;
+}
+
+fn assert_duplicate_query_columns(table: &Value) {
+    assert_eq!(table["kind"], "table", "{table}");
+    assert_eq!(table["columns"][0]["name"], "id");
+    assert_eq!(table["columns"][1]["name"], "id_2");
+    assert_eq!(table["rows"][0][0]["v"], 1);
+    assert_eq!(table["rows"][0][1]["v"], 2);
+}
+
+fn assert_empty_query_table(table: &Value, column: &str) {
+    assert_eq!(table["kind"], "table", "{table}");
+    assert_eq!(table["columns"][0]["name"], column);
+    assert_eq!(table["total"], 0);
+    assert_eq!(table["rows"], serde_json::json!([]));
+    assert_eq!(table["truncated"], false);
+}
+
+fn assert_query_table(events: &[KernelEvent], column: &str, value: &str) {
+    let table = dump_nodes(events).next().unwrap();
+    assert_eq!(table["kind"], "table", "{table}");
+    assert_eq!(table["columns"][0]["name"], column);
+    assert_eq!(table["rows"][0][0]["v"], value);
+}
+
+struct TestVault(BTreeMap<String, String>);
+
+impl Vault for TestVault {
+    fn get(&self, name: &str) -> Result<Option<String>, String> {
+        Ok(self.0.get(name).cloned())
+    }
+
+    fn set(&self, _: &str, _: &str) -> Result<(), String> {
+        Err("Read-only test vault".into())
+    }
+
+    fn delete(&self, _: &str) -> Result<(), String> {
+        Err("Read-only test vault".into())
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires CODINGPAD_TEST_POSTGRES_* and CODINGPAD_TEST_SQLSERVER_* connection settings"]
+async fn typescript_queries_postgres_and_sql_server_with_vault_passwords() {
+    for (kind, prefix, query, insert, large_query) in [
+        (
+            DatabaseKind::Postgres,
+            "POSTGRES",
+            "SELECT $1::text AS name",
+            "INSERT INTO codingpad_test VALUES ($1)",
+            "SELECT CASE WHEN n > 10001 THEN 1 / (n - n) ELSE n END AS n FROM generate_series(1, 1000000) AS n",
+        ),
+        (
+            DatabaseKind::SqlServer,
+            "SQLSERVER",
+            "SELECT @p1 AS name",
+            "DECLARE @sample TABLE(name NVARCHAR(32)); INSERT INTO @sample VALUES (@p1)",
+            "SELECT TOP (20000) 1 AS n FROM sys.all_objects a CROSS JOIN sys.all_objects b",
+        ),
+    ] {
+        let env = |key| {
+            let variable = format!("CODINGPAD_TEST_{prefix}_{key}");
+            std::env::var(&variable).unwrap_or_else(|_| panic!("Set {variable} for this test"))
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let secret_name = "connection:server";
+        let secrets = Arc::new(SecretStore::with_vault(
+            directory.path(),
+            Arc::new(TestVault(BTreeMap::from([(
+                secret_name.into(),
+                env("PASSWORD"),
+            )]))),
+        ));
+        let connections = Arc::new(ConnectionStore::new(directory.path()));
+        connections
+            .save(Connection {
+                id: String::new(),
+                name: "server".into(),
+                kind,
+                path: None,
+                host: Some(env("HOST")),
+                port: Some(env("PORT").parse().unwrap()),
+                database: Some(env("DATABASE")),
+                user: Some(env("USER")),
+                secret: Some(secret_name.into()),
+                tls: TlsMode::Prefer,
+                trust_server_certificate: std::env::var(format!("CODINGPAD_TEST_{prefix}_TRUST"))
+                    .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+            })
+            .unwrap();
+        let supervisor = Supervisor::with_data_dir_and_secrets(directory.path().into(), secrets)
+            .with_connections(connections);
+        let setup = if kind == DatabaseKind::Postgres {
+            r#"
+await db.execute("CREATE TEMPORARY TABLE codingpad_test (name TEXT)");
+const written = await db.query("INSERT INTO codingpad_test VALUES ($1) RETURNING name", [name]);
+if (written[0].name !== name) throw new Error("Expected the returned row from INSERT");
+"#
+        } else {
+            ""
+        };
+        let source = format!(
+            r#"// codingpad: connection=server
+import {{ dump }} from "codingpad";
+import {{ workerData }} from "node:worker_threads";
+const name = "D'Angelo";
+if (workerData.credentials || workerData.connection || workerData.secrets || workerData.secret_errors) {{
+  throw new Error("Run credentials were exposed via workerData");
+}}
+try {{ secret("{secret_name}"); throw new Error("Reserved secret was exposed"); }}
+catch (error) {{ if (!error.message.includes("was not found")) throw error; }}
+dump(await db.query("{query}", [name]));
+dump(await db.query("SELECT 1 AS id, 2 AS id"));
+dump(await db.query("SELECT 1 AS id WHERE 1 = 0"));
+const rows = await db.query("{large_query}");
+if (rows.length !== 10000 || !rows.truncated) throw new Error("Expected a truncated result");
+if ((await db.query("SELECT 1 AS id"))[0].id !== 1) throw new Error("Connection not reusable");
+{setup}
+await db.execute("{insert}", [name])
+"#
+        );
+        let mut events = Vec::new();
+        let result = timeout(
+            Duration::from_secs(60),
+            supervisor.run_language("server", &source, Language::Typescript, |event| {
+                events.push(event)
+            }),
+        )
+        .await
+        .expect("Bun run timed out")
+        .expect("Bun kernel failed");
+        assert!(result.ok, "{prefix}: {events:?}");
+        assert_query_table(&events, "name", "D'Angelo");
+        let nodes: Vec<_> = dump_nodes(&events).collect();
+        assert_duplicate_query_columns(nodes[1]);
+        assert_empty_query_table(nodes[2], "id");
+        assert_eq!(nodes[3]["v"], 1);
+        supervisor.shutdown().await;
+    }
 }
 
 #[tokio::test]

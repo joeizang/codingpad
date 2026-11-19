@@ -149,7 +149,7 @@ file. CodingPad uses [Bun](https://bun.com/docs/installation) and looks for it o
 `PATH`, in `BUN_INSTALL/bin` or `~/.bun/bin`. If Bun is missing, Results offers
 **Install Bun and run**. One click downloads a pinned official Bun release,
 verifies its SHA-256, installs it privately under the app data folder
-(`toolchains/bun/1.4.2`), and retries the script without restarting the app. The
+(`toolchains/bun/1.4.4`), and retries the script without restarting the app. The
 app prefers your own Bun and never changes your shell profiles or `PATH`. Private
 installation supports x86-64 and ARM64 on macOS, Windows and Linux (GNU or musl
 builds); on x86-64 CPUs without AVX2 it installs Bun's baseline build. Import
@@ -167,8 +167,8 @@ TypeScript code intelligence uses the TypeScript 7 native language server
 Install it once with `bun add -g @typescript/native-preview`; CodingPad also
 checks its own `typescript` data folder and `PATH`, and `CODINGPAD_TS_LSP` can
 point at the executable. Completions, hover and type errors cover `dump`,
-`cache` and other `codingpad` helpers; `secret()` waits for the M5.6 database
-client. Versioned imports such as `zod@3` resolve from the shared project;
+`cache`, `db`, `secret()` and other `codingpad` helpers. Versioned imports such
+as `zod@3` resolve from the shared project;
 changing the import set restarts the server. Type errors show as squiggles and a
 count but never block **Run**.
 
@@ -591,6 +591,30 @@ C# parameters can be supplied as a dictionary keyed by the database parameter
 name. Queries return at most 10,000 rows and show when results are truncated. The `CodingPad` package supplies the same API for `dotnet run`; without
 an attached CodingPad connection, calling `db` reports how to attach one.
 
+TypeScript scripts can attach the same connections. Use `db` directly or import
+it from `codingpad`. Await the query and pass the rows to `dump()`, or leave the
+awaited query as the last expression to show its table automatically:
+
+```ts
+// codingpad: connection=codingpad-sample
+await db.query("SELECT * FROM customers LIMIT ?", [10])
+```
+
+Bind values as an array and use the database's placeholders (`?` for SQLite,
+`$1`, `$2`, … for PostgreSQL, and `@p1`, `@p2`, … for SQL Server).
+`db.query(sql, parameters)` returns at most 10,000 rows and exposes `columns`
+and `truncated` on the result. Results preserve headers for empty queries and
+use suffixes such as `id_2` for duplicate column names.
+`db.execute(sql, parameters)` returns the number of affected rows. For a SQL
+Server batch, the count is the sum reported across statements.
+
+The first database call opens the connection using the saved settings and vault
+password. CodingPad closes it when the run ends. SQLite and PostgreSQL use Bun's
+built-in clients. PostgreSQL requires Bun 1.4.4 or later for column metadata.
+The first run with a SQL Server connection installs the `mssql` driver through Bun.
+Relative SQLite connection paths resolve against the CodingPad process's
+working directory across script languages.
+
 Click **Connections…** to add a SQLite, PostgreSQL or SQL Server database, then
 **+ SQL** or open a `.sql` file. The first line names the connection; the rest is plain SQL:
 
@@ -702,13 +726,17 @@ returns an error instead of silently replacing a value. If the vault is
 unavailable, the dialog offers an explicit **Store for this session only** action;
 those values disappear when CodingPad exits.
 
-Python scripts read a secret with `secret("name")` (also importable from
-`codingpad`), and C# scripts with `Secret("name")`:
+Python and TypeScript scripts read a secret with `secret("name")` (also importable
+from `codingpad`), and C# scripts use `Secret("name")`:
 
 ```python
 from codingpad import secret
 
 api_key = secret("api-key")
+```
+
+```ts
+const apiKey = secret("api-key");
 ```
 
 ```csharp

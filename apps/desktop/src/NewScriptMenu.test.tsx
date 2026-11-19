@@ -67,12 +67,15 @@ test("SQL falls back to the bundled sample database", async () => {
   expect(onCreate).toHaveBeenCalledWith("sql", SAMPLE_CONNECTION);
 });
 
-test("C# can attach an optional connection", async () => {
+test.each([
+  { name: "C#", key: "c", language: "csharp" },
+  { name: "TypeScript", key: "t", language: "typescript" },
+])("$name can attach an optional connection", async ({ name, key, language }) => {
   const { onCreate } = renderMenu();
-  fireEvent.keyDown(screen.getByRole("dialog"), { key: "c" });
+  fireEvent.keyDown(screen.getByRole("dialog"), { key });
   fireEvent.click(await screen.findByRole("button", { name: /^shop/ }));
-  fireEvent.click(screen.getByRole("button", { name: "Create C# script on shop" }));
-  expect(onCreate).toHaveBeenCalledWith("csharp", "shop");
+  fireEvent.click(screen.getByRole("button", { name: `Create ${name} script on shop` }));
+  expect(onCreate).toHaveBeenCalledWith(language, "shop");
 });
 
 test("Escape and a click outside close it", async () => {

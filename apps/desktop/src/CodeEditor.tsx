@@ -265,6 +265,23 @@ export default function CodeEditor({
   }, [language, compileDiagnostics]);
 
   useEffect(() => {
+    if (!interactive || language !== "typescript") return;
+    let stopped = false;
+    const timer = window.setTimeout(() => {
+      void invoke("begin_language_server_session", { session: LSP_SESSION })
+        .then(() => {
+          if (stopped) return;
+          return invoke("prepare_typescript_project", { scriptId: id, source, session: LSP_SESSION });
+        })
+        .catch(() => undefined); // Run reports package preparation errors in Results.
+    }, 400);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [id, source, language, interactive]);
+
+  useEffect(() => {
     // Let the editor paint before starting the background language server.
     if (!interactive) return;
     if (!supportsCodeIntelligence(language)) {

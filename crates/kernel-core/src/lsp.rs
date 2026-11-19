@@ -31,8 +31,11 @@ use tokio::{
 use url::Url;
 
 use crate::{
-    data_context::GeneratedContext, databases::SqlManager, find_uv, roslyn, shadow::ShadowProject,
-    toolchains, RUNTIME,
+    data_context::GeneratedContext,
+    databases::SqlManager,
+    find_uv, roslyn,
+    shadow::{ShadowProject, ShadowProjects},
+    toolchains, typescript, RUNTIME,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -85,6 +88,7 @@ pub struct LanguageServers {
     starts: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     session: Mutex<Option<String>>,
     closed: Mutex<HashSet<String>>,
+    shadow_projects: Arc<ShadowProjects>,
 }
 
 impl Default for LanguageServers {
@@ -103,6 +107,7 @@ impl LanguageServers {
             starts: Mutex::new(HashMap::new()),
             session: Mutex::new(None),
             closed: Mutex::new(HashSet::new()),
+            shadow_projects: Arc::default(),
         }
     }
 
@@ -121,6 +126,41 @@ impl LanguageServers {
             databases: Some(databases),
             ..Self::default()
         }
+    }
+
+    pub fn with_shadow_projects(mut self, shadow_projects: Arc<ShadowProjects>) -> Self {
+        self.shadow_projects = shadow_projects;
+        self
+    }
+
+    /// Prepare the editor document and packages before starting TypeScript code intelligence.
+    pub async fn prepare_typescript(
+        &self,
+        script_id: &str,
+        source: &str,
+        session: &str,
+    ) -> Result<Option<LspStartResult>, String> {
+        if script_id.is_empty() {
+            return Err("A script id is required".into());
+        }
+        self.check_session(script_id, session).await?;
+        let Some(script) = typescript::parse(source)? else {
+            return Ok(None);
+        };
+        let project = self
+            .shadow_projects
+            .prepare_typescript(script_id, source, Some(script.imports), |_| {})
+            .await?;
+        // Close may have removed the previous project before this request
+        // registered with the shared manager.
+        if self.closed.lock().await.contains(script_id) {
+            self.shadow_projects.close(script_id).await;
+            return Err("The script was closed".into());
+        }
+        self.check_session(script_id, session).await?;
+        Ok(Some(LspStartResult {
+            uri: project.shadow.document_uri().to_owned(),
+        }))
     }
 
     async fn data_context(&self, source: &str) -> Option<GeneratedContext> {
@@ -427,6 +467,7 @@ impl LanguageServers {
     pub async fn close(&self, script_id: &str) {
         self.closed.lock().await.insert(script_id.to_owned());
         self.starts.lock().await.remove(script_id);
+        self.shadow_projects.close(script_id).await;
         self.stop(script_id).await;
     }
 

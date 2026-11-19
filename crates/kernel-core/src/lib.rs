@@ -12,7 +12,7 @@ mod packages;
 mod roslyn;
 pub mod samples;
 pub mod secrets;
-mod shadow;
+pub mod shadow;
 pub mod store;
 pub mod text;
 pub mod toolchains;
@@ -239,6 +239,7 @@ pub struct Supervisor {
     dotnet: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     kernels: Mutex<HashMap<String, SharedSlot>>,
+    shadow_projects: Arc<shadow::ShadowProjects>,
     csharp: OnceCell<csharp::Installation>,
     secrets: Option<Arc<SecretStore>>,
     connections: Option<Arc<databases::ConnectionStore>>,
@@ -292,6 +293,7 @@ impl Supervisor {
             dotnet: None,
             data_dir: None,
             kernels: Mutex::new(HashMap::new()),
+            shadow_projects: Arc::default(),
             csharp: OnceCell::new(),
             secrets: None,
             connections: None,
@@ -307,6 +309,7 @@ impl Supervisor {
             dotnet: Some(dotnet),
             data_dir: None,
             kernels: Mutex::new(HashMap::new()),
+            shadow_projects: Arc::default(),
             csharp: OnceCell::new(),
             secrets: None,
             connections: None,
@@ -334,6 +337,10 @@ impl Supervisor {
     pub fn with_connections(mut self, connections: Arc<databases::ConnectionStore>) -> Self {
         self.connections = Some(connections);
         self
+    }
+
+    pub fn shadow_projects(&self) -> Arc<shadow::ShadowProjects> {
+        self.shadow_projects.clone()
     }
 
     /// Ask kernels to materialise lazy values inside each dump instead of
@@ -470,6 +477,14 @@ impl Supervisor {
         if *closed.borrow() {
             return Err("Script was closed".into());
         }
+        let script = if language == Language::Typescript {
+            typescript::parse(source)?
+        } else {
+            None
+        };
+        let (typescript_imports, final_expression) = script.map_or((None, None), |script| {
+            (Some(script.imports), script.final_expression)
+        });
         let mut packages = if language == Language::Python {
             Packages::parse(source)?
         } else {
@@ -520,10 +535,32 @@ impl Supervisor {
                 packages.dependencies.dedup();
             }
         }
-        if guard
-            .as_ref()
-            .is_some_and(|kernel| kernel.packages != packages || kernel.language != language)
-        {
+        let typescript_project = if language == Language::Typescript {
+            let prepare = self.shadow_projects.prepare_typescript(script_id, source, typescript_imports, |text| {
+                emit(KernelEvent {
+                    method: "stream".into(),
+                    params: json!({"runId": 0, "stream": "stderr", "text": format!("{text}\n")}),
+                });
+            });
+            Some(tokio::select! {
+                biased;
+                _ = closed.changed() => return Err("Script was closed".into()),
+                _ = stop.changed() => return Ok(RunResult { ok: false, stopped: true, cache_cleared: false }),
+                result = prepare => result?,
+            })
+        } else {
+            None
+        };
+        if guard.as_ref().is_some_and(|kernel| {
+            kernel.packages != packages
+                || kernel.language != language
+                || typescript_project.as_ref().is_some_and(|project| {
+                    kernel
+                        .typescript_project
+                        .as_ref()
+                        .is_some_and(|current| !Arc::ptr_eq(current, project))
+                })
+        }) {
             *guard = None;
             emit(KernelEvent {
                 method: "stream".into(),
@@ -545,7 +582,7 @@ impl Supervisor {
                         }
                         Language::Python => Kernel::start(&self.uv_path(), packages, &mut emit).await,
                         Language::Typescript => {
-                            Kernel::start_typescript(packages).await
+                            Kernel::start_typescript(packages, typescript_project.unwrap()).await
                         }
                     }
                 } => result,
@@ -554,15 +591,11 @@ impl Supervisor {
             };
             *guard = Some(startup?);
         }
-        let final_expression = if language == Language::Typescript {
-            typescript::final_expression(source)
-        } else {
-            None
-        };
+        let kernel = guard.as_mut().unwrap();
         let data = data.map(|data| json!({"source": data.source, "connection": data.connection}));
         let params = json!({"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection, "data": data, "eager": self.eager_dumps, "finalExpression": final_expression});
         let result = tokio::select! {
-            result = guard.as_mut().unwrap().run(params, &mut emit, &mut stop) => result,
+            result = kernel.run(params, &mut emit, &mut stop) => result,
             _ = closed.changed() => Err("Script was closed".into()),
         };
         if result.as_ref().is_ok_and(|result| result.cache_cleared) || result.is_err() {
@@ -599,6 +632,7 @@ impl Supervisor {
             slot.closed.send_replace(true);
             *slot.kernel.lock().await = None;
         }
+        self.shadow_projects.close(script_id).await;
     }
 
     pub async fn expand(
@@ -723,6 +757,7 @@ impl Supervisor {
         for slot in slots {
             *slot.kernel.lock().await = None;
         }
+        self.shadow_projects.shutdown().await;
     }
 }
 
@@ -734,6 +769,9 @@ struct Kernel {
     _files: Arc<TempDir>,
     packages: Packages,
     language: Language,
+    // Retain the package directory while this kernel uses it. The manager
+    // holds the current project independently of the kernel.
+    typescript_project: Option<Arc<typescript::Project>>,
 }
 
 impl Kernel {
@@ -751,15 +789,19 @@ impl Kernel {
         ))
     }
 
-    async fn start_typescript(packages: Packages) -> Result<Self, String> {
-        let (command, files) = typescript::command()?;
+    async fn start_typescript(
+        packages: Packages,
+        project: Arc<typescript::Project>,
+    ) -> Result<Self, String> {
+        let bun = typescript::find_bun();
+        let (command, files) = typescript::command(&bun, &project)?;
         let language = Language::Typescript;
         let mut child = Self::spawn_child(command, language, Stdio::inherit())?;
         let mut input = child.stdin.take().unwrap();
         let output = typescript::connect(&mut child, &mut input).await?;
-        Ok(Self::from_child(
-            child, input, output, files, packages, language,
-        ))
+        let mut kernel = Self::from_child(child, input, output, files, packages, language);
+        kernel.typescript_project = Some(project);
+        Ok(kernel)
     }
 
     fn spawn_child(
@@ -780,10 +822,8 @@ impl Kernel {
         command.spawn().map_err(|error| match language {
             Language::Python => format!("Could not start Python: {error}"),
             Language::Csharp => format!("Could not start C# kernel: {error}"),
-            Language::Typescript if error.kind() == std::io::ErrorKind::NotFound => {
-                "Bun was not found. Install Bun from https://bun.com/docs/installation and run the script again.".into()
-            }
-            Language::Typescript => format!("Could not start the Bun kernel: {error}"),
+            Language::Typescript => typescript::bun_not_found(&error)
+                .unwrap_or_else(|| format!("Could not start the Bun kernel: {error}")),
         })
     }
 
@@ -803,6 +843,7 @@ impl Kernel {
             _files: files,
             packages,
             language,
+            typescript_project: None,
         }
     }
 

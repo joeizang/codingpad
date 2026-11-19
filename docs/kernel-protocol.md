@@ -434,7 +434,7 @@ using that name. Outside the kernel, `Cancel` is `CancellationToken.None` and
 and use `#:package CodingPad@0.1.0`, disabling AOT publishing to avoid downloading
 an AOT compiler. Registry publication is a separate release action.
 
-## TypeScript kernel (M5.0–M5.2)
+## TypeScript kernel
 
 The Bun kernel sends the same `stream`, `dump`, `dump_update`, and
 `run_finished` notifications and run response. On startup the supervisor passes
@@ -468,8 +468,25 @@ Reset, Close, and a forced restart clear both.
 The bundled `codingpad` module is available inside each worker. `run.params.path`
 sets the base for file-relative imports from a saved tab. Unsaved tabs resolve
 relative to a private scratch subdirectory. Run uses the editor snapshot without
-writing to the script file. Versioned auto-install imports and the shadow
-project arrive in M5.3 (D5).
+writing to the script file.
+
+Since M5.3, scripts can use Bun's versioned npm imports, such as
+`import { z } from "zod@3"`, with the same syntax in CodingPad and standalone Bun.
+CodingPad reads imports, re-exports, and literal `import()` and `require()`
+specifiers in the script snapshot. Declare any versioned dependencies used by
+local helper modules in the main script too. CodingPad installs these packages
+into a per-script shadow project when the editor opens the script or runs it. The
+package names retain their versions so several versions can coexist and the
+TypeScript language server can resolve their declarations. Bun uses its shared
+package cache across projects and prefers cached packages when installing. A
+rerun or Reset with unchanged dependencies reuses the installed packages.
+Changing dependencies creates a new shadow project and restarts the kernel on
+Run. Runs report when package installation starts. Install errors identify the
+requested packages and include Bun's error output. Package lifecycle scripts
+are skipped during installation. Use version strings that work across platforms,
+such as `3`, `3.x`, `^3.20.0`, `~3.20.0` or `next`.
+A versioned subpath defined only in a package's exports map may fail to
+resolve in Bun workers.
 
 Bun executes TypeScript with top-level `await` and runs scripts with type errors.
 The editor registers TypeScript syntax highlighting. Type diagnostics arrive in

@@ -1,19 +1,115 @@
-//! Hidden C# shadow project for Roslyn code intelligence.
-//!
-//! The project is generated from the same file directives the kernel parses,
-//! so completion and diagnostics see the script's packages, compiler options,
-//! SDK choice and the built-in `CodingPad` library. Rust and TypeScript can
-//! reuse the manager shape later with their own project writers.
+//! Shadow project storage shared by language-specific project writers.
 use crate::data_context::GeneratedContext;
+use crate::typescript::{self, Imports, Project};
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tempfile::TempDir;
+use tokio::sync::{watch, Mutex};
 
 use crate::lsp::path_to_uri;
+
+/// Projects shared by the editor and kernel supervisor for the lifetime of a tab.
+#[derive(Default)]
+pub struct ShadowProjects {
+    typescript: Mutex<HashMap<String, Arc<TypescriptSlot>>>,
+    #[cfg(test)]
+    pub(crate) registry: Option<String>,
+}
+
+struct TypescriptSlot {
+    staged: Mutex<Option<StagedTypescript>>,
+    closed: watch::Sender<bool>,
+}
+
+struct StagedTypescript {
+    project: Arc<Project>,
+    source: String,
+}
+
+impl ShadowProjects {
+    pub(crate) async fn prepare_typescript(
+        &self,
+        script_id: &str,
+        source: &str,
+        imports: Option<Imports>,
+        mut notice: impl FnMut(String),
+    ) -> Result<Arc<Project>, String> {
+        let slot = self
+            .typescript
+            .lock()
+            .await
+            .entry(script_id.to_owned())
+            .or_insert_with(|| {
+                Arc::new(TypescriptSlot {
+                    staged: Mutex::new(None),
+                    closed: watch::channel(false).0,
+                })
+            })
+            .clone();
+        let mut closed = slot.closed.subscribe();
+        if *closed.borrow() {
+            return Err("Script was closed".into());
+        }
+        let prepare = async {
+            let mut staged = match slot.staged.try_lock() {
+                Ok(staged) => staged,
+                Err(_) => {
+                    notice("Waiting for the TypeScript shadow project…".into());
+                    slot.staged.lock().await
+                }
+            };
+            if let Some(current) = staged.as_mut().filter(|current| {
+                imports
+                    .as_ref()
+                    .is_none_or(|imports| imports == &current.project.imports)
+            }) {
+                if current.source != source {
+                    current.project.stage(source)?;
+                    current.source = source.to_owned();
+                }
+                return Ok(current.project.clone());
+            }
+            let project = Arc::new(
+                Project::prepare(
+                    &typescript::find_bun(),
+                    imports.unwrap_or_default(),
+                    notice,
+                    #[cfg(test)]
+                    self.registry.as_deref(),
+                )
+                .await?,
+            );
+            project.stage(source)?;
+            *staged = Some(StagedTypescript {
+                project: project.clone(),
+                source: source.to_owned(),
+            });
+            Ok(project)
+        };
+        tokio::select! {
+            biased;
+            _ = closed.changed() => Err("Script was closed".into()),
+            result = prepare => result,
+        }
+    }
+
+    pub(crate) async fn close(&self, script_id: &str) {
+        if let Some(slot) = self.typescript.lock().await.remove(script_id) {
+            slot.closed.send_replace(true);
+        }
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        for (_, slot) in self.typescript.lock().await.drain() {
+            slot.closed.send_replace(true);
+        }
+    }
+}
 
 const RUNTIME_SOURCES: &[(&str, &str)] = &[
     (
@@ -268,12 +364,35 @@ pub(crate) struct ShadowProject {
     _temp: TempDir,
     root: PathBuf,
     parent: Option<PathBuf>,
-    persistent: bool,
+    document: PathBuf,
     document_uri: String,
     root_uri: String,
 }
 
 impl ShadowProject {
+    pub(crate) fn temporary(document_name: &str) -> Result<Self, String> {
+        let temp = project_directory()?;
+        let root = temp.path().to_path_buf();
+        Self::new(temp, root, document_name, None)
+    }
+
+    fn new(
+        temp: TempDir,
+        root: PathBuf,
+        document_name: &str,
+        parent: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let document = root.join(document_name);
+        Ok(Self {
+            parent,
+            _temp: temp,
+            document_uri: path_to_uri(&document)?,
+            root_uri: path_to_uri(&root)?,
+            document,
+            root,
+        })
+    }
+
     pub(crate) fn create(
         source: &str,
         script_path: Option<&Path>,
@@ -284,8 +403,7 @@ impl ShadowProject {
         if let Some(data) = data {
             directives.add_data_packages(&data.connection.kind, &data.csharp);
         }
-        let temp = tempfile::tempdir()
-            .map_err(|error| format!("Could not create a code-intelligence workspace: {error}"))?;
+        let temp = project_directory()?;
         let temporary = temp.path().join("shadow");
         let neighbour = script_path
             .and_then(Path::parent)
@@ -307,10 +425,9 @@ impl ShadowProject {
         };
         let parent = persistent.then(|| root.parent().unwrap().to_path_buf());
 
-        let program = root.join("Program.cs");
-        fs::write(&program, strip_directives(source)).map_err(|error| {
-            format!("Could not stage the script for code intelligence: {error}")
-        })?;
+        let project = Self::new(temp, root, "Program.cs", parent)?;
+        let root = project.root();
+        project.write_source(&strip_directives(source))?;
         for (name, contents) in RUNTIME_SOURCES {
             fs::write(root.join("CodingPad").join(name), contents).map_err(|error| {
                 format!("Could not stage the CodingPad library for code intelligence: {error}")
@@ -334,25 +451,22 @@ impl ShadowProject {
         } else {
             ""
         };
-        let project = format!(
+        let manifest = format!(
             "<Project Sdk=\"{sdk}\">\n  <PropertyGroup>\n{}\n  </PropertyGroup>\n  <ItemGroup>\n{}\n    <Compile Include=\"Program.cs\" />\n    <Compile Include=\"CodingPadUsings.cs\" />\n{data_source}    <Compile Include=\"CodingPad/*.cs\" />\n  </ItemGroup>\n</Project>\n",
             directives.property_manifest(),
             directives.package_manifest(),
         );
-        fs::write(root.join("CodingPad.Script.csproj"), project).map_err(|error| {
+        fs::write(root.join("CodingPad.Script.csproj"), manifest).map_err(|error| {
             format!("Could not generate the code-intelligence project: {error}")
         })?;
 
-        let project = Self {
-            persistent,
-            parent,
-            _temp: temp,
-            document_uri: path_to_uri(&program)?,
-            root_uri: path_to_uri(&root)?,
-            root,
-        };
         project.touch();
         Ok(project)
+    }
+
+    pub(crate) fn write_source(&self, source: &str) -> Result<(), String> {
+        fs::write(&self.document, source)
+            .map_err(|error| format!("Could not stage the script for code intelligence: {error}"))
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -373,14 +487,17 @@ impl ShadowProject {
     }
 }
 
+fn project_directory() -> Result<TempDir, String> {
+    tempfile::tempdir()
+        .map_err(|error| format!("Could not create a code-intelligence workspace: {error}"))
+}
+
 impl Drop for ShadowProject {
     fn drop(&mut self) {
-        if self.persistent {
+        if let Some(parent) = &self.parent {
             let _ = fs::remove_dir_all(&self.root);
-            if let Some(parent) = &self.parent {
-                // Fails harmlessly while another script in the folder is open.
-                let _ = fs::remove_dir(parent);
-            }
+            // Fails harmlessly while another script in the folder is open.
+            let _ = fs::remove_dir(parent);
         }
     }
 }

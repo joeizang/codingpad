@@ -411,6 +411,19 @@ async fn begin_language_server_session(
 }
 
 #[tauri::command]
+async fn prepare_typescript_project(
+    language_servers: State<'_, LanguageServers>,
+    script_id: String,
+    source: String,
+    session: String,
+) -> Result<(), String> {
+    language_servers
+        .prepare_typescript(&script_id, &source, &session)
+        .await?;
+    Ok(())
+}
+
+#[tauri::command]
 async fn start_language_server(
     language_servers: State<'_, LanguageServers>,
     script_id: String,
@@ -471,8 +484,8 @@ async fn close_script(
     sql: State<'_, Arc<SqlManager>>,
     script_id: String,
 ) -> Result<(), String> {
-    supervisor.close(&script_id).await;
     language_servers.close(&script_id).await;
+    supervisor.close(&script_id).await;
     sql.reset(&script_id);
     Ok(())
 }
@@ -564,13 +577,16 @@ fn main() {
             app.manage(connections.clone());
             let sql = Arc::new(SqlManager::new(connections.clone(), secrets.clone()));
             app.manage(sql.clone());
-            app.manage(
-                Supervisor::with_data_dir_and_secrets(data_dir.clone(), secrets)
-                    .with_connections(connections),
-            );
+            let supervisor = Supervisor::with_data_dir_and_secrets(data_dir.clone(), secrets)
+                .with_connections(connections);
+            let shadow_projects = supervisor.shadow_projects();
+            app.manage(supervisor);
             app.manage(Toolchains::new(data_dir.clone()));
             app.manage(Exports::default());
-            app.manage(LanguageServers::with_data_dir_and_databases(data_dir, sql));
+            app.manage(
+                LanguageServers::with_data_dir_and_databases(data_dir, sql)
+                    .with_shadow_projects(shadow_projects),
+            );
             bench_phase("setup_finished", serde_json::Value::Null);
             Ok(())
         })
@@ -603,6 +619,7 @@ fn main() {
             cancel_export,
             close_script,
             begin_language_server_session,
+            prepare_typescript_project,
             start_language_server,
             change_language_server,
             request_language_server,

@@ -1,5 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { Connection } from "./ConnectionsDialog";
+import { SAMPLE_CONNECTION } from "./NewScriptMenu";
 import {
   baseName,
   type FolderEntry,
@@ -24,6 +26,10 @@ type SidebarProps = {
   onAddPinned: () => void;
   onRemovePinned: (path: string) => void;
   error?: string;
+  /** Shown above the library, such as the attached connection's schema. */
+  top?: ReactNode;
+  /** Pinned to the bottom of the sidebar. */
+  bottom?: ReactNode;
 };
 
 type Loaded = { entries?: FolderEntry[]; error?: string };
@@ -199,101 +205,149 @@ export function Sidebar({
   onAddPinned,
   onRemovePinned,
   error,
+  top,
+  bottom,
 }: SidebarProps) {
   return (
     <aside className="sidebar" aria-label="Library">
-      <div className="sidebar-actions">
-        <button onClick={onOpenFile}>Open file…</button>
-      </div>
-      {error && (
-        <div className="sidebar-error">
-          {error}
-        </div>
-      )}
-      {(samples.length > 0 || samplesError) && (
-        <section className="sidebar-section">
-          <h2>Samples</h2>
-          {samplesError ? (
-            <div className="tree-error" role="alert">
-              {samplesError}
-            </div>
-          ) : (
-            <div className="tree-status">Opening one makes an unsaved copy.</div>
-          )}
-          {groupSamples(samples).map((group) => (
-            <SampleGroup
-              key={group.language}
-              label={group.label}
-              samples={group.samples}
-              activeSample={activeSample}
-              defaultOpen={group.language === "python"}
-              onOpen={onOpenSample}
-            />
-          ))}
-        </section>
-      )}
-      {!settings ? (
-        <div className="tree-status">Loading library…</div>
-      ) : (
-        <>
-          <section className="sidebar-section">
-            <h2>
-              Library
-              <button
-                className="section-action"
-                aria-label="Change library folder"
-                onClick={onChangeLibrary}
-              >
-                Change…
-              </button>
-            </h2>
-            <div className="folder-label" title={settings.libraryPath}>
-              {baseName(settings.libraryPath) || settings.libraryPath}
-            </div>
-            <FolderTree
-              path={settings.libraryPath}
-              activePath={activePath}
-              refresh={refresh}
-              onOpen={onOpen}
-            />
-          </section>
-          <section className="sidebar-section">
-            <h2>
-              Pinned folders
-              <button
-                className="section-action"
-                aria-label="Pin folder"
-                onClick={onAddPinned}
-              >
-                + Add
-              </button>
-            </h2>
-            {settings.pinnedFolders.length === 0 && (
-              <div className="tree-status">No pinned folders</div>
-            )}
-            {settings.pinnedFolders.map((path) => (
-              <div className="pinned-folder" key={path}>
-                <div className="folder-label" title={path}>
-                  <span>{baseName(path) || path}</span>
+      <div className="sidebar-scroll">
+        {top}
+        {error && <div className="sidebar-error">{error}</div>}
+        {!settings ? (
+          <div className="tree-status">Loading library…</div>
+        ) : (
+          <>
+            <section className="sidebar-section">
+              <h2>
+                Library
+                <span className="section-actions">
+                  <button className="section-action" onClick={onOpenFile}>
+                    Open file…
+                  </button>
                   <button
                     className="section-action"
-                    aria-label={`Unpin ${baseName(path) || path}`}
-                    onClick={() => onRemovePinned(path)}
+                    aria-label="Change library folder"
+                    onClick={onChangeLibrary}
                   >
-                    ×
+                    Change…
                   </button>
-                </div>
-                <FolderTree
-                  path={path}
-                  activePath={activePath}
-                  refresh={refresh}
-                  onOpen={onOpen}
-                />
+                </span>
+              </h2>
+              <div className="folder-label" title={settings.libraryPath}>
+                {baseName(settings.libraryPath) || settings.libraryPath}
               </div>
+              <FolderTree
+                path={settings.libraryPath}
+                activePath={activePath}
+                refresh={refresh}
+                onOpen={onOpen}
+              />
+            </section>
+            <section className="sidebar-section">
+              <h2>
+                Pinned folders
+                <button
+                  className="section-action"
+                  aria-label="Pin folder"
+                  onClick={onAddPinned}
+                >
+                  + Add
+                </button>
+              </h2>
+              {settings.pinnedFolders.length === 0 && (
+                <div className="tree-status">No pinned folders</div>
+              )}
+              {settings.pinnedFolders.map((path) => (
+                <div className="pinned-folder" key={path}>
+                  <div className="folder-label" title={path}>
+                    <span>{baseName(path) || path}</span>
+                    <button
+                      className="section-action"
+                      aria-label={`Unpin ${baseName(path) || path}`}
+                      onClick={() => onRemovePinned(path)}
+                    >
+                      ×
+                    </button>
+                  </div>
+                  <FolderTree
+                    path={path}
+                    activePath={activePath}
+                    refresh={refresh}
+                    onOpen={onOpen}
+                  />
+                </div>
+              ))}
+            </section>
+          </>
+        )}
+        {(samples.length > 0 || samplesError) && (
+          <section className="sidebar-section">
+            <h2>Samples</h2>
+            {samplesError ? (
+              <div className="tree-error" role="alert">
+                {samplesError}
+              </div>
+            ) : (
+              <div className="tree-status">Opening one makes an unsaved copy.</div>
+            )}
+            {groupSamples(samples).map((group) => (
+              <SampleGroup
+                key={group.language}
+                label={group.label}
+                samples={group.samples}
+                activeSample={activeSample}
+                defaultOpen={group.language === "python"}
+                onOpen={onOpenSample}
+              />
             ))}
           </section>
-        </>
-      )}
+        )}
+      </div>
+      {bottom}
     </aside>
+  );
+}
+
+export function ConnectionList({
+  connections,
+  attached,
+  onManage,
+  onSecrets,
+}: {
+  connections: Connection[];
+  attached?: string;
+  onManage: () => void;
+  onSecrets: () => void;
+}) {
+  const rows = [
+    ...connections.map((item) => ({ name: item.name, detail: item.kind })),
+    { name: SAMPLE_CONNECTION, detail: "sample" },
+  ];
+  return (
+    <section className="sidebar-section sidebar-connections">
+      <h2>
+        Connections
+        <span className="section-actions">
+          <button className="section-action" aria-label="Connections" onClick={onManage}>
+            Manage…
+          </button>
+          <button className="section-action" aria-label="Secrets" onClick={onSecrets}>
+            Secrets…
+          </button>
+        </span>
+      </h2>
+      <ul className="connection-list">
+        {rows.map((row) => (
+          <li
+            key={row.name}
+            className={row.name === attached ? "attached" : undefined}
+            title={row.name === attached ? "Attached to this script" : undefined}
+          >
+            <span className="connection-name">{row.name}</span>
+            <span className="connection-kind">{row.detail}</span>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }

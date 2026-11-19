@@ -1,5 +1,6 @@
 import { expect, test } from "vitest";
 import {
+  scriptPackages,
   baseName,
   headerSummary,
   joinPath,
@@ -72,4 +73,20 @@ test("parses the same header forms as the Rust store", () => {
   for (const [source, expected] of examples) {
     expect(parseHeader(source)).toEqual(expected);
   }
+});
+
+test("reads package requirements from a Python inline metadata block", () => {
+  const source = [
+    "# /// script",
+    '# requires-python = ">=3.12"',
+    "# dependencies = [",
+    '#   "pandas[excel]>=2.2",',
+    "#   'httpx',",
+    "# ]",
+    "# ///",
+    "import pandas",
+  ].join("\n");
+  expect(scriptPackages(source)).toEqual(["pandas[excel]>=2.2", "httpx"]);
+  expect(scriptPackages('# dependencies = ["requests"]\n')).toEqual([]);
+  expect(scriptPackages("# /// script\n# ///\n")).toEqual([]);
 });

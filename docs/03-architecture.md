@@ -27,6 +27,12 @@ Decision numbers (D#) refer to [04-open-questions.md](04-open-questions.md). Ter
 the script header's connection and vault secrets like the app, and prints dumps
 as text or, with `--html`, as one standalone page.
 
+`cpad mcp` (D64–D70) is the same headless core behind an MCP server on stdio, for
+the user's own agents. It returns dump previews that agents page through, gates
+database connections and secrets, and, when the app is open, mirrors each agent
+run into the window over a per-user local socket. See
+[ADR 0008](adr/0008-local-mcp-server-for-agents.md).
+
 ## Decisions at a glance
 | Area | Decision | Ref |
 |---|---|---|

@@ -37,9 +37,7 @@ pub(crate) fn find(data_dir: Option<&Path>) -> Result<Ts7, String> {
 }
 
 fn find_with(data_dir: Option<&Path>, explicit: Option<OsString>) -> Result<Ts7, String> {
-    let bun = data_dir
-        .map(crate::toolchains::resolve_bun)
-        .unwrap_or_else(crate::typescript::find_bun);
+    let bun = crate::toolchains::bun_for(None, data_dir);
     let mut candidates = Vec::new();
     if let Some(path) = explicit {
         candidates.push(PathBuf::from(path));

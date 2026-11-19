@@ -136,8 +136,8 @@ installation removes abandoned staging files while holding a process lock, so
 another app instance's active download is preserved.
 The app prefers your existing `uv` over its private copy and never changes your
 shell profiles or `PATH`. Private installation supports x86-64 and ARM64 on macOS,
-Linux (GNU and musl), and Windows. Other architectures can use a manually installed
-`uv`. No tools are bundled in the application installer.
+Windows and Linux (GNU or musl builds). Other architectures can use a manually
+installed `uv`. No tools are bundled in the application installer.
 
 Python 3.10+ must already be installed. The app uses the installed Python selected
 by `uv python find`; a missing Python produces an actionable message in Results.
@@ -151,8 +151,9 @@ file. CodingPad uses [Bun](https://bun.com/docs/installation) and looks for it o
 verifies its SHA-256, installs it privately under the app data folder
 (`toolchains/bun/1.4.2`), and retries the script without restarting the app. The
 app prefers your own Bun and never changes your shell profiles or `PATH`. Private
-installation supports x86-64 and ARM64 on macOS, Linux (GNU and musl), and
-Windows. Import `dump` from `codingpad` to
+installation supports x86-64 and ARM64 on macOS, Windows and Linux (GNU or musl
+builds); on x86-64 CPUs without AVX2 it installs Bun's baseline build. Import
+`dump` from `codingpad` to
 display a value in Results. The last expression is dumped automatically.
 Top-level `await` works and the kernel runs scripts with type errors. Import
 `cache` from `codingpad` to keep a structured-cloneable result between reruns of

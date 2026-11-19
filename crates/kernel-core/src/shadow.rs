@@ -1,6 +1,6 @@
 //! Shadow project storage shared by language-specific project writers.
 use crate::data_context::GeneratedContext;
-use crate::typescript::{self, Imports, Project};
+use crate::typescript::{Imports, Project};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -41,8 +41,7 @@ impl ShadowProjects {
         }
     }
 
-    /// Pin TypeScript package preparation to one Bun, as the installer
-    /// acceptance test does when the user's own Bun must not be used.
+    /// Pin the TypeScript package installer to one Bun.
     pub(crate) fn with_bun(bun: PathBuf) -> Self {
         Self {
             bun: Some(bun),
@@ -52,14 +51,8 @@ impl ShadowProjects {
 
     /// Resolve Bun on every project preparation so a private install made in
     /// this launch is used without restarting the app.
-    fn bun(&self) -> PathBuf {
-        if let Some(bun) = &self.bun {
-            return bun.clone();
-        }
-        self.data_dir
-            .as_deref()
-            .map(crate::toolchains::resolve_bun)
-            .unwrap_or_else(typescript::find_bun)
+    fn bun_path(&self) -> PathBuf {
+        crate::toolchains::bun_for(self.bun.as_deref(), self.data_dir.as_deref())
     }
 
     pub(crate) async fn prepare_typescript(
@@ -107,7 +100,7 @@ impl ShadowProjects {
             }
             let project = Arc::new(
                 Project::prepare(
-                    &self.bun(),
+                    &self.bun_path(),
                     imports.unwrap_or_default(),
                     types,
                     notice,

@@ -379,13 +379,22 @@ impl Supervisor {
     }
 
     fn bun_path(&self) -> PathBuf {
-        if let Some(bun) = &self.bun {
-            return bun.clone();
+        toolchains::bun_for(self.bun.as_deref(), self.data_dir.as_deref())
+    }
+
+    /// A private Bun that cannot start is removed so the next Run reports the
+    /// missing toolchain and offers the one-click install again.
+    fn discard_broken_bun(&self, bun: &Path) {
+        if self.bun.is_some() {
+            return;
         }
-        self.data_dir
+        if self
+            .data_dir
             .as_deref()
-            .map(toolchains::resolve_bun)
-            .unwrap_or_else(typescript::find_bun)
+            .is_some_and(|data_dir| toolchains::private_bun(data_dir).as_path() == bun)
+        {
+            let _ = std::fs::remove_file(bun);
+        }
     }
 
     pub async fn run(
@@ -613,11 +622,15 @@ impl Supervisor {
                         Language::Python => Kernel::start(&self.uv_path(), packages, &mut emit).await,
                         Language::Typescript => {
                             let bun = self.bun_path();
-                            Kernel::start_typescript(
+                            let started = Kernel::start_typescript(
                                 packages,
                                 typescript_project.unwrap(),
                                 &bun,
-                            ).await
+                            ).await;
+                            if started.is_err() {
+                                self.discard_broken_bun(&bun);
+                            }
+                            started
                         }
                     }
                 } => result,
@@ -1210,6 +1223,23 @@ mod tests {
         assert!(
             matches!(result, Err(message) if message.starts_with("Bun was not found. Choose Install Bun"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_private_bun_that_cannot_start_is_discarded() {
+        let data = tempfile::tempdir().unwrap();
+        let private = toolchains::private_bun(data.path());
+        std::fs::create_dir_all(private.parent().unwrap()).unwrap();
+        std::fs::write(&private, "broken").unwrap();
+        let supervisor = Supervisor::with_data_dir(data.path().to_path_buf());
+        supervisor.discard_broken_bun(&private);
+        assert!(!private.exists(), "the next run can offer a reinstall");
+        // An explicit pin, as tests and embedders set, belongs to the caller.
+        let pinned = data.path().join("pinned-bun");
+        std::fs::write(&pinned, "broken").unwrap();
+        let supervisor = Supervisor::with_bun(pinned.clone());
+        supervisor.discard_broken_bun(&pinned);
+        assert!(pinned.exists());
     }
 
     #[test]

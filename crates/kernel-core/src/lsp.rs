@@ -111,7 +111,7 @@ impl LanguageServers {
         }
     }
 
-    /// Resolve user tools and the app-private uv on every server startup.
+    /// Resolve user tools and the app-private installs on every server startup.
     pub fn with_data_dir(data_dir: PathBuf) -> Self {
         Self {
             data_dir: Some(data_dir.clone()),

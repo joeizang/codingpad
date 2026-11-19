@@ -128,7 +128,13 @@ type Toolchain = "uv" | "dotnet" | "bun";
 
 const TOOLCHAIN_INSTALL: Record<
   Toolchain,
-  { command: string; name: string; downloading: string; description: string }
+  {
+    command: string;
+    name: string;
+    downloading: string;
+    description: string;
+    notFoundPrefix: string;
+  }
 > = {
   uv: {
     command: "install_uv",
@@ -136,6 +142,7 @@ const TOOLCHAIN_INSTALL: Record<
     downloading: "Downloading and verifying uv…",
     description:
       "Install uv privately for CodingPad to run Python scripts. This needs an internet connection.",
+    notFoundPrefix: "uv was not found.",
   },
   dotnet: {
     command: "install_dotnet",
@@ -143,6 +150,7 @@ const TOOLCHAIN_INSTALL: Record<
     downloading: "Downloading and verifying the .NET install script…",
     description:
       "Install the .NET SDK privately for CodingPad to run C# scripts. This needs an internet connection.",
+    notFoundPrefix: ".NET was not found.",
   },
   bun: {
     command: "install_bun",
@@ -150,8 +158,18 @@ const TOOLCHAIN_INSTALL: Record<
     downloading: "Downloading and verifying Bun…",
     description:
       "Install Bun privately for CodingPad to run TypeScript scripts. This needs an internet connection.",
+    notFoundPrefix: "Bun was not found.",
   },
 };
+
+const TOOLCHAINS = Object.keys(TOOLCHAIN_INSTALL) as Toolchain[];
+
+/** The installable toolchain a run error says is missing. */
+function missingToolchainFor(message: string): Toolchain | undefined {
+  return TOOLCHAINS.find((toolchain) =>
+    message.startsWith(TOOLCHAIN_INSTALL[toolchain].notFoundPrefix),
+  );
+}
 
 /** Starter text for a new tab, with a header line when a connection is attached. */
 function starterSource(language: ScriptLanguage, connection?: string): string {
@@ -422,13 +440,7 @@ export default function App() {
         ...item,
         status: "Could not run",
         error: message,
-        missingToolchain: message.startsWith("uv was not found.")
-          ? "uv"
-          : message.startsWith(".NET was not found.")
-            ? "dotnet"
-            : message.startsWith("Bun was not found.")
-              ? "bun"
-              : undefined,
+        missingToolchain: missingToolchainFor(message),
       }));
     } finally {
       flush();

@@ -19,6 +19,8 @@ use tokio::{
 
 const KERNEL: &str = include_str!("../../../kernels/typescript/kernel.ts");
 const RUN: &str = include_str!("../../../kernels/typescript/run.ts");
+const DUMP: &str = include_str!("../../../kernels/typescript/dump.ts");
+const ERRORS: &str = include_str!("../../../kernels/typescript/errors.ts");
 const RUNTIME: &str = include_str!("../../../runtimes/typescript/codingpad/index.ts");
 
 pub(crate) fn command() -> Result<(Command, Arc<TempDir>), String> {
@@ -27,6 +29,8 @@ pub(crate) fn command() -> Result<(Command, Arc<TempDir>), String> {
     std::fs::write(&kernel, KERNEL).map_err(|error| error.to_string())?;
     std::fs::write(files.path().join("runtime.ts"), RUNTIME).map_err(|error| error.to_string())?;
     std::fs::write(files.path().join("run.ts"), RUN).map_err(|error| error.to_string())?;
+    std::fs::write(files.path().join("dump.ts"), DUMP).map_err(|error| error.to_string())?;
+    std::fs::write(files.path().join("errors.ts"), ERRORS).map_err(|error| error.to_string())?;
     let scratch = files.path().join("scratch");
     std::fs::create_dir(&scratch).map_err(|error| error.to_string())?;
     let mut command = Command::new(find_bun());

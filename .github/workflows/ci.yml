@@ -47,6 +47,18 @@ jobs:
         with:
           bun-version: "1.4.2"
 
+      - name: Install TypeScript 7 language server
+        shell: bash
+        run: |
+          # Pinned preview; bump deliberately with the TypeScript tests.
+          bun add -g @typescript/native-preview@7.0.0-dev.20260707.2
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            BIN=$(cygpath -u "$(bun pm bin -g)")
+            echo "CODINGPAD_TS_LSP=$(cygpath -w "$BIN/tsgo.cmd")" >> "$GITHUB_ENV"
+          else
+            echo "CODINGPAD_TS_LSP=$(bun pm bin -g)/tsgo" >> "$GITHUB_ENV"
+          fi
+
       - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           dotnet-version: 10.0.x
@@ -73,3 +85,6 @@ jobs:
 
       - name: just check
         run: just check
+
+      - name: TypeScript package code intelligence
+        run: cargo test -p codingpad-kernel-core --test language_server typescript_code_intelligence_resolves_versioned_packages --locked -- --ignored

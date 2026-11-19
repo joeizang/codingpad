@@ -154,6 +154,16 @@ cache plain data rather than class instances. Reset or closing the tab clears
 cached values. Globals start fresh on every run. Cooperative Stop keeps the
 cache; a forced restart clears it. CI installs Bun to exercise this path.
 
+TypeScript code intelligence uses the TypeScript 7 native language server
+(`tsgo`) on the same hidden project that Run prepares for versioned imports.
+Install it once with `bun add -g @typescript/native-preview`; CodingPad also
+checks its own `typescript` data folder and `PATH`, and `CODINGPAD_TS_LSP` can
+point at the executable. Completions, hover and type errors cover `dump`,
+`cache` and other `codingpad` helpers; `secret()` waits for the M5.6 database
+client. Versioned imports such as `zod@3` resolve from the shared project;
+changing the import set restarts the server. Type errors show as squiggles and a
+count but never block **Run**.
+
 If no .NET 10+ runtime is installed, Results offers **Install .NET and run**. One
 click downloads the official `dotnet-install` script pinned to the
 `dotnet/install-scripts` tag `v2026.07.21`, verifies its SHA-256, and runs it to
@@ -711,8 +721,10 @@ effect on the next run of each script.
 - `crates/kernel-core`: Rust kernel supervisor, independent of the window
 - `kernels/python`: Python stdio kernel
 - `kernels/csharp`: C# stdio kernel and pinned Roslyn dependency
+- `kernels/typescript`: Bun kernel, worker and dump renderer
 - `runtimes/dotnet/CodingPad`: bundled C# `.Dump()` extension library
 - `runtimes/python/codingpad`: bundled `dump()` helper (no registry download)
+- `runtimes/typescript/codingpad`: bundled TypeScript helper and its declarations
 - `samples`: built-in Python, C# and SQL samples plus the bundled SQLite database
 - `tests/python`: Python kernel protocol and execution tests
 - `tests/dotnet`: C# cancellation protocol and standalone package checks
@@ -801,13 +813,23 @@ declares. Editing the inline metadata restarts the language server for the new
 dependency set; only wheels are used, so an sdist is never built just by opening
 a script.
 
+TypeScript completions, hover and type diagnostics come from the **TypeScript 7
+native language server** (`tsgo`) through the same bridge and the same shared
+hidden project Run uses. The project maps the bundled `codingpad` helper
+declarations and keeps installed versioned imports (`zod@3`) available to the
+language server. The server restarts when the prepared project changes. Install
+it with `bun add -g @typescript/native-preview`, or point `CODINGPAD_TS_LSP` at
+`tsgo`. The hidden project is temporary and never touches your saved script.
+The shared project prefers real `@types/bun` types and falls back to a small
+checked-in declaration file when it cannot install them.
+
 Type errors appear as squiggles and a count in the editor header, but they never
-stop **Run**; Python executes regardless.
+stop **Run**; Python and TypeScript execute regardless.
 
 ## Performance checks
 
-`just bench` builds the release app and measures the M1 and M2 targets from D38
-on Linux:
+`just bench` builds the release app and measures the M1, M2 and M5 targets from
+D38 on Linux:
 
 | Metric | Target |
 |---|---|
@@ -821,12 +843,16 @@ on Linux:
 | Warm C# rerun after an edit | < 500 ms |
 | 100k-item `IEnumerable`, first page to host | < 1 s |
 | C# completion | < 300 ms |
+| TypeScript completion | < 300 ms |
 
 The first completion run may download basedpyright; later runs reuse the cache.
 The C# completion metric needs Roslyn, from the VS Code C# extension or
 `CODINGPAD_ROSLYN_LSP`. It waits for Roslyn to load the script, then times the
 first completion after an edit. The `IEnumerable` metric runs in a warm kernel
 and is timed from the start of the run, so it includes compilation.
+The TypeScript completion metric needs the TypeScript 7 native server and Bun;
+install `@typescript/native-preview` or set `CODINGPAD_TS_LSP`. It is skipped
+when the server is not found.
 C# runs use no NuGet packages, so the measurements exclude package downloads.
 App readiness requires a mounted, writable Monaco model and registered editor
 commands/providers after a paint. Process entry, Tauri setup, WebView loading,

@@ -416,11 +416,10 @@ async fn prepare_typescript_project(
     script_id: String,
     source: String,
     session: String,
-) -> Result<(), String> {
+) -> Result<Option<LspStartResult>, String> {
     language_servers
         .prepare_typescript(&script_id, &source, &session)
-        .await?;
-    Ok(())
+        .await
 }
 
 #[tauri::command]
@@ -452,6 +451,13 @@ async fn start_language_server(
                         let _ = on_event.send(event);
                     },
                 )
+                .await
+        }
+        "typescript" => {
+            language_servers
+                .start_typescript(&script_id, &source, &session, move |event| {
+                    let _ = on_event.send(event);
+                })
                 .await
         }
         _ => Err("Code intelligence is not available for this language".into()),

@@ -24,7 +24,7 @@ bundle:
     npm --prefix apps/desktop ci
     npm --prefix apps/desktop run tauri -- build
 
-# Measure the M1 and M2 speed targets (D38, D48, D55). Needs a desktop session; Windows skips app metrics.
+# Measure the M1, M2 and M5 speed targets (D38, D48, D55). Needs a desktop session; Windows skips app metrics.
 bench:
     npm --prefix apps/desktop ci
     npm --prefix apps/desktop run tauri -- build --no-bundle

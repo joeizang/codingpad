@@ -133,7 +133,13 @@ async fn typescript_stop_preserves_kernel_and_clears_script_state() {
     assert!(prior.ok, "{events:?}");
     let scratch = &events[0].params["node"]["items"];
     let pid = scratch[0]["v"].clone();
-    assert_eq!(scratch[1]["v"], scratch[2]["v"]);
+    let script_dir = scratch[1]["v"].as_str().unwrap();
+    let working_dir = scratch[2]["v"].as_str().unwrap();
+    if cfg!(windows) {
+        assert!(script_dir.eq_ignore_ascii_case(working_dir));
+    } else {
+        assert_eq!(script_dir, working_dir);
+    }
     assert_eq!(scratch[3]["v"], false);
     assert_eq!(scratch[4]["v"], false);
     assert!(std::path::Path::new(scratch[2]["v"].as_str().unwrap()).ends_with("scratch"));
@@ -217,7 +223,15 @@ fn dump_nodes(events: &[KernelEvent]) -> impl Iterator<Item = &Value> {
     events
         .iter()
         .filter(|event| event.method == "dump")
-        .map(|event| &event.params["node"])
+        .map(|event| rendered_dump(events, &event.params["node"]))
+}
+
+fn rendered_dump<'a>(events: &'a [KernelEvent], node: &'a Value) -> &'a Value {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.method == "dump_update" && event.params["nodeId"] == node["id"])
+        .map_or(node, |update| &update.params["node"])
 }
 
 fn handle(node: &Value) -> &str {
@@ -461,4 +475,58 @@ async fn typescript_errors_point_to_the_editor_snapshot() {
             assert_eq!(node["causes"][0]["message"], "inner");
         }
     }
+}
+
+#[tokio::test]
+async fn typescript_iterable_dumps_keep_results_in_call_order() {
+    let supervisor = Supervisor::default();
+    let Some(events) = run_dump_script(
+        &supervisor,
+        r#"
+import { dump } from "codingpad";
+function* syncRows() { yield 1; }
+async function* asyncRows() {
+  await Bun.sleep(10);
+  yield 2;
+}
+dump(syncRows());
+dump("after sync");
+console.log("stdout");
+dump(asyncRows());
+dump("after async");
+console.warn("stderr");
+dump(syncRows());
+"#,
+    )
+    .await
+    else {
+        return;
+    };
+    let results: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event.method.as_str() {
+            "dump" => {
+                let node = rendered_dump(&events, &event.params["node"]);
+                if node["kind"] == "table" {
+                    Some(node["rows"][0][0]["v"].to_string())
+                } else {
+                    Some(node["v"].as_str().unwrap().to_owned())
+                }
+            }
+            "stream" => Some(event.params["text"].as_str().unwrap().trim_end().to_owned()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        results,
+        [
+            "1",
+            "after sync",
+            "stdout",
+            "2",
+            "after async",
+            "stderr",
+            "1"
+        ]
+    );
 }

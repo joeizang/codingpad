@@ -447,11 +447,12 @@ process. The run completes after the top-level module settles and the initial
 pages of any dumped iterables are ready. A worker with preview handles stays
 available for `expand` and `export_rows`. The next run asks unfinished iterators
 to close, then terminates the worker with a bounded wait and starts a fresh
-one. Handles also expire on Reset and Close. Results only receive output and
-live updates during the run, so await asynchronous work that should produce
-output. Stop targets the active worker and waits for it to exit.
-If the worker cannot exit within two seconds, the Rust supervisor kills the
-kernel. Reset and Close also discard the process. The `cache()` helper arrives in
+one. Handles also expire on Reset and Close. Background work such as timers
+and open sockets can remain active in a retained worker until the next run,
+Reset or Close. Results receive output and live updates during the run, so
+await asynchronous work whose output you want to see. Stop targets the active
+worker and waits for it to exit. If the worker cannot exit within two seconds,
+the Rust supervisor kills the kernel. Reset and Close also discard the process. The `cache()` helper arrives in
 M5.2. An overlapping run request receives error `-32000` ("Run already in progress").
 
 The bundled `codingpad` module is available inside each worker. `run.params.path`
@@ -475,10 +476,11 @@ lazy nodes for deeper values and nested table cells. Object fields are read
 from property descriptors. Accessor fields show an `[Accessor]` marker.
 Built-in values such as dates and maps use bounded text previews.
 
-Custom synchronous and asynchronous iterables become tables. Each preview pulls
-at most 100 items without lookahead, retains the iterator and caches the items
-already read so a repeated page reuses those items. Columns are fixed from
-the first page. Export uses those columns for iterables and discovers all
+Custom synchronous and asynchronous iterables become tables. Each dump reserves
+its place in Results and sends a `dump_update` when the first page is ready.
+Each preview pulls at most 100 items without lookahead, retains the iterator
+and caches the items already read so a repeated page reuses those items.
+Columns are fixed from the first page. Export uses those columns for iterables and discovers all
 columns for arrays. The table uses the same unknown-total placeholder as C# until
 the iterator finishes. Iterator failures appear as a final error row.
 

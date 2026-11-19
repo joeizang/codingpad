@@ -107,10 +107,13 @@ export class Dumps {
   dump(value: unknown) {
     if (!this.#running) return;
     if (isSequence(value)) {
-      const pending = this.#sequence(value, []).then(
-        (node) => this.notify("dump", { node }),
-        (error) => this.notify("dump", { node: this.error(error) }),
-      ).finally(() => this.#pending.delete(pending));
+      // Reserve the Results position before an iterator can yield or log.
+      const nodeId = this.#id();
+      this.notify("dump", { node: { id: nodeId, kind: "string", v: "Loading iterable…" } });
+      const pending = this.#sequence(value, [])
+        .catch((error) => this.error(error))
+        .then((node) => this.notify("dump_update", { nodeId, node }))
+        .finally(() => this.#pending.delete(pending));
       this.#pending.add(pending);
       return;
     }

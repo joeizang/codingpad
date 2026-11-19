@@ -1,7 +1,7 @@
 //! The terminal runner behind `cpad run` (D28).
 //!
 //! The command reuses the desktop's Rust core: the same kernel supervisor,
-//! warm Python, C# and TypeScript kernels, SQL manager, connection store and
+//! Python, C# and TypeScript kernels, SQL manager, connection store and
 //! secret vault. It replaces the results panel with terminal output.
 //!
 //! Kernels normally defer C# properties and deep values as lazy nodes so the
@@ -18,7 +18,7 @@
 use codingpad_kernel_core::{
     databases::{ConnectionStore, SqlManager},
     html,
-    secrets::SecretStore,
+    secrets::{OsVault, SecretStore, Vault},
     text::render_dump,
     KernelEvent, Language, Supervisor,
 };
@@ -65,6 +65,20 @@ pub enum ScriptLanguage {
     Sql,
 }
 
+impl ScriptLanguage {
+    const KERNELS: [(Self, Language); 3] = [
+        (Self::Python, Language::Python),
+        (Self::Csharp, Language::Csharp),
+        (Self::Typescript, Language::Typescript),
+    ];
+
+    fn kernel(self) -> Option<Language> {
+        Self::KERNELS
+            .into_iter()
+            .find_map(|(script, kernel)| (script == self).then_some(kernel))
+    }
+}
+
 /// How the run prints its dumps (D28).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -96,21 +110,24 @@ pub fn language_for(path: &Path) -> Result<ScriptLanguage, String> {
         .and_then(|extension| extension.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    match extension.as_str() {
-        "py" => Ok(ScriptLanguage::Python),
-        "cs" => Ok(ScriptLanguage::Csharp),
-        "ts" => Ok(ScriptLanguage::Typescript),
-        "sql" => Ok(ScriptLanguage::Sql),
-        other => Err(format!(
-            "Cannot run \"{}\": expected a .py, .cs, .ts or .sql script{}.",
-            path.display(),
-            if other.is_empty() {
-                String::new()
-            } else {
-                format!(", not .{other}")
-            }
-        )),
+    if extension == "sql" {
+        return Ok(ScriptLanguage::Sql);
     }
+    if let Some((script, _)) = ScriptLanguage::KERNELS
+        .into_iter()
+        .find(|(_, kernel)| kernel.extension() == extension)
+    {
+        return Ok(script);
+    }
+    Err(format!(
+        "Cannot run \"{}\": expected a .py, .cs, .ts or .sql script{}.",
+        path.display(),
+        if extension.is_empty() {
+            String::new()
+        } else {
+            format!(", not .{extension}")
+        }
+    ))
 }
 
 /// Run one script and return the process exit code, printing dumps as text.
@@ -123,6 +140,15 @@ pub async fn run_file(path: &Path) -> i32 {
 /// Successful runs return 0, script failures return 1, stopped runs (including
 /// Ctrl-C) return 130, and usage or script-type errors return 2.
 pub async fn run_file_with_format(path: &Path, format: OutputFormat) -> i32 {
+    run_file_in(path, format, data_dir(), Arc::new(OsVault)).await
+}
+
+async fn run_file_in(
+    path: &Path,
+    format: OutputFormat,
+    data_directory: PathBuf,
+    vault: Arc<dyn Vault>,
+) -> i32 {
     // Check the type before touching the disk: `cpad run notes.txt` is a usage
     // error even when that file does not exist.
     let language = match language_for(path) {
@@ -148,7 +174,6 @@ pub async fn run_file_with_format(path: &Path, format: OutputFormat) -> i32 {
             return 1;
         }
     };
-    let data_directory = data_dir();
     if let Err(error) = fs::create_dir_all(&data_directory) {
         eprintln!(
             "Could not create the CodingPad data folder {}: {error}",
@@ -157,7 +182,7 @@ pub async fn run_file_with_format(path: &Path, format: OutputFormat) -> i32 {
         return 1;
     }
 
-    let secrets = Arc::new(SecretStore::new(&data_directory));
+    let secrets = Arc::new(SecretStore::with_vault(&data_directory, vault));
     let connections = Arc::new(ConnectionStore::new(&data_directory));
     if let Err(error) = codingpad_kernel_core::samples::ensure_database(&data_directory) {
         eprintln!("cpad could not prepare the sample database: {error}");
@@ -188,14 +213,12 @@ pub async fn run_file_with_format(path: &Path, format: OutputFormat) -> i32 {
         Some(report) => Recorder::Html(report.clone()),
         None => Recorder::Text(Output::default()),
     };
-    let kernel_language = match language {
-        ScriptLanguage::Python => Some(Language::Python),
-        ScriptLanguage::Csharp => Some(Language::Csharp),
-        ScriptLanguage::Typescript => Some(Language::Typescript),
-        ScriptLanguage::Sql => None,
-    };
-    let result = match kernel_language {
-        Some(kernel_language) => {
+    let result = match language {
+        ScriptLanguage::Sql => {
+            run_sql_script(&sql, &script_id, &source, &absolute, &mut recorder).await
+        }
+        script_language => {
+            let kernel_language = script_language.kernel().expect("kernel script language");
             // Use the same header connection and db client as the desktop,
             // including generated data models for Python and C#.
             let (data, data_error) =
@@ -220,7 +243,6 @@ pub async fn run_file_with_format(path: &Path, format: OutputFormat) -> i32 {
                     stopped: result.stopped,
                 })
         }
-        None => run_sql_script(&sql, &script_id, &source, &absolute, &mut recorder).await,
     };
 
     // A dump with a lazy node was held back. Apply any buffered live updates,
@@ -966,8 +988,9 @@ fn write_recorded(record: &Recorded) {
 
 #[cfg(test)]
 mod tests {
-    use super::{language_for, ScriptLanguage};
-    use std::path::Path;
+    use super::{language_for, run_file_in, OutputFormat, ScriptLanguage};
+    use codingpad_kernel_core::secrets::Vault;
+    use std::{fs, path::Path, sync::Arc};
 
     #[test]
     fn extensions_pick_the_runner() {
@@ -994,5 +1017,45 @@ mod tests {
         let message = language_for(Path::new("notes.txt")).unwrap_err();
         assert!(message.contains(".py, .cs, .ts or .sql"));
         assert!(message.contains("notes.txt"));
+    }
+
+    #[tokio::test]
+    async fn typescript_cli_runner_reads_a_vault_secret() {
+        struct TestVault;
+
+        impl Vault for TestVault {
+            fn get(&self, name: &str) -> Result<Option<String>, String> {
+                assert_eq!(name, "test-token");
+                Ok(Some("vault-fixture".into()))
+            }
+
+            fn set(&self, _: &str, _: &str) -> Result<(), String> {
+                panic!("Running a script must not write vault entries");
+            }
+
+            fn delete(&self, _: &str) -> Result<(), String> {
+                panic!("Running a script must not delete vault entries");
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        fs::create_dir(&data).unwrap();
+        fs::write(data.join("secrets.json"), r#"["test-token"]"#).unwrap();
+        let script = directory.path().join("secret.ts");
+        fs::write(
+            &script,
+            r#"
+import { secret } from "codingpad";
+if (secret("test-token") !== "vault-fixture") {
+  throw new Error("The CLI did not pass the vault value to the script");
+}
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            run_file_in(&script, OutputFormat::Text, data, Arc::new(TestVault),).await,
+            0
+        );
     }
 }

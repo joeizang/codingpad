@@ -11,7 +11,10 @@
 //! the desktop's connection file and lets users delete or change their own
 //! connections without the sample coming back.
 
-use crate::databases::{Connection, DatabaseKind};
+use crate::{
+    databases::{Connection, DatabaseKind},
+    Language,
+};
 use serde::Serialize;
 use std::{
     fs,
@@ -46,6 +49,17 @@ pub enum SampleLanguage {
     Csharp,
     Typescript,
     Sql,
+}
+
+impl SampleLanguage {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Python => Language::Python.extension(),
+            Self::Csharp => Language::Csharp.extension(),
+            Self::Typescript => Language::Typescript.extension(),
+            Self::Sql => "sql",
+        }
+    }
 }
 
 const DATABASE: &[u8] = include_bytes!("../../../samples/sample.sqlite");

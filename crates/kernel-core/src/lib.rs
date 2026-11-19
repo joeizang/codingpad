@@ -134,6 +134,16 @@ pub enum Language {
     Typescript,
 }
 
+impl Language {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Python => "py",
+            Self::Csharp => "cs",
+            Self::Typescript => "ts",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KernelEvent {

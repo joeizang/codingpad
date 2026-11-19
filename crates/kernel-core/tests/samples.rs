@@ -12,7 +12,7 @@ use codingpad_kernel_core::{
     secrets::SecretStore,
     Language, Supervisor,
 };
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 use tokio::time::timeout;
 
 fn manager(directory: &std::path::Path) -> (Arc<ConnectionStore>, SqlManager) {
@@ -50,13 +50,14 @@ fn every_sample_is_listed_with_runnable_source() {
             "duplicate sample id {}",
             sample.id
         );
-        let expected = match sample.language {
-            SampleLanguage::Python => ".py",
-            SampleLanguage::Csharp => ".cs",
-            SampleLanguage::Typescript => ".ts",
-            SampleLanguage::Sql => ".sql",
-        };
-        assert!(sample.name.ends_with(expected), "{}", sample.name);
+        assert_eq!(
+            Path::new(&sample.name)
+                .extension()
+                .and_then(|ext| ext.to_str()),
+            Some(sample.language.extension()),
+            "{}",
+            sample.name
+        );
     }
 }
 
@@ -85,7 +86,7 @@ async fn sql_samples_run_against_the_bundled_database() {
 }
 
 #[tokio::test]
-async fn typescript_samples_run_as_unsaved_tabs() {
+async fn typescript_samples_run_without_a_saved_path() {
     let directory = tempfile::tempdir().unwrap();
     let (connections, _) = manager(directory.path());
     let supervisor =
@@ -102,17 +103,8 @@ async fn typescript_samples_run_as_unsaved_tabs() {
             }),
         )
         .await
-        .unwrap_or_else(|_| panic!("{} timed out", sample.id));
-        let result = match result {
-            Err(message)
-                if message.starts_with("Bun was not found.")
-                    && std::env::var_os("CI").is_none() =>
-            {
-                eprintln!("Install Bun to exercise the TypeScript samples");
-                return;
-            }
-            result => result.unwrap_or_else(|error| panic!("{} failed: {error}", sample.id)),
-        };
+        .unwrap_or_else(|_| panic!("{} timed out", sample.id))
+        .unwrap_or_else(|error| panic!("{} failed: {error}", sample.id));
         assert!(result.ok, "{} failed: {events:?}", sample.id);
         assert!(
             events.iter().any(|event| event.method == "dump"),

@@ -65,16 +65,18 @@ fn typescript_samples_run_from_saved_files() {
         fs::write(&script, sample.source).unwrap();
         let output = cpad(&data, &script);
         let errors = stderr(&output);
-        if errors.starts_with("Bun was not found.") && std::env::var_os("CI").is_none() {
-            eprintln!("Install Bun to exercise the TypeScript samples");
-            return;
-        }
         let text = stdout(&output);
         assert!(output.status.success(), "{}: {text}\n{errors}", sample.id);
         assert!(!text.trim().is_empty(), "{} produced no output", sample.id);
         if sample.name == "cache.ts" {
             assert_eq!(text.matches("Computing squares").count(), 1, "{text}");
-            assert!(text.contains("reused: True"), "{text}");
+            assert!(text.to_ascii_lowercase().contains("reused: true"), "{text}");
+        }
+        if sample.name == "query_products.ts" {
+            assert!(text.contains("Ethiopia Yirgacheffe"), "{text}");
+        }
+        if sample.name == "query_orders.ts" {
+            assert!(text.contains("Ada Lovelace"), "{text}");
         }
         if sample.name == "rich_output.ts" {
             let output = cpad_html(&data, &script);
@@ -84,6 +86,51 @@ fn typescript_samples_run_from_saved_files() {
             assert!(page.contains("<strong>All three steps completed.</strong>"));
         }
     }
+}
+
+#[test]
+fn typescript_queries_a_user_saved_connection() {
+    let directory = tempdir().unwrap();
+    let data = directory.path().join("data");
+    let database = directory.path().join("shop.db");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(
+        data.join("connections.json"),
+        serde_json::to_string(&json!([{
+            "id": "saved-shop",
+            "name": "shop",
+            "kind": "sqlite",
+            "path": database.to_string_lossy(),
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    let setup = directory.path().join("setup.sql");
+    fs::write(
+        &setup,
+        "-- codingpad: connection=shop\n\
+         CREATE TABLE stockrooms (id INTEGER, name TEXT);\n\
+         INSERT INTO stockrooms VALUES (1, 'Front room'), (2, 'Workshop');\n",
+    )
+    .unwrap();
+    let output = cpad(&data, &setup);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let script = directory.path().join("shop.ts");
+    fs::write(
+        &script,
+        r#"// codingpad: connection=shop
+import { db } from "codingpad";
+await db.query("SELECT name FROM stockrooms WHERE id = ?", [2]);
+"#,
+    )
+    .unwrap();
+
+    let output = cpad(&data, &script);
+    let text = stdout(&output);
+    assert!(output.status.success(), "{text}\n{}", stderr(&output));
+    assert!(text.lines().any(|line| line.trim() == "Workshop"), "{text}");
+    assert!(text.contains("(1 rows)"), "{text}");
 }
 
 #[test]

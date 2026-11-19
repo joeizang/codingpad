@@ -981,6 +981,12 @@ impl LspServer {
     /// Roslyn publishes document diagnostics on request rather than on edit.
     async fn document_diagnostics(&self) -> Option<(i64, Value)> {
         let version = *self.version.lock().await;
+        // Version 0 means `didOpen` has not been sent, and it is only sent
+        // after the `initialize` response. LSP forbids requests before that
+        // response, and tsgo crashes on one, which a slow Windows start exposes.
+        if version == 0 {
+            return None;
+        }
         let result = self
             .request(
                 "textDocument/diagnostic",
@@ -1675,6 +1681,79 @@ print("hi")
             .await
             .unwrap_err();
         assert!(error.contains("closed"));
+    }
+
+    /// A language server that is slow to answer `initialize` and exits, as tsgo
+    /// does, if any request arrives before that answer.
+    const SLOW_INITIALIZE_SERVER: &str = r#"
+import json, sys, threading, time
+stdin, stdout = sys.stdin.buffer, sys.stdout.buffer
+lock = threading.Lock()
+initialized = threading.Event()
+def send(message):
+    body = json.dumps(message).encode()
+    with lock:
+        stdout.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+        stdout.flush()
+def answer_initialize(id):
+    time.sleep(1.5)
+    initialized.set()
+    send({"jsonrpc": "2.0", "id": id, "result": {"capabilities": {}}})
+while True:
+    length = 0
+    while True:
+        line = stdin.readline()
+        if not line:
+            sys.exit(0)
+        if line in (b"\r\n", b"\n"):
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    message = json.loads(stdin.read(length))
+    if "id" not in message:
+        continue
+    if message["method"] == "initialize":
+        threading.Thread(target=answer_initialize, args=(message["id"],)).start()
+    elif not initialized.is_set():
+        sys.stderr.write("request before initialize: " + message["method"] + "\n")
+        sys.exit(3)
+    else:
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {"kind": "full", "items": []}})
+"#;
+
+    #[tokio::test]
+    async fn diagnostics_wait_for_the_initialize_response() {
+        let Some(python) = ["python3", "python"].into_iter().find(|python| {
+            std::process::Command::new(python)
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        }) else {
+            eprintln!("skipping: Python is needed for the fake language server");
+            return;
+        };
+        let mut command = Command::new(python);
+        command.args(["-c", SLOW_INITIALIZE_SERVER]);
+        // Any pull-diagnostics language runs the poller; a C# shadow project is
+        // the cheapest workspace to stage.
+        let workspace = Workspace::Csharp(ShadowProject::temporary("Program.cs").unwrap());
+        let server = LspServer::start(
+            command,
+            workspace,
+            "csharp",
+            "C#",
+            String::new(),
+            "missing".into(),
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap();
+        // The diagnostics poller wakes every 500 ms; initialize takes 1.5 s.
+        server.initialize().await.unwrap();
+        server.did_open("const value = 1;\n").await.unwrap();
+        assert!(server.document_diagnostics().await.is_some());
+        assert!(server.alive());
+        server.stop().await;
     }
 
     #[tokio::test]

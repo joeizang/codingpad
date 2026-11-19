@@ -196,6 +196,166 @@ async fn typescript_stop_preserves_kernel_and_clears_script_state() {
     assert_eq!(items[6]["fields"][0]["value"]["v"], 5);
 }
 
+#[tokio::test]
+async fn typescript_cache_survives_reruns_and_reset_clears_it() {
+    let supervisor = Supervisor::default();
+    let mut events = Vec::new();
+    let probe = supervisor
+        .run_language("cache", "1", Language::Typescript, |_| {})
+        .await;
+    if let Err(message) = probe {
+        if message.starts_with("Bun was not found.") && std::env::var_os("CI").is_none() {
+            eprintln!("Install Bun to exercise TypeScript execution");
+            return;
+        }
+        panic!("Bun kernel failed: {message}");
+    }
+
+    macro_rules! run {
+        ($source:expr) => {
+            timeout(
+                Duration::from_secs(10),
+                supervisor.run_language("cache", $source, Language::Typescript, |event| {
+                    events.push(event)
+                }),
+            )
+            .await
+        };
+    }
+
+    let result = run!(
+        r#"
+import { cache } from "codingpad";
+[cache("value", () => 42), cache("value", () => 99)]
+"#
+    )
+    .expect("Bun run timed out")
+    .expect("Bun kernel failed");
+    assert!(result.ok, "{events:?}");
+    let items = &events[0].params["node"]["items"];
+    assert_eq!(items[0]["v"], 42);
+    assert_eq!(items[1]["v"], 42);
+
+    // A rerun reads the value the previous worker stored in the kernel.
+    events.clear();
+    let result = run!("import { cache } from 'codingpad';\n[cache('value', () => 7)]")
+        .expect("Bun rerun timed out")
+        .expect("Bun kernel failed");
+    assert!(result.ok, "{events:?}");
+    assert_eq!(events[0].params["node"]["items"][0]["v"], 42);
+
+    // Cached undefined is a hit, and failed factories are retried.
+    events.clear();
+    let result = run!(
+        "import { cache } from 'codingpad';\n[cache('none', () => undefined), cache('none', () => 7)]"
+    )
+    .expect("Bun run timed out")
+    .expect("Bun kernel failed");
+    assert!(result.ok, "{events:?}");
+    assert_eq!(events[0].params["node"]["items"][1]["v"], "undefined");
+
+    events.clear();
+    let failed =
+        run!("import { cache } from 'codingpad';\ncache('retry', () => { throw new Error('no') })")
+            .expect("Bun run timed out")
+            .expect("Bun kernel failed");
+    assert!(!failed.ok, "{events:?}");
+    events.clear();
+    let result = run!("import { cache } from 'codingpad';\n[cache('retry', () => 7)]")
+        .expect("Bun rerun timed out")
+        .expect("Bun kernel failed");
+    assert!(result.ok, "{events:?}");
+    assert_eq!(events[0].params["node"]["items"][0]["v"], 7);
+
+    // A miss is cloned too, so the first run already behaves like a rerun and
+    // never returns a live class instance that later becomes a plain object.
+    events.clear();
+    let result = run!(
+        r#"
+import { cache } from "codingpad";
+class Point { constructor(x) { this.x = x; } norm() { return this.x; } }
+const point = cache("point", () => new Point(1));
+[typeof point.norm, point.x, Object.getPrototypeOf(point) === Object.prototype]
+"#
+    )
+    .expect("Bun run timed out")
+    .expect("Bun kernel failed");
+    assert!(result.ok, "{events:?}");
+    let items = &events[0].params["node"]["items"];
+    assert_eq!(items[0]["v"], "undefined");
+    assert_eq!(items[1]["v"], 1);
+    assert_eq!(items[2]["v"], true);
+
+    events.clear();
+    let result = run!(
+        "import { cache } from 'codingpad';\nconst point = cache('point', () => { throw new Error('factory ran again') });\n[typeof point.norm, point.x]"
+    )
+    .expect("Bun rerun timed out")
+    .expect("Bun kernel failed");
+    assert!(result.ok, "{events:?}");
+    assert_eq!(events[0].params["node"]["items"][0]["v"], "undefined");
+    assert_eq!(events[0].params["node"]["items"][1]["v"], 1);
+
+    // Async factories fail clearly and their rejected promise is handled.
+    events.clear();
+    let result = run!(
+        "import { cache } from 'codingpad';\ncache('async', () => Promise.reject(new Error('late')))"
+    )
+    .expect("Bun run timed out")
+    .expect("Bun kernel failed");
+    assert!(!result.ok, "{events:?}");
+    let reported = events.iter().any(|event| {
+        event.params["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("must return synchronously"))
+            || event.params["node"]["message"]
+                .as_str()
+                .is_some_and(|text| text.contains("must return synchronously"))
+    });
+    assert!(reported, "{events:?}");
+
+    // Cooperative Stop keeps the kernel and its cached values.
+    let (started, wait_for_start) = oneshot::channel();
+    let mut started = Some(started);
+    let pending = supervisor.run_language(
+        "cache",
+        "import { cache } from 'codingpad';\ncache('stopped', () => 'kept'); console.log('waiting'); while (true) {}",
+        Language::Typescript,
+        move |event| {
+            if event.params["text"] == "waiting\n" {
+                started.take().unwrap().send(()).unwrap();
+            }
+        },
+    );
+    let stop = async {
+        wait_for_start.await.unwrap();
+        supervisor.stop("cache").await;
+    };
+    let (result, ()) = timeout(Duration::from_secs(10), async {
+        tokio::join!(pending, stop)
+    })
+    .await
+    .expect("Bun Stop timed out");
+    let result = result.expect("Bun kernel failed");
+    assert!(result.stopped && !result.cache_cleared, "{result:?}");
+
+    events.clear();
+    let result = run!("import { cache } from 'codingpad';\n[cache('stopped', () => 'lost')]")
+        .expect("Bun rerun timed out")
+        .expect("Bun kernel failed");
+    assert!(result.ok, "{events:?}");
+    assert_eq!(events[0].params["node"]["items"][0]["v"], "kept");
+
+    // Reset discards the warm kernel, so the next run recomputes every value.
+    supervisor.reset("cache").await.unwrap();
+    events.clear();
+    let result = run!("import { cache } from 'codingpad';\n[cache('value', () => 7)]")
+        .expect("Bun rerun timed out")
+        .expect("Bun kernel failed");
+    assert!(result.ok, "{events:?}");
+    assert_eq!(events[0].params["node"]["items"][0]["v"], 7);
+}
+
 async fn run_dump_script(supervisor: &Supervisor, source: &str) -> Option<Vec<KernelEvent>> {
     let mut events = Vec::new();
     let result = timeout(

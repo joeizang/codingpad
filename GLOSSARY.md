@@ -85,3 +85,21 @@ _Avoid_: Credential, password, key
 **Data context**:
 Typed code generated from a connection's schema, in which tables and their relationships appear as objects the editor understands.
 _Avoid_: ORM model, schema classes
+
+### Agents
+
+**Agent**:
+An AI coding tool the user already runs, such as Claude Code, that starts `cpad mcp` and uses CodingPad through MCP. CodingPad itself contains no AI.
+_Avoid_: Assistant, bot, copilot
+
+**Agent run**:
+A script run requested by an agent. It runs headless and, when the app is open, also shows in the window as a read-only run.
+_Avoid_: Remote run, tool call
+
+**Dump preview**:
+The shortened dump an agent gets back from a run: the top tree levels and the first rows of each table, with ids for fetching the rest.
+_Avoid_: Summary, truncated dump
+
+**Agent credential**:
+An optional second vault credential for a connection, pointing at a read-only database role, that agent runs use instead of the main credential.
+_Avoid_: Agent password, service account

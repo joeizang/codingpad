@@ -1,3 +1,5 @@
+import { languageLabel } from "./scriptLanguages";
+
 export type SampleLanguage = "python" | "csharp" | "sql";
 
 export type Sample = {
@@ -9,16 +11,6 @@ export type Sample = {
 };
 
 export const SAMPLE_LANGUAGES: SampleLanguage[] = ["python", "csharp", "sql"];
-
-export function languageLabel(language: string): string {
-  return language === "csharp"
-    ? "C#"
-    : language === "python"
-      ? "Python"
-      : language === "sql"
-        ? "SQL"
-        : "Text";
-}
 
 export function groupSamples(samples: Sample[]): Array<{
   language: SampleLanguage;

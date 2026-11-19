@@ -27,7 +27,6 @@ import {
 import {
   NewScriptMenu,
   SAMPLE_CONNECTION,
-  type ScriptLanguage,
 } from "./NewScriptMenu";
 import { SecretsDialog } from "./SecretsDialog";
 import { SchemaPanel } from "./SchemaPanel";
@@ -44,7 +43,10 @@ import {
   type LibrarySettings,
   type ScriptFile,
 } from "./library";
-import { languageLabel, type Sample } from "./samples";
+import type { Sample } from "./samples";
+import {
+  SCRIPT_LANGUAGES, languageLabel, scriptLanguage, scriptLanguageDetails, type ScriptLanguage,
+} from "./scriptLanguages";
 
 const SAMPLE = `from codingpad import dump
 
@@ -65,25 +67,24 @@ await Task.Delay(10);
 Enumerable.Range(1, 10).Sum();
 `;
 
+const TYPESCRIPT_SAMPLE = `import { dump } from "codingpad";
+
+console.log("Hello from TypeScript!");
+dump({ name: "Ada", language: "TypeScript" });
+
+// The last expression is displayed automatically.
+await Promise.resolve(6 * 7);
+`;
+
 const SQL_SAMPLE = `-- codingpad: connection=codingpad-sample
 
 SELECT 1 AS answer;
 `;
 
 const SCRIPT_FILTERS = [
-  { name: "Python", extensions: ["py"] },
-  { name: "C#", extensions: ["cs"] },
-  { name: "SQL", extensions: ["sql"] },
+  ...SCRIPT_LANGUAGES.map(({ name, extension }) => ({ name, extensions: [extension] })),
   { name: "All files", extensions: ["*"] },
 ];
-
-const scriptLanguage = (script: Script) => {
-  const name = script.path ?? script.name;
-  if (/\.py$/i.test(name)) return "python";
-  if (/\.cs$/i.test(name)) return "csharp";
-  if (/\.sql$/i.test(name)) return "sql";
-  return "plaintext";
-};
 
 type Script = {
   id: string;
@@ -116,18 +117,18 @@ function intelligenceLabel(summary: DiagnosticsSummary): string {
   return parts.length ? parts.join(" · ") : "No type problems";
 }
 
-const HEADER_COMMENT: Record<ScriptLanguage, string> = {
-  python: "#",
-  csharp: "//",
-  sql: "--",
+const SCRIPT_STARTERS: Record<ScriptLanguage, string> = {
+  python: SAMPLE,
+  csharp: CSHARP_SAMPLE,
+  typescript: TYPESCRIPT_SAMPLE,
+  sql: SQL_SAMPLE,
 };
 
 /** Starter text for a new tab, with a header line when a connection is attached. */
 function starterSource(language: ScriptLanguage, connection?: string): string {
-  const starter =
-    language === "csharp" ? CSHARP_SAMPLE : language === "sql" ? SQL_SAMPLE : SAMPLE;
+  const starter = SCRIPT_STARTERS[language];
   if (!connection) return starter;
-  const header = `${HEADER_COMMENT[language]} codingpad: connection=${connection}`;
+  const header = `${scriptLanguageDetails(language)!.comment} codingpad: connection=${connection}`;
   // The SQL starter already carries a header for the sample database; replace it.
   return parseHeader(starter)
     ? starter.replace(/^[^\n]*/, header)
@@ -140,7 +141,7 @@ const newScript = (
   connection?: string,
 ): Script => ({
   id: uniqueId("scratch"),
-  name: `Scratch ${number}.${language === "csharp" ? "cs" : language === "sql" ? "sql" : "py"}`,
+  name: `Scratch ${number}.${scriptLanguageDetails(language)!.extension}`,
   source: starterSource(language, connection),
   dirty: false,
   output: [],
@@ -284,7 +285,10 @@ export default function App() {
     ? active.compilation.diagnostics
     : EMPTY_DIAGNOSTICS;
   const activeHeader = parseHeader(active.source);
-  const connectionName = activeHeader?.settings.connection || undefined;
+  const connectionName =
+    scriptLanguageDetails(language)?.connection === "unavailable"
+      ? undefined
+      : activeHeader?.settings.connection || undefined;
   const [schemaRevision, setSchemaRevision] = useState(0);
   const schemaState = useConnectionSchema(connectionName, schemaRevision);
   const update = (id: string, change: (script: Script) => Script) =>
@@ -970,13 +974,7 @@ export default function App() {
                   onClick={() => setActiveId(script.id)}
                 >
                   <span className="language-chip" aria-hidden>
-                    {scriptLang === "csharp"
-                      ? "C#"
-                      : scriptLang === "sql"
-                        ? "SQL"
-                        : scriptLang === "python"
-                          ? "PY"
-                          : "TXT"}
+                    {scriptLanguageDetails(scriptLang)?.chip ?? "TXT"}
                   </span>
                   {script.name}
                   {script.dirty && (

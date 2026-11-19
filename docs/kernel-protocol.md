@@ -1,7 +1,9 @@
-# Kernel protocol v1 (Python and C# skeleton)
+# Kernel protocol v1
 
-JSON-RPC 2.0 over UTF-8 stdio, one JSON object per line. The Rust supervisor starts
-one warm kernel process per open script, writes requests to stdin and reads stdout.
+JSON-RPC 2.0 over UTF-8, one JSON object per line. The Rust supervisor writes
+requests to the kernel's stdin. It reads responses from stdout for Python and C#
+and from a dedicated loopback connection for TypeScript. Each open script keeps
+one warm kernel process.
 The kernel and its runtime are embedded in the Rust build and extracted to a
 private temporary directory for the process lifetime; installed apps do not need
 the source checkout or a registry package. Python starts with `-I -u -X utf8` and adds only
@@ -431,3 +433,35 @@ using that name. Outside the kernel, `Cancel` is `CancellationToken.None` and
 `KeyNotFoundException` when no value was supplied. Package acceptance checks build a local feed
 and use `#:package CodingPad@0.1.0`, disabling AOT publishing to avoid downloading
 an AOT compiler. Registry publication is a separate release action.
+
+## TypeScript kernel (M5.0)
+
+The Bun kernel sends the same `stream`, `dump`, and `run_finished` notifications
+and run response. On startup the supervisor passes Bun a loopback port and a
+one-time token over stdin. Bun authenticates the response connection with the
+token. Raw writes to file descriptors 1 and 2 go to the application's inherited
+stdout and stderr and cannot corrupt the protocol.
+
+Each open script keeps a warm Bun process. Each run gets a fresh worker in that
+process. The worker ends as soon as the top-level module settles. Await timers
+and other asynchronous work before the script returns if their output should
+appear in Results. Stop targets the active worker and waits for it to exit.
+If the worker cannot exit within two seconds, the Rust supervisor kills the
+kernel. Reset and Close also discard the process. The `cache()` helper arrives in
+M5.2. An overlapping run request receives error `-32000` ("Run already in progress").
+
+The bundled `codingpad` module is available inside each worker. `run.params.path`
+sets the base for file-relative imports from a saved tab. Unsaved tabs resolve
+relative to a private scratch subdirectory. Run uses the editor snapshot without
+writing to the script file. Versioned auto-install imports and the shadow
+project arrive in M5.3 (D5).
+
+Bun executes TypeScript with top-level `await` and runs scripts with type errors.
+The editor registers TypeScript syntax highlighting. Type diagnostics arrive in
+M5.4. Console output and JavaScript writes to `process.stdout` and
+`process.stderr` become stream notifications. The host identifies the final
+top-level expression, which the worker evaluates once. Automatic dumps skip
+`undefined`. M5.0 limits basic previews to six levels, 100 children per
+container and 1,000 nodes per dump. Built-in values such as dates and maps use
+text previews. Lazy handles and paging arrive in M5.1. Syntax and runtime errors
+produce a stderr notification and `ok: false`.

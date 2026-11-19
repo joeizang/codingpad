@@ -5,6 +5,9 @@ import * as monaco from "monaco-editor/editor/editor.api.js";
 import "monaco-editor/languages/definitions/python/register.js";
 import "monaco-editor/languages/definitions/csharp/register.js";
 import "monaco-editor/languages/definitions/sql/register.js";
+// Syntax highlighting only. The TS language server arrives in M5.4.
+import "monaco-editor/languages/definitions/typescript/register.js";
+import { scriptLanguageDetails } from "./scriptLanguages";
 import { createSqlCompletions } from "./sqlCompletions";
 import { EDITOR_OPTIONS } from "./editorOptions";
 import type { ConnectionSchema } from "./schema";
@@ -362,7 +365,7 @@ export default function CodeEditor({
 
   return (
     <Editor
-      path={`${id}.${language === "csharp" ? "cs" : language === "python" ? "py" : language === "sql" ? "sql" : "txt"}`}
+      path={`${id}.${scriptLanguageDetails(language)?.extension ?? "txt"}`}
       language={language}
       theme="codingpad-dark"
       value={source}

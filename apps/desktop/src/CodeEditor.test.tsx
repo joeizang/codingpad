@@ -45,6 +45,7 @@ vi.mock("monaco-editor/editor/editor.api.js", () => ({
 vi.mock("monaco-editor/languages/definitions/python/register.js", () => ({}));
 vi.mock("monaco-editor/languages/definitions/csharp/register.js", () => ({}));
 vi.mock("monaco-editor/languages/definitions/sql/register.js", () => ({}));
+vi.mock("monaco-editor/languages/definitions/typescript/register.js", () => ({}));
 vi.mock("monaco-editor/editor/editor.worker.js?worker", () => ({ default: class {} }));
 
 test("retries a failed language server after uv installation using the latest source", async () => {

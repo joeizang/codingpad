@@ -97,11 +97,10 @@ async fn every_sample_runs_end_to_end() {
 
     // Run the samples that need no database first, so each language keeps one
     // warm kernel for the plain scripts and restarts only for the db samples.
-    for language in [Language::Python, Language::Csharp] {
-        let expected = match language {
-            Language::Python => SampleLanguage::Python,
-            Language::Csharp => SampleLanguage::Csharp,
-        };
+    for (language, expected) in [
+        (Language::Python, SampleLanguage::Python),
+        (Language::Csharp, SampleLanguage::Csharp),
+    ] {
         let mut scripts: Vec<_> = samples
             .iter()
             .filter(|sample| sample.language == expected)

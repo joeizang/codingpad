@@ -24,7 +24,7 @@ Decision numbers (D#) refer to [04-open-questions.md](04-open-questions.md). Ter
 - **Databases:** SQLite, PostgreSQL and SQL Server (D8). A database client in every language. Data contexts for C# (EF Core) and Python (SQLAlchemy 2.0) (D9).
 - **Library:** a default library folder plus pinned folders (D21).
 - **Secrets:** OS vault, with `secret("name")` (D23).
-- **CLI:** `cpad run <script>` (D28).
+- **CLI:** `cpad run <script>` (D28), and `cpad mcp`, a local MCP server for the user's own agents, from 0.3 (D64).
 - **Learners:** built-in samples plus a bundled SQLite sample database (D14).
 - **Platforms:** Linux and Windows for now; macOS is deferred (D13, D62).
 - **Distribution:** GitHub Releases, unsigned at first, with an update notice instead of an auto-updater (D29, D30).

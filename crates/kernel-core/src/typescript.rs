@@ -1,7 +1,8 @@
 use crate::shadow::ShadowProject;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Expression, ImportExpression, Statement, TSExternalModuleReference, TSImportType,
+    Argument, CallExpression, Expression, ImportExpression, Statement, TSExternalModuleReference,
+    TSImportType, TemplateLiteral,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
@@ -63,12 +64,17 @@ pub(crate) fn command(bun: &Path, project: &Project) -> Result<(Command, Arc<Tem
 }
 
 pub(crate) struct Project {
-    shadow: ShadowProject,
+    pub(crate) shadow: ShadowProject,
     pub(crate) imports: Imports,
 }
 
 impl Project {
-    pub(crate) async fn prepare(bun: &Path, imports: Imports) -> Result<Self, String> {
+    pub(crate) async fn prepare(
+        bun: &Path,
+        imports: Imports,
+        mut notice: impl FnMut(String),
+        #[cfg(test)] registry: Option<&str>,
+    ) -> Result<Self, String> {
         let shadow = ShadowProject::temporary("script.ts")?;
         let root = shadow.root();
         // Install under the original module name, including its version.
@@ -94,6 +100,8 @@ impl Project {
             })?;
         }
         if !imports.0.is_empty() {
+            let packages = imports.0.keys().cloned().collect::<Vec<_>>().join(", ");
+            notice(format!("Installing TypeScript packages: {packages}"));
             let mut command = Command::new(bun);
             command
                 .current_dir(root)
@@ -107,6 +115,14 @@ impl Project {
                 .env("NO_COLOR", "1")
                 .stdin(Stdio::null())
                 .kill_on_drop(true);
+            #[cfg(test)]
+            if let Some(registry) = registry {
+                command
+                    .arg("--registry")
+                    .arg(registry)
+                    .arg("--cache-dir")
+                    .arg(root.join("test-cache"));
+            }
             #[cfg(unix)]
             command.process_group(0);
             #[cfg(windows)]
@@ -117,7 +133,6 @@ impl Project {
                 })
             })?;
             if !output.status.success() {
-                let packages = imports.0.keys().cloned().collect::<Vec<_>>().join(", ");
                 let details = String::from_utf8_lossy(&output.stderr);
                 return Err(format!(
                     "Could not install TypeScript packages ({packages}). Check the package versions and registry connection. Bun exited with {}.\n{}",
@@ -263,8 +278,10 @@ struct Specifiers<'a>(Vec<&'a str>);
 
 impl<'a> Visit<'a> for Specifiers<'a> {
     fn visit_import_expression(&mut self, import: &ImportExpression<'a>) {
-        if let Expression::StringLiteral(source) = &import.source {
-            self.0.push(source.value.as_str());
+        match &import.source {
+            Expression::StringLiteral(source) => self.0.push(source.value.as_str()),
+            Expression::TemplateLiteral(template) => self.template(template),
+            _ => (),
         }
         walk::walk_import_expression(self, import);
     }
@@ -276,6 +293,26 @@ impl<'a> Visit<'a> for Specifiers<'a> {
 
     fn visit_ts_external_module_reference(&mut self, import: &TSExternalModuleReference<'a>) {
         self.0.push(import.expression.value.as_str());
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if matches!(&call.callee, Expression::Identifier(name) if name.name == "require") {
+            match call.arguments.as_slice() {
+                [Argument::StringLiteral(source)] => self.0.push(source.value.as_str()),
+                [Argument::TemplateLiteral(template)] => self.template(template),
+                _ => (),
+            }
+        }
+        walk::walk_call_expression(self, call);
+    }
+}
+
+impl<'a> Specifiers<'a> {
+    fn template(&mut self, template: &TemplateLiteral<'a>) {
+        if let [quasi] = template.quasis.as_slice() {
+            self.0
+                .extend(quasi.value.cooked.as_ref().map(|text| text.as_str()));
+        }
     }
 }
 
@@ -307,18 +344,13 @@ fn versioned_package(specifier: &str) -> Result<Option<(&str, String)>, String> 
         return Ok(None);
     }
     if version.is_empty()
-        || version.trim() != version
+        || version.ends_with('.')
         || !version
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b".-+^~*<>=| ".contains(&byte))
+            .all(|byte| byte.is_ascii_alphanumeric() || b".-+^~".contains(&byte))
     {
         return Err(format!(
-            "Invalid TypeScript package import \"{specifier}\". Use an npm version, range or tag after @."
-        ));
-    }
-    if cfg!(windows) && version.contains(['*', '<', '>', '|']) {
-        return Err(format!(
-            "TypeScript package import \"{specifier}\" uses characters Windows cannot mirror. Use an exact version, tag, caret range or tilde range."
+            "Invalid TypeScript package import \"{specifier}\". Use a portable npm version such as 3, 3.x, ^3.20.0, ~3.20.0 or next."
         ));
     }
     Ok(Some((alias, format!("npm:{npm_name}@{version}"))))
@@ -343,6 +375,191 @@ fn final_expression(source: &str, program: &oxc_ast::ast::Program<'_>) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{lsp::LanguageServers, Language, Supervisor};
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    async fn fixture_registry() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let registry = format!("http://{}", listener.local_addr().unwrap());
+        let manifest = json!({
+            "name": "codingpad-fixture",
+            "version": "1.2.3",
+            "exports": {
+                ".": {"types": "./index.d.ts", "default": "./index.cjs"},
+            },
+        });
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        for (path, contents) in [
+            ("package/package.json", manifest.to_string()),
+            ("package/index.cjs", "exports.answer = 42;".into()),
+            (
+                "package/index.d.ts",
+                "export declare const answer: number;".into(),
+            ),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(contents.len() as u64);
+            header.set_cksum();
+            tar.append_data(&mut header, path, contents.as_bytes())
+                .unwrap();
+        }
+        let archive = tar.into_inner().unwrap().finish().unwrap();
+        let mut version = manifest;
+        version["dist"] = json!({"tarball": format!("{registry}/fixture.tgz")});
+        let metadata = json!({
+            "name": "codingpad-fixture",
+            "dist-tags": {"latest": "1.2.3"},
+            "versions": {"1.2.3": version},
+        })
+        .to_string();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut request = String::new();
+                reader.read_line(&mut request).await.unwrap();
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).await.unwrap() == 0 || header == "\r\n" {
+                        break;
+                    }
+                }
+                let (status, mime, body) = match request.split_whitespace().nth(1) {
+                    Some("/codingpad-fixture") => {
+                        ("200 OK", "application/json", metadata.as_bytes())
+                    }
+                    Some("/fixture.tgz") => {
+                        ("200 OK", "application/octet-stream", archive.as_slice())
+                    }
+                    _ => ("404 Not Found", "text/plain", &b"Unknown package"[..]),
+                };
+                let stream = reader.get_mut();
+                let headers = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if stream.write_all(headers.as_bytes()).await.is_ok() {
+                    let _ = stream.write_all(body).await;
+                }
+            }
+        });
+        (registry, server)
+    }
+
+    #[tokio::test]
+    async fn shares_versioned_packages_between_the_editor_and_kernel_without_a_live_registry() {
+        let (registry, server) = fixture_registry().await;
+        let mut supervisor = Supervisor::default();
+        Arc::get_mut(&mut supervisor.shadow_projects)
+            .unwrap()
+            .registry = Some(registry);
+        let editor = LanguageServers::default().with_shadow_projects(supervisor.shadow_projects());
+        editor.begin_session("editor").await;
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("packages.ts");
+        let source = r#"
+const { answer } = require("codingpad-fixture@1");
+const { answer: imported } = await import(`codingpad-fixture@1`);
+answer + imported
+"#;
+        fs::write(&script, "throw new Error('saved copy ran')").unwrap();
+
+        let missing = "import 'codingpad-fixture@999';";
+        let mut notices = Vec::new();
+        let error = timeout(
+            Duration::from_secs(20),
+            supervisor.run_language_at(
+                "packages",
+                missing,
+                Language::Typescript,
+                script.to_str(),
+                |event| notices.push(event.params["text"].clone()),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        if error.starts_with("Bun was not found.") && env::var_os("CI").is_none() {
+            server.abort();
+            return;
+        }
+        assert!(
+            error.contains("Could not install TypeScript packages (codingpad-fixture@999)"),
+            "{error}"
+        );
+        assert_eq!(
+            notices,
+            ["Installing TypeScript packages: codingpad-fixture@999\n"]
+        );
+
+        let prepared = timeout(
+            Duration::from_secs(20),
+            editor.prepare_typescript("packages", source, "editor"),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let document = url::Url::parse(&prepared.uri)
+            .unwrap()
+            .to_file_path()
+            .unwrap();
+        assert_eq!(fs::read_to_string(&document).unwrap(), source);
+        assert!(document
+            .with_file_name("node_modules")
+            .join("codingpad-fixture@1/index.d.ts")
+            .is_file());
+        server.abort();
+        let _ = server.await;
+
+        for expected in [84, 84, 85] {
+            let source = if expected == 85 {
+                format!("{source} + 1")
+            } else {
+                source.to_owned()
+            };
+            let mut events = Vec::new();
+            let result = timeout(
+                Duration::from_secs(10),
+                supervisor.run_language_at(
+                    "packages",
+                    &source,
+                    Language::Typescript,
+                    script.to_str(),
+                    |event| events.push(event),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(result.ok, "{events:?}");
+            assert_eq!(events[0].params["node"]["v"], expected, "{events:?}");
+            assert_eq!(fs::read_to_string(&document).unwrap(), source);
+            supervisor.reset("packages").await.unwrap();
+        }
+        supervisor.close("packages").await;
+        assert!(!document.exists());
+        assert_eq!(
+            fs::read_to_string(script).unwrap(),
+            "throw new Error('saved copy ran')"
+        );
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn rejects_nonportable_version_ranges_on_every_platform() {
+        for version in ["*", ">=3 <4", "3.x || 4.x"] {
+            let source = format!("import 'zod@{version}';");
+            assert!(parse(&source)
+                .err()
+                .unwrap()
+                .contains("portable npm version"));
+        }
+    }
 
     #[test]
     fn mirrors_versioned_imports_and_exports_by_package() {

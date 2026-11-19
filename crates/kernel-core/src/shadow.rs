@@ -1,14 +1,115 @@
 //! Shadow project storage shared by language-specific project writers.
 use crate::data_context::GeneratedContext;
+use crate::typescript::{self, Imports, Project};
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tempfile::TempDir;
+use tokio::sync::{watch, Mutex};
 
 use crate::lsp::path_to_uri;
+
+/// Projects shared by the editor and kernel supervisor for the lifetime of a tab.
+#[derive(Default)]
+pub struct ShadowProjects {
+    typescript: Mutex<HashMap<String, Arc<TypescriptSlot>>>,
+    #[cfg(test)]
+    pub(crate) registry: Option<String>,
+}
+
+struct TypescriptSlot {
+    staged: Mutex<Option<StagedTypescript>>,
+    closed: watch::Sender<bool>,
+}
+
+struct StagedTypescript {
+    project: Arc<Project>,
+    source: String,
+}
+
+impl ShadowProjects {
+    pub(crate) async fn prepare_typescript(
+        &self,
+        script_id: &str,
+        source: &str,
+        imports: Option<Imports>,
+        mut notice: impl FnMut(String),
+    ) -> Result<Arc<Project>, String> {
+        let slot = self
+            .typescript
+            .lock()
+            .await
+            .entry(script_id.to_owned())
+            .or_insert_with(|| {
+                Arc::new(TypescriptSlot {
+                    staged: Mutex::new(None),
+                    closed: watch::channel(false).0,
+                })
+            })
+            .clone();
+        let mut closed = slot.closed.subscribe();
+        if *closed.borrow() {
+            return Err("Script was closed".into());
+        }
+        let prepare = async {
+            let mut staged = match slot.staged.try_lock() {
+                Ok(staged) => staged,
+                Err(_) => {
+                    notice("Waiting for the TypeScript shadow project…".into());
+                    slot.staged.lock().await
+                }
+            };
+            if let Some(current) = staged.as_mut().filter(|current| {
+                imports
+                    .as_ref()
+                    .is_none_or(|imports| imports == &current.project.imports)
+            }) {
+                if current.source != source {
+                    current.project.stage(source)?;
+                    current.source = source.to_owned();
+                }
+                return Ok(current.project.clone());
+            }
+            let project = Arc::new(
+                Project::prepare(
+                    &typescript::find_bun(),
+                    imports.unwrap_or_default(),
+                    notice,
+                    #[cfg(test)]
+                    self.registry.as_deref(),
+                )
+                .await?,
+            );
+            project.stage(source)?;
+            *staged = Some(StagedTypescript {
+                project: project.clone(),
+                source: source.to_owned(),
+            });
+            Ok(project)
+        };
+        tokio::select! {
+            biased;
+            _ = closed.changed() => Err("Script was closed".into()),
+            result = prepare => result,
+        }
+    }
+
+    pub(crate) async fn close(&self, script_id: &str) {
+        if let Some(slot) = self.typescript.lock().await.remove(script_id) {
+            slot.closed.send_replace(true);
+        }
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        for (_, slot) in self.typescript.lock().await.drain() {
+            slot.closed.send_replace(true);
+        }
+    }
+}
 
 const RUNTIME_SOURCES: &[(&str, &str)] = &[
     (

@@ -48,6 +48,23 @@ vi.mock("monaco-editor/languages/definitions/sql/register.js", () => ({}));
 vi.mock("monaco-editor/languages/definitions/typescript/register.js", () => ({}));
 vi.mock("monaco-editor/editor/editor.worker.js?worker", () => ({ default: class {} }));
 
+test("prepares the latest TypeScript snapshot without starting a language server", async () => {
+  invoke.mockClear();
+  invoke.mockResolvedValue(undefined);
+  const props = { id: "typescript", language: "typescript", onChange: vi.fn(), onRun: vi.fn() };
+  const view = render(<CodeEditor {...props} source="import 'zod@3';" />);
+  expect(invoke).not.toHaveBeenCalledWith("prepare_typescript_project", expect.anything());
+  mountEditor();
+  view.rerender(<CodeEditor {...props} source="import 'zod@4';" />);
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith(
+    "prepare_typescript_project",
+    expect.objectContaining({ scriptId: "typescript", source: "import 'zod@4';" }),
+  ));
+  expect(invoke.mock.calls.filter(([command]) => command === "prepare_typescript_project")).toHaveLength(1);
+  expect(invoke).not.toHaveBeenCalledWith("start_language_server", expect.anything());
+  invoke.mockClear();
+});
+
 test("retries a failed language server after uv installation using the latest source", async () => {
   let installed = false;
   invoke.mockImplementation(async (command) => {

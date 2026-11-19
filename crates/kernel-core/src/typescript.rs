@@ -218,6 +218,8 @@ pub(crate) fn bun_not_found(error: &io::Error) -> Option<String> {
     })
 }
 
+const KERNEL_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(crate) async fn connect(
     child: &mut Child,
     stdin: &mut ChildStdin,
@@ -240,7 +242,10 @@ pub(crate) async fn connect(
         }
     };
 
-    timeout(Duration::from_secs(5), connect)
+    // Bun exiting is caught above, so this limit only bounds a hung startup.
+    // A cold start on a loaded Windows machine, with antivirus scanning the new
+    // kernel files, can take well over 5 s.
+    timeout(KERNEL_STARTUP_TIMEOUT, connect)
         .await
         .map_err(|_| "Timed out connecting to the Bun kernel.".to_owned())?
         .map_err(|error| format!("Could not connect to the Bun kernel: {error}"))
@@ -586,8 +591,9 @@ answer + imported
                 source.to_owned()
             };
             let mut events = Vec::new();
+            // Leave room for the kernel's own startup limit on slow runners.
             let result = timeout(
-                Duration::from_secs(10),
+                KERNEL_STARTUP_TIMEOUT + Duration::from_secs(15),
                 supervisor.run_language_at(
                     "packages",
                     &source,

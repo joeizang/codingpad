@@ -32,6 +32,7 @@ tokio-util = { version = "0.7", features = ["compat"] }
 rust_xlsxwriter = { version = "0.102.0", features = ["constant_memory"] }
 oxc_allocator = "0.110"
 oxc_ast = "0.110"
+oxc_ast_visit = "0.110"
 oxc_parser = { version = "0.110", default-features = false }
 oxc_span = "0.110"
 

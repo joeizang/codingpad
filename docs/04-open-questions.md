@@ -8,7 +8,7 @@
 | D2 | **Open source**, dual-licensed **MIT OR Apache-2.0** (the core app and the per-language helper libraries) | 2026-10-30 |
 | D3 | **Database support is in the MVP** | 2026-10-30 |
 | D4 | Language build order: **Python → C# → TypeScript → Rust** | 2026-10-30 |
-| D5 | TypeScript runs on **Bun**, with a hidden project behind each script for completions. See [ADR 0002](adr/0002-bun-for-typescript.md). M5.0 uses a fresh worker inside the warm kernel. Versioned auto-install imports arrive in [M5.3](https://github.com/joeizang/codingpad/issues/60) because Bun 1.4.2 resolves them in the standalone runner but fails to resolve them inside a worker | 2026-10-30 |
+| D5 | TypeScript runs on **Bun**, with a shadow project behind each script for completions. See [ADR 0002](adr/0002-bun-for-typescript.md). Each run uses a fresh worker inside the warm kernel. [M5.3](https://github.com/joeizang/codingpad/issues/60) installs versioned npm imports into the shadow project so Bun workers can resolve them | 2026-10-30 |
 | D6 | Product name stays **CodingPad** | 2026-10-30 |
 | D7 | Desktop shell: **Tauri 2 on system webviews, move to bundled Chromium (CEF) when stable**. See [ADR 0001](adr/0001-tauri-with-system-webview-then-cef.md) | 2026-10-30 |
 | D8 | MVP databases: **SQLite, PostgreSQL, SQL Server**. MySQL/MariaDB comes right after the MVP | 2026-10-30 |

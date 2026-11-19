@@ -468,8 +468,20 @@ Reset, Close, and a forced restart clear both.
 The bundled `codingpad` module is available inside each worker. `run.params.path`
 sets the base for file-relative imports from a saved tab. Unsaved tabs resolve
 relative to a private scratch subdirectory. Run uses the editor snapshot without
-writing to the script file. Versioned auto-install imports and the shadow
-project arrive in M5.3 (D5).
+writing to the script file.
+
+Since M5.3, scripts can use Bun's versioned npm imports, such as
+`import { z } from "zod@3"`, with the same syntax in CodingPad and standalone Bun.
+CodingPad reads imports, re-exports and literal dynamic imports in the script
+snapshot and installs their packages into a per-script shadow project. The
+package names retain their versions so several versions can coexist and the
+TypeScript language server can resolve their declarations. Bun uses its shared
+package cache across projects and prefers cached packages when installing. A
+rerun with unchanged dependencies reuses the installed packages. Changing
+dependencies replaces the kernel and shadow project. Install errors identify
+the requested packages and include Bun's error output. Package lifecycle
+scripts are skipped during installation. On Windows, use filesystem-compatible
+versions such as `3`, `^3.20.0` or `next`.
 
 Bun executes TypeScript with top-level `await` and runs scripts with type errors.
 The editor registers TypeScript syntax highlighting. Type diagnostics arrive in

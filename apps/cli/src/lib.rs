@@ -1,8 +1,8 @@
 //! The terminal runner behind `cpad run` (D28).
 //!
 //! The command reuses the desktop's Rust core: the same kernel supervisor,
-//! warm Python/C# kernels, SQL manager, connection store and secret vault. It
-//! only replaces the results panel with plain text on the terminal.
+//! warm Python, C# and TypeScript kernels, SQL manager, connection store and
+//! secret vault. It replaces the results panel with terminal output.
 //!
 //! Kernels normally defer C# properties and deep values as lazy nodes so the
 //! desktop can expand them on click. A terminal cannot click, so the runner
@@ -61,6 +61,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 pub enum ScriptLanguage {
     Python,
     Csharp,
+    Typescript,
     Sql,
 }
 
@@ -98,9 +99,10 @@ pub fn language_for(path: &Path) -> Result<ScriptLanguage, String> {
     match extension.as_str() {
         "py" => Ok(ScriptLanguage::Python),
         "cs" => Ok(ScriptLanguage::Csharp),
+        "ts" => Ok(ScriptLanguage::Typescript),
         "sql" => Ok(ScriptLanguage::Sql),
         other => Err(format!(
-            "Cannot run \"{}\": expected a .py, .cs or .sql script{}.",
+            "Cannot run \"{}\": expected a .py, .cs, .ts or .sql script{}.",
             path.display(),
             if other.is_empty() {
                 String::new()
@@ -186,14 +188,16 @@ pub async fn run_file_with_format(path: &Path, format: OutputFormat) -> i32 {
         Some(report) => Recorder::Html(report.clone()),
         None => Recorder::Text(Output::default()),
     };
-    let result = match language {
-        ScriptLanguage::Python | ScriptLanguage::Csharp => {
-            let kernel_language = match language {
-                ScriptLanguage::Python => Language::Python,
-                _ => Language::Csharp,
-            };
-            // A header connection behaves as it does in the app: models and a
-            // `db` client backed by the vault password.
+    let kernel_language = match language {
+        ScriptLanguage::Python => Some(Language::Python),
+        ScriptLanguage::Csharp => Some(Language::Csharp),
+        ScriptLanguage::Typescript => Some(Language::Typescript),
+        ScriptLanguage::Sql => None,
+    };
+    let result = match kernel_language {
+        Some(kernel_language) => {
+            // Use the same header connection and db client as the desktop,
+            // including generated data models for Python and C#.
             let (data, data_error) =
                 codingpad_kernel_core::attached_data_context(&sql, &source, kernel_language).await;
             if let Some(error) = data_error {
@@ -216,9 +220,7 @@ pub async fn run_file_with_format(path: &Path, format: OutputFormat) -> i32 {
                     stopped: result.stopped,
                 })
         }
-        ScriptLanguage::Sql => {
-            run_sql_script(&sql, &script_id, &source, &absolute, &mut recorder).await
-        }
+        None => run_sql_script(&sql, &script_id, &source, &absolute, &mut recorder).await,
     };
 
     // A dump with a lazy node was held back. Apply any buffered live updates,
@@ -978,6 +980,10 @@ mod tests {
             Ok(ScriptLanguage::Csharp)
         );
         assert_eq!(
+            language_for(Path::new("hello.TS")),
+            Ok(ScriptLanguage::Typescript)
+        );
+        assert_eq!(
             language_for(Path::new("query.sql")),
             Ok(ScriptLanguage::Sql)
         );
@@ -986,7 +992,7 @@ mod tests {
     #[test]
     fn unknown_extensions_are_rejected_with_the_expected_ones() {
         let message = language_for(Path::new("notes.txt")).unwrap_err();
-        assert!(message.contains(".py, .cs or .sql"));
+        assert!(message.contains(".py, .cs, .ts or .sql"));
         assert!(message.contains("notes.txt"));
     }
 }

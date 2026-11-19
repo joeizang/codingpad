@@ -1,7 +1,7 @@
 //! Every built-in sample must run against the bundled sample database.
 //!
-//! The structural and SQL checks run in the normal suite. The full acceptance
-//! run is ignored because the first Python/C# database sample installs
+//! The structural, SQL and TypeScript checks run in the normal suite. The full
+//! acceptance run is ignored because the first Python/C# database sample installs
 //! SQLAlchemy or EF Core and may need network access; run it explicitly with
 //! `cargo test -p codingpad-kernel-core --test samples -- --ignored`.
 
@@ -25,14 +25,11 @@ fn manager(directory: &std::path::Path) -> (Arc<ConnectionStore>, SqlManager) {
 #[test]
 fn every_sample_is_listed_with_runnable_source() {
     let samples = samples::all();
-    assert!(
-        samples.len() >= 30,
-        "expected about 10 samples per language"
-    );
     let mut ids = std::collections::HashSet::new();
     for language in [
         SampleLanguage::Python,
         SampleLanguage::Csharp,
+        SampleLanguage::Typescript,
         SampleLanguage::Sql,
     ] {
         let count = samples
@@ -56,6 +53,7 @@ fn every_sample_is_listed_with_runnable_source() {
         let expected = match sample.language {
             SampleLanguage::Python => ".py",
             SampleLanguage::Csharp => ".cs",
+            SampleLanguage::Typescript => ".ts",
             SampleLanguage::Sql => ".sql",
         };
         assert!(sample.name.ends_with(expected), "{}", sample.name);
@@ -87,8 +85,47 @@ async fn sql_samples_run_against_the_bundled_database() {
 }
 
 #[tokio::test]
+async fn typescript_samples_run_as_unsaved_tabs() {
+    let directory = tempfile::tempdir().unwrap();
+    let (connections, _) = manager(directory.path());
+    let supervisor =
+        Supervisor::with_data_dir(directory.path().to_path_buf()).with_connections(connections);
+    for sample in samples::all()
+        .into_iter()
+        .filter(|sample| sample.language == SampleLanguage::Typescript)
+    {
+        let mut events = Vec::new();
+        let result = timeout(
+            Duration::from_secs(90),
+            supervisor.run_language(&sample.id, sample.source, Language::Typescript, |event| {
+                events.push(event);
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{} timed out", sample.id));
+        let result = match result {
+            Err(message)
+                if message.starts_with("Bun was not found.")
+                    && std::env::var_os("CI").is_none() =>
+            {
+                eprintln!("Install Bun to exercise the TypeScript samples");
+                return;
+            }
+            result => result.unwrap_or_else(|error| panic!("{} failed: {error}", sample.id)),
+        };
+        assert!(result.ok, "{} failed: {events:?}", sample.id);
+        assert!(
+            events.iter().any(|event| event.method == "dump"),
+            "{} produced no dump",
+            sample.id
+        );
+    }
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
 #[ignore = "installs SQLAlchemy and EF Core packages; run explicitly"]
-async fn every_sample_runs_end_to_end() {
+async fn python_csharp_and_sql_samples_run_end_to_end() {
     let directory = tempfile::tempdir().unwrap();
     let (connections, sql) = manager(directory.path());
     let supervisor =

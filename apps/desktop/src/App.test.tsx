@@ -857,7 +857,15 @@ test("samples open as unsaved copies and keep their original source", async () =
           language: "python",
           source: "print('from the sample')",
         },
+        {
+          id: "typescript/hello",
+          name: "hello.ts",
+          title: "Hello, TypeScript!",
+          language: "typescript",
+          source: "console.log('from the TypeScript sample')",
+        },
       ];
+    if (command === "run_script") return { ok: true };
     return undefined;
   });
   render(<App />);
@@ -872,6 +880,22 @@ test("samples open as unsaved copies and keep their original source", async () =
   // Reopening the sample focuses the existing copy instead of discarding edits.
   fireEvent.click(screen.getByRole("button", { name: /^Hello, world!/ }));
   expect(screen.getByLabelText("Code")).toHaveValue("print('my copy')");
+
+  fireEvent.click(screen.getByRole("button", { name: /TypeScript.*1/ }));
+  fireEvent.click(screen.getByRole("button", { name: /^Hello, TypeScript!/ }));
+  expect(screen.getByLabelText("Code")).toHaveValue(
+    "console.log('from the TypeScript sample')",
+  );
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  await waitFor(() =>
+    expect(invoke).toHaveBeenCalledWith(
+      "run_script",
+      expect.objectContaining({
+        language: "typescript",
+        source: "console.log('from the TypeScript sample')",
+      }),
+    ),
+  );
 });
 
 test("a failed sample list is reported in the Samples section", async () => {

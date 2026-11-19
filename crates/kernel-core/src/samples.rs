@@ -4,7 +4,7 @@
 //! opening or saving them. Opening a sample creates an unsaved copy in a tab;
 //! the original embedded source is never written back. The database is copied
 //! into the app data folder on first use and exposed as a built-in connection,
-//! so SQL, Python and C# samples can query it without any setup.
+//! so SQL, Python, C# and TypeScript samples can query it without any setup.
 //!
 //! The built-in connection is resolved by [`crate::databases::ConnectionStore`]
 //! and is never written to `connections.json`. That keeps `cpad` from rewriting
@@ -44,6 +44,7 @@ pub struct Sample {
 pub enum SampleLanguage {
     Python,
     Csharp,
+    Typescript,
     Sql,
 }
 
@@ -103,6 +104,36 @@ pub fn all() -> Vec<Sample> {
             Csharp
         ),
         sample!("csharp/query_orders.cs", "Join the sample database", Csharp),
+        sample!("typescript/hello.ts", "Hello, world!", Typescript),
+        sample!(
+            "typescript/objects.ts",
+            "Objects and nested values",
+            Typescript
+        ),
+        sample!(
+            "typescript/tables.ts",
+            "Tables from TypeScript data",
+            Typescript
+        ),
+        sample!("typescript/collections.ts", "Maps and sets", Typescript),
+        sample!("typescript/text.ts", "Text, dates and JSON", Typescript),
+        sample!("typescript/async.ts", "Top-level await", Typescript),
+        sample!("typescript/cache.ts", "Cache a result", Typescript),
+        sample!(
+            "typescript/rich_output.ts",
+            "Live values and HTML",
+            Typescript
+        ),
+        sample!(
+            "typescript/query_products.ts",
+            "Query the sample database",
+            Typescript
+        ),
+        sample!(
+            "typescript/query_orders.ts",
+            "Join the sample database",
+            Typescript
+        ),
         sample!("sql/hello.sql", "Hello from SQL", Sql),
         sample!("sql/tables.sql", "Explore the database", Sql),
         sample!("sql/customers.sql", "Customers", Sql),

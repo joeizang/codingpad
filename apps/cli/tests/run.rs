@@ -1,3 +1,4 @@
+use codingpad_kernel_core::samples::{self, SampleLanguage};
 use serde_json::json;
 use std::{
     fs,
@@ -50,6 +51,39 @@ fn python_script_prints_streams_and_dumps_as_text() {
     assert!(text.contains("hello from Python"), "{text}");
     assert!(text.contains("{name: \"Ada\", score: 10}"), "{text}");
     assert!(text.contains("\n42\n"), "{text}");
+}
+
+#[test]
+fn typescript_samples_run_from_saved_files() {
+    let directory = tempdir().unwrap();
+    let data = directory.path().join("data");
+    for sample in samples::all()
+        .into_iter()
+        .filter(|sample| sample.language == SampleLanguage::Typescript)
+    {
+        let script = directory.path().join(&sample.name);
+        fs::write(&script, sample.source).unwrap();
+        let output = cpad(&data, &script);
+        let errors = stderr(&output);
+        if errors.starts_with("Bun was not found.") && std::env::var_os("CI").is_none() {
+            eprintln!("Install Bun to exercise the TypeScript samples");
+            return;
+        }
+        let text = stdout(&output);
+        assert!(output.status.success(), "{}: {text}\n{errors}", sample.id);
+        assert!(!text.trim().is_empty(), "{} produced no output", sample.id);
+        if sample.name == "cache.ts" {
+            assert_eq!(text.matches("Computing squares").count(), 1, "{text}");
+            assert!(text.contains("reused: True"), "{text}");
+        }
+        if sample.name == "rich_output.ts" {
+            let output = cpad_html(&data, &script);
+            assert!(output.status.success(), "stderr: {}", stderr(&output));
+            let page = stdout(&output);
+            assert!(page.starts_with("<!doctype html>"), "{page}");
+            assert!(page.contains("<strong>All three steps completed.</strong>"));
+        }
+    }
 }
 
 #[test]
@@ -407,14 +441,14 @@ fn usage_errors_exit_with_two() {
 
     let output = cpad(&data, &script);
     assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
-    assert!(stderr(&output).contains(".py, .cs or .sql"));
+    assert!(stderr(&output).contains(".py, .cs, .ts or .sql"));
 
     // The type check comes before opening the file, so a missing unknown path
     // is still a usage error rather than "Could not open".
     let missing = directory.path().join("missing.txt");
     let output = cpad(&data, &missing);
     assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
-    assert!(stderr(&output).contains(".py, .cs or .sql"));
+    assert!(stderr(&output).contains(".py, .cs, .ts or .sql"));
 
     // An unknown option is a usage error too.
     let output = Command::new(env!("CARGO_BIN_EXE_cpad"))

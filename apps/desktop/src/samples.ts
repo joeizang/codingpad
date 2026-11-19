@@ -1,25 +1,21 @@
-import { languageLabel } from "./scriptLanguages";
-
-export type SampleLanguage = "python" | "csharp" | "sql";
+import { SCRIPT_LANGUAGES, type ScriptLanguage } from "./scriptLanguages";
 
 export type Sample = {
   id: string;
   name: string;
   title: string;
-  language: SampleLanguage;
+  language: ScriptLanguage;
   source: string;
 };
 
-export const SAMPLE_LANGUAGES: SampleLanguage[] = ["python", "csharp", "sql"];
-
 export function groupSamples(samples: Sample[]): Array<{
-  language: SampleLanguage;
+  language: ScriptLanguage;
   label: string;
   samples: Sample[];
 }> {
-  return SAMPLE_LANGUAGES.map((language) => ({
-    language,
-    label: languageLabel(language),
-    samples: samples.filter((sample) => sample.language === language),
+  return SCRIPT_LANGUAGES.map(({ id, name }) => ({
+    language: id,
+    label: name,
+    samples: samples.filter((sample) => sample.language === id),
   })).filter((group) => group.samples.length > 0);
 }

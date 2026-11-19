@@ -85,12 +85,18 @@ An agent credential is **required** whenever the user needs a guarantee that age
 
 - `cache()` belongs to that script key only. A run never sees values another script cached, and repeated runs of the same script key keep their cache until it is reset or its kernel is evicted. An agent that wants inline snippets kept apart passes different `session` names.
 - MCP kernels are separate processes from the GUI's, so an agent run never shares a cache with the user's open scripts.
-- `cpad mcp` keeps at most 4 warm kernels (configurable). Starting a fifth evicts the least recently used one, which ends its cache, as Reset does.
+- `cpad mcp` keeps at most 4 resident kernel processes (configurable). Starting a fifth evicts the least recently used one, which ends its cache and expires its dumps' handles, as Reset does.
 
-**Keeping dumps pageable.** Kernel handles expire when the next run starts in the same kernel, or when it resets or restarts ([kernel-protocol.md](../kernel-protocol.md)). With one kernel per script key, a run only expires the dumps of the previous run of **the same script key**, which that rerun replaces. Runs of other scripts don't touch them. In addition:
+**Rust keeps D11's exception.** When Rust joins MCP in M6, a Rust agent run starts a fresh process every time, as in the GUI, and does not get a warm kernel:
+
+- Its `cache()` persists to disk, scoped to the script key: under `<app data>/mcp/rust-cache/<hash of language and script key>/`. This folder is separate from the GUI's Rust disk caches, so agent runs and the user's open scripts never read each other's cached values, and two script keys never share one.
+- A Rust script key's disk cache is cleared by `reset_script` on that key. Eviction from the process limit does not clear it, because no warm cache is lost. The whole `mcp/rust-cache` folder is kept within a size budget (default 1 GiB), deleting the least recently used script keys' caches first.
+- If M6 keeps a finished Rust process alive to serve lazy handles for its dumps (it runs no further script code), `cpad mcp` follows the same lifetime and counts that process toward the resident limit. The next run of the same script key replaces it with a fresh process.
+
+**Keeping dumps pageable.** Kernel handles expire when the next run starts in the same kernel, or when it resets or restarts ([kernel-protocol.md](../kernel-protocol.md)). With one kernel per script key, a run expires the dumps of the previous run of **the same script key**, which that rerun replaces. Running another script preserves a dump's handles **only while the kernel that produced it stays resident**: a run for a new script key beyond the limit evicts the least recently used kernel and expires its unfetched handles. In addition:
 
 - The server **keeps every page and node it has already returned**, so anything the agent has fetched stays readable after its kernel moves on.
-- A request that needs a kernel handle that has since expired (a rerun of the same script key, Reset, or eviction) returns an `expired` error that tells the agent to run the script again. It never returns a page from a different run.
+- A request that needs a kernel handle that has since expired (a rerun of the same script key, `reset_script`, or eviction) returns an `expired` error that tells the agent to run the script again. It never returns a page from a different run.
 - Dumps live for the MCP session, within an LRU memory budget.
 
 **Unknown totals and the enumeration frontier.** C# and TypeScript iterables can have an unknown length until they are fully enumerated (`totalKnown: false` in the protocol, where `total` includes a placeholder row for the desktop). The kernel enumerates in pages (Bun and C# pull up to 100 items for the first page) and caches what it has read, while the MCP preview shows only ~20 rows. The **frontier** is the number of rows the kernel has enumerated so far.
@@ -108,7 +114,7 @@ Agents can list and read scripts in the **library** and in the user's **pinned f
 
 ## First tool set
 
-`run_script(language, source | path, session?, connection?)`, `expand_node(dump_id, node_id)`, `get_rows(dump_id, table_id, offset, limit)`, `list_connections()` (only connections allowed for agents, with their read-only level), `get_schema(connection)`, `list_scripts()` (the library and pinned folders), `read_script(path)`, `save_script(name, language, source)` (into `Agent/`). Exact names and shapes are settled in the milestone's first issue.
+`run_script(language, source | path, session?, connection?)`, `expand_node(dump_id, node_id)`, `get_rows(dump_id, table_id, offset, limit)`, `list_connections()` (only connections allowed for agents, with their read-only level), `get_schema(connection)`, `reset_script(language, path | session)`, `list_scripts()` (the library and pinned folders), `read_script(path)`, `save_script(name, language, source)` (into `Agent/`). Exact names and shapes are settled in the milestone's first issue.
 
 ## Considered options
 

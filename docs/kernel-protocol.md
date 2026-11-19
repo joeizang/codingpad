@@ -1,8 +1,9 @@
 # Kernel protocol v1
 
-JSON-RPC 2.0 over UTF-8 stdio, one JSON object per line. The Rust supervisor
-writes requests to a kernel process's stdin and reads its stdout. Python, C# and
-TypeScript keep one warm kernel per open script.
+JSON-RPC 2.0 over UTF-8, one JSON object per line. The Rust supervisor writes
+requests to the kernel's stdin. It reads responses from stdout for Python and C#
+and from a dedicated loopback connection for TypeScript. Each open script keeps
+one warm kernel process.
 The kernel and its runtime are embedded in the Rust build and extracted to a
 private temporary directory for the process lifetime; installed apps do not need
 the source checkout or a registry package. Python starts with `-I -u -X utf8` and adds only
@@ -436,15 +437,22 @@ an AOT compiler. Registry publication is a separate release action.
 ## TypeScript kernel (M5.0)
 
 The Bun kernel sends the same `stream`, `dump`, and `run_finished` notifications
-and run response. Each open script keeps a warm Bun process. Each run gets a fresh
-worker in that process. Stop targets the active worker and waits for it to exit.
+and run response. On startup the supervisor passes Bun a loopback port and a
+one-time token over stdin. Bun authenticates the response connection with the
+token. Raw writes to file descriptors 1 and 2 go to the application's inherited
+stdout and stderr and cannot corrupt the protocol.
+
+Each open script keeps a warm Bun process. Each run gets a fresh worker in that
+process. The worker ends as soon as the top-level module settles. Await timers
+and other asynchronous work before the script returns if their output should
+appear in Results. Stop targets the active worker and waits for it to exit.
 If the worker cannot exit within two seconds, the Rust supervisor kills the
 kernel. Reset and Close also discard the process. The `cache()` helper arrives in
-M5.2.
+M5.2. An overlapping run request receives error `-32000` ("Run already in progress").
 
 The bundled `codingpad` module is available inside each worker. `run.params.path`
 sets the base for file-relative imports from a saved tab. Unsaved tabs resolve
-relative to the kernel's private directory. Run uses the editor snapshot without
+relative to a private scratch subdirectory. Run uses the editor snapshot without
 writing to the script file. Versioned auto-install imports and the shadow
 project arrive in M5.3 (D5).
 

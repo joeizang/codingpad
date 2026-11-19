@@ -107,8 +107,8 @@ use serde_json::{json, Value};
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
 use tempfile::TempDir;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
-    process::{Child, ChildStdin, ChildStdout, Command},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, Lines},
+    process::{Child, ChildStdin, Command},
     sync::{watch, Mutex, OnceCell},
 };
 
@@ -195,7 +195,7 @@ pub async fn attached_data_context(
             let source = match language {
                 Language::Python => generated.python,
                 Language::Csharp => generated.csharp,
-                Language::Typescript => unreachable!(),
+                Language::Typescript => return (None, None),
             };
             (
                 Some(DataContextRun {
@@ -545,8 +545,7 @@ impl Supervisor {
                         }
                         Language::Python => Kernel::start(&self.uv_path(), packages, &mut emit).await,
                         Language::Typescript => {
-                            let (command, files) = typescript::command()?;
-                            Kernel::spawn(command, files, packages, language)
+                            Kernel::start_typescript(packages).await
                         }
                     }
                 } => result,
@@ -730,7 +729,7 @@ impl Supervisor {
 struct Kernel {
     child: Child,
     input: ChildStdin,
-    output: Lines<BufReader<ChildStdout>>,
+    output: Lines<BufReader<Box<dyn AsyncRead + Unpin + Send>>>,
     next_id: u64,
     _files: Arc<TempDir>,
     packages: Packages,
@@ -739,14 +738,38 @@ struct Kernel {
 
 impl Kernel {
     fn spawn(
-        mut command: Command,
+        command: Command,
         files: Arc<TempDir>,
         packages: Packages,
         language: Language,
     ) -> Result<Self, String> {
+        let mut child = Self::spawn_child(command, language, Stdio::piped())?;
+        let input = child.stdin.take().unwrap();
+        let output = child.stdout.take().unwrap();
+        Ok(Self::from_child(
+            child, input, output, files, packages, language,
+        ))
+    }
+
+    async fn start_typescript(packages: Packages) -> Result<Self, String> {
+        let (command, files) = typescript::command()?;
+        let language = Language::Typescript;
+        let mut child = Self::spawn_child(command, language, Stdio::inherit())?;
+        let mut input = child.stdin.take().unwrap();
+        let output = typescript::connect(&mut child, &mut input).await?;
+        Ok(Self::from_child(
+            child, input, output, files, packages, language,
+        ))
+    }
+
+    fn spawn_child(
+        mut command: Command,
+        language: Language,
+        stdout: Stdio,
+    ) -> Result<Child, String> {
         command
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .stdout(stdout)
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
         // Let the host handle terminal Ctrl-C and send Stop over the protocol.
@@ -754,23 +777,33 @@ impl Kernel {
         command.process_group(0);
         #[cfg(windows)]
         command.creation_flags(0x08000000 | 0x00000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
-        let mut child = command.spawn().map_err(|error| match language {
+        command.spawn().map_err(|error| match language {
             Language::Python => format!("Could not start Python: {error}"),
             Language::Csharp => format!("Could not start C# kernel: {error}"),
             Language::Typescript if error.kind() == std::io::ErrorKind::NotFound => {
                 "Bun was not found. Install Bun from https://bun.com/docs/installation and run the script again.".into()
             }
             Language::Typescript => format!("Could not start the Bun kernel: {error}"),
-        })?;
-        Ok(Self {
-            input: child.stdin.take().unwrap(),
-            output: BufReader::new(child.stdout.take().unwrap()).lines(),
+        })
+    }
+
+    fn from_child(
+        child: Child,
+        input: ChildStdin,
+        output: impl AsyncRead + Unpin + Send + 'static,
+        files: Arc<TempDir>,
+        packages: Packages,
+        language: Language,
+    ) -> Self {
+        Self {
+            input,
+            output: BufReader::new(Box::new(output) as Box<dyn AsyncRead + Unpin + Send>).lines(),
             child,
             next_id: 0,
             _files: files,
             packages,
             language,
-        })
+        }
     }
 
     async fn start(

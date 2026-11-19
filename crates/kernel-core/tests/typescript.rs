@@ -32,6 +32,9 @@ const wrongType: number = "still runs";
 console.log("hello %s 🌍", wrongType);
 console.warn("warning");
 process.stdout.write("direct output");
+import { writeSync } from "node:fs";
+writeSync(1, "raw fd 1\n");
+writeSync(2, "raw fd 2\n");
 dump({ name: "Ada", values: [count, null] });
 const answer = async () => 42;
 await answer() // final expression
@@ -114,7 +117,7 @@ async fn typescript_stop_preserves_kernel_and_clears_script_state() {
     let prior = supervisor
         .run_language(
             "scratch",
-            "globalThis.prior = true; [process.pid, import.meta.dir, process.cwd()]",
+            "globalThis.prior = true; [process.pid, import.meta.dir, process.cwd(), await Bun.file('./run.ts').exists(), await Bun.file('./runtime.ts').exists()]",
             Language::Typescript,
             |event| events.push(event),
         )
@@ -131,6 +134,9 @@ async fn typescript_stop_preserves_kernel_and_clears_script_state() {
     let scratch = &events[0].params["node"]["items"];
     let pid = scratch[0]["v"].clone();
     assert_eq!(scratch[1]["v"], scratch[2]["v"]);
+    assert_eq!(scratch[3]["v"], false);
+    assert_eq!(scratch[4]["v"], false);
+    assert!(std::path::Path::new(scratch[2]["v"].as_str().unwrap()).ends_with("scratch"));
     assert_ne!(
         scratch[2]["v"].as_str().unwrap(),
         std::env::current_dir().unwrap().to_str().unwrap()

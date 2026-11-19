@@ -1,3 +1,5 @@
+import { once } from "node:events";
+import { createConnection } from "node:net";
 import { createInterface } from "node:readline";
 import { Worker } from "node:worker_threads";
 import type { Script } from "./run.ts";
@@ -8,12 +10,21 @@ type Request =
   | { id: number; method: "expand" };
 
 const messages = createInterface({ input: process.stdin, crlfDelay: Infinity });
+const requests = messages[Symbol.asyncIterator]();
+const hello = await requests.next();
+if (hello.done) process.exit(0);
+const { port, token } = JSON.parse(hello.value) as { port: number; token: number[] };
+const responses = createConnection({ host: "127.0.0.1", port });
+await once(responses, "connect");
+responses.setNoDelay(true);
+responses.write(Buffer.from(token));
+
 const workerUrl = new URL("./run.ts", import.meta.url);
 let active: { id: number; stop: () => void } | undefined;
 
 function send(message: object) {
   // Rust's JSON decoder requires strings to contain well-formed Unicode.
-  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }, (_, value) =>
+  responses.write(JSON.stringify({ jsonrpc: "2.0", ...message }, (_, value) =>
     typeof value === "string" ? value.toWellFormed() : value,
   ) + "\n");
 }
@@ -48,6 +59,7 @@ function run(id: number, params: Omit<Script, "runId">) {
     finish(false);
   });
   worker.on("exit", (code) => {
+    if (active?.id !== id) return;
     if (outcome === undefined) stderr(`TypeScript worker exited before completing the run (${code}).\n`);
     const ok = outcome ?? false;
     notify("run_finished", { ok });
@@ -56,11 +68,15 @@ function run(id: number, params: Omit<Script, "runId">) {
   });
 }
 
-for await (const line of messages) {
-  const request = JSON.parse(line) as Request;
+for (let next = await requests.next(); !next.done; next = await requests.next()) {
+  const request = JSON.parse(next.value) as Request;
   if (request.method === "cancel") {
     if (active?.id === request.params.runId) active.stop();
-  } else if (request.method === "run" && !active) {
+  } else if (request.method === "run") {
+    if (active) {
+      send({ id: request.id, error: { code: -32000, message: "Run already in progress" } });
+      continue;
+    }
     try {
       run(request.id, request.params);
     } catch (error) {
@@ -71,3 +87,5 @@ for await (const line of messages) {
   }
 }
 active?.stop();
+active = undefined;
+responses.end();

@@ -209,6 +209,15 @@ test("a nested table cell expands below the table instead of clipping the row", 
   expect(expand).toHaveBeenCalledWith("cell", null);
 });
 
+test("bounded collections show the full count when no next page is available", () => {
+  render(<DumpTree node={{
+    kind: "list", type: "Array", items: [{ kind: "primitive", v: 1 }],
+    total: 500, next: null, truncated: true,
+  }} />);
+  expect(screen.getByText("(1 of 500)")).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Show more" })).not.toBeInTheDocument();
+});
+
 test("strings cut by a limit say they were truncated", () => {
   const { container } = render(
     <DumpTree node={{ kind: "string", v: "abc", truncated: true, total: 20000 }} />,

@@ -1,7 +1,8 @@
 import { once } from "node:events";
 import { createConnection } from "node:net";
 import { createInterface } from "node:readline";
-import { Worker } from "node:worker_threads";
+import { MessageChannel, Worker } from "node:worker_threads";
+import type { MessagePort } from "node:worker_threads";
 import { missingHandle, type PageRequest } from "./dump.ts";
 import type { Script } from "./run.ts";
 
@@ -25,6 +26,45 @@ const workerUrl = new URL("./run.ts", import.meta.url);
 let active: { id: number; stop: () => void } | undefined;
 let retained: Worker | undefined;
 let preview: Preview | undefined;
+
+// Values persist for this kernel process. Reset and forced stop discard the
+// process, which clears them; each run gets a fresh worker and clean globals.
+const cache = new Map<string, unknown>();
+
+type CacheRequest = {
+  id: number;
+  method: "get" | "set";
+  key: string;
+  value?: unknown;
+};
+
+function answerCache(request: CacheRequest, port: MessagePort, flag: Int32Array) {
+  let reply: object;
+  try {
+    if (request.method === "get") {
+      const found = cache.has(request.key);
+      reply = { id: request.id, found, value: found ? cache.get(request.key) : undefined };
+    } else {
+      // postMessage already gave this process its own copy of the value, and
+      // the get reply below clones it again for each later run.
+      if (!cache.has(request.key)) cache.set(request.key, request.value);
+      reply = { id: request.id, found: true };
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    reply = { id: request.id, error: message };
+  }
+  try {
+    port.postMessage(reply);
+  } catch {
+    // The worker was stopped while the value was being sent.
+  } finally {
+    // The worker waits until this exact request id appears, so a late reply
+    // from an abandoned request cannot wake the next one early.
+    Atomics.store(flag, 0, request.id);
+    Atomics.notify(flag, 0);
+  }
+}
 
 function send(message: object) {
   // Rust's JSON decoder requires strings to contain well-formed Unicode.
@@ -63,8 +103,14 @@ function run(id: number, params: Omit<Script, "runId">) {
     if (active?.id === id) send({ method, params: { runId: id, ...params } });
   };
   const stderr = (text: string) => notify("stream", { stream: "stderr", text });
+  const { port1: cachePort, port2: workerCachePort } = new MessageChannel();
+  const cacheFlag = new SharedArrayBuffer(4);
+  cachePort.on("message", (request: CacheRequest) =>
+    answerCache(request, cachePort, new Int32Array(cacheFlag)));
   const worker = new Worker(workerUrl, {
-    workerData: { ...params, runId: id }, stdout: true, stderr: true,
+    workerData: { ...params, runId: id, cachePort: workerCachePort, cacheFlag },
+    transferList: [workerCachePort],
+    stdout: true, stderr: true,
   });
   let stopping = false;
   let outcome: boolean | undefined;
@@ -107,6 +153,7 @@ function run(id: number, params: Omit<Script, "runId">) {
     void worker.terminate();
   });
   worker.on("exit", (code) => {
+    cachePort.close();
     if (retained === worker) {
       retained = undefined;
       if (preview) unavailable(preview.id);

@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
-import { dump, html, image, live, setDumpSink } from "./runtime.ts";
+import { cache, dump, html, image, live, setDumpSink } from "./runtime.ts";
 import { Dumps, type PageRequest } from "./dump.ts";
 import { errorDetails } from "./errors.ts";
 import { parentPort, workerData } from "node:worker_threads";
@@ -89,7 +89,7 @@ async function run({ runId, source, path: scriptPath, finalExpression }: Script)
   Bun.plugin({
     name: "CodingPad script",
     setup(builder) {
-      builder.module("codingpad", () => ({ loader: "object", exports: { dump, html, image, live } }));
+      builder.module("codingpad", () => ({ loader: "object", exports: { cache, dump, html, image, live } }));
       builder.module(FINAL_DUMP_MODULE, () => ({
         loader: "object",
         exports: { dumpFinal: (value: unknown) => { if (value !== undefined) dump(value); } },

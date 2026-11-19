@@ -434,7 +434,7 @@ using that name. Outside the kernel, `Cancel` is `CancellationToken.None` and
 and use `#:package CodingPad@0.1.0`, disabling AOT publishing to avoid downloading
 an AOT compiler. Registry publication is a separate release action.
 
-## TypeScript kernel (M5.0–M5.1)
+## TypeScript kernel (M5.0–M5.2)
 
 The Bun kernel sends the same `stream`, `dump`, `dump_update`, and
 `run_finished` notifications and run response. On startup the supervisor passes
@@ -452,8 +452,18 @@ and open sockets can remain active in a retained worker until the next run,
 Reset or Close. Results receive output and live updates during the run, so
 await asynchronous work whose output you want to see. Stop targets the active
 worker and waits for it to exit. If the worker cannot exit within two seconds,
-the Rust supervisor kills the kernel. Reset and Close also discard the process. The `cache()` helper arrives in
-M5.2. An overlapping run request receives error `-32000` ("Run already in progress").
+the Rust supervisor kills the kernel. Reset and Close also discard the process. An overlapping run request receives
+error `-32000` ("Run already in progress").
+
+`cache(key, factory)` is importable from `codingpad`. The Bun kernel, not the
+per-run worker, owns the cache, so a value survives reruns while globals start
+fresh each run. Keys and values must be structured-cloneable, and values are
+cloned on every run including the first, so class prototypes, methods and
+accessors are not preserved. Factory calls must return synchronously, failed
+factories are not cached, and a cached `undefined` counts as a hit. Each worker
+asks the kernel for a key over a `MessageChannel` and blocks on `Atomics.wait`
+until the reply is queued. Cooperative Stop keeps the kernel and its cache;
+Reset, Close, and a forced restart clear both.
 
 The bundled `codingpad` module is available inside each worker. `run.params.path`
 sets the base for file-relative imports from a saved tab. Unsaved tabs resolve

@@ -103,7 +103,7 @@ await answer() // final expression
         assert_eq!(result.ok, expected.is_some(), "{source} {events:?}");
         let dumps: Vec<_> = events
             .iter()
-            .filter(|event| event.method == "dump")
+            .filter(|event| event.method == "dump" && event.params["node"]["kind"] != "error")
             .map(|event| event.params["node"]["v"].clone())
             .collect();
         assert_eq!(dumps, expected.into_iter().collect::<Vec<_>>(), "{source}");
@@ -188,4 +188,277 @@ async fn typescript_stop_preserves_kernel_and_clears_script_state() {
     }
     assert_eq!(items[6]["type"], "Example");
     assert_eq!(items[6]["fields"][0]["value"]["v"], 5);
+}
+
+async fn run_dump_script(supervisor: &Supervisor, source: &str) -> Option<Vec<KernelEvent>> {
+    let mut events = Vec::new();
+    let result = timeout(
+        Duration::from_secs(10),
+        supervisor.run_language("dump", source, Language::Typescript, |event| {
+            events.push(event)
+        }),
+    )
+    .await
+    .expect("Bun run timed out");
+    match result {
+        Err(message)
+            if message.starts_with("Bun was not found.") && std::env::var_os("CI").is_none() =>
+        {
+            None
+        }
+        result => {
+            assert!(result.expect("Bun kernel failed").ok, "{events:?}");
+            Some(events)
+        }
+    }
+}
+
+fn dump_nodes(events: &[KernelEvent]) -> impl Iterator<Item = &Value> {
+    events
+        .iter()
+        .filter(|event| event.method == "dump")
+        .map(|event| &event.params["node"])
+}
+
+fn handle(node: &Value) -> &str {
+    node["handle"].as_str().unwrap()
+}
+
+#[tokio::test]
+async fn typescript_expands_lazy_nodes_and_pages_large_arrays() {
+    let supervisor = Supervisor::default();
+    let Some(events) = run_dump_script(
+        &supervisor,
+        r#"
+import { dump } from "codingpad";
+const root = { next: null };
+root.next = root;
+dump(root);
+let nested = { value: 42, get broken() { throw new Error("getter ran"); } };
+for (let i = 0; i < 9; ++i) nested = [nested];
+dump({ get broken() { throw new Error("getter ran"); } });
+dump(nested);
+dump(Array.from({ length: 250 }, (_, n) => n));
+const records = Array.from({ length: 100_000 }, (_, n) => ({ n, tags: [n], full: "x".repeat(1_001) }));
+records.at(-1).late = "included in export";
+dump(records);
+"#,
+    )
+    .await
+    else {
+        return;
+    };
+    let nodes: Vec<_> = dump_nodes(&events).collect();
+    assert_eq!(nodes[0]["fields"][0]["value"]["v"], "[Circular]");
+    assert_eq!(nodes[1]["fields"][0]["value"]["v"], "[Accessor]");
+    let mut lazy = nodes[2];
+    for _ in 0..6 {
+        lazy = &lazy["items"][0];
+    }
+    assert_eq!(lazy["kind"], "lazy");
+    let expanded = supervisor
+        .expand("dump", handle(lazy), None, None)
+        .await
+        .unwrap()
+        .node;
+    assert_eq!(expanded["kind"], "list");
+
+    let list = nodes[3];
+    assert_eq!(list["next"], "100");
+    let tail = supervisor
+        .expand("dump", handle(list), Some("200"), None)
+        .await
+        .unwrap()
+        .node;
+    assert_eq!(tail["items"][0]["v"], 200);
+    assert_eq!(tail["items"].as_array().unwrap().len(), 50);
+    assert!(tail["next"].is_null());
+
+    let table = nodes[4];
+    assert_eq!(table["kind"], "table");
+    assert_eq!(table["total"], 100_000);
+    assert_eq!(table["rows"].as_array().unwrap().len(), 100);
+    assert_eq!(table["rows"][99][0]["v"], 99);
+    assert_eq!(table["rows"][99][1]["kind"], "lazy");
+    let page = supervisor
+        .expand("dump", handle(table), Some("99800"), None)
+        .await
+        .unwrap()
+        .node;
+    assert_eq!(page["rows"][0][0]["v"], 99_800);
+    let exported = supervisor
+        .export_page("dump", handle(table), Some("99800"), 1)
+        .await
+        .unwrap();
+    assert_eq!(exported.rows[0][2].as_str().unwrap().len(), 1_001);
+    assert_eq!(exported.next.as_deref(), Some("99801"));
+    assert_eq!(exported.columns, ["n", "tags", "full", "late"]);
+
+    let new_events = run_dump_script(&supervisor, "[{ x: 1 }]").await.unwrap();
+    let new_handle = handle(dump_nodes(&new_events).next().unwrap());
+    assert!(supervisor
+        .expand("dump", handle(table), None, None)
+        .await
+        .unwrap_err()
+        .contains("Run the script again"));
+    supervisor.reset("dump").await.unwrap();
+    assert!(supervisor
+        .expand("dump", new_handle, None, None)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn typescript_pulls_iterables_one_page_at_a_time() {
+    let supervisor = Supervisor::default();
+    let directory = tempfile::tempdir().unwrap();
+    let cleanup = serde_json::to_string(&directory.path().join("closed")).unwrap();
+    let source = format!(
+        r#"
+import {{ dump }} from "codingpad";
+import {{ writeFileSync }} from "node:fs";
+let reads = 0;
+async function* endless() {{
+  try {{
+    while (true) {{
+      await Promise.resolve();
+      yield {{ n: ++reads }};
+    }}
+  }} finally {{
+    writeFileSync({cleanup}, String(reads));
+  }}
+}}
+function* finite() {{
+  for (let i = 0; i < 100; ++i) yield i;
+  throw new Error("iterator failed");
+}}
+dump(endless());
+dump(finite());
+"#
+    );
+    let Some(events) = run_dump_script(&supervisor, &source).await else {
+        return;
+    };
+    let nodes: Vec<_> = dump_nodes(&events).collect();
+    let endless = nodes
+        .iter()
+        .find(|node| node["columns"][0]["name"] == "n")
+        .unwrap();
+    let finite = nodes
+        .iter()
+        .find(|node| node["columns"][0]["name"] == "Value")
+        .unwrap();
+    assert_eq!(endless["rows"].as_array().unwrap().len(), 100);
+    assert_eq!(endless["rows"][99][0]["v"], 100);
+    assert_eq!(endless["totalKnown"], false);
+    assert_eq!(endless["total"], 101);
+    for (cursor, last) in [("100", 200), ("0", 100), ("100", 200), ("200", 300)] {
+        let page = supervisor
+            .expand("dump", handle(endless), Some(cursor), None)
+            .await
+            .unwrap()
+            .node;
+        assert_eq!(page["rows"][99][0]["v"], last);
+        assert_eq!(page["totalKnown"], false);
+    }
+    assert!(supervisor
+        .expand("dump", handle(endless), Some("400"), None)
+        .await
+        .unwrap_err()
+        .contains("previous page"));
+    let last = supervisor
+        .expand("dump", handle(finite), Some("100"), None)
+        .await
+        .unwrap()
+        .node;
+    assert_eq!(last["totalKnown"], true);
+    assert_eq!(last["total"], 101);
+    assert_eq!(last["rows"][0][0]["kind"], "error");
+    assert_eq!(last["rows"][0][0]["message"], "iterator failed");
+    assert_eq!(last["rows"][0][0]["traceback"][0]["script"], true);
+
+    let events = run_dump_script(&supervisor, &format!("await Bun.file({cleanup}).text()"))
+        .await
+        .unwrap();
+    assert_eq!(dump_nodes(&events).next().unwrap()["v"], "300");
+}
+
+#[tokio::test]
+async fn typescript_renders_images_html_and_live_updates() {
+    let supervisor = Supervisor::default();
+    let Some(events) = run_dump_script(
+        &supervisor,
+        r#"
+import { dump, html, image, live } from "codingpad";
+dump(html("<b>ready</b>"));
+dump(image(Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10)));
+const status = live("starting");
+dump(status);
+await Promise.resolve();
+status.value = "ready";
+"#,
+    )
+    .await
+    else {
+        return;
+    };
+    let nodes: Vec<_> = dump_nodes(&events).collect();
+    assert_eq!(nodes[0]["kind"], "html");
+    assert_eq!(nodes[0]["html"], "<b>ready</b>");
+    assert_eq!(nodes[1]["kind"], "image");
+    assert_eq!(nodes[1]["src"], "data:image/png;base64,iVBORw0KGgo=");
+    assert_eq!(nodes[2]["kind"], "live");
+    assert_eq!(nodes[2]["node"]["v"], "starting");
+    let update = events
+        .iter()
+        .find(|event| event.method == "dump_update")
+        .unwrap();
+    assert_eq!(update.params["nodeId"], nodes[2]["node"]["id"]);
+    assert_eq!(update.params["node"]["v"], "ready");
+    assert_eq!(events.last().unwrap().method, "run_finished");
+}
+
+#[tokio::test]
+async fn typescript_errors_point_to_the_editor_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("saved #1.ts");
+    let script = path.to_str().unwrap();
+    let supervisor = Supervisor::default();
+    for (source, line, column, message) in [
+        ("// first\nconst answer = ;", 2, 16, "Unexpected"),
+        (
+            "const emoji = '💡';\n(() => { throw new Error('boom', { cause: new Error('inner') }); })()",
+            2,
+            20,
+            "boom",
+        ),
+        (
+            "const first = true;\n(() => {\n  throw new Error('multiline');\n})()",
+            3,
+            13,
+            "multiline",
+        ),
+    ] {
+        let mut events = Vec::new();
+        let result = supervisor
+            .run_language_at("dump", source, Language::Typescript, Some(script), |event| {
+                events.push(event)
+            })
+            .await;
+        match result {
+            Err(message) if message.starts_with("Bun was not found.") && std::env::var_os("CI").is_none() => return,
+            result => assert!(!result.unwrap().ok, "{events:?}"),
+        }
+        let node = dump_nodes(&events).next().unwrap();
+        assert_eq!(node["kind"], "error");
+        assert!(node["message"].as_str().unwrap().contains(message));
+        let frame = &node["traceback"][0];
+        assert_eq!(frame["script"], true, "{node}");
+        assert_eq!(frame["line"], line, "{node}");
+        assert_eq!(frame["column"], column, "{node}");
+        assert_eq!(frame["text"], source.lines().nth(line - 1).unwrap());
+        if message == "boom" {
+            assert_eq!(node["causes"][0]["message"], "inner");
+        }
+    }
 }

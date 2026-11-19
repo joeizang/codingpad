@@ -434,18 +434,22 @@ using that name. Outside the kernel, `Cancel` is `CancellationToken.None` and
 and use `#:package CodingPad@0.1.0`, disabling AOT publishing to avoid downloading
 an AOT compiler. Registry publication is a separate release action.
 
-## TypeScript kernel (M5.0)
+## TypeScript kernel (M5.0–M5.1)
 
-The Bun kernel sends the same `stream`, `dump`, and `run_finished` notifications
-and run response. On startup the supervisor passes Bun a loopback port and a
-one-time token over stdin. Bun authenticates the response connection with the
+The Bun kernel sends the same `stream`, `dump`, `dump_update`, and
+`run_finished` notifications and run response. On startup the supervisor passes
+Bun a loopback port and a one-time token over stdin. Bun authenticates the response connection with the
 token. Raw writes to file descriptors 1 and 2 go to the application's inherited
 stdout and stderr and cannot corrupt the protocol.
 
 Each open script keeps a warm Bun process. Each run gets a fresh worker in that
-process. The worker ends as soon as the top-level module settles. Await timers
-and other asynchronous work before the script returns if their output should
-appear in Results. Stop targets the active worker and waits for it to exit.
+process. The run completes after the top-level module settles and the initial
+pages of any dumped iterables are ready. A worker with preview handles stays
+available for `expand` and `export_rows`. The next run asks unfinished iterators
+to close, then terminates the worker with a bounded wait and starts a fresh
+one. Handles also expire on Reset and Close. Results only receive output and
+live updates during the run, so await asynchronous work that should produce
+output. Stop targets the active worker and waits for it to exit.
 If the worker cannot exit within two seconds, the Rust supervisor kills the
 kernel. Reset and Close also discard the process. The `cache()` helper arrives in
 M5.2. An overlapping run request receives error `-32000` ("Run already in progress").
@@ -461,7 +465,29 @@ The editor registers TypeScript syntax highlighting. Type diagnostics arrive in
 M5.4. Console output and JavaScript writes to `process.stdout` and
 `process.stderr` become stream notifications. The host identifies the final
 top-level expression, which the worker evaluates once. Automatic dumps skip
-`undefined`. M5.0 limits basic previews to six levels, 100 children per
-container and 1,000 nodes per dump. Built-in values such as dates and maps use
-text previews. Lazy handles and paging arrive in M5.1. Syntax and runtime errors
-produce a stderr notification and `ok: false`.
+`undefined`. Syntax and runtime failures produce structured `error` nodes and
+`ok: false`. Stack frames in the editor snapshot use the original source
+locations, including for exceptions in the automatically dumped expression.
+
+Arrays of records become tables with up to 32 columns inferred from the first
+100 rows. Other arrays and object fields page in groups of at most 100, with
+lazy nodes for deeper values and nested table cells. Object fields are read
+from property descriptors. Accessor fields show an `[Accessor]` marker.
+Built-in values such as dates and maps use bounded text previews.
+
+Custom synchronous and asynchronous iterables become tables. Each preview pulls
+at most 100 items without lookahead, retains the iterator and caches the items
+already read so a repeated page reuses those items. Columns are fixed from
+the first page. Export uses those columns for iterables and discovers all
+columns for arrays. The table uses the same unknown-total placeholder as C# until
+the iterator finishes. Iterator failures appear as a final error row.
+
+```typescript
+import { dump, html, image, live } from "codingpad";
+
+dump(html("<strong>Ready</strong>"));
+dump(image("plot.png")); // Also accepts a Uint8Array or ArrayBuffer.
+const status = live("Starting");
+dump(status);
+status.value = "Ready";
+```

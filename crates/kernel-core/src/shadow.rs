@@ -37,6 +37,7 @@ impl ShadowProjects {
         script_id: &str,
         source: &str,
         imports: Option<Imports>,
+        types: bool,
         mut notice: impl FnMut(String),
     ) -> Result<Arc<Project>, String> {
         let slot = self
@@ -78,6 +79,7 @@ impl ShadowProjects {
                 Project::prepare(
                     &typescript::find_bun(),
                     imports.unwrap_or_default(),
+                    types,
                     notice,
                     #[cfg(test)]
                     self.registry.as_deref(),

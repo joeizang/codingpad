@@ -489,8 +489,15 @@ A versioned subpath defined only in a package's exports map may fail to
 resolve in Bun workers.
 
 Bun executes TypeScript with top-level `await` and runs scripts with type errors.
-The editor registers TypeScript syntax highlighting. Type diagnostics arrive in
-M5.4. Console output and JavaScript writes to `process.stdout` and
+M5.4 attaches the TypeScript 7 native language server (`tsgo`) through the same
+language-server bridge and pull-diagnostics loop as Roslyn. It opens the staged
+document from the shared M5.3 shadow project, maps the bundled `codingpad`
+declarations, and resolves the installed versioned packages directly. A new
+shared project (a changed import set) restarts the server. A package install
+failure falls back to a package-free project so helper types and plain
+TypeScript still work. Type errors are editor-only and never block a run.
+Console output and JavaScript writes to
+`process.stdout` and
 `process.stderr` become stream notifications. The host identifies the final
 top-level expression, which the worker evaluates once. Automatic dumps skip
 `undefined`. Syntax and runtime failures produce structured `error` nodes and

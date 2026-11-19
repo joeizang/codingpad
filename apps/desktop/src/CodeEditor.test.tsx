@@ -48,9 +48,13 @@ vi.mock("monaco-editor/languages/definitions/sql/register.js", () => ({}));
 vi.mock("monaco-editor/languages/definitions/typescript/register.js", () => ({}));
 vi.mock("monaco-editor/editor/editor.worker.js?worker", () => ({ default: class {} }));
 
-test("prepares the latest TypeScript snapshot without starting a language server", async () => {
+test("prepares the latest TypeScript snapshot and starts the language server", async () => {
   invoke.mockClear();
-  invoke.mockResolvedValue(undefined);
+  invoke.mockImplementation(async (command) =>
+    command === "prepare_typescript_project" || command === "start_language_server"
+      ? { uri: "file:///typescript/script.ts" }
+      : undefined,
+  );
   const props = { id: "typescript", language: "typescript", onChange: vi.fn(), onRun: vi.fn() };
   const view = render(<CodeEditor {...props} source="import 'zod@3';" />);
   expect(invoke).not.toHaveBeenCalledWith("prepare_typescript_project", expect.anything());
@@ -60,8 +64,11 @@ test("prepares the latest TypeScript snapshot without starting a language server
     "prepare_typescript_project",
     expect.objectContaining({ scriptId: "typescript", source: "import 'zod@4';" }),
   ));
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith(
+    "start_language_server",
+    expect.objectContaining({ scriptId: "typescript", source: "import 'zod@4';" }),
+  ), { timeout: 2500 });
   expect(invoke.mock.calls.filter(([command]) => command === "prepare_typescript_project")).toHaveLength(1);
-  expect(invoke).not.toHaveBeenCalledWith("start_language_server", expect.anything());
   invoke.mockClear();
 });
 
@@ -109,6 +116,46 @@ test("C# reports compiler diagnostics and starts Roslyn for the same script", as
   await waitFor(() => expect(diagnostics).toHaveBeenCalledWith(expect.objectContaining({ errors: 0 })));
 });
 
+
+test("TypeScript starts the TS7 language server on the script", async () => {
+  invoke.mockClear();
+  invoke.mockImplementation(async (command) =>
+    command === "start_language_server" || command === "prepare_typescript_project"
+      ? { uri: "file:///typescript/script.ts" }
+      : undefined,
+  );
+  const diagnostics = vi.fn();
+  render(
+    <CodeEditor
+      id="typescript"
+      language="typescript"
+      source={'import { dump } from "codingpad";\ndump(42);'}
+      onChange={vi.fn()}
+      onRun={vi.fn()}
+      onDiagnostics={diagnostics}
+    />,
+  );
+  mountEditor();
+  await waitFor(
+    () =>
+      expect(invoke).toHaveBeenCalledWith(
+        "start_language_server",
+        expect.objectContaining({
+          scriptId: "typescript",
+          language: "typescript",
+          path: null,
+        }),
+      ),
+    { timeout: 2500 },
+  );
+  await waitFor(
+    () =>
+      expect(diagnostics).toHaveBeenLastCalledWith(
+        expect.objectContaining({ message: "Checking types…" }),
+      ),
+    { timeout: 2500 },
+  );
+});
 
 test("reports editor readiness before starting intelligence and preserves resolved deprecation tags", async () => {
   invoke.mockClear();

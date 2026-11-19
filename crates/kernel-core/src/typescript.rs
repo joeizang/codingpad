@@ -31,6 +31,12 @@ const RUN: &str = include_str!("../../../kernels/typescript/run.ts");
 const DUMP: &str = include_str!("../../../kernels/typescript/dump.ts");
 const ERRORS: &str = include_str!("../../../kernels/typescript/errors.ts");
 const RUNTIME: &str = include_str!("../../../runtimes/typescript/codingpad/index.ts");
+const CODINGPAD_TYPES: &str = include_str!("../../../runtimes/typescript/codingpad/index.d.ts");
+const FALLBACK_GLOBALS: &str = include_str!("../../../runtimes/typescript/codingpad/globals.d.ts");
+
+/// Pinned with the Bun version CI installs (1.4.2). Bump it deliberately with
+/// the CI Bun pin and the TypeScript code-intelligence tests.
+const BUN_TYPES_VERSION: &str = "1.4.2";
 
 pub(crate) fn command(bun: &Path, project: &Project) -> Result<(Command, Arc<TempDir>), String> {
     let files = tempfile::tempdir().map_err(|error| error.to_string())?;
@@ -72,6 +78,7 @@ impl Project {
     pub(crate) async fn prepare(
         bun: &Path,
         imports: Imports,
+        types: bool,
         mut notice: impl FnMut(String),
         #[cfg(test)] registry: Option<&str>,
     ) -> Result<Self, String> {
@@ -85,20 +92,15 @@ impl Project {
             "type": "module",
             "dependencies": imports.0,
         });
-        let tsconfig = json!({
-            "compilerOptions": {
-                "module": "ESNext",
-                "moduleResolution": "Bundler",
-                "target": "ESNext",
-                "noEmit": true,
-            },
-            "files": ["script.ts"],
-        });
-        for (file, contents) in [("package.json", manifest), ("tsconfig.json", tsconfig)] {
-            fs::write(root.join(file), contents.to_string()).map_err(|error| {
-                format!("Could not write {file} for the TypeScript shadow project: {error}")
-            })?;
-        }
+        fs::write(root.join("package.json"), manifest.to_string()).map_err(|error| {
+            format!("Could not write package.json for the TypeScript shadow project: {error}")
+        })?;
+        fs::write(root.join("codingpad.d.ts"), CODINGPAD_TYPES).map_err(|error| {
+            format!("Could not write codingpad.d.ts for the TypeScript shadow project: {error}")
+        })?;
+        fs::write(root.join("globals.d.ts"), FALLBACK_GLOBALS).map_err(|error| {
+            format!("Could not write globals.d.ts for the TypeScript shadow project: {error}")
+        })?;
         if !imports.0.is_empty() {
             let packages = imports.0.keys().cloned().collect::<Vec<_>>().join(", ");
             notice(format!("Installing TypeScript packages: {packages}"));
@@ -141,6 +143,37 @@ impl Project {
                 ));
             }
         }
+        // Prefer real Bun/Node types when the editor asks for them. Run does
+        // not need types and must not pay a package install before the kernel
+        // starts. The checked-in globals keep common built-ins available when
+        // the editor reuses a project that Run prepared, or when installation
+        // fails.
+        #[cfg(test)]
+        let bun_types = types && registry.is_none() && install_bun_types(bun, root).await;
+        #[cfg(not(test))]
+        let bun_types = types && install_bun_types(bun, root).await;
+        let mut files = vec!["script.ts", "codingpad.d.ts"];
+        if !bun_types {
+            files.push("globals.d.ts");
+        }
+        let tsconfig = json!({
+            "compilerOptions": {
+                "module": "ESNext",
+                "moduleResolution": "Bundler",
+                "target": "ESNext",
+                "noEmit": true,
+                "strict": true,
+                "skipLibCheck": true,
+                "lib": ["ESNext", "DOM", "DOM.Iterable"],
+                "types": if bun_types { json!(["bun"]) } else { json!([]) },
+                // TypeScript 7 removed baseUrl; paths resolve beside tsconfig.
+                "paths": { "codingpad": ["./codingpad.d.ts"] },
+            },
+            "files": files,
+        });
+        fs::write(root.join("tsconfig.json"), tsconfig.to_string()).map_err(|error| {
+            format!("Could not write tsconfig.json for the TypeScript shadow project: {error}")
+        })?;
         Ok(Self { shadow, imports })
     }
 
@@ -149,11 +182,43 @@ impl Project {
     }
 }
 
+async fn install_bun_types(bun: &Path, root: &Path) -> bool {
+    let mut command = Command::new(bun);
+    command
+        .current_dir(root)
+        .args([
+            "--no-env-file",
+            "add",
+            "--dev",
+            "--prefer-offline",
+            "--ignore-scripts",
+            "--no-progress",
+        ])
+        .arg(format!("@types/bun@{BUN_TYPES_VERSION}"))
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000 | 0x00000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+    let installed = timeout(Duration::from_secs(20), command.status())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .is_some_and(|status| status.success());
+    installed && root.join("node_modules/@types/bun/package.json").is_file()
+}
+
 pub(crate) fn bun_not_found(error: &io::Error) -> Option<String> {
     (error.kind() == io::ErrorKind::NotFound).then(|| {
         "Bun was not found. Install Bun from https://bun.com/docs/installation and run the script again.".into()
     })
 }
+
+const KERNEL_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) async fn connect(
     child: &mut Child,
@@ -177,7 +242,10 @@ pub(crate) async fn connect(
         }
     };
 
-    timeout(Duration::from_secs(5), connect)
+    // Bun exiting is caught above, so this limit only bounds a hung startup.
+    // A cold start on a loaded Windows machine, with antivirus scanning the new
+    // kernel files, can take well over 5 s.
+    timeout(KERNEL_STARTUP_TIMEOUT, connect)
         .await
         .map_err(|_| "Timed out connecting to the Bun kernel.".to_owned())?
         .map_err(|error| format!("Could not connect to the Bun kernel: {error}"))
@@ -523,8 +591,9 @@ answer + imported
                 source.to_owned()
             };
             let mut events = Vec::new();
+            // Leave room for the kernel's own startup limit on slow runners.
             let result = timeout(
-                Duration::from_secs(10),
+                KERNEL_STARTUP_TIMEOUT + Duration::from_secs(15),
                 supervisor.run_language_at(
                     "packages",
                     &source,
@@ -590,6 +659,33 @@ import "@scope/unversioned";
                 ("zod@4".into(), "npm:zod@4".into()),
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn tsconfig_points_codingpad_at_the_helper_declaration() {
+        let project = Project::prepare(
+            &find_bun(),
+            Imports::default(),
+            false,
+            |_| {},
+            Some("http://127.0.0.1:9"),
+        )
+        .await
+        .unwrap();
+        let root = project.shadow.root();
+        let config: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.join("tsconfig.json")).unwrap()).unwrap();
+        assert_eq!(
+            config["compilerOptions"]["paths"]["codingpad"][0],
+            "./codingpad.d.ts"
+        );
+        assert_eq!(config["compilerOptions"]["strict"], true);
+        assert_eq!(config["compilerOptions"]["types"], json!([]));
+        assert!(config["files"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("globals.d.ts")));
+        assert!(root.join("codingpad.d.ts").is_file());
     }
 
     #[test]

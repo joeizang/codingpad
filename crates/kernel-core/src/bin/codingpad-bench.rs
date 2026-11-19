@@ -1,4 +1,4 @@
-//! Local M1 and M2 performance checks (D38, D48, D55). Run with `just bench`.
+//! Local M1, M2 and M5 performance checks (D38, D48, D55). Run with `just bench`.
 
 use codingpad_kernel_core::{lsp::LanguageServers, KernelEvent, Language, Supervisor};
 use serde_json::json;
@@ -23,6 +23,8 @@ const TARGET_CSHARP_COMPLETION: Duration = Duration::from_millis(300);
 
 /// Roslyn loads the shadow project in the background after it starts.
 const ROSLYN_WARM_TIMEOUT: Duration = Duration::from_secs(90);
+/// The native TypeScript server also loads its project in the background.
+const TYPESCRIPT_WARM_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[cfg(unix)]
 const APP_READY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -225,12 +227,26 @@ async fn run_once() -> bool {
         Err(error) => rows.push(Row::failed("C# completion", "< 300 ms", error)),
     }
 
+    match typescript_completion_latency().await {
+        Ok(measured) => rows.push(Row::time(
+            "TypeScript completion",
+            measured,
+            TARGET_COMPLETION,
+        )),
+        Err(error) if error.contains("language server was not found") => rows.push(Row::skipped(
+            "TypeScript completion",
+            "< 300 ms",
+            "install @typescript/native-preview or set CODINGPAD_TS_LSP",
+        )),
+        Err(error) => rows.push(Row::failed("TypeScript completion", "< 300 ms", error)),
+    }
+
     report(&rows);
     if failures.is_empty() && rows.iter().all(|row| row.status != Status::Fail) {
-        println!("\nAll measured M1 and M2 targets pass.");
+        println!("\nAll measured M1, M2 and M5 targets pass.");
         true
     } else {
-        eprintln!("\nSome M1 or M2 targets did not pass or could not be measured.");
+        eprintln!("\nSome M1, M2 or M5 targets did not pass or could not be measured.");
         false
     }
 }
@@ -284,9 +300,13 @@ async fn dump_first_page(supervisor: &Supervisor) -> Result<Duration, String> {
 }
 
 fn completion_params(uri: &str, character: u32) -> serde_json::Value {
+    completion_params_at(uri, 1, character)
+}
+
+fn completion_params_at(uri: &str, line: u32, character: u32) -> serde_json::Value {
     json!({
         "textDocument": { "uri": uri },
-        "position": { "line": 1, "character": character },
+        "position": { "line": line, "character": character },
         "context": { "triggerKind": 1 },
     })
 }
@@ -507,6 +527,59 @@ async fn csharp_completion_latency() -> Result<Duration, String> {
     measured
 }
 
+async fn typescript_completion_latency() -> Result<Duration, String> {
+    eprintln!("Warming the TypeScript language server...");
+    let servers = LanguageServers::default();
+    let measured = async {
+        servers.begin_session("bench").await;
+        // The empty import clause lists every helper export, including dump.
+        let source = "import {  } from \"codingpad\";\nconst value = 42;\n";
+        let start = servers
+            .start_typescript("bench-ts-lsp", source, "bench", |_| {})
+            .await?;
+        let warm = Instant::now();
+        loop {
+            let result = servers
+                .request(
+                    "bench-ts-lsp",
+                    "textDocument/completion",
+                    completion_params_at(&start.uri, 0, 9),
+                )
+                .await?;
+            if useful_completion(&result, "dump").is_ok() {
+                break;
+            }
+            if warm.elapsed() > TYPESCRIPT_WARM_TIMEOUT {
+                return Err(
+                    "the TypeScript language server did not load the shadow project in time"
+                        .to_owned(),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        servers
+            .did_change(
+                "bench-ts-lsp",
+                "import {  } from \"codingpad\";\nconst value = 42;\nvalue.",
+            )
+            .await?;
+        let started = Instant::now();
+        let result = servers
+            .request(
+                "bench-ts-lsp",
+                "textDocument/completion",
+                csharp_completion_params(&start.uri, 2, 6),
+            )
+            .await?;
+        let elapsed = started.elapsed();
+        useful_completion(&result, "toFixed")?;
+        Ok(elapsed)
+    }
+    .await;
+    servers.shutdown().await;
+    measured
+}
+
 fn report(rows: &[Row]) {
     let metric_width = rows
         .iter()
@@ -528,7 +601,7 @@ fn report(rows: &[Row]) {
         .max("target".len());
 
     println!(
-        "CodingPad M1 and M2 performance ({}, {} build)\n",
+        "CodingPad M1, M2 and M5 performance ({}, {} build)\n",
         std::env::consts::OS,
         if cfg!(debug_assertions) {
             "debug"

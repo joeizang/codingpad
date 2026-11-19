@@ -1,7 +1,19 @@
 use codingpad_kernel_core::lsp::{LanguageServers, LspEvent};
 use serde_json::json;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::timeout;
+
+fn has_label(result: &serde_json::Value, expected: &str) -> bool {
+    result
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item["label"].as_str() == Some(expected)
+                    || item["label"]["label"].as_str() == Some(expected)
+            })
+        })
+}
 
 async fn next_diagnostics(
     receiver: &mut tokio::sync::mpsc::UnboundedReceiver<LspEvent>,
@@ -288,4 +300,242 @@ async fn csharp_code_intelligence_uses_the_shadow_project() {
             .any(|diagnostic| diagnostic["code"] == "CS0103"),
         "reused server sent no current diagnostics: {repeated:?}"
     );
+}
+
+#[tokio::test]
+async fn typescript_code_intelligence_uses_the_shadow_project() {
+    // The TypeScript 7 native server is a separate preview install. Set
+    // CODINGPAD_TS_LSP to opt in to this end-to-end check.
+    if std::env::var_os("CODINGPAD_TS_LSP").is_none() {
+        eprintln!("skipping: set CODINGPAD_TS_LSP to a TypeScript 7 language server");
+        return;
+    }
+    let servers = LanguageServers::default();
+    let source = r#"import {  } from "codingpad";
+import { dump, cache } from "codingpad";
+const value: number = "not a number";
+dump(value);
+cache("answer", () => 42);
+"#;
+    servers.begin_session("test").await;
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let started = timeout(
+        Duration::from_secs(120),
+        servers.start_typescript("typescript", source, "test", move |event| {
+            let _ = sender.send(event);
+        }),
+    )
+    .await
+    .expect("language server startup timed out")
+    .expect("language server failed to start");
+
+    let diagnostics = next_diagnostics(&mut receiver, &started.uri).await;
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == 2322),
+        "expected the assignment type error: {diagnostics:?}"
+    );
+    assert!(
+        !diagnostics.iter().any(|diagnostic| diagnostic["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Cannot find module 'codingpad'"))),
+        "the bundled codingpad types were not visible: {diagnostics:?}"
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == 5102),
+        "the generated project used a setting TypeScript 7 removed: {diagnostics:?}"
+    );
+
+    let mut labels = Vec::new();
+    for _ in 0..40 {
+        let completions = servers
+            .request(
+                "typescript",
+                "textDocument/completion",
+                json!({
+                    "textDocument": { "uri": started.uri },
+                    "position": { "line": 0, "character": 9 },
+                    "context": { "triggerKind": 1 }
+                }),
+            )
+            .await
+            .expect("completion request failed");
+        labels = completions
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|item| {
+                item["label"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| item["label"]["label"].as_str().map(str::to_owned))
+            })
+            .collect();
+        if ["dump", "cache"]
+            .iter()
+            .all(|name| labels.iter().any(|label| label == name))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    for name in ["dump", "cache"] {
+        assert!(
+            labels.iter().any(|label| label == name),
+            "missing {name} completion: {labels:?}"
+        );
+    }
+    servers.stop("typescript").await;
+}
+
+#[tokio::test]
+#[ignore = "installs a versioned package and needs Bun plus network or a warm Bun cache"]
+async fn typescript_code_intelligence_resolves_versioned_packages() {
+    if std::env::var_os("CODINGPAD_TS_LSP").is_none() {
+        eprintln!("skipping: set CODINGPAD_TS_LSP to a TypeScript 7 language server");
+        return;
+    }
+    let servers = LanguageServers::default();
+    let source = r#"import { z } from "zod@3";
+const schema = z.string();
+const value: number = "not a number";
+schema.parse("hi");
+"#;
+    servers.begin_session("test").await;
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let started = timeout(
+        Duration::from_secs(120),
+        servers.start_typescript("typescript-packages", source, "test", move |event| {
+            let _ = sender.send(event);
+        }),
+    )
+    .await
+    .expect("language server startup timed out")
+    .expect("language server failed to start");
+
+    let diagnostics = next_diagnostics(&mut receiver, &started.uri).await;
+    assert!(
+        !diagnostics.iter().any(|diagnostic| diagnostic["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Cannot find module 'zod@3'"))),
+        "the versioned package was not visible: {diagnostics:?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == 2322),
+        "expected the assignment type error: {diagnostics:?}"
+    );
+    servers.stop("typescript-packages").await;
+}
+
+#[tokio::test]
+async fn typescript_completion_is_under_300_ms() {
+    if std::env::var_os("CODINGPAD_TS_LSP").is_none() {
+        eprintln!("skipping: set CODINGPAD_TS_LSP to a TypeScript 7 language server");
+        return;
+    }
+    let servers = LanguageServers::default();
+    let source = "import {  } from \"codingpad\";\nconst value = 42;\n";
+    servers.begin_session("test").await;
+    let started = timeout(
+        Duration::from_secs(120),
+        servers.start_typescript("typescript-latency", source, "test", |_| {}),
+    )
+    .await
+    .expect("language server startup timed out")
+    .expect("language server failed to start");
+
+    let mut warm = false;
+    for _ in 0..40 {
+        let result = servers
+            .request(
+                "typescript-latency",
+                "textDocument/completion",
+                json!({
+                    "textDocument": { "uri": started.uri },
+                    "position": { "line": 0, "character": 9 },
+                    "context": { "triggerKind": 1 }
+                }),
+            )
+            .await
+            .expect("completion request failed");
+        if has_label(&result, "dump") {
+            warm = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(warm, "the helper completion never loaded");
+
+    // Warm the number member list once, then time the first completion after a
+    // small edit. This mirrors the D38 warm-completion target.
+    servers
+        .did_change(
+            "typescript-latency",
+            "import {  } from \"codingpad\";\nconst value = 42;\nvalue.",
+        )
+        .await
+        .expect("document change failed");
+    let mut members = false;
+    for _ in 0..40 {
+        let result = servers
+            .request(
+                "typescript-latency",
+                "textDocument/completion",
+                json!({
+                    "textDocument": { "uri": started.uri },
+                    "position": { "line": 2, "character": 6 },
+                    "context": { "triggerKind": 2, "triggerCharacter": "." }
+                }),
+            )
+            .await
+            .expect("completion request failed");
+        if has_label(&result, "toFixed") {
+            members = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(members, "the number member completion never loaded");
+
+    servers
+        .did_change(
+            "typescript-latency",
+            "import {  } from \"codingpad\";\nconst value = 42;\nvalue.toF",
+        )
+        .await
+        .expect("document change failed");
+    let measured = Instant::now();
+    let result = servers
+        .request(
+            "typescript-latency",
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": started.uri },
+                "position": { "line": 2, "character": 9 },
+                "context": { "triggerKind": 1 }
+            }),
+        )
+        .await
+        .expect("completion request failed");
+    let elapsed = measured.elapsed();
+    eprintln!(
+        "TypeScript completion: {:.1} ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
+    assert!(
+        has_label(&result, "toFixed"),
+        "unexpected completion: {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "TypeScript completion took {elapsed:?}"
+    );
+    servers.stop("typescript-latency").await;
 }

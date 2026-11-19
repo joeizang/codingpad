@@ -16,6 +16,7 @@ pub mod shadow;
 pub mod store;
 pub mod text;
 pub mod toolchains;
+mod ts7;
 mod typescript;
 pub mod updates;
 
@@ -536,7 +537,7 @@ impl Supervisor {
             }
         }
         let typescript_project = if language == Language::Typescript {
-            let prepare = self.shadow_projects.prepare_typescript(script_id, source, typescript_imports, |text| {
+            let prepare = self.shadow_projects.prepare_typescript(script_id, source, typescript_imports, false, |text| {
                 emit(KernelEvent {
                     method: "stream".into(),
                     params: json!({"runId": 0, "stream": "stderr", "text": format!("{text}\n")}),

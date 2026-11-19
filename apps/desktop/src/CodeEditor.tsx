@@ -5,7 +5,6 @@ import * as monaco from "monaco-editor/editor/editor.api.js";
 import "monaco-editor/languages/definitions/python/register.js";
 import "monaco-editor/languages/definitions/csharp/register.js";
 import "monaco-editor/languages/definitions/sql/register.js";
-// Syntax highlighting only. The TS language server arrives in M5.4.
 import "monaco-editor/languages/definitions/typescript/register.js";
 import { scriptLanguageDetails } from "./scriptLanguages";
 import { createSqlCompletions } from "./sqlCompletions";
@@ -94,7 +93,7 @@ type Props = {
 
 const EMPTY_DIAGNOSTICS: CompileDiagnostic[] = [];
 
-const COMPLETION_TRIGGERS = [".", "'", '"', "/"];
+const COMPLETION_TRIGGERS = [".", "'", '"', "/", "`", "@", "<"];
 
 type MonacoCompletionItem = monaco.languages.CompletionItem & {
   data?: unknown;
@@ -148,7 +147,9 @@ const directiveKey = (source: string, language: string) =>
   language === "csharp" ? csharpDirectiveKey(source) : inlineDependencyKey(source);
 
 const supportsCodeIntelligence = (language: string) =>
-  language === "python" || language === "csharp";
+  language === "python" ||
+  language === "csharp" ||
+  language === "typescript";
 
 function attachedConnection(source: string): string {
   const first = source.split(/\r?\n/, 1)[0] ?? "";
@@ -218,6 +219,15 @@ export default function CodeEditor({
     return () => window.clearTimeout(timer);
   }, [source, dependencyKey, language]);
 
+  const [typescriptProject, setTypescriptProject] = useState<{
+    id: string;
+    uri: string;
+  } | null>(null);
+  const typescriptKey =
+    language === "typescript" && typescriptProject?.id === id
+      ? typescriptProject.uri
+      : "";
+
   const applyDiagnostics = (diagnostics: LspDiagnostic[]) => {
     onDiagnosticsRef.current?.(summarizeDiagnostics(diagnostics));
     const model = editorRef.current?.getModel();
@@ -230,7 +240,11 @@ export default function CodeEditor({
       "codingpad-lsp",
       diagnosticMarkers(
         diagnostics,
-        language === "csharp" ? "csharp" : "basedpyright",
+        language === "csharp"
+          ? "csharp"
+          : language === "typescript"
+            ? "typescript"
+            : "basedpyright",
       ) as monaco.editor.IMarkerData[],
     );
   };
@@ -265,15 +279,33 @@ export default function CodeEditor({
   }, [language, compileDiagnostics]);
 
   useEffect(() => {
-    if (!interactive || language !== "typescript") return;
+    if (!interactive || language !== "typescript") {
+      setTypescriptProject(null);
+      return;
+    }
     let stopped = false;
     const timer = window.setTimeout(() => {
+      const update = (uri: string) =>
+        setTypescriptProject((current) =>
+          current?.id === id && current.uri === uri ? current : { id, uri },
+        );
       void invoke("begin_language_server_session", { session: LSP_SESSION })
         .then(() => {
-          if (stopped) return;
-          return invoke("prepare_typescript_project", { scriptId: id, source, session: LSP_SESSION });
+          if (stopped) return null;
+          return invoke<{ uri: string } | null>("prepare_typescript_project", {
+            scriptId: id,
+            source,
+            session: LSP_SESSION,
+          });
         })
-        .catch(() => undefined); // Run reports package preparation errors in Results.
+        .then((result) => {
+          if (!stopped) update(result?.uri ?? "unavailable");
+        })
+        .catch(() => {
+          // Run reports package preparation errors in Results. Keep the LSP
+          // path alive so plain TypeScript and helper types still work.
+          if (!stopped) update("unavailable");
+        });
     }, 400);
     return () => {
       stopped = true;
@@ -289,6 +321,14 @@ export default function CodeEditor({
         errors: 0,
         warnings: 0,
         message: "Code intelligence unavailable",
+      });
+      return;
+    }
+    if (language === "typescript" && !typescriptKey) {
+      onDiagnosticsRef.current?.({
+        errors: 0,
+        warnings: 0,
+        message: "Preparing code intelligence…",
       });
       return;
     }
@@ -368,6 +408,7 @@ export default function CodeEditor({
     connectionKey,
     language,
     path,
+    typescriptKey,
     interactive,
   ]);
 

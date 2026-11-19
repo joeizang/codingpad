@@ -35,7 +35,7 @@ use crate::{
     databases::SqlManager,
     find_uv, roslyn,
     shadow::{ShadowProject, ShadowProjects},
-    toolchains, typescript, RUNTIME,
+    toolchains, ts7, typescript, RUNTIME,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -140,27 +140,68 @@ impl LanguageServers {
         source: &str,
         session: &str,
     ) -> Result<Option<LspStartResult>, String> {
+        let project = self
+            .prepare_typescript_workspace(script_id, source, session)
+            .await?;
+        Ok(Some(LspStartResult {
+            uri: project.shadow.document_uri().to_owned(),
+        }))
+    }
+
+    /// Prepare the shared project and return the document `tsgo` should open.
+    ///
+    /// The shared manager owns package installation and the staged document.
+    /// A syntax error or an unsupported import version still gets a document so
+    /// the language server can show the problem. An install failure falls back
+    /// to a package-free project, keeping helper types and plain TypeScript
+    /// available instead of disabling code intelligence for the tab.
+    async fn prepare_typescript_workspace(
+        &self,
+        script_id: &str,
+        source: &str,
+        session: &str,
+    ) -> Result<Arc<typescript::Project>, String> {
         if script_id.is_empty() {
             return Err("A script id is required".into());
         }
         self.check_session(script_id, session).await?;
-        let Some(script) = typescript::parse(source)? else {
-            return Ok(None);
-        };
-        let project = self
+        let imports = typescript::parse(source)
+            .ok()
+            .flatten()
+            .map(|script| script.imports);
+        let project = match self
             .shadow_projects
-            .prepare_typescript(script_id, source, Some(script.imports), |_| {})
-            .await?;
-        // Close may have removed the previous project before this request
-        // registered with the shared manager.
+            .prepare_typescript(script_id, source, imports, true, |_| {})
+            .await
+        {
+            Ok(project) => project,
+            Err(error) => {
+                // Close may have removed the previous project before this
+                // request registered with the shared manager.
+                if self.closed.lock().await.contains(script_id) {
+                    self.shadow_projects.close(script_id).await;
+                    return Err("The script was closed".into());
+                }
+                self.check_session(script_id, session).await?;
+                // An install failure must not disable code intelligence. A
+                // package-free project still provides the codingpad helper
+                // types, and the unresolved import appears as a diagnostic.
+                self.shadow_projects
+                    .prepare_typescript(script_id, source, None, true, |_| {})
+                    .await
+                    .map_err(|fallback| {
+                        format!(
+                            "Could not prepare TypeScript code intelligence: {error}\n{fallback}"
+                        )
+                    })?
+            }
+        };
         if self.closed.lock().await.contains(script_id) {
             self.shadow_projects.close(script_id).await;
             return Err("The script was closed".into());
         }
         self.check_session(script_id, session).await?;
-        Ok(Some(LspStartResult {
-            uri: project.shadow.document_uri().to_owned(),
-        }))
+        Ok(project)
     }
 
     async fn data_context(&self, source: &str) -> Option<GeneratedContext> {
@@ -404,6 +445,99 @@ impl LanguageServers {
         })
     }
 
+    /// Start the TypeScript 7 native language server on the shared shadow
+    /// project that Run and the editor both use.
+    pub async fn start_typescript(
+        &self,
+        script_id: &str,
+        source: &str,
+        session: &str,
+        emit: impl Fn(LspEvent) + Send + Sync + 'static,
+    ) -> Result<LspStartResult, String> {
+        if script_id.is_empty() {
+            return Err("A script id is required".into());
+        }
+        // Fail before preparing if the server is missing: the editor can still
+        // run scripts, and there is no reason to install packages for a server
+        // that cannot start.
+        let server = ts7::find(self.data_dir.as_deref())?;
+        // Prepare before taking the per-script start lock. A package install
+        // must not make another start wait on the network.
+        let project = self
+            .prepare_typescript_workspace(script_id, source, session)
+            .await?;
+        let restart_key = project.shadow.document_uri().to_owned();
+        let events: EventSink = Arc::new(emit);
+
+        let start = {
+            let mut starts = self.starts.lock().await;
+            starts
+                .entry(script_id.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _start = start.lock().await;
+        self.check_session(script_id, session).await?;
+        let existing = self.servers.lock().await.get(script_id).cloned();
+        if let Some(existing) = existing {
+            if existing.restart_key == restart_key && existing.alive() {
+                existing.set_events(events.clone());
+                if existing.did_change(source).await.is_ok() {
+                    self.check_session(script_id, session).await?;
+                    return Ok(LspStartResult {
+                        uri: existing.document_uri.clone(),
+                    });
+                }
+            }
+            self.servers.lock().await.remove(script_id);
+            existing.stop().await;
+        }
+
+        let mut command = server.command();
+        command.current_dir(project.shadow.root());
+        let server = LspServer::start(
+            command,
+            Workspace::TypeScript(project),
+            "typescript",
+            "TypeScript",
+            restart_key,
+            "The TypeScript 7 language server was not found. Install it with `bun add -g @typescript/native-preview`, or set CODINGPAD_TS_LSP to the tsgo executable.".to_owned(),
+            events,
+        )
+        .await?;
+        let previous = self
+            .servers
+            .lock()
+            .await
+            .insert(script_id.to_owned(), server.clone());
+        if let Some(previous) = previous {
+            previous.stop().await;
+        }
+
+        if let Err(error) = server.initialize().await {
+            let message = server.failure_message(error).await;
+            if self.remove_if_same(script_id, &server).await {
+                server.stop().await;
+            }
+            return Err(message);
+        }
+        if let Err(error) = server.did_open(source).await {
+            let message = server.failure_message(error).await;
+            if self.remove_if_same(script_id, &server).await {
+                server.stop().await;
+            }
+            return Err(message);
+        }
+        if !self.is_current(script_id, &server).await {
+            server.stop().await;
+            return Err("The language server was stopped".into());
+        }
+        self.check_session(script_id, session).await?;
+        Ok(LspStartResult {
+            uri: server.document_uri.clone(),
+        })
+    }
+
     async fn check_session(&self, script_id: &str, session: &str) -> Result<(), String> {
         if self.closed.lock().await.contains(script_id) {
             return Err("The script was closed".into());
@@ -544,6 +678,7 @@ struct LspServer {
 enum Workspace {
     Python(PythonWorkspace),
     Csharp(ShadowProject),
+    TypeScript(Arc<typescript::Project>),
 }
 
 impl Workspace {
@@ -551,6 +686,7 @@ impl Workspace {
         match self {
             Workspace::Python(workspace) => &workspace.root,
             Workspace::Csharp(workspace) => workspace.root(),
+            Workspace::TypeScript(project) => project.shadow.root(),
         }
     }
 
@@ -558,6 +694,7 @@ impl Workspace {
         match self {
             Workspace::Python(workspace) => &workspace.document_uri,
             Workspace::Csharp(workspace) => workspace.document_uri(),
+            Workspace::TypeScript(project) => project.shadow.document_uri(),
         }
     }
 
@@ -565,13 +702,14 @@ impl Workspace {
         match self {
             Workspace::Python(workspace) => &workspace.root_uri,
             Workspace::Csharp(workspace) => workspace.root_uri(),
+            Workspace::TypeScript(project) => project.shadow.root_uri(),
         }
     }
 
     fn extra_paths(&self) -> &[String] {
         match self {
             Workspace::Python(workspace) => &workspace.extra_paths,
-            Workspace::Csharp(_) => &[],
+            Workspace::Csharp(_) | Workspace::TypeScript(_) => &[],
         }
     }
 
@@ -655,7 +793,7 @@ impl LspServer {
             restart_key,
             language_id,
             server_name,
-            pull_diagnostics: language_id == "csharp",
+            pull_diagnostics: matches!(language_id, "csharp" | "typescript"),
             document_uri,
             workspace_uri: root_uri,
             extra_paths,
@@ -670,6 +808,7 @@ impl LspServer {
             document_uri: server.document_uri.clone(),
             workspace_uri: server.workspace_uri.clone(),
             extra_paths: server.extra_paths.clone(),
+            server_name,
             version,
         };
         tokio::spawn(read_loop(
@@ -780,11 +919,16 @@ impl LspServer {
                     "publishDiagnostics": {
                         "relatedInformation": true,
                         "versionSupport": true
+                    },
+                    "diagnostic": {
+                        "dynamicRegistration": false,
+                        "relatedDocumentSupport": true
                     }
                 },
                 "workspace": {
                     "workspaceFolders": true,
-                    "configuration": true
+                    "configuration": true,
+                    "didChangeConfiguration": { "dynamicRegistration": true }
                 },
                 "window": {
                     "workDoneProgress": true
@@ -1043,6 +1187,7 @@ struct ResponseConfig {
     document_uri: String,
     workspace_uri: String,
     extra_paths: Vec<String>,
+    server_name: &'static str,
     version: Arc<Mutex<i64>>,
 }
 
@@ -1110,9 +1255,10 @@ async fn read_loop(
     alive.store(false, Ordering::Relaxed);
     let mut pending = pending.lock().await;
     for (_, sender) in pending.drain() {
-        let _ = sender.send(Err(
-            "The Python language server stopped. Reopen the tab to restart it.".to_owned(),
-        ));
+        let _ = sender.send(Err(format!(
+            "The {} language server stopped. Reopen the tab to restart it.",
+            config.server_name
+        )));
     }
 }
 
@@ -1170,6 +1316,9 @@ fn configuration_result(message: &Value, config: &ResponseConfig) -> Value {
                     "basedpyright" => json!({
                         "analysis": analysis_settings(config)
                     }),
+                    // The TypeScript server uses its own defaults; an empty
+                    // object answers the registration without overriding them.
+                    "typescript" | "javascript" | "js/ts" => json!({}),
                     _ => Value::Null,
                 }
             })
@@ -1379,15 +1528,17 @@ print("hi")
             document_uri: "file:///tmp/workspace/script.py".into(),
             workspace_uri: "file:///tmp/workspace".into(),
             extra_paths: vec!["/tmp/runtime".into()],
+            server_name: "Python",
             version: Arc::new(Mutex::new(0)),
         };
         let result = configuration_result(
-            &json!({"params": {"items": [{"section": "python"}, {"section": "python.analysis"}, {"section": "other"}]}}),
+            &json!({"params": {"items": [{"section": "python"}, {"section": "python.analysis"}, {"section": "typescript"}, {"section": "other"}]}}),
             &config,
         );
         assert_eq!(result[0]["analysis"]["extraPaths"][0], "/tmp/runtime");
         assert_eq!(result[1]["extraPaths"][0], "/tmp/runtime");
-        assert_eq!(result[2], Value::Null);
+        assert_eq!(result[2], json!({}));
+        assert_eq!(result[3], Value::Null);
     }
 
     #[tokio::test]

@@ -605,12 +605,15 @@ Bind values as an array and use the database's placeholders (`?` for SQLite,
 `db.query(sql, parameters)` returns at most 10,000 rows and exposes `columns`
 and `truncated` on the result. Results preserve headers for empty queries and
 use suffixes such as `id_2` for duplicate column names.
-`db.execute(sql, parameters)` returns the number of affected rows.
+`db.execute(sql, parameters)` returns the number of affected rows. For a SQL
+Server batch, the count is the sum reported across statements.
 
 The first database call opens the connection using the saved settings and vault
 password. CodingPad closes it when the run ends. SQLite and PostgreSQL use Bun's
 built-in clients. PostgreSQL requires Bun 1.4.4 or later for column metadata.
 The first run with a SQL Server connection installs the `mssql` driver through Bun.
+Relative SQLite connection paths resolve against the CodingPad process's
+working directory across script languages.
 
 Click **Connections…** to add a SQLite, PostgreSQL or SQL Server database, then
 **+ SQL** or open a `.sql` file. The first line names the connection; the rest is plain SQL:

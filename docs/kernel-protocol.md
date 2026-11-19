@@ -488,8 +488,17 @@ The worker exposes the run's `db` and `secret()` as globals and exports from
 run finishes. For SQL Server, `run.params.sql_server_driver` names the private
 project directory from which the worker resolves `mssql`. The field is null for
 other connections. The worker removes the credential fields from `workerData`
-before loading user modules. Query dumps retain column headers for empty
-results and set `truncated` when more than 10,000 rows were returned by the driver.
+before loading user modules. `run.params.final_expression` supplies the optional
+source range for the automatic dump.
+
+Query dumps retain column headers for empty results. Duplicate names gain the
+first unused suffix starting at `_2`, including collisions with earlier
+suffixed names. Results keep 10,000 rows and mark the table `truncated` when an
+additional row is present. SQLite iterates rows and PostgreSQL fetches up to
+10,001 rows through a cursor. PostgreSQL statements that cannot run in a
+cursor, such as `INSERT … RETURNING`, may still buffer their result. SQL Server
+streams its result sets and discards rows beyond the limit while the request
+finishes.
 
 Since M5.3, scripts can use Bun's versioned npm imports, such as
 `import { z } from "zod@3"`, with the same syntax in CodingPad and standalone Bun.

@@ -99,6 +99,7 @@ async function retire(worker: Worker) {
 }
 
 function run(id: number, params: Omit<Script, "runId">) {
+  const { connection, sql_server_driver, secrets, secret_errors, ...script } = params;
   const notify = (method: string, params: object) => {
     if (active?.id === id) send({ method, params: { runId: id, ...params } });
   };
@@ -108,7 +109,10 @@ function run(id: number, params: Omit<Script, "runId">) {
   cachePort.on("message", (request: CacheRequest) =>
     answerCache(request, cachePort, new Int32Array(cacheFlag)));
   const worker = new Worker(workerUrl, {
-    workerData: { ...params, runId: id, cachePort: workerCachePort, cacheFlag },
+    workerData: {
+      ...script, runId: id, cachePort: workerCachePort, cacheFlag,
+      credentials: { connection, sql_server_driver, secrets, secret_errors },
+    },
     transferList: [workerCachePort],
     stdout: true, stderr: true,
   });

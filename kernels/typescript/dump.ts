@@ -260,7 +260,7 @@ export class Dumps {
 
   #arrayTable(
     id: string, value: unknown[], columns: string[], path: object[],
-    database?: { columns: readonly string[]; truncated: boolean },
+    metadata?: { columns: readonly string[]; truncated: boolean },
   ): Node {
     const total = value.length;
     const slice = (offset: number, size: number) =>
@@ -273,11 +273,11 @@ export class Dumps {
       const rows = slice(offset, size).map((row) =>
         cells(row, columns).map((cell) => this.#preview(cell, remaining, path, 0, true)));
       const end = offset + rows.length;
-      return { id, kind: "table", type: database ? "DatabaseRows" : "Array",
+      return { id, kind: "table", type: metadata ? "DatabaseRows" : "Array",
         columns: columns.map((name) => ({ name: name.slice(0, MAX_TEXT) })),
-        rows, total, truncated: database?.truncated, next: end < total ? String(end) : null, handle };
+        rows, total, truncated: metadata?.truncated, next: end < total ? String(end) : null, handle };
     };
-    let exportColumns = database?.columns;
+    let exportColumns = metadata?.columns;
     const handle = this.#keep((offset, size) => page(this.#id(), offset, size), async (offset, size) => {
       exportColumns ??= columnsFor((function* () {
         for (let index = 0; index < total; index++) yield property(value, index);

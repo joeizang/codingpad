@@ -457,6 +457,11 @@ impl Supervisor {
         if script_id.is_empty() {
             return Err("A script id is required".into());
         }
+        let typescript_script = if language == Language::Typescript {
+            typescript::parse(source)?
+        } else {
+            None
+        };
         let slot = self
             .kernels
             .lock()
@@ -472,7 +477,10 @@ impl Supervisor {
             Some(store) => {
                 let store = Arc::clone(store);
                 // Bun's require() can also load scripts that access secret().
-                let names = if language == Language::Typescript && source.contains("require") {
+                let names = if typescript_script
+                    .as_ref()
+                    .is_some_and(|script| script.uses_require)
+                {
                     None
                 } else {
                     referenced_secret_names(source)
@@ -497,9 +505,7 @@ impl Supervisor {
                     .ok_or_else(|| {
                         format!("Connection \"{name}\" was not found. Add it in Connections…")
                     })?;
-                if language == Language::Typescript
-                    && connection.kind == databases::DatabaseKind::Sqlite
-                {
+                if connection.kind == databases::DatabaseKind::Sqlite {
                     if let Some(path) = connection
                         .path
                         .as_deref()
@@ -602,6 +608,7 @@ impl Supervisor {
                 &self.shadow_projects,
                 script_id,
                 source,
+                typescript_script,
                 connection_kind,
                 |text| {
                     emit(KernelEvent {
@@ -674,7 +681,7 @@ impl Supervisor {
         }
         let kernel = guard.as_mut().unwrap();
         let data = data.map(|data| json!({"source": data.source, "connection": data.connection}));
-        let params = json!({"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection, "data": data, "eager": self.eager_dumps, "finalExpression": final_expression, "sql_server_driver": sql_server_driver});
+        let params = json!({"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection, "data": data, "eager": self.eager_dumps, "final_expression": final_expression, "sql_server_driver": sql_server_driver});
         let result = tokio::select! {
             result = kernel.run(params, &mut emit, &mut stop) => result,
             _ = closed.changed() => Err("Script was closed".into()),

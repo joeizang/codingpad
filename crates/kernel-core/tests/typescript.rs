@@ -406,7 +406,8 @@ fn handle(node: &Value) -> &str {
 
 #[tokio::test]
 async fn typescript_queries_attached_sqlite_and_reads_current_secrets() {
-    let directory = tempfile::tempdir().unwrap();
+    let working_directory = std::env::current_dir().unwrap();
+    let directory = tempfile::tempdir_in(&working_directory).unwrap();
     let path = directory.path().join("saved #1.sqlite");
     let connection = rusqlite::Connection::open(&path).unwrap();
     connection
@@ -419,7 +420,13 @@ async fn typescript_queries_attached_sqlite_and_reads_current_secrets() {
             id: String::new(),
             name: "sample".into(),
             kind: DatabaseKind::Sqlite,
-            path: Some(path.to_str().unwrap().into()),
+            path: Some(
+                path.strip_prefix(&working_directory)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .into(),
+            ),
             host: None,
             port: None,
             database: None,
@@ -455,8 +462,8 @@ dump(await db.execute("INSERT INTO items VALUES (?)", ["Grace"]));
 dump(await db.query("SELECT 1 AS id, 2 AS id, 3 AS id_2"));
 dump(await db.query("SELECT name FROM items WHERE 1 = 0"));
 const rows = await db.query(`
-  WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM nums WHERE n < 10001)
-  SELECT n FROM nums
+  WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM nums WHERE n < 1000000)
+  SELECT CASE WHEN n > 10001 THEN abs(-9223372036854775808) ELSE n END AS n FROM nums
 `);
 if (rows.length !== 10000 || !rows.truncated || rows.columns[0] !== "n") {
   throw new Error("Database row limit or metadata is wrong");
@@ -564,18 +571,20 @@ impl Vault for TestVault {
 #[tokio::test]
 #[ignore = "requires CODINGPAD_TEST_POSTGRES_* and CODINGPAD_TEST_SQLSERVER_* connection settings"]
 async fn typescript_queries_postgres_and_sql_server_with_vault_passwords() {
-    for (kind, prefix, query, insert) in [
+    for (kind, prefix, query, insert, large_query) in [
         (
             DatabaseKind::Postgres,
             "POSTGRES",
             "SELECT $1::text AS name",
             "INSERT INTO codingpad_test VALUES ($1)",
+            "SELECT CASE WHEN n > 10001 THEN 1 / (n - n) ELSE n END AS n FROM generate_series(1, 1000000) AS n",
         ),
         (
             DatabaseKind::SqlServer,
             "SQLSERVER",
             "SELECT @p1 AS name",
             "DECLARE @sample TABLE(name NVARCHAR(32)); INSERT INTO @sample VALUES (@p1)",
+            "SELECT TOP (20000) 1 AS n FROM sys.all_objects a CROSS JOIN sys.all_objects b",
         ),
     ] {
         let env = |key| {
@@ -611,7 +620,11 @@ async fn typescript_queries_postgres_and_sql_server_with_vault_passwords() {
         let supervisor = Supervisor::with_data_dir_and_secrets(directory.path().into(), secrets)
             .with_connections(connections);
         let setup = if kind == DatabaseKind::Postgres {
-            r#"await db.execute("CREATE TEMPORARY TABLE codingpad_test (name TEXT)");"#
+            r#"
+await db.execute("CREATE TEMPORARY TABLE codingpad_test (name TEXT)");
+const written = await db.query("INSERT INTO codingpad_test VALUES ($1) RETURNING name", [name]);
+if (written[0].name !== name) throw new Error("Expected the returned row from INSERT");
+"#
         } else {
             ""
         };
@@ -620,7 +633,7 @@ async fn typescript_queries_postgres_and_sql_server_with_vault_passwords() {
 import {{ dump }} from "codingpad";
 import {{ workerData }} from "node:worker_threads";
 const name = "D'Angelo";
-if (workerData.connection || workerData.secrets || workerData.secret_errors) {{
+if (workerData.credentials || workerData.connection || workerData.secrets || workerData.secret_errors) {{
   throw new Error("Run credentials were exposed via workerData");
 }}
 try {{ secret("{secret_name}"); throw new Error("Reserved secret was exposed"); }}
@@ -628,6 +641,9 @@ catch (error) {{ if (!error.message.includes("was not found")) throw error; }}
 dump(await db.query("{query}", [name]));
 dump(await db.query("SELECT 1 AS id, 2 AS id"));
 dump(await db.query("SELECT 1 AS id WHERE 1 = 0"));
+const rows = await db.query("{large_query}");
+if (rows.length !== 10000 || !rows.truncated) throw new Error("Expected a truncated result");
+if ((await db.query("SELECT 1 AS id"))[0].id !== 1) throw new Error("Connection not reusable");
 {setup}
 await db.execute("{insert}", [name])
 "#

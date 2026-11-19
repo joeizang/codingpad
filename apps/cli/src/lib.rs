@@ -65,20 +65,6 @@ pub enum ScriptLanguage {
     Sql,
 }
 
-impl ScriptLanguage {
-    const KERNELS: [(Self, Language); 3] = [
-        (Self::Python, Language::Python),
-        (Self::Csharp, Language::Csharp),
-        (Self::Typescript, Language::Typescript),
-    ];
-
-    fn kernel(self) -> Option<Language> {
-        Self::KERNELS
-            .into_iter()
-            .find_map(|(script, kernel)| (script == self).then_some(kernel))
-    }
-}
-
 /// How the run prints its dumps (D28).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -110,24 +96,21 @@ pub fn language_for(path: &Path) -> Result<ScriptLanguage, String> {
         .and_then(|extension| extension.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if extension == "sql" {
-        return Ok(ScriptLanguage::Sql);
+    match extension.as_str() {
+        ext if ext == Language::Python.extension() => Ok(ScriptLanguage::Python),
+        ext if ext == Language::Csharp.extension() => Ok(ScriptLanguage::Csharp),
+        ext if ext == Language::Typescript.extension() => Ok(ScriptLanguage::Typescript),
+        "sql" => Ok(ScriptLanguage::Sql),
+        ext => Err(format!(
+            "Cannot run \"{}\": expected a .py, .cs, .ts or .sql script{}.",
+            path.display(),
+            if ext.is_empty() {
+                String::new()
+            } else {
+                format!(", not .{ext}")
+            }
+        )),
     }
-    if let Some((script, _)) = ScriptLanguage::KERNELS
-        .into_iter()
-        .find(|(_, kernel)| kernel.extension() == extension)
-    {
-        return Ok(script);
-    }
-    Err(format!(
-        "Cannot run \"{}\": expected a .py, .cs, .ts or .sql script{}.",
-        path.display(),
-        if extension.is_empty() {
-            String::new()
-        } else {
-            format!(", not .{extension}")
-        }
-    ))
 }
 
 /// Run one script and return the process exit code, printing dumps as text.
@@ -213,35 +196,36 @@ async fn run_file_in(
         Some(report) => Recorder::Html(report.clone()),
         None => Recorder::Text(Output::default()),
     };
+    let mut run_kernel = async |kernel_language| {
+        // Use the same header connection and db client as the desktop,
+        // including generated data models for Python and C#.
+        let (data, data_error) =
+            codingpad_kernel_core::attached_data_context(&sql, &source, kernel_language).await;
+        if let Some(error) = data_error {
+            recorder.stderr(format!("{error}\n"));
+        }
+        // The user's path keeps diagnostics short and clickable.
+        supervisor
+            .run_language_at_with_data(
+                &script_id,
+                &source,
+                kernel_language,
+                Some(&script_id),
+                data,
+                |event| recorder.record(&event, path),
+            )
+            .await
+            .map(|result| Outcome {
+                ok: result.ok,
+                stopped: result.stopped,
+            })
+    };
     let result = match language {
+        ScriptLanguage::Python => run_kernel(Language::Python).await,
+        ScriptLanguage::Csharp => run_kernel(Language::Csharp).await,
+        ScriptLanguage::Typescript => run_kernel(Language::Typescript).await,
         ScriptLanguage::Sql => {
             run_sql_script(&sql, &script_id, &source, &absolute, &mut recorder).await
-        }
-        script_language => {
-            let kernel_language = script_language.kernel().expect("kernel script language");
-            // Use the same header connection and db client as the desktop,
-            // including generated data models for Python and C#.
-            let (data, data_error) =
-                codingpad_kernel_core::attached_data_context(&sql, &source, kernel_language).await;
-            if let Some(error) = data_error {
-                recorder.stderr(format!("{error}\n"));
-            }
-            // The user's path keeps diagnostics short and clickable.
-            let script = path;
-            supervisor
-                .run_language_at_with_data(
-                    &script_id,
-                    &source,
-                    kernel_language,
-                    Some(&script_id),
-                    data,
-                    |event| recorder.record(&event, script),
-                )
-                .await
-                .map(|result| Outcome {
-                    ok: result.ok,
-                    stopped: result.stopped,
-                })
         }
     };
 

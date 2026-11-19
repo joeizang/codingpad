@@ -37,6 +37,9 @@ pub(crate) fn find(data_dir: Option<&Path>) -> Result<Ts7, String> {
 }
 
 fn find_with(data_dir: Option<&Path>, explicit: Option<OsString>) -> Result<Ts7, String> {
+    let bun = data_dir
+        .map(crate::toolchains::resolve_bun)
+        .unwrap_or_else(crate::typescript::find_bun);
     let mut candidates = Vec::new();
     if let Some(path) = explicit {
         candidates.push(PathBuf::from(path));
@@ -52,7 +55,7 @@ fn find_with(data_dir: Option<&Path>, explicit: Option<OsString>) -> Result<Ts7,
         candidates.extend(server_files(&home.join(".bun/bin")));
     }
     for candidate in candidates {
-        if let Some(server) = resolve(&candidate) {
+        if let Some(server) = resolve(&candidate, &bun) {
             return Ok(server);
         }
     }
@@ -78,7 +81,7 @@ fn server_files_for(directory: &Path, windows: bool) -> Vec<PathBuf> {
     }
 }
 
-fn resolve(candidate: &Path) -> Option<Ts7> {
+fn resolve(candidate: &Path, bun: &Path) -> Option<Ts7> {
     if !candidate.is_file() {
         return None;
     }
@@ -91,7 +94,7 @@ fn resolve(candidate: &Path) -> Option<Ts7> {
             });
         }
         return Some(Ts7 {
-            program: crate::typescript::find_bun(),
+            program: bun.to_path_buf(),
             prefix: vec![shim.into_os_string()],
         });
     }
@@ -103,7 +106,7 @@ fn resolve(candidate: &Path) -> Option<Ts7> {
             });
         }
         return Some(Ts7 {
-            program: crate::typescript::find_bun(),
+            program: bun.to_path_buf(),
             prefix: vec![candidate.as_os_str().to_owned()],
         });
     }
@@ -270,12 +273,26 @@ mod tests {
         fs::create_dir_all(native.parent().unwrap()).unwrap();
         fs::write(&native, "").unwrap();
 
-        let server = resolve(&shim).unwrap();
+        let server = resolve(&shim, Path::new("bun")).unwrap();
         assert_eq!(
             fs::canonicalize(&server.program).unwrap(),
             fs::canonicalize(&native).unwrap()
         );
         assert!(server.prefix.is_empty());
+    }
+
+    #[test]
+    fn a_javascript_shim_without_a_native_package_runs_on_the_resolved_bun() {
+        let directory = tempfile::tempdir().unwrap();
+        let shim = directory
+            .path()
+            .join("node_modules/@typescript/native-preview/bin/tsgo");
+        fs::create_dir_all(shim.parent().unwrap()).unwrap();
+        fs::write(&shim, "#!/usr/bin/env node\n").unwrap();
+        let bun = Path::new("/app/toolchains/bun/1.4.2/bun");
+        let server = resolve(&shim, bun).unwrap();
+        assert_eq!(server.program, bun);
+        assert_eq!(server.prefix, [shim.into_os_string()]);
     }
 
     #[test]

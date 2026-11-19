@@ -443,7 +443,11 @@ token. Raw writes to file descriptors 1 and 2 go to the application's inherited
 stdout and stderr and cannot corrupt the protocol.
 
 Each open script keeps a warm Bun process. Each run gets a fresh worker in that
-process. The run completes after the top-level module settles and the initial
+process. Since M5.5, the supervisor resolves Bun from `PATH`, `BUN_INSTALL/bin`
+and `~/.bun/bin`, then from CodingPad's private copy under the app data folder.
+The user's own Bun always wins, a one-click install is picked up by the next run
+without restarting the app, and an interrupted private install is replaced on
+retry. The run completes after the top-level module settles and the initial
 pages of any dumped iterables are ready. A worker with preview handles stays
 available for `expand` and `export_rows`. The next run asks unfinished iterators
 to close, then terminates the worker with a bounded wait and starts a fresh

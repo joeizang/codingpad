@@ -34,9 +34,8 @@ const RUNTIME: &str = include_str!("../../../runtimes/typescript/codingpad/index
 const CODINGPAD_TYPES: &str = include_str!("../../../runtimes/typescript/codingpad/index.d.ts");
 const FALLBACK_GLOBALS: &str = include_str!("../../../runtimes/typescript/codingpad/globals.d.ts");
 
-/// Pinned with the Bun version CI installs (1.4.2). Bump it deliberately with
-/// the CI Bun pin and the TypeScript code-intelligence tests.
-const BUN_TYPES_VERSION: &str = "1.4.2";
+/// Pinned with the Bun version CI installs and the private installer uses.
+const BUN_TYPES_VERSION: &str = crate::toolchains::BUN_VERSION;
 
 pub(crate) fn command(bun: &Path, project: &Project) -> Result<(Command, Arc<TempDir>), String> {
     let files = tempfile::tempdir().map_err(|error| error.to_string())?;
@@ -214,7 +213,7 @@ async fn install_bun_types(bun: &Path, root: &Path) -> bool {
 
 pub(crate) fn bun_not_found(error: &io::Error) -> Option<String> {
     (error.kind() == io::ErrorKind::NotFound).then(|| {
-        "Bun was not found. Install Bun from https://bun.com/docs/installation and run the script again.".into()
+        "Bun was not found. Choose Install Bun and run to install a private copy for CodingPad, or install Bun from https://bun.com/docs/installation and run the script again.".into()
     })
 }
 

@@ -15,6 +15,46 @@ use tokio::{
 
 pub const UV_VERSION: &str = "0.13.6";
 
+/// Pinned with the Bun version CI installs (1.4.2).
+pub const BUN_VERSION: &str = "1.4.2";
+
+// SHA-256 digests from https://github.com/oven-sh/bun/releases/tag/bun-v1.4.2
+// Update BUN_VERSION, all asset digests, the CI Bun pin and README together.
+const BUN_RELEASES: &[(&str, &str)] = &[
+    (
+        "bun-darwin-aarch64.zip",
+        "90987a3a16d7db556d886ac3d551e7b6d3edf0a1cf43acaed622e8676be1d12f",
+    ),
+    (
+        "bun-darwin-x64.zip",
+        "80520d7e17526308c9185d261679ac6d27798d3803a0e9f7ff9121ab8affb012",
+    ),
+    (
+        "bun-linux-aarch64-musl.zip",
+        "71760b6c8ea30623b81a4907cb815d48e2ea266f2e73e751534a44a0607950df",
+    ),
+    (
+        "bun-linux-aarch64.zip",
+        "54328bbc2d9c8e0c9f892c544d66c57a83b84139e34909e5ee81758f1ac8fda7",
+    ),
+    (
+        "bun-linux-x64-musl.zip",
+        "4835eca59d6da70f4674f5642f6e459dcadab773695b2ed9922d131057989742",
+    ),
+    (
+        "bun-linux-x64.zip",
+        "36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913",
+    ),
+    (
+        "bun-windows-aarch64.zip",
+        "a7a16b876a305fd1029c66dbd27007b4f6112ae896532f675878731a21e50cfd",
+    ),
+    (
+        "bun-windows-x64.zip",
+        "ce4c17497b2f29712a99d3d53f028de28cd42e3bacb8589599e7f000e49b6405",
+    ),
+];
+
 // Pinned official .NET install script from dotnet/install-scripts tag
 // v2026.07.21. The tag is immutable, so the URLs and digests never change under
 // us. Update the tag, both digests, and README together.
@@ -96,6 +136,47 @@ pub fn private_uv(data_dir: &Path) -> PathBuf {
 pub fn resolve_uv(data_dir: &Path) -> PathBuf {
     let user = find_uv();
     prefer_user(user, private_uv(data_dir))
+}
+
+/// The user's Bun first, then CodingPad's private copy.
+pub fn resolve_bun(data_dir: &Path) -> PathBuf {
+    let user = crate::typescript::find_bun();
+    prefer_user(user, private_bun(data_dir))
+}
+
+pub fn private_bun(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join("toolchains")
+        .join("bun")
+        .join(BUN_VERSION)
+        .join(if cfg!(windows) { "bun.exe" } else { "bun" })
+}
+
+fn bun_release(os: &str, arch: &str, musl: bool) -> Result<(&'static str, &'static str), String> {
+    let platform_arch = match arch {
+        "x86_64" => "x64",
+        "aarch64" => "aarch64",
+        _ => return Err(unsupported_bun(os, arch)),
+    };
+    let platform = match os {
+        "macos" => format!("darwin-{platform_arch}"),
+        "windows" => format!("windows-{platform_arch}"),
+        "linux" if musl => format!("linux-{platform_arch}-musl"),
+        "linux" => format!("linux-{platform_arch}"),
+        _ => return Err(unsupported_bun(os, arch)),
+    };
+    let name = format!("bun-{platform}.zip");
+    BUN_RELEASES
+        .iter()
+        .copied()
+        .find(|(asset, _)| *asset == name)
+        .ok_or_else(|| unsupported_bun(os, arch))
+}
+
+fn unsupported_bun(os: &str, arch: &str) -> String {
+    format!(
+        "Private Bun installation is not supported on {os}/{arch}. Install Bun from https://bun.com/docs/installation and try Run again."
+    )
 }
 
 fn prefer_user(user: PathBuf, private: PathBuf) -> PathBuf {
@@ -302,6 +383,15 @@ impl Toolchains {
         }
         install_private_dotnet(&self.data_dir, progress).await
     }
+
+    pub async fn install_bun(&self, progress: impl FnMut(&str) + Send) -> Result<PathBuf, String> {
+        let _guard = self.install.lock().await;
+        let existing = resolve_bun(&self.data_dir);
+        if existing.is_file() {
+            return Ok(existing);
+        }
+        install_private_bun(&self.data_dir, progress).await
+    }
 }
 
 /// Releases the installer lock explicitly on drop, so a duplicate or inherited
@@ -386,6 +476,40 @@ async fn install_private_uv(
     )
     .await?;
     progress("uv installed. Starting script…");
+    Ok(path)
+}
+
+async fn install_private_bun(
+    data_dir: &Path,
+    mut progress: impl FnMut(&str) + Send,
+) -> Result<PathBuf, String> {
+    let destination = private_bun(data_dir);
+    let _lock = prepare_install(destination.parent().ok_or("Missing tool directory")?)?;
+    let (asset, sha256) = bun_release(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cfg!(target_env = "musl"),
+    )?;
+    let member = format!(
+        "{}/{}",
+        asset.trim_end_matches(".zip"),
+        if cfg!(windows) { "bun.exe" } else { "bun" }
+    );
+    let url =
+        format!("https://github.com/oven-sh/bun/releases/download/bun-v{BUN_VERSION}/{asset}");
+    progress("Downloading and verifying Bun…");
+    let path = installer::install_binary(
+        &Artifact {
+            url: &url,
+            sha256,
+            max_bytes: 100 * 1024 * 1024,
+        },
+        Archive::Zip,
+        &member,
+        &destination,
+    )
+    .await?;
+    progress("Bun installed. Starting script…");
     Ok(path)
 }
 
@@ -652,6 +776,44 @@ mod tests {
     }
 
     #[test]
+    fn bun_platforms_have_pinned_artifacts() {
+        for (os, arch, musl) in [
+            ("linux", "x86_64", false),
+            ("linux", "x86_64", true),
+            ("linux", "aarch64", false),
+            ("linux", "aarch64", true),
+            ("macos", "x86_64", false),
+            ("macos", "aarch64", false),
+            ("windows", "x86_64", false),
+            ("windows", "aarch64", false),
+        ] {
+            let (asset, hash) = bun_release(os, arch, musl).unwrap();
+            assert!(asset.starts_with("bun-"), "{asset}");
+            assert!(asset.ends_with(".zip"), "{asset}");
+            assert_eq!(hash.len(), 64);
+            assert!(hash.bytes().all(|c| c.is_ascii_hexdigit()));
+        }
+        assert_eq!(
+            bun_release("linux", "x86_64", true).unwrap().0,
+            "bun-linux-x64-musl.zip"
+        );
+        assert!(bun_release("linux", "mips", false).is_err());
+        assert!(bun_release("unknown", "x86_64", false).is_err());
+    }
+
+    #[test]
+    fn private_bun_lives_under_the_app_data_folder() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = private_bun(directory.path());
+        assert!(path.starts_with(directory.path().join("toolchains").join("bun")));
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            if cfg!(windows) { "bun.exe" } else { "bun" }
+        );
+        assert!(path.to_string_lossy().contains(BUN_VERSION));
+    }
+
+    #[test]
     fn user_tool_wins_and_private_install_survives_restart() {
         let directory = tempfile::tempdir().unwrap();
         let user = directory.path().join("user-uv");
@@ -868,6 +1030,43 @@ mod tests {
                 .count(),
             2 // Installed executable plus the persistent process lock.
         );
+    }
+
+    /// Network acceptance test for the one-click Bun install.
+    #[tokio::test]
+    #[ignore = "downloads the official Bun release; run explicitly when validating the installer"]
+    async fn official_bun_release_installs_privately_and_runs_typescript() {
+        let data = tempfile::tempdir().unwrap();
+        let installed = install_private_bun(data.path(), |_| {}).await.unwrap();
+        assert_eq!(installed, private_bun(data.path()));
+        let output = tokio::process::Command::new(&installed)
+            .arg("--version")
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .starts_with(BUN_VERSION));
+        let supervisor = crate::Supervisor::with_bun(installed);
+        let mut events = Vec::new();
+        let result = supervisor
+            .run_language(
+                "bun",
+                "console.log('private bun works');\nawait Promise.resolve(6 * 7)",
+                crate::Language::Typescript,
+                |event| events.push(event),
+            )
+            .await
+            .unwrap();
+        assert!(result.ok, "{events:?}");
+        assert!(events
+            .iter()
+            .any(|event| event.params.to_string().contains("private bun works")));
+        assert!(events
+            .iter()
+            .any(|event| event.params.to_string().contains("42")));
+        supervisor.shutdown().await;
     }
 
     /// Network acceptance test for the one-click .NET SDK install.

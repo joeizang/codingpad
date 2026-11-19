@@ -105,7 +105,12 @@ fn referenced_secret_names(source: &str) -> Option<Vec<String>> {
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, Lines},
@@ -238,6 +243,7 @@ type SharedSlot = Arc<Slot>;
 pub struct Supervisor {
     uv: PathBuf,
     dotnet: Option<PathBuf>,
+    bun: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     kernels: Mutex<HashMap<String, SharedSlot>>,
     shadow_projects: Arc<shadow::ShadowProjects>,
@@ -292,6 +298,7 @@ impl Supervisor {
         Self {
             uv,
             dotnet: None,
+            bun: None,
             data_dir: None,
             kernels: Mutex::new(HashMap::new()),
             shadow_projects: Arc::default(),
@@ -308,6 +315,7 @@ impl Supervisor {
         Self {
             uv: find_uv(),
             dotnet: Some(dotnet),
+            bun: None,
             data_dir: None,
             kernels: Mutex::new(HashMap::new()),
             shadow_projects: Arc::default(),
@@ -318,10 +326,21 @@ impl Supervisor {
         }
     }
 
+    /// Pin TypeScript execution to one Bun, as the installer acceptance test
+    /// does when the user's own Bun must not be used.
+    pub fn with_bun(bun: PathBuf) -> Self {
+        Self {
+            shadow_projects: Arc::new(shadow::ShadowProjects::with_bun(bun.clone())),
+            bun: Some(bun),
+            ..Self::default()
+        }
+    }
+
     /// Resolve user tools first, then the app-private installation on each startup.
     pub fn with_data_dir(data_dir: PathBuf) -> Self {
         Self {
-            data_dir: Some(data_dir),
+            data_dir: Some(data_dir.clone()),
+            shadow_projects: Arc::new(shadow::ShadowProjects::with_data_dir(data_dir)),
             ..Self::default()
         }
     }
@@ -357,6 +376,16 @@ impl Supervisor {
             .as_deref()
             .map(toolchains::resolve_uv)
             .unwrap_or_else(|| self.uv.clone())
+    }
+
+    fn bun_path(&self) -> PathBuf {
+        if let Some(bun) = &self.bun {
+            return bun.clone();
+        }
+        self.data_dir
+            .as_deref()
+            .map(toolchains::resolve_bun)
+            .unwrap_or_else(typescript::find_bun)
     }
 
     pub async fn run(
@@ -583,7 +612,12 @@ impl Supervisor {
                         }
                         Language::Python => Kernel::start(&self.uv_path(), packages, &mut emit).await,
                         Language::Typescript => {
-                            Kernel::start_typescript(packages, typescript_project.unwrap()).await
+                            let bun = self.bun_path();
+                            Kernel::start_typescript(
+                                packages,
+                                typescript_project.unwrap(),
+                                &bun,
+                            ).await
                         }
                     }
                 } => result,
@@ -793,9 +827,9 @@ impl Kernel {
     async fn start_typescript(
         packages: Packages,
         project: Arc<typescript::Project>,
+        bun: &Path,
     ) -> Result<Self, String> {
-        let bun = typescript::find_bun();
-        let (command, files) = typescript::command(&bun, &project)?;
+        let (command, files) = typescript::command(bun, &project)?;
         let language = Language::Typescript;
         let mut child = Self::spawn_child(command, language, Stdio::inherit())?;
         let mut input = child.stdin.take().unwrap();
@@ -1174,7 +1208,7 @@ mod tests {
             Language::Typescript,
         );
         assert!(
-            matches!(result, Err(message) if message.starts_with("Bun was not found. Install Bun"))
+            matches!(result, Err(message) if message.starts_with("Bun was not found. Choose Install Bun"))
         );
     }
 

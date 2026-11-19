@@ -11,6 +11,59 @@ in-memory Roslyn compilation, console output, rich `.Dump()` trees and deferred
 enumerable tables, top-level `await`, and compiler diagnostics in the editor and
 Results.
 
+## Install a build (M4.5)
+
+Releases are published on GitHub Releases as installers built locally on their
+own platform (D29, D39): an AppImage, a `.deb` and an `.rpm` on Linux, and an
+NSIS setup on Windows. Early builds are unsigned (D30). macOS installers are
+deferred (D62), so no `.dmg` is published yet.
+
+Build the installer for the machine you are on:
+
+```sh
+just bundle
+```
+
+The installers land in `target/release/bundle/` (`appimage/`, `deb/`, `rpm/`,
+`nsis/`). The app embeds its Python and C# kernels, so an installer is
+self-contained; it does not include Python, the .NET SDK or `uv`. A first run
+offers **Install uv and run** or **Install .NET and run** when a toolchain is
+missing, or uses one you already have.
+
+`packaging/app-icon.png` is the icon source. Regenerate the desktop icons with
+`npm --prefix apps/desktop run tauri -- icon packaging/app-icon.png`. Keep
+`32x32.png`, `128x128.png`, `128x128@2x.png`, `icon.png` and `icon.ico`; delete
+the `Square*`/`StoreLogo` files, `64x64.png`, `icon.icns` and the `android/` and
+`ios/` folders that the generator also writes.
+
+### Linux
+
+- **AppImage**: `chmod +x CodingPad_0.1.0_amd64.AppImage`, then run the file.
+- **Debian/Ubuntu**: `sudo apt install ./CodingPad_0.1.0_amd64.deb`
+- **Fedora/RHEL**: `sudo dnf install ./CodingPad-0.1.0-1.x86_64.rpm`
+
+Use the version and architecture of the file you downloaded. The `.deb` and
+`.rpm` install for all users; the AppImage is a single file and needs no install.
+The AppImage bundles WebKitGTK and GTK, so it runs on a minimal system; the
+`.deb` and `.rpm` list those system packages as dependencies and let your package
+manager install them.
+
+### Windows
+
+Run `CodingPad_0.1.0_x64-setup.exe`. The build is unsigned, so SmartScreen may
+show **Windows protected your PC**: choose **More info**, then **Run anyway**.
+The setup installs for the current user and needs no administrator rights, and
+it installs the WebView2 runtime when it is missing (which needs an internet
+connection).
+
+### First launch
+
+CodingPad sends no telemetry. Its network use is limited to the release check and
+the toolchain or package downloads you trigger, such as **Install uv and run**,
+**Install .NET and run**, and the language servers and packages a script needs.
+There is no auto-updater (D29): see [Update notice](#update-notice-m43), and
+install the newest build over the current one to update.
+
 ## Develop locally
 
 Install:
@@ -37,6 +90,7 @@ From the repository root:
 ```sh
 just check  # Install locked frontend dependencies; build and test every component
 just run    # Open the Tauri application with frontend hot reload
+just bundle # Build this platform's installer (see Install a build)
 ```
 
 `just check` checks TypeScript, builds the UI, runs frontend and Python tests,
@@ -223,6 +277,41 @@ release pages in this repository are linked.
 This is the only request CodingPad makes on its own (D29, D31), and it never
 downloads or installs anything. To update, download the newest installer from
 GitHub Releases and install it over the current build.
+
+## Report a crash (M4.4)
+
+CodingPad has no telemetry (D31). A fatal panic in the app, or an error that
+stops the interface from drawing, shows a crash screen with **Report on
+GitHub**. The button opens a pre-filled issue in the system browser; nothing is
+submitted until you review it there and press Submit. Nothing is sent
+automatically.
+
+The issue holds the app version, the platform and the error details: the
+message and the position. The crash screen also shows a backtrace locally, but
+that stays out of the issue because it is the likeliest place for source paths
+and production values. The user's home folder becomes `~`, credentials in URLs
+and values after keys such as `password=` or `token=` become `[redacted]`, and
+long details are cut so the link stays usable. Scripts and connection details
+are never read for a report. Review the issue before submitting.
+
+A fatal panic is written to `pending-crash.json` in the app data folder and
+offered on the next launch, because the process that panicked may be gone before
+it can draw anything. Only main-thread panics are recorded, and a clean exit
+discards the file, so a worker panic the app recovered from does not reappear.
+To see the screen on purpose, start a debug build once with
+`CODINGPAD_FORCE_CRASH=1`; it crashes, and the next launch offers the button:
+
+```sh
+CODINGPAD_FORCE_CRASH=1 target/debug/codingpad-desktop
+target/debug/codingpad-desktop
+```
+
+On Windows PowerShell, set `$env:CODINGPAD_FORCE_CRASH = "1"` for the first
+command, then clear it with `Remove-Item Env:CODINGPAD_FORCE_CRASH`.
+
+Event-handler and promise errors keep the app running and do not open the crash
+screen, and `cpad` is a terminal command with its own exit status; neither is
+covered by this report in the 0.1 preview.
 
 ## C# scripts (M2.3)
 

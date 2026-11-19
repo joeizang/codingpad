@@ -8,6 +8,8 @@ import {
 } from "@tauri-apps/plugin-dialog";
 import CodeEditor, { type EditorHandle } from "./CodeEditor";
 import { ConnectionsDialog, type Connection } from "./ConnectionsDialog";
+import { CrashScreen } from "./CrashScreen";
+import { usePendingCrash } from "./crash";
 import {
   DumpTree,
   type ExportFormat,
@@ -197,6 +199,7 @@ export default function App() {
   const [closing, setClosing] = useState(false);
   const [secretsOpen, setSecretsOpen] = useState(false);
   const [connectionsOpen, setConnectionsOpen] = useState(false);
+  const [pendingCrash, dismissPendingCrash] = usePendingCrash();
   const [connections, setConnections] = useState<Connection[]>([]);
   const [connectionsRevision, setConnectionsRevision] = useState(0);
   const [newScriptOpen, setNewScriptOpen] = useState(false);
@@ -942,6 +945,9 @@ export default function App() {
 
   return (
     <main className="app">
+      {pendingCrash && (
+        <CrashScreen details={pendingCrash} onDismiss={dismissPendingCrash} />
+      )}
       <header className="topbar">
         <div className="brand">
           <span className="brand-mark" aria-hidden>

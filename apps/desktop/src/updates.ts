@@ -1,5 +1,4 @@
-import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useOncePerLaunch, resetOncePerLaunchForTests } from "./oncePerLaunch";
 
 /** A release newer than this build, ready for the notice. */
 export type AvailableUpdate = { version: string; url: string };
@@ -21,41 +20,15 @@ export function isAvailableUpdate(value: unknown): value is AvailableUpdate {
 }
 
 /**
- * One shared request per launch. React StrictMode runs effects twice in
- * development, so the second run joins the first instead of asking GitHub
- * again. Tests forget the shared check between cases.
- */
-let pending: Promise<unknown> | undefined;
-
-function requestUpdate(): Promise<unknown> {
-  pending ??= invoke<unknown>("check_for_update");
-  return pending;
-}
-
-/** Forget a shared check so each test starts clean. Tests only. */
-export function resetUpdateCheckForTests(): void {
-  pending = undefined;
-}
-
-/**
  * Ask GitHub once per launch whether a newer release exists. This is the only
  * request CodingPad makes on its own (D29, D31). A failed check, an offline
  * machine and a current build all leave the app exactly as it was.
  */
 export function useAvailableUpdate(): AvailableUpdate | null {
-  const [update, setUpdate] = useState<AvailableUpdate | null>(null);
-  useEffect(() => {
-    let current = true;
-    void requestUpdate().then(
-      (found) => {
-        if (current && isAvailableUpdate(found)) setUpdate(found);
-      },
-      // A failed check stays silent: no error, no dialog, no retry.
-      () => {},
-    );
-    return () => {
-      current = false;
-    };
-  }, []);
-  return update;
+  return useOncePerLaunch("check_for_update", isAvailableUpdate);
+}
+
+/** Forget the shared check so each test starts clean. Tests only. */
+export function resetUpdateCheckForTests(): void {
+  resetOncePerLaunchForTests();
 }

@@ -1,4 +1,5 @@
 //! Desktop-independent supervisor for one warm kernel process per script.
+pub mod crash;
 mod csharp;
 pub mod data_context;
 pub mod databases;

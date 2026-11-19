@@ -9,7 +9,10 @@
     "dialog:default",
     {
       "identifier": "opener:allow-open-url",
-      "allow": [{ "url": "https://github.com/joeizang/codingpad/releases/*" }]
+      "allow": [
+        { "url": "https://github.com/joeizang/codingpad/releases/*" },
+        { "url": "https://github.com/joeizang/codingpad/issues/*" }
+      ]
     }
   ]
 }

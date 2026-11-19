@@ -137,12 +137,16 @@ Console.WriteLine(result);
         self.assertEqual(result.stdout.strip(), "42")
 
 
+    # Test projects run through `dotnet run`, so they need no native launcher.
+    # Distro-built SDKs (Ubuntu's) ship only their own RID's apphost pack and
+    # would otherwise try to download Microsoft.NETCore.App.Host.linux-x64
+    # from the offline test feed.
     def test_direct_consumers_can_disable_helper_imports(self):
         project = self.work / "opt-out"
         project.mkdir()
         (project / "OptOut.csproj").write_text('''<Project Sdk="Microsoft.NET.Sdk">
 <PropertyGroup>
-<TargetFramework>net10.0</TargetFramework><OutputType>Exe</OutputType>
+<TargetFramework>net10.0</TargetFramework><OutputType>Exe</OutputType><UseAppHost>false</UseAppHost>
 <ImplicitUsings>disable</ImplicitUsings><CodingPadImplicitUsings>false</CodingPadImplicitUsings>
 </PropertyGroup>
 <ItemGroup><PackageReference Include="CodingPad" Version="0.1.0" /></ItemGroup>
@@ -269,7 +273,7 @@ static class LocalHelpers { public static T Cache<T>(string key, Func<T> factory
         # its unsigned friend name permits exercising host scopes in this fixture.
         (project / "Proof.csproj").write_text('''<Project Sdk="Microsoft.NET.Sdk">
 <PropertyGroup><TargetFramework>net10.0</TargetFramework><OutputType>Exe</OutputType>
-<AssemblyName>CodingPad.Kernel</AssemblyName></PropertyGroup>
+<AssemblyName>CodingPad.Kernel</AssemblyName><UseAppHost>false</UseAppHost></PropertyGroup>
 <ItemGroup><PackageReference Include="CodingPad" Version="0.1.0" /></ItemGroup>
 </Project>''', encoding="utf-8")
         (project / "Program.cs").write_text('''using System.Reflection;

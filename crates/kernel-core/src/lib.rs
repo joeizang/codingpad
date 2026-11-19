@@ -382,19 +382,23 @@ impl Supervisor {
         toolchains::bun_for(self.bun.as_deref(), self.data_dir.as_deref())
     }
 
-    /// A private Bun that cannot start is removed so the next Run reports the
-    /// missing toolchain and offers the one-click install again.
-    fn discard_broken_bun(&self, bun: &Path) {
+    /// After a failed TypeScript start, remove a private Bun only when the binary
+    /// itself no longer runs. A handshake timeout, antivirus scan or temp-file
+    /// failure must not force a needless re-download.
+    async fn recover_typescript_start_error(&self, bun: &Path, error: String) -> String {
         if self.bun.is_some() {
-            return;
+            return error;
         }
-        if self
-            .data_dir
-            .as_deref()
-            .is_some_and(|data_dir| toolchains::private_bun(data_dir).as_path() == bun)
+        let private = self.data_dir.as_deref().map(toolchains::private_bun);
+        if !private.as_deref().is_some_and(|private| private == bun)
+            || toolchains::bun_runs(bun).await
         {
-            let _ = std::fs::remove_file(bun);
+            return error;
         }
+        let _ = std::fs::remove_file(bun);
+        // Surface the same message a missing Bun produces so Results offers
+        // Install Bun and run on this run rather than the next one.
+        typescript::BUN_NOT_FOUND.to_owned()
     }
 
     pub async fn run(
@@ -622,15 +626,16 @@ impl Supervisor {
                         Language::Python => Kernel::start(&self.uv_path(), packages, &mut emit).await,
                         Language::Typescript => {
                             let bun = self.bun_path();
-                            let started = Kernel::start_typescript(
+                            match Kernel::start_typescript(
                                 packages,
                                 typescript_project.unwrap(),
                                 &bun,
-                            ).await;
-                            if started.is_err() {
-                                self.discard_broken_bun(&bun);
+                            ).await {
+                                Ok(kernel) => Ok(kernel),
+                                Err(error) => {
+                                    Err(self.recover_typescript_start_error(&bun, error).await)
+                                }
                             }
-                            started
                         }
                     }
                 } => result,
@@ -1226,19 +1231,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_private_bun_that_cannot_start_is_discarded() {
+    async fn a_broken_private_bun_is_discarded_with_the_install_message() {
         let data = tempfile::tempdir().unwrap();
         let private = toolchains::private_bun(data.path());
         std::fs::create_dir_all(private.parent().unwrap()).unwrap();
-        std::fs::write(&private, "broken").unwrap();
+        std::fs::write(&private, "not a program").unwrap();
         let supervisor = Supervisor::with_data_dir(data.path().to_path_buf());
-        supervisor.discard_broken_bun(&private);
-        assert!(!private.exists(), "the next run can offer a reinstall");
-        // An explicit pin, as tests and embedders set, belongs to the caller.
+        assert_eq!(
+            supervisor
+                .recover_typescript_start_error(&private, "handshake timeout".into())
+                .await,
+            typescript::BUN_NOT_FOUND,
+            "this run offers the one-click install instead of the next run"
+        );
+        assert!(!private.exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_typescript_start_with_a_broken_private_bun_offers_install() {
+        let data = tempfile::tempdir().unwrap();
+        let private = toolchains::private_bun(data.path());
+        std::fs::create_dir_all(private.parent().unwrap()).unwrap();
+        std::fs::write(&private, "not a program").unwrap();
+        // A user-installed Bun wins over the private copy, so only exercise the
+        // private path on machines without one.
+        if toolchains::resolve_bun(data.path()) != private {
+            return;
+        }
+        let supervisor = Supervisor::with_data_dir(data.path().to_path_buf());
+        let error = supervisor
+            .run_language("private-bun", "1 + 1", Language::Typescript, |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(error, typescript::BUN_NOT_FOUND);
+        assert!(!private.exists());
+        supervisor.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_working_private_bun_survives_an_unrelated_start_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let data = tempfile::tempdir().unwrap();
+        let private = toolchains::private_bun(data.path());
+        std::fs::create_dir_all(private.parent().unwrap()).unwrap();
+        std::fs::write(&private, "#!/bin/sh\necho 1.4.2\n").unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let supervisor = Supervisor::with_data_dir(data.path().to_path_buf());
+        assert_eq!(
+            supervisor
+                .recover_typescript_start_error(&private, "handshake timeout".into())
+                .await,
+            "handshake timeout"
+        );
+        assert!(private.exists());
+    }
+
+    #[tokio::test]
+    async fn a_pinned_bun_is_never_discarded() {
+        let data = tempfile::tempdir().unwrap();
         let pinned = data.path().join("pinned-bun");
-        std::fs::write(&pinned, "broken").unwrap();
+        std::fs::write(&pinned, "not a program").unwrap();
         let supervisor = Supervisor::with_bun(pinned.clone());
-        supervisor.discard_broken_bun(&pinned);
+        assert_eq!(
+            supervisor
+                .recover_typescript_start_error(&pinned, "kept".into())
+                .await,
+            "kept"
+        );
         assert!(pinned.exists());
     }
 

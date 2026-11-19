@@ -211,10 +211,12 @@ async fn install_bun_types(bun: &Path, root: &Path) -> bool {
     installed && root.join("node_modules/@types/bun/package.json").is_file()
 }
 
+/// The actionable message for a missing Bun. The desktop keys the one-click
+/// install button off this prefix.
+pub(crate) const BUN_NOT_FOUND: &str = "Bun was not found. Choose Install Bun and run to install a private copy for CodingPad, or install Bun from https://bun.com/docs/installation and run the script again.";
+
 pub(crate) fn bun_not_found(error: &io::Error) -> Option<String> {
-    (error.kind() == io::ErrorKind::NotFound).then(|| {
-        "Bun was not found. Choose Install Bun and run to install a private copy for CodingPad, or install Bun from https://bun.com/docs/installation and run the script again.".into()
-    })
+    (error.kind() == io::ErrorKind::NotFound).then(|| BUN_NOT_FOUND.into())
 }
 
 const KERNEL_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);

@@ -606,9 +606,10 @@ async fn install_private_bun(
         &mut progress,
     )
     .await?;
-    // install_binary probes `--version` before promoting, but the destination
-    // may be a file left by an earlier install. Run the copy that will be used
-    // and remove it if this machine cannot start it, so a reinstall can retry.
+    // install_binary probes `--version` before promoting, but another CodingPad
+    // instance can win the persist_noclobber race and supply the file that is
+    // actually used. Run that copy and remove it if this machine cannot start
+    // it, so a reinstall can retry.
     if !bun_runs(&path).await {
         let _ = std::fs::remove_file(&path);
         return Err(
@@ -620,7 +621,7 @@ async fn install_private_bun(
     Ok(path)
 }
 
-async fn bun_runs(path: &Path) -> bool {
+pub(crate) async fn bun_runs(path: &Path) -> bool {
     if !path.is_file() {
         return false;
     }

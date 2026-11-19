@@ -1314,7 +1314,9 @@ using var registration = Cancel.Register(() => Environment.SetEnvironmentVariabl
 var worker = Task.Run(() => { started.Set(); Cancel.WaitHandle.WaitOne(); });
 started.Wait();
 Console.WriteLine("ready");
-try { Cancel.WaitHandle.WaitOne(); worker.GetAwaiter().GetResult(); Cancel.ThrowIfCancellationRequested(); }
+// WaitHandle is signalled before callbacks run; wait for the callback so disposing
+// `registration` cannot skip it.
+try { Cancel.WaitHandle.WaitOne(); worker.GetAwaiter().GetResult(); SpinWait.SpinUntil(() => Environment.GetEnvironmentVariable("CPAD_CANCEL_CALLBACK") != null, 5000); Cancel.ThrowIfCancellationRequested(); }
 finally { ThreadPool.SetMaxThreads(maxWorker, maxIo); ThreadPool.SetMinThreads(minWorker, minIo); }
 "#).await;
     supervisor.stop("control").await;

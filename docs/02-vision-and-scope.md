@@ -29,7 +29,7 @@ Decision numbers (D#) refer to [04-open-questions.md](04-open-questions.md). Ter
 - **Platforms:** Linux and Windows for now; macOS is deferred (D13, D62).
 - **Distribution:** GitHub Releases, unsigned at first, with an update notice instead of an auto-updater (D29, D30).
 
-## Milestones (D33, D34)
+## Milestones (D33, D34, D64)
 Builds and tests run with `just`, locally and in GitHub Actions on Linux and Windows (D39, D43, D63).
 
 | Milestone | Scope | Release |

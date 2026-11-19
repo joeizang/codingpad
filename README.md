@@ -13,8 +13,8 @@ Results.
 
 ## Install a build (M4.5)
 
-Releases are published on GitHub Releases as installers built locally on their
-own platform (D29, D39): an AppImage, a `.deb` and an `.rpm` on Linux, and an
+Releases are published on GitHub Releases as installers that GitHub Actions builds
+on their own platform when a `vX.Y.Z` tag is pushed (D29, D63): an AppImage, a `.deb` and an `.rpm` on Linux, and an
 NSIS setup on Windows. Early builds are unsigned (D30). macOS installers are
 deferred (D62), so no `.dmg` is published yet.
 
@@ -95,9 +95,24 @@ just bundle # Build this platform's installer (see Install a build)
 
 `just check` checks TypeScript, builds the UI, runs frontend and Python tests,
 checks Rust formatting and Clippy, runs Rust integration tests against real Python
-processes, and builds the desktop executable. No CI is configured (D39). The same
-command is intended for Linux and Windows; native builds run on their own
+processes, and builds the desktop executable. GitHub Actions runs the same command
+on Linux and Windows for every pull request (D63). The same command is intended for
+Linux and Windows; native builds run on their own
 platforms. macOS support is deferred for now (D62).
+
+### CI and releases (D63)
+
+- **Pull requests** to `master` run `just check` on Linux and Windows. Both checks
+  must pass on an up-to-date branch before the squash merge; no review approval is
+  required. A private repository runs Linux only.
+- **Releases**: bump `version` in `apps/desktop/src-tauri/tauri.conf.json` (and
+  the workspace `Cargo.toml`), merge, then push a matching tag:
+  `git tag v0.2.0 && git push origin v0.2.0`. The release workflow builds the
+  installers and publishes the GitHub Release with generated notes. A tag with a
+  suffix such as `v0.2.0-rc.1` becomes a pre-release, which the update notice ignores.
+- **Repository protections** (rulesets, merge and Actions settings, secret
+  scanning, CodeQL) are applied by `tools/github/configure-repo.sh` on a public
+  repository; set **Pull requests → Collaborators only** by hand in Settings.
 
 [M3 verification results](docs/m3-verification.md) record the Linux and Windows database,
 vault and benchmark runs for the M3 close.
@@ -843,7 +858,7 @@ OS-cache launches, not a disk-cache-flushed cold-start test. Save the full outpu
 and environment with each run; retain earlier failures when recording new results.
 The dump metric ends when the first page reaches the Rust host, before rendering.
 The app metrics need a desktop session and are skipped on Windows, where a
-Windows VM confirms that `just check` passes (D42, D48). Set `CODINGPAD_DESKTOP`
+Windows CI confirms that `just check` passes (D48, D63). Set `CODINGPAD_DESKTOP`
 to benchmark a different app binary. The owner has closed M1 and M2.
 
 Dual-licensed MIT OR Apache-2.0.

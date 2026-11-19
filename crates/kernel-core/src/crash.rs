@@ -614,9 +614,7 @@ mod tests {
 
     #[test]
     fn the_environment_line_names_the_platform_and_arch() {
-        assert_eq!(
-            super::environment("0.1.0").platform_line(),
-            "linux (x86_64)"
-        );
+        let expected = format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH);
+        assert_eq!(super::environment("0.1.0").platform_line(), expected);
     }
 }

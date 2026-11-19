@@ -264,6 +264,19 @@ async fn install_dotnet(
 }
 
 #[tauri::command]
+async fn install_bun(
+    tools: State<'_, Toolchains>,
+    on_progress: Channel<String>,
+) -> Result<(), String> {
+    tools
+        .install_bun(|message| {
+            let _ = on_progress.send(message.to_owned());
+        })
+        .await?;
+    Ok(())
+}
+
+#[tauri::command]
 async fn run_script(
     supervisor: State<'_, Supervisor>,
     sql: State<'_, Arc<SqlManager>>,
@@ -617,6 +630,7 @@ fn main() {
             take_pending_crash,
             install_uv,
             install_dotnet,
+            install_bun,
             run_script,
             stop_script,
             reset_script,

@@ -981,6 +981,49 @@ test("missing .NET offers one-click SDK installation and reruns the latest sourc
   expect(screen.queryByRole("button", { name: "Install .NET and run" })).not.toBeInTheDocument();
 });
 
+test("missing Bun offers one-click installation and reruns the latest source", async () => {
+  let installed = false;
+  let finish!: () => void;
+  invoke.mockImplementation(async (command, args) => {
+    if (command === "run_script") {
+      if (!installed) throw "Bun was not found. Choose Install Bun and run.";
+      return { ok: true };
+    }
+    if (command === "install_bun") {
+      args.onProgress.onmessage("Downloading and verifying Bun…");
+      await new Promise<void>((resolve) => { finish = resolve; });
+      installed = true;
+    }
+  });
+  render(<App />);
+  createScript("TypeScript");
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Install Bun and run" }));
+  expect(screen.getByRole("button", { name: "Installing Bun…" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "▶ Run" })).toBeDisabled();
+  fireEvent.change(screen.getByLabelText("Code"), { target: { value: 'console.log("hi");' } });
+  await act(async () => finish());
+  await screen.findByText("Finished");
+  expect(screen.getByLabelText("Code")).toHaveAttribute("data-toolchain-version", "1");
+  expect(invoke).toHaveBeenLastCalledWith("run_script", expect.objectContaining({ source: 'console.log("hi");' }));
+  expect(screen.queryByRole("button", { name: "Install Bun and run" })).not.toBeInTheDocument();
+});
+
+test("failed Bun installation can be retried without rerunning prematurely", async () => {
+  invoke.mockImplementation(async (command) => {
+    if (command === "run_script") throw "Bun was not found. Choose Install Bun and run.";
+    if (command === "install_bun") throw "Tool download failed SHA-256 verification.";
+  });
+  render(<App />);
+  createScript("TypeScript");
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Install Bun and run" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("SHA-256 verification");
+  expect(screen.getByLabelText("Code")).toHaveAttribute("data-toolchain-version", "0");
+  expect(screen.getByRole("button", { name: "Install Bun and run" })).toBeEnabled();
+  expect(invoke.mock.calls.filter(([command]) => command === "run_script")).toHaveLength(1);
+});
+
 test("failed uv installation can be retried without rerunning prematurely", async () => {
   invoke.mockImplementation(async (command) => {
     if (command === "run_script") throw "uv was not found. Install a private copy.";
@@ -1004,6 +1047,7 @@ test("ordinary script errors never offer a uv installation", async () => {
   await screen.findByRole("alert");
   expect(screen.queryByRole("button", { name: "Install uv and run" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Install .NET and run" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Install Bun and run" })).not.toBeInTheDocument();
 });
 
 
@@ -1046,6 +1090,9 @@ test("a TypeScript scratch runs through the kernel and shows a missing Bun error
   hasBun = false;
   fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
   await screen.findByText(/Bun was not found/);
+  expect(
+    screen.getByRole("button", { name: "Install Bun and run" }),
+  ).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "▶ Run" })).toBeEnabled();
 });
 

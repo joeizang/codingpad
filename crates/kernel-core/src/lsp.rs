@@ -111,10 +111,11 @@ impl LanguageServers {
         }
     }
 
-    /// Resolve user tools and the app-private uv on every server startup.
+    /// Resolve user tools and the app-private installs on every server startup.
     pub fn with_data_dir(data_dir: PathBuf) -> Self {
         Self {
-            data_dir: Some(data_dir),
+            data_dir: Some(data_dir.clone()),
+            shadow_projects: Arc::new(ShadowProjects::with_data_dir(data_dir)),
             ..Self::default()
         }
     }
@@ -122,9 +123,8 @@ impl LanguageServers {
     /// Generate typed data contexts from this manager's saved connections.
     pub fn with_data_dir_and_databases(data_dir: PathBuf, databases: Arc<SqlManager>) -> Self {
         Self {
-            data_dir: Some(data_dir),
             databases: Some(databases),
-            ..Self::default()
+            ..Self::with_data_dir(data_dir)
         }
     }
 

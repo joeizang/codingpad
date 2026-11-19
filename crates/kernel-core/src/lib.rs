@@ -105,7 +105,12 @@ fn referenced_secret_names(source: &str) -> Option<Vec<String>> {
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, Lines},
@@ -238,6 +243,7 @@ type SharedSlot = Arc<Slot>;
 pub struct Supervisor {
     uv: PathBuf,
     dotnet: Option<PathBuf>,
+    bun: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     kernels: Mutex<HashMap<String, SharedSlot>>,
     shadow_projects: Arc<shadow::ShadowProjects>,
@@ -292,6 +298,7 @@ impl Supervisor {
         Self {
             uv,
             dotnet: None,
+            bun: None,
             data_dir: None,
             kernels: Mutex::new(HashMap::new()),
             shadow_projects: Arc::default(),
@@ -308,6 +315,7 @@ impl Supervisor {
         Self {
             uv: find_uv(),
             dotnet: Some(dotnet),
+            bun: None,
             data_dir: None,
             kernels: Mutex::new(HashMap::new()),
             shadow_projects: Arc::default(),
@@ -318,10 +326,33 @@ impl Supervisor {
         }
     }
 
+    /// Pin TypeScript execution to one Bun, as the installer acceptance test
+    /// does when the user's own Bun must not be used.
+    pub fn with_bun(bun: PathBuf) -> Self {
+        Self {
+            shadow_projects: Arc::new(shadow::ShadowProjects::with_bun(bun.clone())),
+            bun: Some(bun),
+            ..Self::default()
+        }
+    }
+
+    /// Resolve the private install through an explicit data folder, without a
+    /// user Bun. Tests use this to exercise the real start path deterministically.
+    #[cfg(test)]
+    fn with_private_bun(data_dir: PathBuf, bun: PathBuf) -> Self {
+        Self {
+            data_dir: Some(data_dir),
+            bun: Some(bun.clone()),
+            shadow_projects: Arc::new(shadow::ShadowProjects::with_bun(bun)),
+            ..Self::default()
+        }
+    }
+
     /// Resolve user tools first, then the app-private installation on each startup.
     pub fn with_data_dir(data_dir: PathBuf) -> Self {
         Self {
-            data_dir: Some(data_dir),
+            data_dir: Some(data_dir.clone()),
+            shadow_projects: Arc::new(shadow::ShadowProjects::with_data_dir(data_dir)),
             ..Self::default()
         }
     }
@@ -357,6 +388,26 @@ impl Supervisor {
             .as_deref()
             .map(toolchains::resolve_uv)
             .unwrap_or_else(|| self.uv.clone())
+    }
+
+    fn bun_path(&self) -> PathBuf {
+        toolchains::bun_for(self.bun.as_deref(), self.data_dir.as_deref())
+    }
+
+    /// After a failed TypeScript start, remove a private Bun only when the binary
+    /// itself no longer runs. A handshake timeout, antivirus scan or temp-file
+    /// failure must not force a needless re-download.
+    async fn recover_typescript_start_error(&self, bun: &Path, error: String) -> String {
+        let private = self.data_dir.as_deref().map(toolchains::private_bun);
+        if !private.as_deref().is_some_and(|private| private == bun)
+            || !toolchains::bun_is_broken(bun).await
+        {
+            return error;
+        }
+        let _ = std::fs::remove_file(bun);
+        // Surface the same message a missing Bun produces so Results offers
+        // Install Bun and run on this run rather than the next one.
+        typescript::BUN_NOT_FOUND.to_owned()
     }
 
     pub async fn run(
@@ -583,7 +634,17 @@ impl Supervisor {
                         }
                         Language::Python => Kernel::start(&self.uv_path(), packages, &mut emit).await,
                         Language::Typescript => {
-                            Kernel::start_typescript(packages, typescript_project.unwrap()).await
+                            let bun = self.bun_path();
+                            match Kernel::start_typescript(
+                                packages,
+                                typescript_project.unwrap(),
+                                &bun,
+                            ).await {
+                                Ok(kernel) => Ok(kernel),
+                                Err(error) => {
+                                    Err(self.recover_typescript_start_error(&bun, error).await)
+                                }
+                            }
                         }
                     }
                 } => result,
@@ -793,9 +854,9 @@ impl Kernel {
     async fn start_typescript(
         packages: Packages,
         project: Arc<typescript::Project>,
+        bun: &Path,
     ) -> Result<Self, String> {
-        let bun = typescript::find_bun();
-        let (command, files) = typescript::command(&bun, &project)?;
+        let (command, files) = typescript::command(bun, &project)?;
         let language = Language::Typescript;
         let mut child = Self::spawn_child(command, language, Stdio::inherit())?;
         let mut input = child.stdin.take().unwrap();
@@ -1174,8 +1235,78 @@ mod tests {
             Language::Typescript,
         );
         assert!(
-            matches!(result, Err(message) if message.starts_with("Bun was not found. Install Bun"))
+            matches!(result, Err(message) if message.starts_with("Bun was not found. Choose Install Bun"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_broken_private_bun_is_discarded_with_the_install_message() {
+        let data = tempfile::tempdir().unwrap();
+        let private = toolchains::private_bun(data.path());
+        std::fs::create_dir_all(private.parent().unwrap()).unwrap();
+        std::fs::write(&private, "not a program").unwrap();
+        let supervisor = Supervisor::with_data_dir(data.path().to_path_buf());
+        assert_eq!(
+            supervisor
+                .recover_typescript_start_error(&private, "handshake timeout".into())
+                .await,
+            typescript::BUN_NOT_FOUND,
+            "this run offers the one-click install instead of the next run"
+        );
+        assert!(!private.exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_typescript_start_with_a_broken_private_bun_offers_install() {
+        let data = tempfile::tempdir().unwrap();
+        let private = toolchains::private_bun(data.path());
+        std::fs::create_dir_all(private.parent().unwrap()).unwrap();
+        std::fs::write(&private, "not a program").unwrap();
+        // Route through the real start path with the private copy, even when
+        // the test machine has its own Bun on PATH.
+        let supervisor = Supervisor::with_private_bun(data.path().to_path_buf(), private.clone());
+        let error = supervisor
+            .run_language("private-bun", "1 + 1", Language::Typescript, |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(error, typescript::BUN_NOT_FOUND);
+        assert!(!private.exists());
+        supervisor.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_working_private_bun_survives_an_unrelated_start_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let data = tempfile::tempdir().unwrap();
+        let private = toolchains::private_bun(data.path());
+        std::fs::create_dir_all(private.parent().unwrap()).unwrap();
+        std::fs::write(&private, "#!/bin/sh\necho 1.4.2\n").unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let supervisor = Supervisor::with_data_dir(data.path().to_path_buf());
+        assert_eq!(
+            supervisor
+                .recover_typescript_start_error(&private, "handshake timeout".into())
+                .await,
+            "handshake timeout"
+        );
+        assert!(private.exists());
+    }
+
+    #[tokio::test]
+    async fn a_pinned_bun_is_never_discarded() {
+        let data = tempfile::tempdir().unwrap();
+        let pinned = data.path().join("pinned-bun");
+        std::fs::write(&pinned, "not a program").unwrap();
+        let supervisor = Supervisor::with_bun(pinned.clone());
+        assert_eq!(
+            supervisor
+                .recover_typescript_start_error(&pinned, "kept".into())
+                .await,
+            "kept"
+        );
+        assert!(pinned.exists());
     }
 
     #[test]

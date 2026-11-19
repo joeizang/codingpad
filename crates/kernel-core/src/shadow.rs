@@ -1,6 +1,6 @@
 //! Shadow project storage shared by language-specific project writers.
 use crate::data_context::GeneratedContext;
-use crate::typescript::{self, Imports, Project};
+use crate::typescript::{Imports, Project};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -17,6 +17,8 @@ use crate::lsp::path_to_uri;
 #[derive(Default)]
 pub struct ShadowProjects {
     typescript: Mutex<HashMap<String, Arc<TypescriptSlot>>>,
+    data_dir: Option<PathBuf>,
+    bun: Option<PathBuf>,
     #[cfg(test)]
     pub(crate) registry: Option<String>,
 }
@@ -32,6 +34,27 @@ struct StagedTypescript {
 }
 
 impl ShadowProjects {
+    pub(crate) fn with_data_dir(data_dir: PathBuf) -> Self {
+        Self {
+            data_dir: Some(data_dir),
+            ..Self::default()
+        }
+    }
+
+    /// Pin the TypeScript package installer to one Bun.
+    pub(crate) fn with_bun(bun: PathBuf) -> Self {
+        Self {
+            bun: Some(bun),
+            ..Self::default()
+        }
+    }
+
+    /// Resolve Bun on every project preparation so a private install made in
+    /// this launch is used without restarting the app.
+    fn bun_path(&self) -> PathBuf {
+        crate::toolchains::bun_for(self.bun.as_deref(), self.data_dir.as_deref())
+    }
+
     pub(crate) async fn prepare_typescript(
         &self,
         script_id: &str,
@@ -77,7 +100,7 @@ impl ShadowProjects {
             }
             let project = Arc::new(
                 Project::prepare(
-                    &typescript::find_bun(),
+                    &self.bun_path(),
                     imports.unwrap_or_default(),
                     types,
                     notice,

@@ -100,7 +100,7 @@ type Script = {
   updates: Record<string, DumpNode>;
   controlling?: boolean;
   error?: string;
-  missingToolchain?: "uv" | "dotnet";
+  missingToolchain?: Toolchain;
   /** How long the last finished run took, measured from the click. */
   elapsed?: number;
   compilation?: { source: string; diagnostics: CompileDiagnostic[] };
@@ -123,6 +123,53 @@ const SCRIPT_STARTERS: Record<ScriptLanguage, string> = {
   typescript: TYPESCRIPT_SAMPLE,
   sql: SQL_SAMPLE,
 };
+
+type Toolchain = "uv" | "dotnet" | "bun";
+
+const TOOLCHAIN_INSTALL: Record<
+  Toolchain,
+  {
+    command: string;
+    name: string;
+    downloading: string;
+    description: string;
+    notFoundPrefix: string;
+  }
+> = {
+  uv: {
+    command: "install_uv",
+    name: "uv",
+    downloading: "Downloading and verifying uv…",
+    description:
+      "Install uv privately for CodingPad to run Python scripts. This needs an internet connection.",
+    notFoundPrefix: "uv was not found.",
+  },
+  dotnet: {
+    command: "install_dotnet",
+    name: ".NET",
+    downloading: "Downloading and verifying the .NET install script…",
+    description:
+      "Install the .NET SDK privately for CodingPad to run C# scripts. This needs an internet connection.",
+    notFoundPrefix: ".NET was not found.",
+  },
+  bun: {
+    command: "install_bun",
+    name: "Bun",
+    downloading: "Downloading and verifying Bun…",
+    description:
+      "Install Bun privately for CodingPad to run TypeScript scripts. This needs an internet connection.",
+    notFoundPrefix: "Bun was not found.",
+  },
+};
+
+const TOOLCHAINS = Object.keys(TOOLCHAIN_INSTALL) as Toolchain[];
+
+/** The installable toolchain a run error says is missing. */
+function missingToolchainFor(message: string): Toolchain | undefined {
+  return TOOLCHAINS.find((toolchain) =>
+    message.startsWith(TOOLCHAIN_INSTALL[toolchain].notFoundPrefix),
+  );
+}
 
 /** Starter text for a new tab, with a header line when a connection is attached. */
 function starterSource(language: ScriptLanguage, connection?: string): string {
@@ -393,11 +440,7 @@ export default function App() {
         ...item,
         status: "Could not run",
         error: message,
-        missingToolchain: message.startsWith("uv was not found.")
-          ? "uv"
-          : message.startsWith(".NET was not found.")
-            ? "dotnet"
-            : undefined,
+        missingToolchain: missingToolchainFor(message),
       }));
     } finally {
       flush();
@@ -469,15 +512,12 @@ export default function App() {
 
   async function installToolchainAndRun(
     script: Script,
-    toolchain: "uv" | "dotnet",
+    toolchain: Toolchain,
   ) {
     if (installingToolchain.current) return;
     installingToolchain.current = true;
-    setInstallProgress(
-      toolchain === "uv"
-        ? "Downloading and verifying uv…"
-        : "Downloading and verifying the .NET install script…",
-    );
+    const install = TOOLCHAIN_INSTALL[toolchain];
+    setInstallProgress(install.downloading);
     update(script.id, (item) => ({ ...item, error: undefined }));
     const onProgress = new Channel<string>();
     onProgress.onmessage = (message) => {
@@ -485,9 +525,7 @@ export default function App() {
     };
     let installed = false;
     try {
-      await invoke(toolchain === "uv" ? "install_uv" : "install_dotnet", {
-        onProgress,
-      });
+      await invoke(install.command, { onProgress });
       installed = true;
       setToolchainVersion((version) => version + 1);
     } catch (error) {
@@ -1185,11 +1223,7 @@ export default function App() {
               {installProgress && <p role="status">{installProgress}</p>}
               {active.missingToolchain && (
                 <div className="tool-install">
-                  <p>
-                    {active.missingToolchain === "dotnet"
-                      ? "Install the .NET SDK privately for CodingPad to run C# scripts. This needs an internet connection."
-                      : "Install uv privately for CodingPad to run Python scripts. This needs an internet connection."}
-                  </p>
+                  <p>{TOOLCHAIN_INSTALL[active.missingToolchain].description}</p>
                   <button
                     className="control-button"
                     disabled={installProgress !== null || active.running}
@@ -1201,12 +1235,8 @@ export default function App() {
                     }
                   >
                     {installProgress
-                      ? active.missingToolchain === "dotnet"
-                        ? "Installing .NET…"
-                        : "Installing uv…"
-                      : active.missingToolchain === "dotnet"
-                        ? "Install .NET and run"
-                        : "Install uv and run"}
+                      ? `Installing ${TOOLCHAIN_INSTALL[active.missingToolchain].name}…`
+                      : `Install ${TOOLCHAIN_INSTALL[active.missingToolchain].name} and run`}
                   </button>
                 </div>
               )}

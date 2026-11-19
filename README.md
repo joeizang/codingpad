@@ -26,9 +26,9 @@ just bundle
 
 The installers land in `target/release/bundle/` (`appimage/`, `deb/`, `rpm/`,
 `nsis/`). The app embeds its Python and C# kernels, so an installer is
-self-contained; it does not include Python, the .NET SDK or `uv`. A first run
-offers **Install uv and run** or **Install .NET and run** when a toolchain is
-missing, or uses one you already have.
+self-contained; it does not include Python, the .NET SDK, Bun or `uv`. A first
+run offers **Install uv and run**, **Install .NET and run** or **Install Bun and
+run** when a toolchain is missing, or uses one you already have.
 
 `packaging/app-icon.png` is the icon source. Regenerate the desktop icons with
 `npm --prefix apps/desktop run tauri -- icon packaging/app-icon.png`. Keep
@@ -60,7 +60,8 @@ connection).
 
 CodingPad sends no telemetry. Its network use is limited to the release check and
 the toolchain or package downloads you trigger, such as **Install uv and run**,
-**Install .NET and run**, and the language servers and packages a script needs.
+**Install .NET and run**, **Install Bun and run**, and the language servers and
+packages a script needs.
 There is no auto-updater (D29): see [Update notice](#update-notice-m43), and
 install the newest build over the current one to update.
 
@@ -135,17 +136,24 @@ installation removes abandoned staging files while holding a process lock, so
 another app instance's active download is preserved.
 The app prefers your existing `uv` over its private copy and never changes your
 shell profiles or `PATH`. Private installation supports x86-64 and ARM64 on macOS,
-Linux (GNU and musl), and Windows. Other architectures can use a manually installed
-`uv`. No tools are bundled in the application installer.
+Windows and Linux (GNU or musl builds). Other architectures can use a manually
+installed `uv`. No tools are bundled in the application installer.
 
 Python 3.10+ must already be installed. The app uses the installed Python selected
 by `uv python find`; a missing Python produces an actionable message in Results.
 The uv install action installs only `uv`. Scripts with inline dependencies install
 their packages through `uv` when Run is pressed.
 
-To run TypeScript, install [Bun](https://bun.com/docs/installation), then choose
-**TypeScript** in the New Script menu or open a `.ts` file. CodingPad looks for
-Bun on `PATH`, in `BUN_INSTALL/bin` or `~/.bun/bin`. Import `dump` from `codingpad` to
+To run TypeScript, choose **TypeScript** in the New Script menu or open a `.ts`
+file. CodingPad uses [Bun](https://bun.com/docs/installation) and looks for it on
+`PATH`, in `BUN_INSTALL/bin` or `~/.bun/bin`. If Bun is missing, Results offers
+**Install Bun and run**. One click downloads a pinned official Bun release,
+verifies its SHA-256, installs it privately under the app data folder
+(`toolchains/bun/1.4.2`), and retries the script without restarting the app. The
+app prefers your own Bun and never changes your shell profiles or `PATH`. Private
+installation supports x86-64 and ARM64 on macOS, Windows and Linux (GNU or musl
+builds); on x86-64 CPUs without AVX2 it installs Bun's baseline build. Import
+`dump` from `codingpad` to
 display a value in Results. The last expression is dumped automatically.
 Top-level `await` works and the kernel runs scripts with type errors. Import
 `cache` from `codingpad` to keep a structured-cloneable result between reruns of
@@ -176,11 +184,12 @@ changes your shell profiles or `PATH`, and it prefers a supported .NET you
 installed yourself. Code intelligence restarts with the installed SDK.
 
 The default test suite runs offline installer checks. To also download the real
-release into a temporary folder and run Python through it:
+releases into a temporary folder and run a script through each one:
 
 ```sh
 cargo test -p codingpad-kernel-core --lib toolchains::tests::official_release -- --ignored
 cargo test -p codingpad-kernel-core --lib toolchains::tests::official_dotnet -- --ignored
+cargo test -p codingpad-kernel-core --lib toolchains::tests::official_bun -- --ignored
 ```
 
 This needs network access (and Python 3.10+ for the uv test). It leaves user

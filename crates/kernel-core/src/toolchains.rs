@@ -15,6 +15,64 @@ use tokio::{
 
 pub const UV_VERSION: &str = "0.13.6";
 
+/// Pinned with the Bun version CI installs (1.4.2).
+pub const BUN_VERSION: &str = "1.4.2";
+
+// SHA-256 digests from https://github.com/oven-sh/bun/releases/tag/bun-v1.4.2
+// Update BUN_VERSION, all asset digests, the CI Bun pin and README together.
+// macOS assets mirror the uv manifest so a future macOS build (D62) has them;
+// only the current platform's asset is downloaded.
+const BUN_RELEASES: &[(&str, &str)] = &[
+    (
+        "bun-darwin-aarch64.zip",
+        "90987a3a16d7db556d886ac3d551e7b6d3edf0a1cf43acaed622e8676be1d12f",
+    ),
+    (
+        "bun-darwin-x64-baseline.zip",
+        "bad5bbd6cf14d0980d115f5954c9ff904df619d5e994d2da1ffccd3f316300b0",
+    ),
+    (
+        "bun-darwin-x64.zip",
+        "80520d7e17526308c9185d261679ac6d27798d3803a0e9f7ff9121ab8affb012",
+    ),
+    (
+        "bun-linux-aarch64-musl.zip",
+        "71760b6c8ea30623b81a4907cb815d48e2ea266f2e73e751534a44a0607950df",
+    ),
+    (
+        "bun-linux-aarch64.zip",
+        "54328bbc2d9c8e0c9f892c544d66c57a83b84139e34909e5ee81758f1ac8fda7",
+    ),
+    (
+        "bun-linux-x64-baseline.zip",
+        "c678040f14fe0440eb839d37cbd0ce4c051a32da72806ac97de6a6aab6bf728f",
+    ),
+    (
+        "bun-linux-x64-musl-baseline.zip",
+        "76e1db84e98f22f78de0a87e309bfbbf297732847f9720db36750646c85c8c18",
+    ),
+    (
+        "bun-linux-x64-musl.zip",
+        "4835eca59d6da70f4674f5642f6e459dcadab773695b2ed9922d131057989742",
+    ),
+    (
+        "bun-linux-x64.zip",
+        "36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913",
+    ),
+    (
+        "bun-windows-aarch64.zip",
+        "a7a16b876a305fd1029c66dbd27007b4f6112ae896532f675878731a21e50cfd",
+    ),
+    (
+        "bun-windows-x64-baseline.zip",
+        "78c221c2376f79731ccf4e4af0b3bb46d81fefa3296c5abee09ad8a1b21e68c6",
+    ),
+    (
+        "bun-windows-x64.zip",
+        "ce4c17497b2f29712a99d3d53f028de28cd42e3bacb8589599e7f000e49b6405",
+    ),
+];
+
 // Pinned official .NET install script from dotnet/install-scripts tag
 // v2026.07.21. The tag is immutable, so the URLs and digests never change under
 // us. Update the tag, both digests, and README together.
@@ -96,6 +154,82 @@ pub fn private_uv(data_dir: &Path) -> PathBuf {
 pub fn resolve_uv(data_dir: &Path) -> PathBuf {
     let user = find_uv();
     prefer_user(user, private_uv(data_dir))
+}
+
+/// The user's Bun first, then CodingPad's private copy.
+pub fn resolve_bun(data_dir: &Path) -> PathBuf {
+    resolve_bun_with(crate::typescript::find_bun(), data_dir)
+}
+
+fn resolve_bun_with(user: PathBuf, data_dir: &Path) -> PathBuf {
+    prefer_user(user, private_bun(data_dir))
+}
+
+/// The one Bun every part of the app starts: an explicit pin, the user's copy,
+/// then CodingPad's private install.
+pub(crate) fn bun_for(pin: Option<&Path>, data_dir: Option<&Path>) -> PathBuf {
+    if let Some(pin) = pin {
+        return pin.to_path_buf();
+    }
+    data_dir
+        .map(resolve_bun)
+        .unwrap_or_else(crate::typescript::find_bun)
+}
+
+pub fn private_bun(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join("toolchains")
+        .join("bun")
+        .join(BUN_VERSION)
+        .join(if cfg!(windows) { "bun.exe" } else { "bun" })
+}
+
+/// The official Bun build for this machine. Bun's generic x64 build requires
+/// AVX2, so older CPUs get the baseline build.
+fn bun_release(
+    os: &str,
+    arch: &str,
+    musl: bool,
+    avx2: bool,
+) -> Result<(&'static str, &'static str), String> {
+    let platform_arch = match arch {
+        "x86_64" => "x64",
+        "aarch64" => "aarch64",
+        _ => return Err(unsupported_bun(os, arch)),
+    };
+    let mut platform = match os {
+        "macos" => format!("darwin-{platform_arch}"),
+        "windows" => format!("windows-{platform_arch}"),
+        "linux" if musl => format!("linux-{platform_arch}-musl"),
+        "linux" => format!("linux-{platform_arch}"),
+        _ => return Err(unsupported_bun(os, arch)),
+    };
+    if platform_arch == "x64" && !avx2 {
+        platform.push_str("-baseline");
+    }
+    let name = format!("bun-{platform}.zip");
+    BUN_RELEASES
+        .iter()
+        .copied()
+        .find(|(asset, _)| *asset == name)
+        .ok_or_else(|| unsupported_bun(os, arch))
+}
+
+fn has_avx2() -> bool {
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    {
+        is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+    {
+        true
+    }
+}
+
+fn unsupported_bun(os: &str, arch: &str) -> String {
+    format!(
+        "Private Bun installation is not supported on {os}/{arch}. Install Bun from https://bun.com/docs/installation and try Run again."
+    )
 }
 
 fn prefer_user(user: PathBuf, private: PathBuf) -> PathBuf {
@@ -302,6 +436,24 @@ impl Toolchains {
         }
         install_private_dotnet(&self.data_dir, progress).await
     }
+
+    pub async fn install_bun(&self, progress: impl FnMut(&str) + Send) -> Result<PathBuf, String> {
+        let _guard = self.install.lock().await;
+        let existing = resolve_bun(&self.data_dir);
+        if existing.is_file() {
+            let private = private_bun(&self.data_dir);
+            // Trust the user's own Bun, but prove a private copy still runs.
+            // A CPU without AVX2, a partial restore or a changed platform can
+            // leave an executable that exists and cannot start.
+            if existing != private || bun_runs(&existing).await {
+                return Ok(existing);
+            }
+            std::fs::remove_file(&existing).map_err(|error| {
+                format!("Could not replace the unusable Bun installation: {error}")
+            })?;
+        }
+        install_private_bun(&self.data_dir, progress).await
+    }
 }
 
 /// Releases the installer lock explicitly on drop, so a duplicate or inherited
@@ -351,12 +503,48 @@ fn prepare_install(directory: &Path) -> Result<InstallLock, String> {
     Ok(lock)
 }
 
+const MAX_TOOL_BYTES: u64 = 100 * 1024 * 1024;
+
+struct ReleaseInstall<'a> {
+    destination: &'a Path,
+    sha256: &'a str,
+    url: String,
+    member: String,
+    archive: Archive,
+    downloading: &'a str,
+}
+
+/// Take the installer lock, download and verify one release, then promote only
+/// its binary. Shared by the uv and Bun installers.
+async fn install_release(
+    release: ReleaseInstall<'_>,
+    progress: &mut (impl FnMut(&str) + Send),
+) -> Result<PathBuf, String> {
+    let _lock = prepare_install(
+        release
+            .destination
+            .parent()
+            .ok_or("Missing tool directory")?,
+    )?;
+    progress(release.downloading);
+    installer::install_binary(
+        &Artifact {
+            url: &release.url,
+            sha256: release.sha256,
+            max_bytes: MAX_TOOL_BYTES,
+        },
+        release.archive,
+        &release.member,
+        release.destination,
+    )
+    .await
+}
+
 async fn install_private_uv(
     data_dir: &Path,
     mut progress: impl FnMut(&str) + Send,
 ) -> Result<PathBuf, String> {
     let destination = private_uv(data_dir);
-    let _lock = prepare_install(destination.parent().ok_or("Missing tool directory")?)?;
     let (asset, sha256) = release(
         std::env::consts::OS,
         std::env::consts::ARCH,
@@ -368,25 +556,99 @@ async fn install_private_uv(
     } else {
         format!("{}/uv", asset.trim_end_matches(".tar.gz"))
     };
-    let url = format!("https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/{asset}");
-    progress("Downloading and verifying uv…");
-    let path = installer::install_binary(
-        &Artifact {
-            url: &url,
+    let path = install_release(
+        ReleaseInstall {
+            destination: &destination,
             sha256,
-            max_bytes: 100 * 1024 * 1024,
+            url: format!("https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/{asset}"),
+            member,
+            archive: if windows {
+                Archive::Zip
+            } else {
+                Archive::TarGz
+            },
+            downloading: "Downloading and verifying uv…",
         },
-        if windows {
-            Archive::Zip
-        } else {
-            Archive::TarGz
-        },
-        &member,
-        &destination,
+        &mut progress,
     )
     .await?;
     progress("uv installed. Starting script…");
     Ok(path)
+}
+
+async fn install_private_bun(
+    data_dir: &Path,
+    mut progress: impl FnMut(&str) + Send,
+) -> Result<PathBuf, String> {
+    let destination = private_bun(data_dir);
+    let (asset, sha256) = bun_release(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cfg!(target_env = "musl"),
+        has_avx2(),
+    )?;
+    let member = format!(
+        "{}/{}",
+        asset.trim_end_matches(".zip"),
+        if cfg!(windows) { "bun.exe" } else { "bun" }
+    );
+    let path = install_release(
+        ReleaseInstall {
+            destination: &destination,
+            sha256,
+            url: format!(
+                "https://github.com/oven-sh/bun/releases/download/bun-v{BUN_VERSION}/{asset}"
+            ),
+            member,
+            archive: Archive::Zip,
+            downloading: "Downloading and verifying Bun…",
+        },
+        &mut progress,
+    )
+    .await?;
+    // install_binary probes `--version` before promoting, but another CodingPad
+    // instance can win the persist_noclobber race and supply the file that is
+    // actually used. Run that copy and remove it if this machine cannot start
+    // it, so a reinstall can retry.
+    if !bun_runs(&path).await {
+        let _ = std::fs::remove_file(&path);
+        return Err(
+            "The installed Bun could not run on this computer. Nothing was kept; retry installation."
+                .into(),
+        );
+    }
+    progress("Bun installed. Starting script…");
+    Ok(path)
+}
+
+/// Strict health check for the install path: a probe that times out counts as
+/// unusable so a fresh install can retry.
+pub(crate) async fn bun_runs(path: &Path) -> bool {
+    bun_version(path, Duration::from_secs(10)).await == Some(true)
+}
+
+/// Only a definite failure marks an installed copy broken. A probe that times
+/// out may be a busy machine or an antivirus scan, so the recovery path keeps
+/// the copy instead of downloading it again.
+pub(crate) async fn bun_is_broken(path: &Path) -> bool {
+    bun_version(path, Duration::from_secs(10)).await == Some(false)
+}
+
+/// `Some(true)` started successfully, `Some(false)` definitely failed, and
+/// `None` means the probe timed out.
+async fn bun_version(path: &Path, deadline: Duration) -> Option<bool> {
+    if !path.is_file() {
+        return Some(false);
+    }
+    let mut command = tokio::process::Command::new(path);
+    command.arg("--version").kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    match tokio::time::timeout(deadline, command.output()).await {
+        Ok(Ok(output)) => Some(output.status.success()),
+        Ok(Err(_)) => Some(false),
+        Err(_) => None,
+    }
 }
 
 /// Keep learner-facing progress friendly: the script's diagnostic lines include
@@ -652,6 +914,130 @@ mod tests {
     }
 
     #[test]
+    fn bun_platforms_have_pinned_artifacts() {
+        for (os, arch, musl) in [
+            ("linux", "x86_64", false),
+            ("linux", "x86_64", true),
+            ("linux", "aarch64", false),
+            ("linux", "aarch64", true),
+            ("macos", "x86_64", false),
+            ("macos", "aarch64", false),
+            ("windows", "x86_64", false),
+            ("windows", "aarch64", false),
+        ] {
+            for avx2 in [true, false] {
+                let (asset, hash) = bun_release(os, arch, musl, avx2).unwrap();
+                assert!(asset.starts_with("bun-"), "{asset}");
+                assert!(asset.ends_with(".zip"), "{asset}");
+                assert_eq!(hash.len(), 64);
+                assert!(hash.bytes().all(|c| c.is_ascii_hexdigit()));
+            }
+        }
+        assert_eq!(
+            bun_release("linux", "x86_64", false, true).unwrap().0,
+            "bun-linux-x64.zip"
+        );
+        assert_eq!(
+            bun_release("linux", "x86_64", false, false).unwrap().0,
+            "bun-linux-x64-baseline.zip"
+        );
+        assert_eq!(
+            bun_release("linux", "x86_64", true, false).unwrap().0,
+            "bun-linux-x64-musl-baseline.zip"
+        );
+        assert_eq!(
+            bun_release("macos", "x86_64", false, false).unwrap().0,
+            "bun-darwin-x64-baseline.zip"
+        );
+        assert_eq!(
+            bun_release("windows", "x86_64", false, false).unwrap().0,
+            "bun-windows-x64-baseline.zip"
+        );
+        // ARM builds have no baseline variant.
+        assert_eq!(
+            bun_release("linux", "aarch64", false, false).unwrap().0,
+            "bun-linux-aarch64.zip"
+        );
+        assert!(bun_release("linux", "mips", false, true).is_err());
+        assert!(bun_release("unknown", "x86_64", false, true).is_err());
+    }
+
+    #[test]
+    fn resolve_bun_prefers_the_user_copy_then_the_private_one() {
+        let data = tempfile::tempdir().unwrap();
+        let user = data.path().join("user-bun");
+        let private = private_bun(data.path());
+        assert_eq!(resolve_bun_with(user.clone(), data.path()), user);
+        std::fs::create_dir_all(private.parent().unwrap()).unwrap();
+        std::fs::write(&private, "private").unwrap();
+        assert_eq!(resolve_bun_with(user.clone(), data.path()), private);
+        std::fs::write(&user, "user").unwrap();
+        assert_eq!(resolve_bun_with(user.clone(), data.path()), user);
+    }
+
+    #[test]
+    fn bun_for_uses_an_explicit_pin_before_the_user_or_private_copy() {
+        let data = tempfile::tempdir().unwrap();
+        let pin = data.path().join("pinned-bun");
+        assert_eq!(
+            bun_for(Some(&pin), Some(data.path())),
+            pin,
+            "an explicit pin wins even when the file does not exist"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bun_health_check_runs_the_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = |name: &str, body: &str| {
+            let path = directory.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        assert!(
+            bun_runs(&executable("good-bun", "#!/bin/sh\necho 1.4.2\n")).await,
+            "a working binary passes the check"
+        );
+        assert!(
+            !bun_runs(&executable("bad-bun", "#!/bin/sh\nexit 3\n")).await,
+            "a binary that cannot start is rejected"
+        );
+        assert!(!bun_runs(&directory.path().join("missing-bun")).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_slow_version_probe_is_not_a_definite_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("slow-bun");
+        std::fs::write(&path, "#!/bin/sh\nsleep 60\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            bun_version(&path, Duration::from_millis(100)).await,
+            None,
+            "the recovery path keeps a copy when the probe does not finish"
+        );
+    }
+
+    #[test]
+    fn private_bun_lives_under_the_app_data_folder() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = private_bun(directory.path());
+        assert!(path.starts_with(directory.path().join("toolchains").join("bun")));
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            if cfg!(windows) { "bun.exe" } else { "bun" }
+        );
+        assert!(path.to_string_lossy().contains(BUN_VERSION));
+    }
+
+    #[test]
     fn user_tool_wins_and_private_install_survives_restart() {
         let directory = tempfile::tempdir().unwrap();
         let user = directory.path().join("user-uv");
@@ -868,6 +1254,43 @@ mod tests {
                 .count(),
             2 // Installed executable plus the persistent process lock.
         );
+    }
+
+    /// Network acceptance test for the one-click Bun install.
+    #[tokio::test]
+    #[ignore = "downloads the official Bun release; run explicitly when validating the installer"]
+    async fn official_bun_release_installs_privately_and_runs_typescript() {
+        let data = tempfile::tempdir().unwrap();
+        let installed = install_private_bun(data.path(), |_| {}).await.unwrap();
+        assert_eq!(installed, private_bun(data.path()));
+        let output = tokio::process::Command::new(&installed)
+            .arg("--version")
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .starts_with(BUN_VERSION));
+        let supervisor = crate::Supervisor::with_bun(installed);
+        let mut events = Vec::new();
+        let result = supervisor
+            .run_language(
+                "bun",
+                "console.log('private bun works');\nawait Promise.resolve(6 * 7)",
+                crate::Language::Typescript,
+                |event| events.push(event),
+            )
+            .await
+            .unwrap();
+        assert!(result.ok, "{events:?}");
+        assert!(events
+            .iter()
+            .any(|event| event.params.to_string().contains("private bun works")));
+        assert!(events
+            .iter()
+            .any(|event| event.params.to_string().contains("42")));
+        supervisor.shutdown().await;
     }
 
     /// Network acceptance test for the one-click .NET SDK install.

@@ -25,9 +25,16 @@ The supervisor allocates monotonically increasing integer request IDs per kernel
 
 `params.secrets` is an optional object of named secret values resolved by the
 host from the OS password vault before each run. The kernel keeps them in memory;
-Python exposes them through `secret("name")`, C# through `Secret("name")`. They
+Python and TypeScript expose them through `secret("name")`, C# through
+`Secret("name")`. They
 are never written to stdout/stderr or included in dumps unless a script chooses
 to do so.
+
+`params.secret_errors` is an optional object of vault read errors keyed by
+secret name. Kernels surface the stored error when the script requests that name.
+`params.connection` is null or an object with `settings` (the saved connection)
+and `password` (a resolved vault password or null). Reserved connection
+passwords are excluded from `params.secrets`.
 
 `params.eager` is an optional boolean for hosts without an expand gesture, such
 as `cpad run`. When true, kernels materialise values they would otherwise leave
@@ -475,6 +482,14 @@ The bundled `codingpad` module is available inside each worker. `run.params.path
 sets the base for file-relative imports from a saved tab. Unsaved tabs resolve
 relative to a private scratch subdirectory. Run uses the editor snapshot without
 writing to the script file.
+
+The worker exposes the run's `db` and `secret()` as globals and exports from
+`codingpad`. It opens the attached database on first use and closes it when the
+run finishes. For SQL Server, `run.params.sql_server_driver` names the private
+project directory from which the worker resolves `mssql`. The field is null for
+other connections. The worker removes the credential fields from `workerData`
+before loading user modules. Query dumps retain column headers for empty
+results and set `truncated` when more than 10,000 rows were returned by the driver.
 
 Since M5.3, scripts can use Bun's versioned npm imports, such as
 `import { z } from "zod@3"`, with the same syntax in CodingPad and standalone Bun.

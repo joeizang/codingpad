@@ -15,7 +15,7 @@ export type Script = {
   path: string | null;
   finalExpression: { start: number; end: number; append: boolean } | null;
   connection: Connection | null;
-  sqlServerDriver: string | null;
+  sql_server_driver: string | null;
   secrets: Record<string, string>;
   secret_errors: Record<string, string>;
 };
@@ -25,7 +25,7 @@ const port = parentPort!;
 const FINAL_DUMP_MODULE = "codingpad:internal";
 
 async function run({
-  runId, source, path: scriptPath, finalExpression, connection, sqlServerDriver,
+  runId, source, path: scriptPath, finalExpression, connection, sql_server_driver: sqlServerDriver,
   secrets, secret_errors: secretErrors,
 }: Script) {
   let running = true;

@@ -1,4 +1,5 @@
 import { types } from "node:util";
+import { isDatabaseRows } from "./database.ts";
 import { Html, Image, Live } from "./runtime.ts";
 import { inspectValue, MAX_TEXT } from "./errors.ts";
 
@@ -210,6 +211,11 @@ export class Dumps {
     if (!Array.isArray(value) && iterable(value)) return this.#lazy(id, value, ancestors);
 
     const path = [...ancestors, value];
+    if (isDatabaseRows(value) && value.columns.length) {
+      return depth === 0
+        ? this.#arrayTable(id, value, value.columns.slice(0, 32), path, value)
+        : this.#lazy(id, value, ancestors);
+    }
     if (Array.isArray(value) && record(property(value, "0"))) {
       const columns = columnsFor(Array.from({ length: Math.min(PAGE_SIZE, value.length) },
         (_, index) => property(value, index)));
@@ -252,11 +258,14 @@ export class Dumps {
     return read(id, 0, PAGE_SIZE, remaining, depth);
   }
 
-  #arrayTable(id: string, value: unknown[], columns: string[], path: object[]): Node {
+  #arrayTable(
+    id: string, value: unknown[], columns: string[], path: object[],
+    database?: { columns: readonly string[]; truncated: boolean },
+  ): Node {
     const total = value.length;
     const slice = (offset: number, size: number) =>
       Array.from({ length: Math.max(0, Math.min(size, total - offset)) }, (_, index) => property(value, index + offset));
-    const cells = (row: unknown, names: string[]) => record(row)
+    const cells = (row: unknown, names: readonly string[]) => record(row)
       ? names.map((key) => property(row, key))
       : names.map(() => undefined);
     const page = (id: string, offset: number, size: number): Node => {
@@ -264,10 +273,11 @@ export class Dumps {
       const rows = slice(offset, size).map((row) =>
         cells(row, columns).map((cell) => this.#preview(cell, remaining, path, 0, true)));
       const end = offset + rows.length;
-      return { id, kind: "table", type: "Array", columns: columns.map((name) => ({ name: name.slice(0, MAX_TEXT) })),
-        rows, total, next: end < total ? String(end) : null, handle };
+      return { id, kind: "table", type: database ? "DatabaseRows" : "Array",
+        columns: columns.map((name) => ({ name: name.slice(0, MAX_TEXT) })),
+        rows, total, truncated: database?.truncated, next: end < total ? String(end) : null, handle };
     };
-    let exportColumns: string[] | undefined;
+    let exportColumns = database?.columns;
     const handle = this.#keep((offset, size) => page(this.#id(), offset, size), async (offset, size) => {
       exportColumns ??= columnsFor((function* () {
         for (let index = 0; index < total; index++) yield property(value, index);

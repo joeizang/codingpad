@@ -163,6 +163,12 @@ pub struct DataContextRun {
     pub connection: crate::data_context::ConnectionInfo,
 }
 
+#[derive(Serialize)]
+struct RunConnection {
+    settings: databases::Connection,
+    password: Option<String>,
+}
+
 /// The connection named by a script's `codingpad:` header, if any.
 pub fn attached_connection(source: &str) -> Option<String> {
     store::parse_header(source)?
@@ -528,7 +534,10 @@ impl Supervisor {
                 } else {
                     None
                 };
-                Some(json!({"settings": connection, "password": password}))
+                Some(RunConnection {
+                    settings: connection,
+                    password,
+                })
             }
             None => None,
         };
@@ -536,28 +545,20 @@ impl Supervisor {
         if *closed.borrow() {
             return Err("Script was closed".into());
         }
-        let script = if language == Language::Typescript {
-            typescript::parse(source)?
-        } else {
-            None
-        };
-        let (typescript_imports, final_expression) = script.map_or((None, None), |script| {
-            (Some(script.imports), script.final_expression)
-        });
+        let connection_kind = connection
+            .as_ref()
+            .map(|connection| connection.settings.kind);
         let mut packages = if language == Language::Python {
             Packages::parse(source)?
         } else {
             Packages::parse("")?
         };
         if language == Language::Python {
-            if let Some(kind) = connection
-                .as_ref()
-                .and_then(|value| value["settings"]["kind"].as_str())
-            {
+            if let Some(kind) = connection_kind {
                 let driver = match kind {
-                    "postgres" => Some("psycopg[binary]>=3.2,<4"),
-                    "sqlserver" => Some("mssql-python>=1,<2"),
-                    _ => None,
+                    databases::DatabaseKind::Postgres => Some("psycopg[binary]>=3.2,<4"),
+                    databases::DatabaseKind::SqlServer => Some("mssql-python>=1,<2"),
+                    databases::DatabaseKind::Sqlite => None,
                 };
                 if let Some(driver) = driver {
                     packages.dependencies.push(driver.to_owned());
@@ -594,40 +595,32 @@ impl Supervisor {
                 packages.dependencies.dedup();
             }
         }
-        let (typescript_project, sql_server_driver) = if language == Language::Typescript {
-            let prepare = async {
-                let mut notice = |text| {
+        let (typescript_project, sql_server_driver, final_expression) = if language
+            == Language::Typescript
+        {
+            let prepare = typescript::prepare_run(
+                &self.shadow_projects,
+                script_id,
+                source,
+                connection_kind,
+                |text| {
                     emit(KernelEvent {
                         method: "stream".into(),
                         params: json!({"runId": 0, "stream": "stderr", "text": format!("{text}\n")}),
                     });
-                };
-                let driver = if connection
-                    .as_ref()
-                    .is_some_and(|value| value["settings"]["kind"] == "sqlserver")
-                {
-                    Some(
-                        self.shadow_projects
-                            .typescript_sql_server_driver(&mut notice)
-                            .await?,
-                    )
-                } else {
-                    None
-                };
-                let project = self
-                    .shadow_projects
-                    .prepare_typescript(script_id, source, typescript_imports, false, notice)
-                    .await?;
-                Ok::<_, String>((Some(project), driver))
-            };
+                },
+            );
             tokio::select! {
                 biased;
                 _ = closed.changed() => return Err("Script was closed".into()),
                 _ = stop.changed() => return Ok(RunResult { ok: false, stopped: true, cache_cleared: false }),
-                result = prepare => result?,
+                result = prepare => {
+                    let prepared = result?;
+                    (Some(prepared.project), prepared.sql_server_driver, prepared.final_expression)
+                },
             }
         } else {
-            (None, None)
+            (None, None, None)
         };
         if guard.as_ref().is_some_and(|kernel| {
             kernel.packages != packages
@@ -681,7 +674,7 @@ impl Supervisor {
         }
         let kernel = guard.as_mut().unwrap();
         let data = data.map(|data| json!({"source": data.source, "connection": data.connection}));
-        let params = json!({"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection, "data": data, "eager": self.eager_dumps, "finalExpression": final_expression, "sqlServerDriver": sql_server_driver});
+        let params = json!({"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection, "data": data, "eager": self.eager_dumps, "finalExpression": final_expression, "sql_server_driver": sql_server_driver});
         let result = tokio::select! {
             result = kernel.run(params, &mut emit, &mut stop) => result,
             _ = closed.changed() => Err("Script was closed".into()),

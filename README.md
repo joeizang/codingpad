@@ -149,7 +149,7 @@ file. CodingPad uses [Bun](https://bun.com/docs/installation) and looks for it o
 `PATH`, in `BUN_INSTALL/bin` or `~/.bun/bin`. If Bun is missing, Results offers
 **Install Bun and run**. One click downloads a pinned official Bun release,
 verifies its SHA-256, installs it privately under the app data folder
-(`toolchains/bun/1.4.2`), and retries the script without restarting the app. The
+(`toolchains/bun/1.4.4`), and retries the script without restarting the app. The
 app prefers your own Bun and never changes your shell profiles or `PATH`. Private
 installation supports x86-64 and ARM64 on macOS, Windows and Linux (GNU or musl
 builds); on x86-64 CPUs without AVX2 it installs Bun's baseline build. Import
@@ -600,12 +600,17 @@ awaited query as the last expression to show its table automatically:
 await db.query("SELECT * FROM customers LIMIT ?", [10])
 ```
 
-Bind values as an array and use the database's placeholders: `?` for SQLite,
-`$1`, `$2`, … for PostgreSQL, and `@p1`, `@p2`, … for SQL Server. The first
-query opens the connection using the saved settings and vault password, and
-CodingPad closes it when the run ends. SQLite and PostgreSQL use Bun's built-in
-clients. The first run with a SQL Server connection installs the `mssql` driver
-through Bun.
+Bind values as an array and use the database's placeholders (`?` for SQLite,
+`$1`, `$2`, … for PostgreSQL, and `@p1`, `@p2`, … for SQL Server).
+`db.query(sql, parameters)` returns at most 10,000 rows and exposes `columns`
+and `truncated` on the result. Results preserve headers for empty queries and
+use suffixes such as `id_2` for duplicate column names.
+`db.execute(sql, parameters)` returns the number of affected rows.
+
+The first database call opens the connection using the saved settings and vault
+password. CodingPad closes it when the run ends. SQLite and PostgreSQL use Bun's
+built-in clients. PostgreSQL requires Bun 1.4.4 or later for column metadata.
+The first run with a SQL Server connection installs the `mssql` driver through Bun.
 
 Click **Connections…** to add a SQLite, PostgreSQL or SQL Server database, then
 **+ SQL** or open a `.sql` file. The first line names the connection; the rest is plain SQL:

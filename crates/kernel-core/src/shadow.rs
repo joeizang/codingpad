@@ -75,7 +75,7 @@ impl ShadowProjects {
                 .await
             })
             .await?;
-        Ok(project.shadow.root().join("node_modules/mssql/index.js"))
+        Ok(project.shadow.root().to_path_buf())
     }
 
     pub(crate) async fn prepare_typescript(

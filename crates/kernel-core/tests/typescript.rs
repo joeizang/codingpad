@@ -447,6 +447,34 @@ await db.query("SELECT name FROM items WHERE name = ?", [secret("who")])
     };
     assert_query_table(&events, "name", "Ada");
 
+    let events = run_dump_script(
+        &supervisor,
+        r#"// codingpad: connection=sample
+import { dump } from "codingpad";
+dump(await db.execute("INSERT INTO items VALUES (?)", ["Grace"]));
+dump(await db.query("SELECT 1 AS id, 2 AS id, 3 AS id_2"));
+dump(await db.query("SELECT name FROM items WHERE 1 = 0"));
+const rows = await db.query(`
+  WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM nums WHERE n < 10001)
+  SELECT n FROM nums
+`);
+if (rows.length !== 10000 || !rows.truncated || rows.columns[0] !== "n") {
+  throw new Error("Database row limit or metadata is wrong");
+}
+rows
+"#,
+    )
+    .await
+    .unwrap();
+    let nodes: Vec<_> = dump_nodes(&events).collect();
+    assert_eq!(nodes[0]["v"], 1);
+    assert_duplicate_query_columns(nodes[1]);
+    assert_eq!(nodes[1]["columns"][2]["name"], "id_2_2");
+    assert_eq!(nodes[1]["rows"][0][2]["v"], 3);
+    assert_empty_query_table(nodes[2], "name");
+    assert_eq!(nodes[3]["total"], 10_000);
+    assert_eq!(nodes[3]["truncated"], true);
+
     secrets.set_session("who", "Grace").unwrap();
     let events = run_dump_script(
         &supervisor,
@@ -478,6 +506,38 @@ secret("who")
     supervisor.shutdown().await;
 }
 
+#[tokio::test]
+async fn typescript_esm_helper_reads_a_secret_unmentioned_in_the_main_script() {
+    let directory = tempfile::tempdir().unwrap();
+    let helper = directory.path().join("helper.ts");
+    std::fs::write(&helper, r#"export const token = secret("helper-token");"#).unwrap();
+    let url = url::Url::from_file_path(helper).unwrap();
+    let secrets = Arc::new(SecretStore::new(directory.path()));
+    secrets.set_session("helper-token", "from vault").unwrap();
+    let supervisor = Supervisor::with_data_dir_and_secrets(directory.path().into(), secrets);
+    let source = format!("import {{ token }} from {:?};\ntoken", url.as_str());
+    if let Some(events) = run_dump_script(&supervisor, &source).await {
+        assert_eq!(dump_nodes(&events).next().unwrap()["v"], "from vault");
+    }
+    supervisor.shutdown().await;
+}
+
+fn assert_duplicate_query_columns(table: &Value) {
+    assert_eq!(table["kind"], "table", "{table}");
+    assert_eq!(table["columns"][0]["name"], "id");
+    assert_eq!(table["columns"][1]["name"], "id_2");
+    assert_eq!(table["rows"][0][0]["v"], 1);
+    assert_eq!(table["rows"][0][1]["v"], 2);
+}
+
+fn assert_empty_query_table(table: &Value, column: &str) {
+    assert_eq!(table["kind"], "table", "{table}");
+    assert_eq!(table["columns"][0]["name"], column);
+    assert_eq!(table["total"], 0);
+    assert_eq!(table["rows"], serde_json::json!([]));
+    assert_eq!(table["truncated"], false);
+}
+
 fn assert_query_table(events: &[KernelEvent], column: &str, value: &str) {
     let table = dump_nodes(events).next().unwrap();
     assert_eq!(table["kind"], "table", "{table}");
@@ -504,13 +564,19 @@ impl Vault for TestVault {
 #[tokio::test]
 #[ignore = "requires CODINGPAD_TEST_POSTGRES_* and CODINGPAD_TEST_SQLSERVER_* connection settings"]
 async fn typescript_queries_postgres_and_sql_server_with_vault_passwords() {
-    for (kind, prefix, query) in [
+    for (kind, prefix, query, insert) in [
         (
             DatabaseKind::Postgres,
             "POSTGRES",
             "SELECT $1::text AS name",
+            "INSERT INTO codingpad_test VALUES ($1)",
         ),
-        (DatabaseKind::SqlServer, "SQLSERVER", "SELECT @p1 AS name"),
+        (
+            DatabaseKind::SqlServer,
+            "SQLSERVER",
+            "SELECT @p1 AS name",
+            "DECLARE @sample TABLE(name NVARCHAR(32)); INSERT INTO @sample VALUES (@p1)",
+        ),
     ] {
         let env = |key| {
             let variable = format!("CODINGPAD_TEST_{prefix}_{key}");
@@ -544,8 +610,14 @@ async fn typescript_queries_postgres_and_sql_server_with_vault_passwords() {
             .unwrap();
         let supervisor = Supervisor::with_data_dir_and_secrets(directory.path().into(), secrets)
             .with_connections(connections);
+        let setup = if kind == DatabaseKind::Postgres {
+            r#"await db.execute("CREATE TEMPORARY TABLE codingpad_test (name TEXT)");"#
+        } else {
+            ""
+        };
         let source = format!(
             r#"// codingpad: connection=server
+import {{ dump }} from "codingpad";
 import {{ workerData }} from "node:worker_threads";
 const name = "D'Angelo";
 if (workerData.connection || workerData.secrets || workerData.secret_errors) {{
@@ -553,7 +625,11 @@ if (workerData.connection || workerData.secrets || workerData.secret_errors) {{
 }}
 try {{ secret("{secret_name}"); throw new Error("Reserved secret was exposed"); }}
 catch (error) {{ if (!error.message.includes("was not found")) throw error; }}
-await db.query("{query}", [name])
+dump(await db.query("{query}", [name]));
+dump(await db.query("SELECT 1 AS id, 2 AS id"));
+dump(await db.query("SELECT 1 AS id WHERE 1 = 0"));
+{setup}
+await db.execute("{insert}", [name])
 "#
         );
         let mut events = Vec::new();
@@ -568,6 +644,10 @@ await db.query("{query}", [name])
         .expect("Bun kernel failed");
         assert!(result.ok, "{prefix}: {events:?}");
         assert_query_table(&events, "name", "D'Angelo");
+        let nodes: Vec<_> = dump_nodes(&events).collect();
+        assert_duplicate_query_columns(nodes[1]);
+        assert_empty_query_table(nodes[2], "id");
+        assert_eq!(nodes[3]["v"], 1);
         supervisor.shutdown().await;
     }
 }

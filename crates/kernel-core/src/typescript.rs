@@ -1,4 +1,7 @@
-use crate::shadow::ShadowProject;
+use crate::{
+    databases::DatabaseKind,
+    shadow::{ShadowProject, ShadowProjects},
+};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, CallExpression, Expression, ImportExpression, Statement, TSExternalModuleReference,
@@ -74,6 +77,37 @@ pub(crate) fn command(bun: &Path, project: &Project) -> Result<(Command, Arc<Tem
 pub(crate) struct Project {
     pub(crate) shadow: ShadowProject,
     pub(crate) imports: Imports,
+}
+
+pub(crate) struct PreparedRun {
+    pub(crate) project: Arc<Project>,
+    pub(crate) sql_server_driver: Option<PathBuf>,
+    pub(crate) final_expression: Option<FinalExpression>,
+}
+
+pub(crate) async fn prepare_run(
+    projects: &ShadowProjects,
+    script_id: &str,
+    source: &str,
+    connection: Option<DatabaseKind>,
+    mut notice: impl FnMut(String),
+) -> Result<PreparedRun, String> {
+    let (imports, final_expression) = parse(source)?.map_or((None, None), |script| {
+        (Some(script.imports), script.final_expression)
+    });
+    let sql_server_driver = if connection == Some(DatabaseKind::SqlServer) {
+        Some(projects.typescript_sql_server_driver(&mut notice).await?)
+    } else {
+        None
+    };
+    let project = projects
+        .prepare_typescript(script_id, source, imports, false, notice)
+        .await?;
+    Ok(PreparedRun {
+        project,
+        sql_server_driver,
+        final_expression,
+    })
 }
 
 impl Project {

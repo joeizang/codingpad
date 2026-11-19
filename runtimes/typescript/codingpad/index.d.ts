@@ -37,11 +37,18 @@ export function live<T>(value: T): Live<T>;
 /** Compute a value once per key in this script's warm kernel. */
 export function cache<T>(key: unknown, factory: () => T): T;
 
-type DatabaseParameter = string | number | bigint | boolean | Date | Uint8Array | null;
+export type DatabaseParameter = string | number | bigint | boolean | Date | Uint8Array | null;
 
-interface DatabaseClient {
+export interface DatabaseRows extends Array<Record<string, unknown>> {
+  readonly columns: readonly string[];
+  readonly truncated: boolean;
+}
+
+export interface DatabaseClient {
   /** Run SQL on the attached connection and return its rows. */
-  query(sql: string, parameters?: readonly DatabaseParameter[]): Promise<Record<string, unknown>[]>;
+  query(sql: string, parameters?: readonly DatabaseParameter[]): Promise<DatabaseRows>;
+  /** Run a statement on the attached connection and return its affected row count. */
+  execute(sql: string, parameters?: readonly DatabaseParameter[]): Promise<number>;
 }
 
 /** The database connection attached to the current run. */

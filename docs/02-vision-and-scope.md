@@ -30,7 +30,7 @@ Decision numbers (D#) refer to [04-open-questions.md](04-open-questions.md). Ter
 - **Distribution:** GitHub Releases, unsigned at first, with an update notice instead of an auto-updater (D29, D30).
 
 ## Milestones (D33, D34)
-Builds and tests run locally with `just`, no CI (D39, D42, D43).
+Builds and tests run with `just`, locally and in GitHub Actions on Linux and Windows (D39, D43, D63).
 
 | Milestone | Scope | Release |
 |---|---|---|

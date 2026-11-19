@@ -1,7 +1,8 @@
-# Kernel protocol v1 (Python and C# skeleton)
+# Kernel protocol v1
 
-JSON-RPC 2.0 over UTF-8 stdio, one JSON object per line. The Rust supervisor starts
-one warm kernel process per open script, writes requests to stdin and reads stdout.
+JSON-RPC 2.0 over UTF-8 stdio, one JSON object per line. The Rust supervisor
+writes requests to a kernel process's stdin and reads its stdout. Python and C#
+keep one warm kernel per open script. TypeScript starts a process for each run.
 The kernel and its runtime are embedded in the Rust build and extracted to a
 private temporary directory for the process lifetime; installed apps do not need
 the source checkout or a registry package. Python starts with `-I -u -X utf8` and adds only
@@ -431,3 +432,17 @@ using that name. Outside the kernel, `Cancel` is `CancellationToken.None` and
 `KeyNotFoundException` when no value was supplied. Package acceptance checks build a local feed
 and use `#:package CodingPad@0.1.0`, disabling AOT publishing to avoid downloading
 an AOT compiler. Registry publication is a separate release action.
+
+## TypeScript kernel (M5.0)
+
+The Bun kernel sends the same `stream`, `dump`, and `run_finished` notifications
+and run response. The host embeds the kernel and the `codingpad` module. Each run
+starts a fresh Bun process. `run.params.path` supplies the location used for
+relative imports from the editor snapshot. Run does not write to the script file.
+
+Bun executes TypeScript without type checking and supports top-level `await`.
+Console output and JavaScript writes to `process.stdout` and `process.stderr`
+become stream notifications. The host parses the final top-level expression so
+the kernel can evaluate it once and dump its value. Automatic dumps skip
+`undefined`. The built-in `dump()` emits bounded scalar, array and object
+previews. Syntax and runtime errors produce a stderr notification and `ok: false`.

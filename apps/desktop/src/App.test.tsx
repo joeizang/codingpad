@@ -81,7 +81,7 @@ beforeEach(() => {
 });
 
 /** Opens the new-script panel and creates a script in `language`. */
-function createScript(language: "Python" | "C#" | "SQL" = "Python") {
+function createScript(language: "Python" | "C#" | "TypeScript" | "SQL" = "Python") {
   fireEvent.click(screen.getByRole("button", { name: "New script" }));
   fireEvent.click(screen.getByRole("radio", { name: language }));
   fireEvent.click(screen.getByRole("button", { name: /^Create / }));
@@ -1022,6 +1022,31 @@ test("C# scratch runs with compiler diagnostics and clears stale diagnostics on 
   expect(screen.getByTestId("compiler-diagnostics")).toHaveTextContent("CS0103");
   fireEvent.change(screen.getByLabelText("Code"), { target: { value: "42.Dump();" } });
   expect(screen.getByTestId("compiler-diagnostics")).toBeEmptyDOMElement();
+});
+
+test("a TypeScript scratch runs through the kernel and shows a missing Bun error on retry", async () => {
+  let hasBun = true;
+  invoke.mockImplementation(async (command, args) => {
+    if (command !== "run_script") return;
+    if (!hasBun) throw "Bun was not found. Install Bun and try again.";
+    args.onEvent.onmessage({ method: "stream", params: { runId: 1, stream: "stdout", text: "Hello from TypeScript!" } });
+    args.onEvent.onmessage({ method: "dump", params: { runId: 1, node: { id: "1:n1", kind: "primitive", v: 42 } } });
+    return { ok: true };
+  });
+  render(<App />);
+  createScript("TypeScript");
+  expect(screen.getByRole("region", { name: "TypeScript editor" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /^Scratch \d+\.ts$/ })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  await screen.findByText("Hello from TypeScript!");
+  expect(screen.getByText("42")).toBeInTheDocument();
+  expect(invoke).toHaveBeenCalledWith("run_script", expect.objectContaining({
+    language: "typescript", source: expect.stringContaining('from "codingpad"'),
+  }));
+  hasBun = false;
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  await screen.findByText(/Bun was not found/);
+  expect(screen.getByRole("button", { name: "▶ Run" })).toBeEnabled();
 });
 
 test("SQL tabs run through the direct connection and render table results", async () => {

@@ -5,6 +5,7 @@ import * as monaco from "monaco-editor/editor/editor.api.js";
 import "monaco-editor/languages/definitions/python/register.js";
 import "monaco-editor/languages/definitions/csharp/register.js";
 import "monaco-editor/languages/definitions/sql/register.js";
+import "monaco-editor/languages/definitions/typescript/register.js";
 import { createSqlCompletions } from "./sqlCompletions";
 import { EDITOR_OPTIONS } from "./editorOptions";
 import type { ConnectionSchema } from "./schema";
@@ -143,6 +144,8 @@ function toCompletionItem(
 
 const directiveKey = (source: string, language: string) =>
   language === "csharp" ? csharpDirectiveKey(source) : inlineDependencyKey(source);
+
+const MODEL_EXTENSIONS: Record<string, string> = { csharp: "cs", python: "py", sql: "sql", typescript: "ts" };
 
 const supportsCodeIntelligence = (language: string) =>
   language === "python" || language === "csharp";
@@ -362,7 +365,7 @@ export default function CodeEditor({
 
   return (
     <Editor
-      path={`${id}.${language === "csharp" ? "cs" : language === "python" ? "py" : language === "sql" ? "sql" : "txt"}`}
+      path={`${id}.${MODEL_EXTENSIONS[language] ?? "txt"}`}
       language={language}
       theme="codingpad-dark"
       value={source}

@@ -16,6 +16,7 @@ mod shadow;
 pub mod store;
 pub mod text;
 pub mod toolchains;
+mod typescript;
 pub mod updates;
 
 use packages::Packages;
@@ -124,6 +125,7 @@ pub enum Language {
     #[default]
     Python,
     Csharp,
+    Typescript,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -175,6 +177,9 @@ pub async fn attached_data_context(
     source: &str,
     language: Language,
 ) -> (Option<DataContextRun>, Option<String>) {
+    if language == Language::Typescript {
+        return (None, None);
+    }
     let Some(name) = attached_connection(source) else {
         return (None, None);
     };
@@ -184,6 +189,7 @@ pub async fn attached_data_context(
             let source = match language {
                 Language::Python => generated.python,
                 Language::Csharp => generated.csharp,
+                Language::Typescript => unreachable!(),
             };
             (
                 Some(DataContextRun {
@@ -360,7 +366,7 @@ impl Supervisor {
             .await
     }
 
-    /// Run a saved script with file-relative NuGet configuration discovery.
+    /// Run a saved script with file-relative NuGet configuration or imports.
     pub async fn run_language_at(
         &self,
         script_id: &str,
@@ -397,10 +403,10 @@ impl Supervisor {
         let mut stop = slot.stop.subscribe();
         // Vault prompts block. Resolve values off the async thread and let Stop
         // or Close cancel the wait before the kernel slot lock is taken.
-        let names = referenced_secret_names(source);
-        let secrets = match self.secrets.clone() {
-            None => SecretSnapshot::default(),
-            Some(store) => {
+        let secrets = match (&self.secrets, language) {
+            (Some(store), Language::Python | Language::Csharp) => {
+                let store = Arc::clone(store);
+                let names = referenced_secret_names(source);
                 let snapshot =
                     tokio::task::spawn_blocking(move || store.snapshot_named(names.as_deref()));
                 tokio::select! {
@@ -410,10 +416,15 @@ impl Supervisor {
                     _ = stop.changed() => return Ok(RunResult { ok: false, stopped: true, cache_cleared: false }),
                 }
             }
+            _ => SecretSnapshot::default(),
         };
-        let connection = store::parse_header(source)
-            .and_then(|header| header.settings.get("connection").cloned())
-            .filter(|name| !name.trim().is_empty());
+        let connection = if language == Language::Typescript {
+            None
+        } else {
+            store::parse_header(source)
+                .and_then(|header| header.settings.get("connection").cloned())
+                .filter(|name| !name.trim().is_empty())
+        };
         let connection = match connection {
             Some(name) => {
                 let connection = self
@@ -513,38 +524,46 @@ impl Supervisor {
                 params: json!({"runId": 0, "stream": "stderr", "text": "Language or dependencies changed; restarting the kernel and clearing cache.\n"}),
             });
         }
-        // Startup includes resolution/downloads. Stop and Close must cancel that
-        // work too, before there is a Python kernel to send a cancel request to.
+        // Stop and Close can cancel preparation before the kernel starts.
         if guard.is_none() {
-            let uv = self.uv_path();
             let startup = tokio::select! {
                 result = async {
-                    if language == Language::Csharp {
-                        Kernel::start_csharp(
-                            &self.csharp,
-                            self.data_dir.as_deref(),
-                            self.dotnet.as_deref(),
-                        )
-                        .await
+                    match language {
+                        Language::Csharp => {
+                            let (command, files) = csharp::command(
+                                &self.csharp,
+                                self.data_dir.as_deref(),
+                                self.dotnet.as_deref(),
+                            ).await?;
+                            Kernel::spawn(command, files, packages, language)
+                        }
+                        Language::Python => Kernel::start(&self.uv_path(), packages, &mut emit).await,
+                        Language::Typescript => {
+                            let (command, files) = typescript::command()?;
+                            Kernel::spawn(command, files, packages, language)
+                        }
                     }
-                    else { Kernel::start(&uv, packages, &mut emit).await }
                 } => result,
                 _ = closed.changed() => return Err("Script was closed".into()),
                 _ = stop.changed() => return Ok(RunResult { ok: false, stopped: true, cache_cleared: true }),
             };
             *guard = Some(startup?);
         }
+        let source = match language {
+            Language::Typescript => typescript::instrument(source),
+            _ => source.into(),
+        };
         let data = data.map(|data| json!({"source": data.source, "connection": data.connection}));
         let params = json!({"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection, "data": data, "eager": self.eager_dumps});
         let result = tokio::select! {
             result = guard.as_mut().unwrap().run(params, &mut emit, &mut stop) => result,
             _ = closed.changed() => Err("Script was closed".into()),
         };
-        if result.as_ref().is_ok_and(|result| result.cache_cleared) {
-            *guard = None;
-        }
-        if result.is_err() {
-            // Dropping the child kills it. Next run starts a fresh kernel.
+        // TypeScript uses a fresh process per run until warm run control.
+        if language == Language::Typescript
+            || result.as_ref().is_ok_and(|result| result.cache_cleared)
+            || result.is_err()
+        {
             *guard = None;
         }
         result
@@ -716,34 +735,38 @@ struct Kernel {
 }
 
 impl Kernel {
-    async fn start_csharp(
-        cache: &OnceCell<csharp::Installation>,
-        data_dir: Option<&std::path::Path>,
-        dotnet: Option<&std::path::Path>,
+    fn spawn(
+        mut command: Command,
+        files: Arc<TempDir>,
+        packages: Packages,
+        language: Language,
     ) -> Result<Self, String> {
-        let (mut command, files) = csharp::command(cache, data_dir, dotnet).await?;
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
-        // A terminal Ctrl-C must reach only the host; Stop asks the kernel
-        // through the protocol instead of letting .NET die mid-run.
+        // Let the host handle terminal Ctrl-C and send Stop over the protocol.
         #[cfg(unix)]
         command.process_group(0);
         #[cfg(windows)]
         command.creation_flags(0x08000000 | 0x00000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
-        let mut child = command
-            .spawn()
-            .map_err(|e| format!("Could not start C# kernel: {e}"))?;
+        let mut child = command.spawn().map_err(|error| match language {
+            Language::Python => format!("Could not start Python: {error}"),
+            Language::Csharp => format!("Could not start C# kernel: {error}"),
+            Language::Typescript if error.kind() == std::io::ErrorKind::NotFound => {
+                "Bun was not found. Install Bun from https://bun.com/docs/installation and run the script again.".into()
+            }
+            Language::Typescript => format!("Could not start the Bun kernel: {error}"),
+        })?;
         Ok(Self {
             input: child.stdin.take().unwrap(),
             output: BufReader::new(child.stdout.take().unwrap()).lines(),
             child,
             next_id: 0,
             _files: files,
-            packages: Packages::parse("")?,
-            language: Language::Csharp,
+            packages,
+            language,
         })
     }
 
@@ -783,31 +806,8 @@ impl Kernel {
         let kernel = files.path().join("kernel.py");
         std::fs::write(&kernel, KERNEL).map_err(|e| e.to_string())?;
         let mut command = Command::new(executable.trim());
-        command
-            .args(["-I", "-u", "-X", "utf8"])
-            .arg(kernel)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
-        // Keep the kernel out of the terminal's foreground group so Ctrl-C
-        // reaches the host, which then sends a cooperative cancel request.
-        #[cfg(unix)]
-        command.process_group(0);
-        #[cfg(windows)]
-        command.creation_flags(0x08000000 | 0x00000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
-        let mut child = command
-            .spawn()
-            .map_err(|e| format!("Could not start Python: {e}"))?;
-        Ok(Self {
-            input: child.stdin.take().unwrap(),
-            output: BufReader::new(child.stdout.take().unwrap()).lines(),
-            child,
-            next_id: 0,
-            _files: Arc::new(files),
-            packages,
-            language: Language::Python,
-        })
+        command.args(["-I", "-u", "-X", "utf8"]).arg(kernel);
+        Self::spawn(command, Arc::new(files), packages, Language::Python)
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, CallError> {
@@ -1084,6 +1084,21 @@ impl Drop for Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn missing_bun_reports_how_to_run_typescript() {
+        let files = Arc::new(tempfile::tempdir().unwrap());
+        let command = Command::new(files.path().join("missing-bun"));
+        let result = Kernel::spawn(
+            command,
+            files,
+            Packages::parse("").unwrap(),
+            Language::Typescript,
+        );
+        assert!(
+            matches!(result, Err(message) if message.starts_with("Bun was not found. Install Bun"))
+        );
+    }
 
     #[test]
     fn secret_names_are_read_lexically_or_not_at_all() {

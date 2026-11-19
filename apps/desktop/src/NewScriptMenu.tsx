@@ -11,7 +11,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type { Connection } from "./ConnectionsDialog";
 import { baseName } from "./library";
 
-export type ScriptLanguage = "python" | "csharp" | "sql";
+export type ScriptLanguage = "python" | "csharp" | "typescript" | "sql";
 
 /** The bundled database every install has; it is not in the saved connection list. */
 export const SAMPLE_CONNECTION = "codingpad-sample";
@@ -25,6 +25,7 @@ const LANGUAGES: {
 }[] = [
   { id: "python", chip: "PY", name: "Python", detail: "Scripts, packages and dumps", key: "P" },
   { id: "csharp", chip: "C#", name: "C#", detail: "Top-level statements on .NET", key: "C" },
+  { id: "typescript", chip: "TS", name: "TypeScript", detail: "Scripts on Bun", key: "T" },
   { id: "sql", chip: "SQL", name: "SQL", detail: "Query a connected database", key: "S" },
 ];
 
@@ -63,7 +64,9 @@ export function NewScriptMenu({ open, anchor, lastConnection, onCreate, onClose 
   const fallback =
     choices.find((choice) => choice.name === lastConnection)?.name ?? choices[0].name;
   // SQL cannot run without a database, so it always has one picked.
-  const picked = language === "sql" ? connection ?? fallback : connection;
+  const picked = language === "typescript"
+    ? undefined
+    : language === "sql" ? connection ?? fallback : connection;
 
   async function loadConnections() {
     try {
@@ -207,46 +210,48 @@ export function NewScriptMenu({ open, anchor, lastConnection, onCreate, onClose 
           </button>
         ))}
       </div>
-      <div className="new-script-connection" role="group" aria-label="Connection">
-        <p>
-          {language === "sql" ? (
-            <>
-              <em>SQL runs against a connection.</em> Pick one.
-            </>
-          ) : (
-            <>
-              Attach a connection to get <code>db</code> in your script.
-            </>
-          )}
-        </p>
-        <div className="connection-choices">
-          <button
-            aria-pressed={picked === undefined}
-            disabled={language === "sql"}
-            onClick={() => setConnection(undefined)}
-          >
-            None
-          </button>
-          {choices.map((choice) => (
-            <button
-              key={choice.name}
-              aria-pressed={picked === choice.name}
-              onClick={() => setConnection(choice.name)}
-            >
-              {choice.name}
-              <span>{choice.detail}</span>
-            </button>
-          ))}
-          <button className="add-connection" onClick={() => void openDatabaseFile()}>
-            Open a database file…
-          </button>
-        </div>
-        {error && (
-          <p className="new-script-error" role="alert">
-            {error}
+      {language !== "typescript" && (
+        <div className="new-script-connection" role="group" aria-label="Connection">
+          <p>
+            {language === "sql" ? (
+              <>
+                <em>SQL runs against a connection.</em> Pick one.
+              </>
+            ) : (
+              <>
+                Attach a connection to get <code>db</code> in your script.
+              </>
+            )}
           </p>
-        )}
-      </div>
+          <div className="connection-choices">
+            <button
+              aria-pressed={picked === undefined}
+              disabled={language === "sql"}
+              onClick={() => setConnection(undefined)}
+            >
+              None
+            </button>
+            {choices.map((choice) => (
+              <button
+                key={choice.name}
+                aria-pressed={picked === choice.name}
+                onClick={() => setConnection(choice.name)}
+              >
+                {choice.name}
+                <span>{choice.detail}</span>
+              </button>
+            ))}
+            <button className="add-connection" onClick={() => void openDatabaseFile()}>
+              Open a database file…
+            </button>
+          </div>
+          {error && (
+            <p className="new-script-error" role="alert">
+              {error}
+            </p>
+          )}
+        </div>
+      )}
       <div className="new-script-footer">
         <span>
           <kbd>Ctrl N</kbd> opens this. <kbd>Esc</kbd> closes.

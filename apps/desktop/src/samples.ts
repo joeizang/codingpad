@@ -17,7 +17,9 @@ export function languageLabel(language: string): string {
       ? "Python"
       : language === "sql"
         ? "SQL"
-        : "Text";
+        : language === "typescript"
+          ? "TypeScript"
+          : "Text";
 }
 
 export function groupSamples(samples: Sample[]): Array<{

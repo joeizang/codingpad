@@ -162,5 +162,7 @@ jobs:
         run: |
           prerelease=()
           case "$GITHUB_REF_NAME" in *-*) prerelease=(--prerelease) ;; esac
-          gh release create "$GITHUB_REF_NAME" installers/* \
+          # The Linux artifact keeps its appimage/, deb/ and rpm/ folders, and a release asset must be a file.
+          mapfile -t assets < <(find installers -type f | sort)
+          gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
             --verify-tag --generate-notes --title "CodingPad ${GITHUB_REF_NAME#v}" "${prerelease[@]}"

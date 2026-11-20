@@ -16,7 +16,7 @@ Results.
 GitHub Actions builds installers on their native platforms when a `vX.Y.Z` tag
 is pushed (D29, D63). Each [GitHub Release](https://github.com/joeizang/codingpad/releases)
 includes macOS disk images for Apple silicon and Intel, an AppImage, a `.deb`
-and an `.rpm` for Linux, and an NSIS setup for Windows.
+and an `.rpm` for Linux, and an NSIS setup for Windows (D71).
 
 Build the installer for the machine you are on:
 
@@ -54,6 +54,8 @@ without Apple notarization (D30). If macOS blocks the first launch, open
 
 To update, run `brew update` and then
 `brew upgrade --cask joeizang/codingpad/codingpad`.
+Using `--zap` when uninstalling also removes CodingPad's local app data,
+including settings, saved connections, and privately installed toolchains.
 
 ### Linux
 
@@ -118,7 +120,7 @@ checks Rust formatting and Clippy, runs Rust integration tests against real Pyth
 processes, and builds the desktop executable. GitHub Actions runs the same command
 on Linux and Windows for every pull request (D63). The same command is intended for
 Linux and Windows. Release packaging also builds natively on Apple silicon and
-Intel Macs.
+Intel Macs (D71).
 
 ### CI and releases (D63)
 
@@ -140,8 +142,9 @@ Intel Macs.
 vault and benchmark runs for the M3 close.
 [Windows verification results](docs/windows-verification.md) record the native
 build, tests, and desktop smoke check with Python 3.14.7 and Node.js 26.
-[macOS verification results](docs/macos-verification.md) are kept as a historical
-record of earlier acceptance runs on Apple silicon; macOS is not currently verified.
+[macOS verification results](docs/macos-verification.md) record earlier acceptance
+runs on Apple silicon. D71 resumes macOS release packaging while milestone
+acceptance runs target Linux and Windows.
 
 CodingPad checks `PATH`, then the usual `~/.local/bin` and `~/.cargo/bin`
 locations for `uv`, plus `/opt/homebrew/bin` and `/usr/local/bin` on macOS.

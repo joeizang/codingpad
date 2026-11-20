@@ -24,6 +24,21 @@ cask "codingpad" do
   desc "Desktop scratchpad for running scripts and inspecting their results"
   homepage "https://github.com/joeizang/codingpad"
 
+  livecheck do
+    url :url
+    strategy :github_latest
+  end
+
+  depends_on :macos
+
   app "CodingPad.app"
+
+  zap trash: [
+    "~/Library/Application Support/io.github.joeizang.codingpad",
+    "~/Library/Caches/io.github.joeizang.codingpad",
+    "~/Library/Preferences/io.github.joeizang.codingpad.plist",
+    "~/Library/Saved Application State/io.github.joeizang.codingpad.savedState",
+    "~/Library/WebKit/io.github.joeizang.codingpad",
+  ]
 end
 EOF

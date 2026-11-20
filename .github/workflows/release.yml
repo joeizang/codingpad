@@ -62,6 +62,29 @@ jobs:
             exit 1
           fi
 
+      - name: Check the rendered Homebrew cask
+        if: github.event_name == 'pull_request' && runner.os == 'macOS' && runner.arch == 'ARM64'
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          fixture=$(mktemp -d)
+          trap 'rm -r "$fixture"' EXIT
+          mkdir "$fixture/Casks"
+          printf 'Apple silicon fixture\n' > "$fixture/CodingPad_0.1.0_aarch64.dmg"
+          printf 'Intel fixture\n' > "$fixture/CodingPad_0.1.0_x64.dmg"
+          tools/github/render-homebrew-cask.sh v0.1.0 "$fixture" > "$fixture/Casks/codingpad.rb"
+
+          git -C "$fixture" init --quiet
+          git -C "$fixture" add Casks/codingpad.rb
+          git -C "$fixture" -c user.name=CI -c user.email=ci@example.invalid commit --quiet -m 'Create cask fixture'
+          tap=local/codingpad-fixture
+          brew tap "$tap" "file://$fixture"
+          brew trust --cask "$tap/codingpad"
+          brew style --cask "$tap/codingpad"
+          # Online audits need a published release and real disk images.
+          brew audit --cask --strict --arch=all "$tap/codingpad"
+
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -130,7 +153,7 @@ jobs:
 
       - name: Generate the Homebrew cask for stable releases
         if: ${{ !contains(github.ref_name, '-') }}
-        run: bash tools/github/render-homebrew-cask.sh "$GITHUB_REF_NAME" installers > installers/codingpad.rb
+        run: tools/github/render-homebrew-cask.sh "$GITHUB_REF_NAME" installers > installers/codingpad.rb
 
       - name: Create the GitHub Release
         env:

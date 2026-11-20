@@ -86,8 +86,16 @@ connection).
 ### First launch
 
 In the initial Python tab, replace the editor contents with `print(6 * 7)` and
-click **Run**. If prompted, choose **Install uv and run**. Confirm that
-**Results** displays `42`.
+click **Run**. If prompted, choose **Install uv and run**. The script also needs
+Python 3.10 or later. If Results reports that Python is missing, run
+`uv python install 3.13` in a terminal. On macOS, if you installed uv through
+CodingPad, use its private copy:
+
+```sh
+"$HOME/Library/Application Support/io.github.joeizang.codingpad/toolchains/uv/0.13.6/uv" python install 3.13
+```
+
+Click **Run** again and confirm that **Results** displays `42`.
 
 CodingPad sends no telemetry. Its network use is limited to the release check and
 the toolchain or package downloads you trigger, such as **Install uv and run**,

@@ -51,7 +51,9 @@ export function NewScriptMenu({ open, anchor, lastConnection, onCreate, onClose 
   const fallback =
     choices.find((choice) => choice.name === lastConnection)?.name ?? choices[0].name;
   const current = scriptLanguageDetails(language)!;
-  const picked = current.connection === "required" ? connection ?? fallback : connection;
+  const picked = current.connection === "none"
+    ? undefined
+    : current.connection === "required" ? connection ?? fallback : connection;
 
   async function loadConnections() {
     try {
@@ -194,7 +196,7 @@ export function NewScriptMenu({ open, anchor, lastConnection, onCreate, onClose 
           </button>
         ))}
       </div>
-      <div className="new-script-connection" role="group" aria-label="Connection">
+      {current.connection !== "none" && <div className="new-script-connection" role="group" aria-label="Connection">
         <p>
           {current.connection === "required" ? (
             <>
@@ -233,7 +235,7 @@ export function NewScriptMenu({ open, anchor, lastConnection, onCreate, onClose 
             {error}
           </p>
         )}
-      </div>
+      </div>}
       <div className="new-script-footer">
         <span>
           <kbd>Ctrl N</kbd> opens this. <kbd>Esc</kbd> closes.

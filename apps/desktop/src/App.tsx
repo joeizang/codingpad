@@ -81,6 +81,15 @@ const SQL_SAMPLE = `-- codingpad: connection=codingpad-sample
 SELECT 1 AS answer;
 `;
 
+const RUST_STARTER = `use codingpad::dump;
+
+println!("Hello from Rust!");
+dump("Hello from CodingPad!");
+
+// Leave off the semicolon to display the final expression.
+6 * 7
+`;
+
 const SCRIPT_FILTERS = [
   ...SCRIPT_LANGUAGES.map(({ name, extension }) => ({ name, extensions: [extension] })),
   { name: "All files", extensions: ["*"] },
@@ -121,6 +130,7 @@ const SCRIPT_STARTERS: Record<ScriptLanguage, string> = {
   python: SAMPLE,
   csharp: CSHARP_SAMPLE,
   typescript: TYPESCRIPT_SAMPLE,
+  rust: RUST_STARTER,
   sql: SQL_SAMPLE,
 };
 
@@ -332,7 +342,9 @@ export default function App() {
     ? active.compilation.diagnostics
     : EMPTY_DIAGNOSTICS;
   const activeHeader = parseHeader(active.source);
-  const connectionName = runnable ? activeHeader?.settings.connection || undefined : undefined;
+  const connectionName = runnable && language !== "rust"
+    ? activeHeader?.settings.connection || undefined
+    : undefined;
   const [schemaRevision, setSchemaRevision] = useState(0);
   const schemaState = useConnectionSchema(connectionName, schemaRevision);
   const update = (id: string, change: (script: Script) => Script) =>
@@ -351,7 +363,7 @@ export default function App() {
       update(script.id, (item) => ({
         ...item,
         status: "Not runnable",
-        error: "Only Python, C# and SQL scripts run in this build.",
+        error: "Only Python, C#, TypeScript, Rust and SQL scripts run in this build.",
       }));
       return;
     }

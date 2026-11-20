@@ -674,15 +674,15 @@ fn friendly_dotnet_progress(line: &str) -> Option<&'static str> {
 }
 
 #[cfg(unix)]
-struct ProcessGroup(Option<u32>);
+pub(crate) struct ProcessGroup(Option<u32>);
 
 #[cfg(unix)]
 impl ProcessGroup {
-    fn new(pid: Option<u32>) -> Self {
+    pub(crate) fn new(pid: Option<u32>) -> Self {
         Self(pid)
     }
 
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.0 = None;
     }
 }

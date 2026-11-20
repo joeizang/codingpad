@@ -35,6 +35,25 @@ struct StagedTypescript {
 }
 
 impl ShadowProjects {
+    /// Each Rust run owns its staged sources and build products until it exits.
+    pub(crate) fn prepare_rust(&self, source: &str) -> Result<ShadowProject, String> {
+        let project = ShadowProject::temporary("src/main.rs")?;
+        let root = project.root();
+        let stage = || -> std::io::Result<()> {
+            fs::create_dir(root.join("src"))?;
+            fs::create_dir_all(root.join("codingpad/src"))?;
+            fs::write(root.join("Cargo.toml"), crate::rust::SCRIPT_MANIFEST)?;
+            fs::write(
+                root.join("codingpad/Cargo.toml"),
+                crate::rust::RUNTIME_MANIFEST,
+            )?;
+            fs::write(root.join("codingpad/src/lib.rs"), crate::rust::RUNTIME)?;
+            fs::write(root.join("src/main.rs"), source)
+        };
+        stage().map_err(|error| format!("Could not stage the Rust shadow project: {error}"))?;
+        Ok(project)
+    }
+
     pub(crate) fn with_data_dir(data_dir: PathBuf) -> Self {
         Self {
             data_dir: Some(data_dir),

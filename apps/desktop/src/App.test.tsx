@@ -725,26 +725,39 @@ test("closing a dirty tab asks first and keeps it when cancelled", async () => {
   );
 });
 
-test("a non-Python file opens but Run is disabled", async () => {
+test.each([
+  { file: "notes.txt", runnable: false },
+  { file: "script.rs", runnable: true },
+])("$file opens with the expected Run availability", async ({ file, runnable }) => {
   invoke.mockImplementation(async (command, args) => {
     if (command === "load_library_settings")
       return { libraryPath: "/library", pinnedFolders: [] };
     if (command === "list_folder")
-      return [{ name: "notes.rs", path: "/library/notes.rs", isDir: false }];
+      return [{ name: file, path: `/library/${file}`, isDir: false }];
     if (command === "read_script")
       return {
-        path: "/library/notes.rs",
-        name: "notes.rs",
+        path: `/library/${file}`,
+        name: file,
         source: "fn main() {}",
       };
+    if (command === "run_script") return { ok: true };
     return undefined;
   });
   render(<App />);
-  fireEvent.click(await screen.findByRole("button", { name: "notes.rs" }));
+  fireEvent.click(await screen.findByRole("button", { name: file }));
   await waitFor(() =>
     expect(screen.getByLabelText("Code")).toHaveValue("fn main() {}"),
   );
-  expect(screen.getByRole("button", { name: "▶ Run" })).toBeDisabled();
+  const run = screen.getByRole("button", { name: "▶ Run" });
+  if (!runnable) {
+    expect(run).toBeDisabled();
+    return;
+  }
+  fireEvent.click(run);
+  await screen.findByText("Finished");
+  expect(invoke).toHaveBeenCalledWith("run_script", expect.objectContaining({
+    language: "rust", path: "/library/script.rs", source: "fn main() {}",
+  }));
 });
 
 test("a rapid double-open only reads the file once", async () => {

@@ -46,6 +46,7 @@ vi.mock("monaco-editor/languages/definitions/python/register.js", () => ({}));
 vi.mock("monaco-editor/languages/definitions/csharp/register.js", () => ({}));
 vi.mock("monaco-editor/languages/definitions/sql/register.js", () => ({}));
 vi.mock("monaco-editor/languages/definitions/typescript/register.js", () => ({}));
+vi.mock("monaco-editor/languages/definitions/rust/register.js", () => ({}));
 vi.mock("monaco-editor/editor/editor.worker.js?worker", () => ({ default: class {} }));
 
 test("prepares the latest TypeScript snapshot and starts the language server", async () => {

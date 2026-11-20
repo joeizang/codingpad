@@ -557,3 +557,27 @@ const status = live("Starting");
 dump(status);
 status.value = "Ready";
 ```
+
+## Rust kernel
+
+CodingPad builds the editor snapshot in a fresh Cargo shadow project. It uses
+the installed stable Rust toolchain (1.85 or later for edition 2024) and a
+bundled, dependency-free `codingpad` crate. The build works offline. Saved
+scripts run with their directory as the working directory. The script on disk
+is untouched.
+
+```rust
+use codingpad::dump;
+
+println!("Hello from Rust");
+dump("An explicit dump");
+6 * 7
+```
+
+An explicit `fn main()` runs as a normal Rust program. In a top-level script,
+CodingPad automatically dumps a final expression without a semicolon if it
+returns a non-unit value. Dumped values need Rust's `Debug` implementation.
+Compiler errors block execution and are sent as `diagnostics` and error dumps
+with ranges mapped to the original editor snapshot. Stdout and stderr use
+`stream` notifications. Dump messages travel over a separate authenticated
+loopback connection, so native output can contain arbitrary text.

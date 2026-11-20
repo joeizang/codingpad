@@ -23,7 +23,7 @@ use std::{
 };
 use tempfile::TempDir;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
     process::{Child, ChildStdin, Command},
     time::timeout,
@@ -274,7 +274,7 @@ pub(crate) async fn connect(
         stdin.flush().await?;
 
         tokio::select! {
-            stream = accept_kernel(&listener, &token) => stream,
+            stream = crate::accept_kernel(&listener, &token) => stream,
             status = child.wait() => Err(std::io::Error::other(format!(
                 "Bun exited during startup ({})", status?
             ))),
@@ -288,20 +288,6 @@ pub(crate) async fn connect(
         .await
         .map_err(|_| "Timed out connecting to the Bun kernel.".to_owned())?
         .map_err(|error| format!("Could not connect to the Bun kernel: {error}"))
-}
-
-async fn accept_kernel(listener: &TcpListener, token: &[u8; 32]) -> std::io::Result<TcpStream> {
-    loop {
-        let (mut stream, _) = listener.accept().await?;
-        let mut received = [0u8; 32];
-        if matches!(
-            timeout(Duration::from_millis(250), stream.read_exact(&mut received)).await,
-            Ok(Ok(_))
-        ) && &received == token
-        {
-            return Ok(stream);
-        }
-    }
 }
 
 pub(crate) fn find_bun() -> PathBuf {

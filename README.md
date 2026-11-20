@@ -13,10 +13,10 @@ Results.
 
 ## Install a build (M4.5)
 
-Releases are published on GitHub Releases as installers that GitHub Actions builds
-on their own platform when a `vX.Y.Z` tag is pushed (D29, D63): an AppImage, a `.deb` and an `.rpm` on Linux, and an
-NSIS setup on Windows. Early builds are unsigned (D30). macOS installers are
-deferred (D62), so no `.dmg` is published yet.
+GitHub Actions builds installers on their native platforms when a `vX.Y.Z` tag
+is pushed (D29, D63). Each [GitHub Release](https://github.com/joeizang/codingpad/releases)
+includes macOS disk images for Apple silicon and Intel, an AppImage, a `.deb`
+and an `.rpm` for Linux, and an NSIS setup for Windows (D71).
 
 Build the installer for the machine you are on:
 
@@ -24,17 +24,39 @@ Build the installer for the machine you are on:
 just bundle
 ```
 
-The installers land in `target/release/bundle/` (`appimage/`, `deb/`, `rpm/`,
-`nsis/`). The app embeds its Python and C# kernels, so an installer is
+The installers land in `target/release/bundle/` (`dmg/`, `appimage/`, `deb/`,
+`rpm/`, `nsis/`). The app embeds its Python and C# kernels, so an installer is
 self-contained; it does not include Python, the .NET SDK, Bun or `uv`. A first
 run offers **Install uv and run**, **Install .NET and run** or **Install Bun and
 run** when a toolchain is missing, or uses one you already have.
 
 `packaging/app-icon.png` is the icon source. Regenerate the desktop icons with
-`npm --prefix apps/desktop run tauri -- icon packaging/app-icon.png`. Keep
-`32x32.png`, `128x128.png`, `128x128@2x.png`, `icon.png` and `icon.ico`; delete
-the `Square*`/`StoreLogo` files, `64x64.png`, `icon.icns` and the `android/` and
+`npm --prefix apps/desktop run tauri -- icon ../../packaging/app-icon.png`. Keep
+`32x32.png`, `128x128.png`, `128x128@2x.png`, `icon.png`, `icon.ico` and
+`icon.icns`. Delete the `Square*`/`StoreLogo` files, `64x64.png` and the `android/` and
 `ios/` folders that the generator also writes.
+
+### macOS
+
+Once the first stable macOS release has been added to the tap, install
+CodingPad with [Homebrew](https://brew.sh/):
+
+```sh
+brew tap joeizang/codingpad https://github.com/joeizang/codingpad.git
+brew install --cask joeizang/codingpad/codingpad
+```
+
+Homebrew chooses the disk image for your Mac and verifies its SHA-256 checksum.
+Open **CodingPad** from Applications. Early builds use an ad hoc signature
+without Apple notarization (D30). If macOS blocks the first launch, open
+**System Settings → Privacy & Security**, scroll to **Security**, click
+**Open Anyway**, and confirm the prompt. See [Apple’s first-launch instructions](https://support.apple.com/en-us/102445).
+
+To update, run `brew update` and then
+`brew upgrade --cask joeizang/codingpad/codingpad`.
+Using `--zap` when uninstalling also removes CodingPad's local app data,
+including settings, connection metadata, caches, and privately installed
+toolchains. Credentials stored in the macOS Keychain remain there.
 
 ### Linux
 
@@ -98,19 +120,21 @@ just bundle # Build this platform's installer (see Install a build)
 checks Rust formatting and Clippy, runs Rust integration tests against real Python
 processes, and builds the desktop executable. GitHub Actions runs the same command
 on Linux and Windows for every pull request (D63). The same command is intended for
-Linux and Windows; native builds run on their own
-platforms. macOS support is deferred for now (D62).
+Linux and Windows. Release packaging also builds natively on Apple silicon and
+Intel Macs (D71).
 
 ### CI and releases (D63)
 
 - **Pull requests** to `master` run `just check` on Linux and Windows. Both checks
   must pass on an up-to-date branch before the squash merge; no review approval is
   required. A private repository runs Linux only.
-- **Releases**: bump `version` in `apps/desktop/src-tauri/tauri.conf.json` (and
+- **Releases** follow a version tag. Bump `version` in `apps/desktop/src-tauri/tauri.conf.json` (and
   the workspace `Cargo.toml`), merge, then push a matching tag:
   `git tag v0.2.0 && git push origin v0.2.0`. The release workflow builds the
   installers and publishes the GitHub Release with generated notes. A tag with a
   suffix such as `v0.2.0-rc.1` becomes a pre-release, which the update notice ignores.
+- After each stable release, [update the Homebrew tap](Casks/README.md) with
+  the cask generated from the published disk images.
 - **Repository protections** (rulesets, merge and Actions settings, secret
   scanning, CodeQL) are applied by `tools/github/configure-repo.sh` on a public
   repository; set **Pull requests → Collaborators only** by hand in Settings.
@@ -119,8 +143,9 @@ platforms. macOS support is deferred for now (D62).
 vault and benchmark runs for the M3 close.
 [Windows verification results](docs/windows-verification.md) record the native
 build, tests, and desktop smoke check with Python 3.14.7 and Node.js 26.
-[macOS verification results](docs/macos-verification.md) are kept as a historical
-record of earlier acceptance runs on Apple silicon; macOS is not currently verified.
+[macOS verification results](docs/macos-verification.md) record earlier acceptance
+runs on Apple silicon. D71 resumes macOS release packaging while milestone
+acceptance runs target Linux and Windows.
 
 CodingPad checks `PATH`, then the usual `~/.local/bin` and `~/.cargo/bin`
 locations for `uv`, plus `/opt/homebrew/bin` and `/usr/local/bin` on macOS.

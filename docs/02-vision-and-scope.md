@@ -26,7 +26,9 @@ Decision numbers (D#) refer to [04-open-questions.md](04-open-questions.md). Ter
 - **Secrets:** OS vault, with `secret("name")` (D23).
 - **CLI:** `cpad run <script>` (D28), and `cpad mcp`, a local MCP server for the user's own agents, from 0.3 (D64).
 - **Learners:** built-in samples plus a bundled SQLite sample database (D14).
-- **Platforms:** Linux and Windows for now; macOS is deferred (D13, D62).
+- **Platforms:** Development and milestone acceptance target Linux and Windows
+  (D13, D62). macOS release installers and Homebrew distribution resume in M5.8
+  (D71).
 - **Distribution:** GitHub Releases, unsigned at first, with an update notice instead of an auto-updater (D29, D30).
 
 ## Milestones (D33, D34, D64)

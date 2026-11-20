@@ -55,7 +55,8 @@ without Apple notarization (D30). If macOS blocks the first launch, open
 To update, run `brew update` and then
 `brew upgrade --cask joeizang/codingpad/codingpad`.
 Using `--zap` when uninstalling also removes CodingPad's local app data,
-including settings, saved connections, and privately installed toolchains.
+including settings, connection metadata, caches, and privately installed
+toolchains. Credentials stored in the macOS Keychain remain there.
 
 ### Linux
 

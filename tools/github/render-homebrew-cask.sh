@@ -35,6 +35,7 @@ cask "codingpad" do
 
   zap trash: [
     "~/Library/Application Support/io.github.joeizang.codingpad",
+    "~/Library/Caches/codingpad",
     "~/Library/Caches/io.github.joeizang.codingpad",
     "~/Library/Preferences/io.github.joeizang.codingpad.plist",
     "~/Library/Saved Application State/io.github.joeizang.codingpad.savedState",

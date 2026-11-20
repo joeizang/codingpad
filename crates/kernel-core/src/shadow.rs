@@ -48,6 +48,10 @@ impl ShadowProjects {
                 crate::rust::RUNTIME_MANIFEST,
             )?;
             fs::write(root.join("codingpad/src/lib.rs"), crate::rust::RUNTIME)?;
+            fs::write(
+                root.join("codingpad/src/rich.rs"),
+                crate::rust::RICH_RUNTIME,
+            )?;
             fs::write(root.join("src/main.rs"), source)
         };
         stage().map_err(|error| format!("Could not stage the Rust shadow project: {error}"))?;

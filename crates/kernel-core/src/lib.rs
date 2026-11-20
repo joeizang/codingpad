@@ -254,8 +254,14 @@ pub async fn attached_data_context(
     }
 }
 
+#[derive(Default)]
+struct SlotState {
+    kernel: Option<Kernel>,
+    rust_dumps: Option<rust::Dumps>,
+}
+
 struct Slot {
-    kernel: Mutex<Option<Kernel>>,
+    state: Mutex<SlotState>,
     closed: watch::Sender<bool>,
     stop: watch::Sender<u64>,
 }
@@ -263,7 +269,7 @@ struct Slot {
 impl Slot {
     fn new() -> Self {
         Self {
-            kernel: Mutex::new(None),
+            state: Mutex::default(),
             closed: watch::channel(false).0,
             stop: watch::channel(0).0,
         }
@@ -508,17 +514,21 @@ impl Supervisor {
                 biased;
                 _ = closed.changed() => return Err("Script was closed".into()),
                 _ = stop.changed() => return Ok(rust::stopped()),
-                guard = slot.kernel.lock() => guard,
+                guard = slot.state.lock() => guard,
             };
             if *closed.borrow() {
                 return Err("Script was closed".into());
             }
-            *guard = None;
+            *guard = SlotState::default();
             return tokio::select! {
                 biased;
                 _ = closed.changed() => Err("Script was closed".into()),
                 _ = stop.changed() => Ok(rust::stopped()),
-                result = rust::run(&self.shadow_projects, source, path, &mut emit) => result,
+                result = rust::run(&self.shadow_projects, source, path, self.eager_dumps, &mut emit) => {
+                    let (result, dumps) = result?;
+                    guard.rust_dumps = Some(dumps);
+                    Ok(result)
+                }
             };
         }
         // Vault prompts block. Resolve values off the async thread and let Stop
@@ -597,10 +607,11 @@ impl Supervisor {
             }
             None => None,
         };
-        let mut guard = slot.kernel.lock().await;
+        let mut guard = slot.state.lock().await;
         if *closed.borrow() {
             return Err("Script was closed".into());
         }
+        guard.rust_dumps = None;
         let connection_kind = connection
             .as_ref()
             .map(|connection| connection.settings.kind);
@@ -679,7 +690,7 @@ impl Supervisor {
         } else {
             (None, None, None)
         };
-        if guard.as_ref().is_some_and(|kernel| {
+        if guard.kernel.as_ref().is_some_and(|kernel| {
             kernel.packages != packages
                 || kernel.language != language
                 || typescript_project.as_ref().is_some_and(|project| {
@@ -689,14 +700,14 @@ impl Supervisor {
                         .is_some_and(|current| !Arc::ptr_eq(current, project))
                 })
         }) {
-            *guard = None;
+            guard.kernel = None;
             emit(KernelEvent {
                 method: "stream".into(),
                 params: json!({"runId": 0, "stream": "stderr", "text": "Language or dependencies changed; restarting the kernel and clearing cache.\n"}),
             });
         }
         // Stop and Close can cancel preparation before the kernel starts.
-        if guard.is_none() {
+        if guard.kernel.is_none() {
             let startup = tokio::select! {
                 result = async {
                     match language {
@@ -728,9 +739,9 @@ impl Supervisor {
                 _ = closed.changed() => return Err("Script was closed".into()),
                 _ = stop.changed() => return Ok(RunResult { ok: false, stopped: true, cache_cleared: true }),
             };
-            *guard = Some(startup?);
+            guard.kernel = Some(startup?);
         }
-        let kernel = guard.as_mut().unwrap();
+        let kernel = guard.kernel.as_mut().unwrap();
         let data = data.map(|data| json!({"source": data.source, "connection": data.connection}));
         let params = json!({"source": source, "path": path, "secrets": secrets.values, "secret_errors": secrets.errors, "connection": connection, "data": data, "eager": self.eager_dumps, "final_expression": final_expression, "sql_server_driver": sql_server_driver});
         let result = tokio::select! {
@@ -738,7 +749,7 @@ impl Supervisor {
             _ = closed.changed() => Err("Script was closed".into()),
         };
         if result.as_ref().is_ok_and(|result| result.cache_cleared) || result.is_err() {
-            *guard = None;
+            guard.kernel = None;
         }
         result
     }
@@ -749,7 +760,7 @@ impl Supervisor {
             // New subscribers see the current version as already consumed.
             // Always notify runs subscribed before Stop, even before they lock.
             slot.stop.send_modify(|version| *version += 1);
-            drop(slot.kernel.lock().await);
+            drop(slot.state.lock().await);
         }
     }
 
@@ -757,11 +768,11 @@ impl Supervisor {
         self.stop(script_id).await;
         let slot = self.kernels.lock().await.get(script_id).cloned();
         if let Some(slot) = slot {
-            let mut guard = slot.kernel.lock().await;
+            let mut guard = slot.state.lock().await;
             if *slot.closed.borrow() {
                 return Err("Script was closed".into());
             }
-            *guard = None;
+            *guard = SlotState::default();
         }
         Ok(())
     }
@@ -769,7 +780,7 @@ impl Supervisor {
     pub async fn close(&self, script_id: &str) {
         if let Some(slot) = self.kernels.lock().await.remove(script_id) {
             slot.closed.send_replace(true);
-            *slot.kernel.lock().await = None;
+            *slot.state.lock().await = SlotState::default();
         }
         self.shadow_projects.close(script_id).await;
     }
@@ -853,13 +864,16 @@ impl Supervisor {
             biased;
             _ = closed.changed() => return Err(unavailable()),
             _ = stop.changed() => return Err(unavailable()),
-            guard = slot.kernel.lock() => guard,
+            guard = slot.state.lock() => guard,
         };
         if *closed.borrow() {
             return Err(unavailable());
         }
+        if let Some(dumps) = &mut guard.rust_dumps {
+            return dumps.request(method, &params);
+        }
         let outcome = {
-            let kernel = guard.as_mut().ok_or_else(unavailable)?;
+            let kernel = guard.kernel.as_mut().ok_or_else(unavailable)?;
             // Getters and iterators can execute arbitrary script code. On
             // cancellation/timeout, discard the process and its partial response.
             tokio::select! {
@@ -876,7 +890,7 @@ impl Supervisor {
             Err(CallError::Transport(message)) => {
                 // The kernel died or answered with garbage. Drop it so the next
                 // run starts a fresh process instead of failing once.
-                *guard = None;
+                guard.kernel = None;
                 Err(message)
             }
         }
@@ -894,7 +908,7 @@ impl Supervisor {
             slot.closed.send_replace(true);
         }
         for slot in slots {
-            *slot.kernel.lock().await = None;
+            *slot.state.lock().await = SlotState::default();
         }
         self.shadow_projects.shutdown().await;
     }

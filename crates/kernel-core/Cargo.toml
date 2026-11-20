@@ -37,6 +37,7 @@ oxc_parser = { version = "0.110", default-features = false }
 oxc_span = "0.110"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 syn = { version = "2", features = ["full"] }
+unicode-width = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

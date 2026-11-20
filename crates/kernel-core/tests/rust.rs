@@ -92,3 +92,65 @@ async fn runs_explicit_main_against_the_saved_scripts_directory() {
     assert_eq!(dumps(&events)[0]["v"], "relative file");
     assert_eq!(std::fs::read_to_string(path).unwrap(), "disk contents");
 }
+
+#[tokio::test]
+async fn runs_top_level_scripts_with_a_bom_and_shebang() {
+    let supervisor = Supervisor::default();
+    for source in [
+        "\u{feff}42",
+        "#!/usr/bin/env rust-script\n42",
+        "\u{feff}#!/usr/bin/env rust-script\r\n#![allow(unused)]\r\n42",
+    ] {
+        let (result, events) = run(&supervisor, source).await;
+        assert!(result.ok, "{events:?}");
+        assert_eq!(dumps(&events)[0]["v"], 42);
+    }
+}
+
+#[tokio::test]
+async fn stop_closes_a_rust_scripts_descendant_processes() {
+    use tokio::io::AsyncReadExt;
+    use tokio::time::{timeout, Duration};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let source = r#"
+        fn main() {
+            if std::env::args().any(|arg| arg == "child") {
+                let mut socket = std::net::TcpStream::connect("ADDRESS").unwrap();
+                std::io::Write::write_all(&mut socket, b"1").unwrap();
+                let _ = std::io::Read::read(&mut socket, &mut [0]);
+                return;
+            }
+            let _child = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("child")
+                .spawn()
+                .unwrap();
+            std::thread::park();
+        }
+    "#
+    .replace("ADDRESS", &address);
+    let supervisor = std::sync::Arc::new(Supervisor::default());
+    let running = tokio::spawn({
+        let supervisor = supervisor.clone();
+        async move { run(&supervisor, &source).await.0 }
+    });
+    let (mut socket, _) = timeout(Duration::from_secs(30), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut ready = [0];
+    socket.read_exact(&mut ready).await.unwrap();
+    assert_eq!(ready, *b"1");
+
+    supervisor.stop("rust-script").await;
+    assert!(running.await.unwrap().stopped);
+    match timeout(Duration::from_secs(5), socket.read(&mut ready))
+        .await
+        .unwrap()
+    {
+        Ok(0) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        result => panic!("expected the descendant's socket to close, got {result:?}"),
+    }
+}

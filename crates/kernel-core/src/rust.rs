@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines},
     net::{TcpListener, TcpStream},
     process::{Child, Command},
     time::Instant,
@@ -103,25 +103,27 @@ async fn compile(
             "--target-dir",
         ])
         .arg(root.join("target"));
-    let child = spawn(command).map_err(|error| {
+    let mut child = spawn(command).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             MISSING.to_owned()
         } else {
             format!("Could not start Cargo: {error}")
         }
     })?;
-    #[cfg(unix)]
-    let mut group = crate::toolchains::ProcessGroup::new(child.id());
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|error| format!("Could not read Cargo output: {error}"))?;
-    #[cfg(unix)]
-    group.disarm();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut stdout_pipe = child.0.stdout.take().unwrap();
+    let mut stderr_pipe = child.0.stderr.take().unwrap();
+    let (status, _, _) = tokio::try_join!(
+        child.0.wait(),
+        stdout_pipe.read_to_end(&mut stdout),
+        stderr_pipe.read_to_end(&mut stderr),
+    )
+    .map_err(|error| format!("Could not read Cargo output: {error}"))?;
 
     let mut executable = None;
     let mut diagnostics = Vec::new();
-    for line in output.stdout.split(|&byte| byte == b'\n') {
+    for line in stdout.split(|&byte| byte == b'\n') {
         let Ok(message) = serde_json::from_slice::<Value>(line) else {
             continue;
         };
@@ -160,12 +162,12 @@ async fn compile(
         }
     }
     events.send("diagnostics", json!({"diagnostics": diagnostics}));
-    if output.status.success() {
+    if status.success() {
         executable
             .map(Some)
             .ok_or_else(|| "Cargo did not produce a runnable Rust executable.".into())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&stderr);
         if stderr.contains("no default is configured")
             || stderr.contains("could not execute process `rustc")
         {
@@ -198,7 +200,18 @@ fn diagnostic_range(span: &Value, source: &Source<'_>) -> Option<(usize, usize, 
     diagnostic_range(caller, source)
 }
 
-fn spawn(mut command: Command) -> io::Result<Child> {
+// Kill the process tree before the child handle or shadow project drops.
+struct RunningChild(Child);
+
+impl Drop for RunningChild {
+    fn drop(&mut self) {
+        if self.0.id().is_some() {
+            crate::kill_process_tree(&mut self.0);
+        }
+    }
+}
+
+fn spawn(mut command: Command) -> io::Result<RunningChild> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -208,7 +221,7 @@ fn spawn(mut command: Command) -> io::Result<Child> {
     command.process_group(0);
     #[cfg(windows)]
     command.creation_flags(0x08000000 | 0x00000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
-    command.spawn()
+    command.spawn().map(RunningChild)
 }
 
 fn token() -> Result<([u8; 32], OsString), String> {
@@ -242,13 +255,9 @@ async fn execute(
         .env("CODINGPAD_RUST_TOKEN", secret);
     let mut child =
         spawn(command).map_err(|error| format!("Could not start the Rust script: {error}"))?;
-    #[cfg(unix)]
-    let mut group = crate::toolchains::ProcessGroup::new(child.id());
-    let status = read_output(&mut child, &listener, &token, events)
+    let status = read_output(&mut child.0, &listener, &token, events)
         .await
         .map_err(|error| format!("Could not read Rust script output: {error}"))?;
-    #[cfg(unix)]
-    group.disarm();
     if !status.success() {
         events.error(
             "Rust script failed",

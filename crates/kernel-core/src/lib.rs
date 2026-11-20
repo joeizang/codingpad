@@ -120,6 +120,28 @@ use tokio::{
     sync::{watch, Mutex, OnceCell},
 };
 
+fn kill_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // The child was started in its own process group, so this also stops
+        // its descendants.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("taskkill")
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.start_kill();
+}
+
 async fn accept_kernel(listener: &TcpListener, token: &[u8; 32]) -> std::io::Result<TcpStream> {
     loop {
         let (mut stream, _) = listener.accept().await?;

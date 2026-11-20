@@ -646,7 +646,7 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "codingpad-desktop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "codingpad-kernel-core",
  "serde_json",
@@ -659,7 +659,7 @@ dependencies = [
 
 [[package]]
 name = "codingpad-kernel-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -822,7 +822,7 @@ checksum = "417bef24afe1460300965a25ff4a24b8b45ad011948302ec221e8a0a81eb2c79"
 
 [[package]]
 name = "cpad"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "codingpad-kernel-core",
  "dirs",

@@ -38,6 +38,11 @@ run** when a toolchain is missing, or uses one you already have.
 
 ### macOS
 
+Open the `.dmg` from GitHub Releases or from `target/release/bundle/dmg/`
+if you built it locally. Choose the file ending in `_aarch64.dmg` for Apple
+silicon or `_x64.dmg` for Intel. Drag **CodingPad** into **Applications**, then
+eject the disk image.
+
 Once the first stable macOS release has been added to the tap, install
 CodingPad with [Homebrew](https://brew.sh/):
 
@@ -47,8 +52,8 @@ brew install --cask joeizang/codingpad/codingpad
 ```
 
 Homebrew chooses the disk image for your Mac and verifies its SHA-256 checksum.
-Open **CodingPad** from Applications. Early builds use an ad hoc signature
-without Apple notarization (D30). If macOS blocks the first launch, open
+After either installation, open **CodingPad** from Applications. Early builds
+use an ad hoc signature without Apple notarization (D30). If macOS blocks the first launch, open
 **System Settings → Privacy & Security**, scroll to **Security**, click
 **Open Anyway**, and confirm the prompt. See [Apple’s first-launch instructions](https://support.apple.com/en-us/102445).
 
@@ -79,6 +84,10 @@ it installs the WebView2 runtime when it is missing (which needs an internet
 connection).
 
 ### First launch
+
+In the initial Python tab, replace the editor contents with `print(6 * 7)` and
+click **Run**. If prompted, choose **Install uv and run**. Confirm that
+**Results** displays `42`.
 
 CodingPad sends no telemetry. Its network use is limited to the release check and
 the toolchain or package downloads you trigger, such as **Install uv and run**,

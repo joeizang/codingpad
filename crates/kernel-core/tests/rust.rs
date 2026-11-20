@@ -250,7 +250,7 @@ async fn maps_panics_in_snippets_and_native_main_to_script_frames() {
     let supervisor = Supervisor::default();
     let (result, events) = run(
         &supervisor,
-        "fn crash() {\n    panic!(\"boom\");\n}\ncrash();",
+        "fn crash() {\n    panic!(\"boom\");\n}\n\t\tlet _s = \"ééé\"; crash();",
     )
     .await;
     assert!(!result.ok, "{events:?}");
@@ -267,6 +267,13 @@ async fn maps_panics_in_snippets_and_native_main_to_script_frames() {
             .any(|frame| frame["line"] == 4 && frame["script"] == true),
         "{trace:?}"
     );
+
+    #[cfg(target_os = "linux")]
+    {
+        let caller = trace.iter().find(|frame| frame["line"] == 4).unwrap();
+        let expected = "\t\tlet _s = \"ééé\"; ".encode_utf16().count() + 1;
+        assert_eq!(caller["column"], expected, "{trace:?}");
+    }
 
     let source = "fn main() {\tlet _ = \"漢😀\"; panic!(\"main\"); }";
     let (result, events) = run(&supervisor, source).await;
@@ -288,6 +295,10 @@ async fn maps_panics_in_snippets_and_native_main_to_script_frames() {
     assert!(result.ok, "{events:?}");
     assert_eq!(dumps(&events).len(), 1);
     assert_eq!(dumps(&events)[0]["v"], 42);
+    assert!(events.iter().any(|event| event.params["stream"] == "stderr"
+        && event.params["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("caught"))));
 }
 
 #[tokio::test]
@@ -411,4 +422,81 @@ async fn stop_closes_a_rust_scripts_descendant_processes() {
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
         result => panic!("expected the descendant's socket to close, got {result:?}"),
     }
+}
+
+#[tokio::test]
+async fn recovered_panics_are_visible_and_do_not_mask_a_later_exit() {
+    let supervisor = Supervisor::default();
+    let (result, events) = run(
+        &supervisor,
+        r#"
+        let _ = std::thread::spawn(|| panic!("worker recovery")).join();
+        let _ = std::panic::catch_unwind(|| panic!("main recovery"));
+        std::process::exit(7);
+    "#,
+    )
+    .await;
+    assert!(!result.ok);
+    let stderr = events
+        .iter()
+        .filter(|event| event.params["stream"] == "stderr")
+        .filter_map(|event| event.params["text"].as_str())
+        .collect::<String>();
+    assert!(stderr.contains("worker recovery"), "{events:?}");
+    assert!(stderr.contains("main recovery"), "{events:?}");
+    assert_eq!(dumps(&events).len(), 1);
+    assert_eq!(dumps(&events)[0]["type"], "Rust script failed");
+}
+
+#[tokio::test]
+async fn dump_preserves_mixed_variants_and_keeps_debug_markers_private() {
+    let supervisor = Supervisor::default();
+    let (result, events) = run(
+        &supervisor,
+        r#"
+        use codingpad::{dump, html, live};
+        use std::fmt;
+        struct Custom(&'static str);
+        impl fmt::Debug for Custom {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        dump(vec![Ok::<u8, u8>(1), Err(1)]);
+        dump(['\0', '\'', '\\', '\u{1b}']);
+        let status = live(Custom("custom formatting"));
+        println!("{status:?}");
+        println!("{:?}", html("<b>ready</b>"));
+        status.set(Custom("still private"));
+        dump(&status);
+        status.set(Custom("now updated"));
+    "#,
+    )
+    .await;
+    assert!(result.ok, "{events:?}");
+    let values = dumps(&events);
+    assert_eq!(values[0]["kind"], "list");
+    assert_eq!(values[0]["items"][0]["type"], "Ok");
+    assert_eq!(values[0]["items"][1]["type"], "Err");
+    let characters = values[1]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["v"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(characters, ["\0", "'", "\\", "\u{1b}"]);
+    let stdout = events
+        .iter()
+        .filter(|event| event.params["stream"] == "stdout")
+        .filter_map(|event| event.params["text"].as_str())
+        .collect::<String>();
+    assert_eq!(stdout, "custom formatting\n<b>ready</b>\n");
+    assert_eq!(values[2]["kind"], "live");
+    assert_eq!(values[2]["node"]["v"], "still private");
+    let updates = events
+        .iter()
+        .filter(|event| event.method == "dump_update")
+        .collect::<Vec<_>>();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].params["node"]["v"], "now updated");
 }

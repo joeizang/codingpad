@@ -18,7 +18,7 @@ pub fn html(markup: impl AsRef<str>) -> Html {
 
 impl Debug for Html {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        if !super::in_app() {
+        if !super::formatting_dump() {
             return f.write_str(&self.0);
         }
         f.debug_tuple("__CodingPadHtml").field(&self.0).finish()
@@ -102,7 +102,7 @@ fn is_svg(bytes: &[u8]) -> bool {
 
 impl Debug for Image {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        if !super::in_app() {
+        if !super::formatting_dump() {
             return write!(f, "[{} image, {} bytes]", self.mime, self.bytes.len());
         }
         f.debug_tuple("__CodingPadImage")
@@ -163,28 +163,39 @@ pub fn live<T: Debug>(value: T) -> Live<T> {
 impl<T: Debug> Live<T> {
     /// Replace the displayed value. Pass `&value` to `dump` to keep updating it.
     pub fn set(&self, value: T) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        state.value = value;
-        state.revision += 1;
-        if state.watched {
-            super::send_debug("live_update", self.id, state.revision, &state.value);
+        let pending = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.value = value;
+            state.revision += 1;
+            state
+                .watched
+                .then(|| (state.revision, super::format_debug(&state.value)))
+        };
+        if let Some((revision, value)) = pending {
+            super::send_debug("live_update", self.id, revision, &value);
         }
     }
 }
 
 impl<T: Debug> Debug for Live<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let Ok(mut state) = self.state.try_lock() else {
-            return f.write_str("[live value unavailable]");
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return f.write_str("[live value unavailable]")
+            }
         };
-        if !super::in_app() {
+        if !super::formatting_dump() {
             return state.value.fmt(f);
         }
+        let value = super::format_debug(&state.value);
         state.watched = true;
         f.debug_tuple("__CodingPadLive")
             .field(&self.id)
             .field(&state.revision)
-            .field(&state.value)
+            .field(&value.text)
+            .field(&value.complete)
             .finish()
     }
 }

@@ -589,7 +589,8 @@ variants show their fields, `None` appears as null, and collections of records
 become paged tables. Other collections appear as lists or maps. Custom
 `Debug` output that has no recognizable structure appears as text. The host
 keeps captured values available for expansion and table export after the process
-exits. Handles expire on rerun, Reset, or Close. Large previews are bounded,
+exits. Live updates appear during the run. Expansion and paging wait for the
+run to finish. Handles expire on rerun, Reset, or Close. Large previews are bounded,
 and a table or list shows a truncation marker if only a prefix could be captured.
 
 ```rust
@@ -607,5 +608,5 @@ BMP and SVG up to 4 MiB. To update a Results block during the run, dump a
 `Live` value by reference as its own block, then call `set`. Updates keep the
 original block and replace its contents, including its preview handles.
 Panics that fail the run appear as structured errors with clickable script
-frames mapped back to the editor snapshot. A panic caught by the script does
-not fail the run.
+frames mapped back to the editor snapshot. Panics from worker threads and
+recovered main-thread panics are visible on stderr.

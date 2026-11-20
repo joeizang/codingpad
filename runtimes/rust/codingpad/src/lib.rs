@@ -3,6 +3,7 @@ mod rich;
 
 pub use rich::{html, image, image_bytes, live, Html, Image, Live};
 
+use std::cell::Cell;
 use std::fmt::{self, Debug};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -10,28 +11,68 @@ use std::sync::{Mutex, OnceLock};
 
 /// Display a Rust value in Results, or pretty-print it in a terminal.
 pub fn dump<T: Debug>(value: T) {
-    send_debug("debug", 0, 0, &value);
+    let formatted = format_debug(&value);
+    if !send_debug("debug", 0, 0, &formatted) {
+        if in_app() {
+            // The channel may have closed after formatting. Don't print the
+            // private rich-value markers to stdout.
+            let _scope = FormatScope(FORMATTING_DUMP.replace(false));
+            println!("{value:#?}");
+        } else {
+            println!("{}", formatted.text);
+        }
+    }
 }
 
-fn send_debug<T: Debug>(kind: &str, key: u64, revision: u64, value: &T) {
+thread_local! {
+    static FORMATTING_DUMP: Cell<bool> = const { Cell::new(false) };
+}
+
+fn formatting_dump() -> bool {
+    FORMATTING_DUMP.get()
+}
+
+struct FormatScope(bool);
+
+impl Drop for FormatScope {
+    fn drop(&mut self) {
+        FORMATTING_DUMP.set(self.0);
+    }
+}
+
+struct FormattedDebug {
+    text: String,
+    name: &'static str,
+    complete: bool,
+}
+
+fn format_debug<T: Debug>(value: &T) -> FormattedDebug {
     use std::fmt::Write;
+    let rich = in_app();
+    let _scope = FormatScope(FORMATTING_DUMP.replace(rich));
     let mut text = Preview(String::new());
-    let complete = if in_app() {
+    let complete = if rich {
         write!(text, "{value:?}")
     } else {
         write!(text, "{value:#?}")
     }
     .is_ok();
-    if !send(&[
+    FormattedDebug {
+        text: text.0,
+        name: std::any::type_name::<T>(),
+        complete,
+    }
+}
+
+fn send_debug(kind: &str, key: u64, revision: u64, value: &FormattedDebug) -> bool {
+    send(&[
         ("kind", kind),
         ("key", &key.to_string()),
         ("revision", &revision.to_string()),
-        ("type", std::any::type_name::<T>()),
-        ("text", &text.0),
-        ("truncated", if complete { "false" } else { "true" }),
-    ]) {
-        println!("{}", text.0);
-    }
+        ("type", value.name),
+        ("text", &value.text),
+        ("truncated", if value.complete { "false" } else { "true" }),
+    ])
 }
 
 struct Preview(String);
@@ -55,12 +96,28 @@ impl fmt::Write for Preview {
 }
 
 #[doc(hidden)]
-pub fn __start() {
-    if !in_app() {
-        return;
+pub struct PanicGuard(bool);
+
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        if self.0 && std::thread::panicking() {
+            send(&[("kind", "main_unwound")]);
+        }
     }
+}
+
+#[doc(hidden)]
+pub fn __start() -> PanicGuard {
+    if !in_app() {
+        return PanicGuard(false);
+    }
+    let main = std::thread::current().id();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().id() != main {
+            previous(info);
+            return;
+        }
         let message = info
             .payload()
             .downcast_ref::<String>()
@@ -86,6 +143,7 @@ pub fn __start() {
             previous(info);
         }
     }));
+    PanicGuard(true)
 }
 
 fn in_app() -> bool {

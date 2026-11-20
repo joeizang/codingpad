@@ -21,7 +21,9 @@ impl<'a> Source<'a> {
         // Native Rust programs retain their entry point and crate-level items.
         if let Some(entry) = native_entry(&original[prefix..]).map(|entry| prefix + entry) {
             staged.copy(0, entry);
-            staged.generated.push_str(" ::codingpad::__start(); ");
+            staged
+                .generated
+                .push_str(" let __codingpad_panic_guard = ::codingpad::__start(); ");
             staged.copy(entry, original.len());
             return staged;
         }
@@ -49,7 +51,7 @@ impl<'a> Source<'a> {
         staged.copy(0, body);
         staged
             .generated
-            .push_str("\nfn main() { ::codingpad::__start();\n");
+            .push_str("\nfn main() { let __codingpad_panic_guard = ::codingpad::__start();\n");
         if let Some(tail) = tail {
             staged.copy(body, tail.start);
             staged.generated.push_str("::codingpad::__finish(");
@@ -85,13 +87,24 @@ impl<'a> Source<'a> {
         Some((line, column))
     }
 
-    pub(super) fn trace_position(&self, line: usize, column: usize) -> Option<(usize, usize)> {
+    fn generated_line(&self, line: usize) -> Option<(usize, &str)> {
         let mut lines = self.generated.split_inclusive('\n');
         let offset = (&mut lines)
             .take(line.checked_sub(1)?)
             .map(str::len)
             .sum::<usize>();
-        let generated = lines.next()?;
+        Some((offset, lines.next()?))
+    }
+
+    pub(super) fn backtrace_position(&self, line: usize, column: usize) -> Option<(usize, usize)> {
+        let (offset, generated) = self.generated_line(line)?;
+        let byte = column.saturating_sub(1);
+        generated.is_char_boundary(byte).then_some(())?;
+        self.position(offset + byte)
+    }
+
+    pub(super) fn panic_position(&self, line: usize, column: usize) -> Option<(usize, usize)> {
+        let (offset, generated) = self.generated_line(line)?;
         // rustc reports panic locations in display columns, with tabs counted
         // as four spaces. Monaco needs UTF-16 columns in the original buffer.
         let mut display_column = 1;
@@ -194,11 +207,13 @@ mod tests {
         let staged = Source::new(source);
         assert!(staged
             .generated
-            .contains("{ #![allow(unused)] ::codingpad::__start();"));
+            .contains("{ #![allow(unused)] let __codingpad_panic_guard = ::codingpad::__start();"));
         assert_eq!(
-            staged
-                .generated
-                .replacen(" ::codingpad::__start(); ", "", 1),
+            staged.generated.replacen(
+                " let __codingpad_panic_guard = ::codingpad::__start(); ",
+                "",
+                1
+            ),
             source
         );
     }

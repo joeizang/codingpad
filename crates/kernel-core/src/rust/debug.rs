@@ -146,7 +146,7 @@ impl<'a> Parser<'a> {
                     ValueNode::Record(fields)
                 } else if self.take('(') {
                     let values = self.sequence(')', depth + 1)?;
-                    self.variant(name, values)?
+                    self.variant(name, values, depth + 1)?
                 } else {
                     match name {
                         "None" => ValueNode::Null,
@@ -177,20 +177,10 @@ impl<'a> Parser<'a> {
             } else if ch == '\\' {
                 escaped = true;
             } else if ch == quote {
-                let (literal, rest) = self.rest.split_at(index + 1);
-                self.rest = rest;
-                return if quote == '"' {
-                    // JSON is the common fast path, including large image data.
-                    serde_json::from_str(literal).ok().or_else(|| {
-                        syn::parse_str::<syn::LitStr>(literal)
-                            .ok()
-                            .map(|literal| literal.value())
-                    })
-                } else {
-                    syn::parse_str::<syn::LitChar>(literal)
-                        .ok()
-                        .map(|literal| literal.value().to_string())
-                };
+                let body = &self.rest[1..index];
+                self.rest = &self.rest[index + 1..];
+                let text = unescape_debug(body)?;
+                return (quote == '"' || text.chars().count() == 1).then_some(text);
             }
         }
         None
@@ -281,7 +271,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn variant(&mut self, name: &str, values: Vec<Index>) -> Option<ValueNode> {
+    fn variant(&mut self, name: &str, values: Vec<Index>, depth: usize) -> Option<ValueNode> {
         let text = |index: Index| match &self.nodes.get(index)?.value {
             ValueNode::Text(text) => Some(text.clone()),
             _ => None,
@@ -307,15 +297,26 @@ impl<'a> Parser<'a> {
                     data: text(*data)?,
                 })
             }
-            ("__CodingPadLive", [key, revision, value]) => {
+            ("__CodingPadLive", [key, revision, value, complete]) => {
                 let unsigned = |index: Index| match &self.nodes[index].value {
                     ValueNode::Scalar(value) => value.as_u64(),
                     _ => None,
                 };
+                let key = unsigned(*key)?;
+                let revision = unsigned(*revision)?;
+                let complete = matches!(
+                    &self.nodes[*complete].value,
+                    ValueNode::Scalar(Value::Bool(true))
+                );
+                let ValueNode::Text(text) = &mut self.nodes[*value].value else {
+                    return None;
+                };
+                let text = std::mem::take(text);
+                let value = self.nested(text, depth, complete);
                 Some(ValueNode::Live {
-                    key: unsigned(*key)?,
-                    revision: unsigned(*revision)?,
-                    value: *value,
+                    key,
+                    revision,
+                    value,
                 })
             }
             _ => Some(ValueNode::Record(
@@ -336,6 +337,55 @@ impl<'a> Parser<'a> {
             )),
         }
     }
+    fn nested(&mut self, text: String, depth: usize, complete: bool) -> Index {
+        if complete {
+            let checkpoint = self.nodes.len();
+            let mut parser = Parser {
+                rest: &text,
+                nodes: std::mem::take(&mut self.nodes),
+            };
+            let root = parser
+                .value(depth)
+                .filter(|_| parser.rest.trim().is_empty());
+            self.nodes = parser.nodes;
+            if let Some(root) = root {
+                return root;
+            }
+            self.nodes.truncate(checkpoint);
+        }
+        let index = self.nodes.len();
+        self.nodes.push(Node {
+            name: String::new(),
+            value: ValueNode::Text(text),
+        });
+        index
+    }
+}
+
+// Decode the escapes Rust Debug emits without allocating proc-macro spans.
+fn unescape_debug(mut text: &str) -> Option<String> {
+    let mut value = String::new();
+    while let Some((plain, escaped)) = text.split_once('\\') {
+        value.push_str(plain);
+        let mut chars = escaped.chars();
+        let escape = chars.next()?;
+        text = chars.as_str();
+        value.push(match escape {
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            '0' => '\0',
+            '\\' | '\'' | '"' => escape,
+            'u' => {
+                let (hex, rest) = text.strip_prefix('{')?.split_once('}')?;
+                text = rest;
+                char::from_u32(u32::from_str_radix(hex, 16).ok()?)?
+            }
+            _ => return None,
+        });
+    }
+    value.push_str(text);
+    Some(value)
 }
 
 fn number(text: &str) -> Option<Value> {

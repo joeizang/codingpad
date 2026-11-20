@@ -334,10 +334,11 @@ fn table(
     let ValueNode::List(items) = &snapshot.nodes[index].value else {
         return None;
     };
-    if !items
-        .iter()
-        .all(|&item| matches!(snapshot.nodes[item].value, ValueNode::Record(_)))
-    {
+    let row_type = &snapshot.nodes[*items.first()?].name;
+    if !items.iter().all(|&item| {
+        let row = &snapshot.nodes[item];
+        row.name == *row_type && matches!(row.value, ValueNode::Record(_))
+    }) {
         return None;
     }
     let mut names = HashSet::new();

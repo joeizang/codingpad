@@ -86,12 +86,19 @@ pub(super) async fn run(
         views: VecDeque::new(),
         latest: VecDeque::new(),
         panic: None,
+        main_unwound: false,
     };
     let build = compile(&cargo(), project.root(), &source, name, &mut events).await?;
     let ok = if let Some(executable) = build {
         let status = execute(&executable, script, project.root(), &mut events).await?;
+        let panic = events.panic.take();
+        if let Some(panic) = panic.as_ref() {
+            if status.success() || !events.main_unwound {
+                events.stream("stderr", &panic.stderr());
+            }
+        }
         if !status.success() {
-            if let Some(panic) = events.panic.take() {
+            if let Some(panic) = panic.filter(|_| events.main_unwound) {
                 events.error("Rust panic", &panic.message, panic.frames(&source, name));
             } else {
                 events.error(
@@ -385,6 +392,7 @@ enum RuntimeEvent {
         value: DebugValue,
     },
     Panic(Panic),
+    MainUnwound,
 }
 
 #[derive(Deserialize)]
@@ -423,6 +431,7 @@ struct Events<'a, F> {
     views: VecDeque<LiveView>,
     latest: VecDeque<LiveSnapshot>,
     panic: Option<Panic>,
+    main_unwound: bool,
 }
 
 impl<F: FnMut(KernelEvent)> Events<'_, F> {
@@ -450,7 +459,12 @@ impl<F: FnMut(KernelEvent)> Events<'_, F> {
                     self.update(key, revision, value);
                 }
             }
-            RuntimeEvent::Panic(panic) => self.panic = Some(panic),
+            RuntimeEvent::Panic(panic) => {
+                if let Some(recovered) = self.panic.replace(panic) {
+                    self.stream("stderr", &recovered.stderr());
+                }
+            }
+            RuntimeEvent::MainUnwound => self.main_unwound = true,
         }
         Ok(())
     }

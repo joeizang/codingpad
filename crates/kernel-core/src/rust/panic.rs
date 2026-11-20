@@ -12,13 +12,26 @@ pub(super) struct Panic {
 }
 
 impl Panic {
+    pub(super) fn stderr(&self) -> String {
+        format!(
+            "thread 'main' panicked at {}:{}:{}:\n{}\n",
+            self.file, self.line, self.column, self.message
+        )
+    }
+
     pub(super) fn frames(&self, source: &Source<'_>, name: &str) -> Vec<Value> {
         let mut frames = Vec::new();
         let mut function = "<panic>";
         for entry in self.trace.lines().map(str::trim) {
             if let Some(location) = entry.strip_prefix("at ") {
                 if let Some((file, line, column)) = split_location(location) {
-                    if let Some(frame) = frame(source, name, function, file, line, column) {
+                    if let Some(frame) = frame(
+                        source,
+                        name,
+                        function,
+                        file,
+                        source.backtrace_position(line, column),
+                    ) {
                         frames.push(frame);
                     }
                 }
@@ -34,7 +47,13 @@ impl Panic {
         // from a library which has no editor buffer.
         let line = self.line.parse().unwrap_or(0);
         let column = self.column.parse().unwrap_or(0);
-        if let Some(top) = frame(source, name, "<panic>", &self.file, line, column) {
+        if let Some(top) = frame(
+            source,
+            name,
+            "<panic>",
+            &self.file,
+            source.panic_position(line, column),
+        ) {
             // Symbolized return addresses can point past the actual panic
             // site. The hook has the exact span supplied by the compiler.
             if frames
@@ -78,14 +97,13 @@ fn frame(
     name: &str,
     function: &str,
     file: &str,
-    line: usize,
-    column: usize,
+    position: Option<(usize, usize)>,
 ) -> Option<Value> {
     let file = file.replace('\\', "/");
     if file != source::FILE && !file.ends_with(&format!("/{}", source::FILE)) {
         return None;
     }
-    let (line, column) = source.trace_position(line, column)?;
+    let (line, column) = position?;
     Some(json!({
         "file": name, "line": line, "column": column, "function": function,
         "text": source.line(line), "script": true,

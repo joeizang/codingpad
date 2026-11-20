@@ -4,8 +4,9 @@ const USAGE: &str = "\
 Usage: cpad run [--html] <script>
 
 Run a CodingPad script from the terminal and print its dumps as text.
-Supports Python (.py), C# (.cs) and SQL (.sql) scripts. A header such as
-\"# codingpad: connection=<name>\" attaches a saved connection to the script.
+Supports Python (.py), C# (.cs), TypeScript (.ts) and SQL (.sql) scripts.
+A \"codingpad: connection=<name>\" header comment attaches a saved connection
+to the script.
 
 Options:
   --html  Print one standalone HTML page instead of text (for example

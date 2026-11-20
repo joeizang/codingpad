@@ -1,3 +1,4 @@
+use codingpad_kernel_core::samples::{self, SampleLanguage};
 use serde_json::json;
 use std::{
     fs,
@@ -50,6 +51,86 @@ fn python_script_prints_streams_and_dumps_as_text() {
     assert!(text.contains("hello from Python"), "{text}");
     assert!(text.contains("{name: \"Ada\", score: 10}"), "{text}");
     assert!(text.contains("\n42\n"), "{text}");
+}
+
+#[test]
+fn typescript_samples_run_from_saved_files() {
+    let directory = tempdir().unwrap();
+    let data = directory.path().join("data");
+    for sample in samples::all()
+        .into_iter()
+        .filter(|sample| sample.language == SampleLanguage::Typescript)
+    {
+        let script = directory.path().join(&sample.name);
+        fs::write(&script, sample.source).unwrap();
+        let output = cpad(&data, &script);
+        let errors = stderr(&output);
+        let text = stdout(&output);
+        assert!(output.status.success(), "{}: {text}\n{errors}", sample.id);
+        assert!(!text.trim().is_empty(), "{} produced no output", sample.id);
+        if sample.name == "cache.ts" {
+            assert_eq!(text.matches("Computing squares").count(), 1, "{text}");
+            assert!(text.to_ascii_lowercase().contains("reused: true"), "{text}");
+        }
+        if sample.name == "query_products.ts" {
+            assert!(text.contains("Ethiopia Yirgacheffe"), "{text}");
+        }
+        if sample.name == "query_orders.ts" {
+            assert!(text.contains("Ada Lovelace"), "{text}");
+        }
+        if sample.name == "rich_output.ts" {
+            let output = cpad_html(&data, &script);
+            assert!(output.status.success(), "stderr: {}", stderr(&output));
+            let page = stdout(&output);
+            assert!(page.starts_with("<!doctype html>"), "{page}");
+            assert!(page.contains("<strong>All three steps completed.</strong>"));
+        }
+    }
+}
+
+#[test]
+fn typescript_queries_a_user_saved_connection() {
+    let directory = tempdir().unwrap();
+    let data = directory.path().join("data");
+    let database = directory.path().join("shop.db");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(
+        data.join("connections.json"),
+        serde_json::to_string(&json!([{
+            "id": "saved-shop",
+            "name": "shop",
+            "kind": "sqlite",
+            "path": database.to_string_lossy(),
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    let setup = directory.path().join("setup.sql");
+    fs::write(
+        &setup,
+        "-- codingpad: connection=shop\n\
+         CREATE TABLE stockrooms (id INTEGER, name TEXT);\n\
+         INSERT INTO stockrooms VALUES (1, 'Front room'), (2, 'Workshop');\n",
+    )
+    .unwrap();
+    let output = cpad(&data, &setup);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let script = directory.path().join("shop.ts");
+    fs::write(
+        &script,
+        r#"// codingpad: connection=shop
+import { db } from "codingpad";
+await db.query("SELECT name FROM stockrooms WHERE id = ?", [2]);
+"#,
+    )
+    .unwrap();
+
+    let output = cpad(&data, &script);
+    let text = stdout(&output);
+    assert!(output.status.success(), "{text}\n{}", stderr(&output));
+    assert!(text.lines().any(|line| line.trim() == "Workshop"), "{text}");
+    assert!(text.contains("(1 rows)"), "{text}");
 }
 
 #[test]
@@ -407,14 +488,14 @@ fn usage_errors_exit_with_two() {
 
     let output = cpad(&data, &script);
     assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
-    assert!(stderr(&output).contains(".py, .cs or .sql"));
+    assert!(stderr(&output).contains(".py, .cs, .ts or .sql"));
 
     // The type check comes before opening the file, so a missing unknown path
     // is still a usage error rather than "Could not open".
     let missing = directory.path().join("missing.txt");
     let output = cpad(&data, &missing);
     assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
-    assert!(stderr(&output).contains(".py, .cs or .sql"));
+    assert!(stderr(&output).contains(".py, .cs, .ts or .sql"));
 
     // An unknown option is a usage error too.
     let output = Command::new(env!("CARGO_BIN_EXE_cpad"))

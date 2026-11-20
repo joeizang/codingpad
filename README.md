@@ -226,22 +226,23 @@ cargo run --locked -p cpad -- run hello.py
 ```
 
 `cargo build --locked -p cpad` produces `target/debug/cpad` (`target/release/cpad`
-with `--release`). Python `.py` and C# `.cs` scripts use the app's warm kernels;
-a `.sql` script runs directly through the connection named in its header. Dumps
-print as text: short values stay on one line, tables are aligned, and C# properties
-and deep Python values are materialised in the kernel so they appear inline. A
-table larger than its first 100-row page prints how many rows are shown and the
-total; use the desktop or CSV export for every row.
+with `--release`). Python (`.py`), C# (`.cs`) and TypeScript (`.ts`) scripts
+use the app's kernels. TypeScript uses Bun on PATH or the private Bun installed
+by CodingPad. A `.sql` script runs through the connection named in its header.
+Dumps print as text. Short values stay on one line, tables are aligned, and C#
+properties and deep Python values are materialised in the kernel so they appear
+inline. For a table larger than its first 100-row page, the output shows the
+displayed and total row counts. Use the desktop or CSV export for every row.
 
 `cpad run` uses the app's data folder (`io.github.joeizang.codingpad`) for
 connections, secret names and private toolchains, so the same saved connection
 works in both places. Set `CODINGPAD_DATA_DIR` to use another folder. A script
-with a `codingpad: connection=<name>` header gets the same `db` client and typed
-data context as the app, and `secret()` reads the same vault values. `cache()`
-reuses a value for the same key within that run; each `cpad run` starts a fresh
-kernel, so values do not survive between invocations. Exit codes are 0 for
-success, 1 for a script failure, 2 for a usage or script-type error, and 130 when
-Ctrl-C stops the run. Output streams as it is produced. Live values print their
+with a `codingpad: connection=<name>` header gets the same `db` client as the
+app, including typed data contexts for Python and C#. `secret()` reads the same
+vault values. `cache()` reuses a value for the same key within that run. Each
+`cpad run` starts a fresh kernel. Exit codes are 0 for success, 1 for a script
+failure, 2 for a usage or script-type error, and 130 when Ctrl-C stops the run.
+Output streams as it is produced. Live values print their
 current value where the dump appears, and later updates are progress lines on
 stderr (`live: 42`), capped at 100 lines. A dump that still contains a value the
 kernel could not make eager (a node budget cut-off) is held until the run
@@ -286,27 +287,28 @@ types remain editable and saveable.
 
 ## Samples and the sample database (M4.2)
 
-The sidebar's **Samples** section lists built-in Python, C# and SQL scripts.
-They cover values and tables, collections and LINQ, async work, `cache()`, live
-values, HTML output and queries against the bundled database. Clicking a sample
-opens a fresh unsaved copy; editing or saving it never changes the embedded
-original. Saving the copy writes an ordinary native file to the folder you
-choose, and the tab then behaves like any other saved script.
+The sidebar's **Samples** section lists built-in Python, C#, TypeScript and SQL
+scripts. They cover values and tables, collections and LINQ, async work,
+`cache()`, live values, HTML output and queries against the bundled database.
+Clicking a sample opens a fresh unsaved copy. The embedded original stays intact
+when you edit or save the copy. Saving writes an ordinary native file to the
+folder you choose, and the tab then behaves like any other saved script.
 
 CodingPad ships a small SQLite shop database (customers, orders, products and
 order items) and prepares it in the app data folder on first use as the reserved
 **codingpad-sample** connection. SQL samples name it in their header, and
-Python/C# samples use `db.query`/`db.Query` against it. No connection setup is
-needed. The connection is built in rather than saved in your connections, so it
-cannot be removed or shadowed by a user connection and `cpad` never rewrites
-`connections.json`. The database file is written once and never replaced, so any
-rows you add through the sample connection stay there; a new bundled version
-uses a new file name and removes the previous bundled copy. The terminal runner
-prepares the same database, so `cpad run samples/sql/orders.sql` works from a
-checkout. `samples/sample.sqlite`
+Python and TypeScript samples use `db.query`, while C# samples use `db.Query`.
+No connection setup is needed. The app protects the built-in connection from
+removal and reserves its name against user connections. `cpad` leaves
+`connections.json` untouched. The database file is written once, so rows you
+add through the sample connection stay there. A new bundled version uses a new
+file name and removes the previous bundled copy. The terminal runner
+prepares the same database, so `cpad run samples/typescript/query_orders.ts`
+works from a checkout. `samples/sample.sqlite`
 is generated by `python3 samples/build_sample_database.py`; the test suite runs
-every SQL sample and an ignored acceptance test runs the complete set with their
-kernels.
+every SQL and TypeScript sample. Install Bun before running the TypeScript
+sample tests. An ignored acceptance test also runs the Python and C# samples,
+which may need network access for their packages.
 
 ## Update notice (M4.3)
 
@@ -762,7 +764,7 @@ effect on the next run of each script.
 - `runtimes/dotnet/CodingPad`: bundled C# `.Dump()` extension library
 - `runtimes/python/codingpad`: bundled `dump()` helper (no registry download)
 - `runtimes/typescript/codingpad`: bundled TypeScript helper and its declarations
-- `samples`: built-in Python, C# and SQL samples plus the bundled SQLite database
+- `samples`: built-in Python, C#, TypeScript and SQL samples plus the bundled SQLite database
 - `tests/python`: Python kernel protocol and execution tests
 - `tests/dotnet`: C# cancellation protocol and standalone package checks
 - `docs`: design decisions and [kernel protocol](docs/kernel-protocol.md)

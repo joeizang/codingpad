@@ -103,13 +103,12 @@ fn connect() -> Option<TcpStream> {
     let address = std::env::var("CODINGPAD_RUST_OUTPUT").ok()?;
     let token = std::env::var("CODINGPAD_RUST_TOKEN").ok()?;
     let mut socket = TcpStream::connect(address).ok()?;
+    socket.set_nodelay(true).ok()?;
     socket
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .ok()?;
     socket.write_all(token.as_bytes()).ok()?;
-    let mut ack = [0];
-    socket.read_exact(&mut ack).ok()?;
-    (ack == *b"1").then_some(socket)
+    Some(socket)
 }
 
 fn send(fields: &[(&str, &str)]) -> bool {
@@ -132,7 +131,8 @@ fn send(fields: &[(&str, &str)]) -> bool {
         quoted(&mut line, value);
     }
     line.push_str("}\n");
-    socket.write_all(line.as_bytes()).is_ok()
+    let mut ack = [0];
+    socket.write_all(line.as_bytes()).is_ok() && socket.read_exact(&mut ack).is_ok() && ack == *b"1"
 }
 
 // The built-in crate compiles offline and uses only the standard library.

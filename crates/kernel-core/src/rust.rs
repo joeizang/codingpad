@@ -313,8 +313,8 @@ async fn read_output(
             }
             _ = tokio::time::sleep_until(deadline), if exit.is_some() => break,
             socket = &mut connect, if !connected => {
-                let mut socket = socket?;
-                socket.write_all(b"1").await?;
+                let socket = socket?;
+                socket.set_nodelay(true)?;
                 runtime = Some(BufReader::new(socket).lines());
                 connected = true;
             }
@@ -329,14 +329,20 @@ async fn read_output(
                 stderr_line.clear();
             }
             line = async { runtime.as_mut().unwrap().next_line().await }, if runtime.is_some() => {
-                match line? {
-                    Some(line) => {
+                match line {
+                    Ok(Some(line)) => {
                         events.runtime(&line)?;
-                        if exit.is_some() {
-                            deadline = Instant::now() + Duration::from_millis(500);
+                        // The child may exit as soon as dump() returns. Acknowledge
+                        // the complete event before allowing that to happen.
+                        let channel = runtime.as_mut().unwrap().get_mut();
+                        if let Err(error) = channel.write_all(b"1").await {
+                            if !peer_closed(&error) { return Err(error); }
+                            runtime = None;
                         }
                     }
-                    None => runtime = None,
+                    Ok(None) => runtime = None,
+                    Err(error) if peer_closed(&error) => runtime = None,
+                    Err(error) => return Err(error),
                 }
             }
         }
@@ -347,6 +353,16 @@ async fn read_output(
         }
     }
     Ok(exit.unwrap())
+}
+
+fn peer_closed(error: &io::Error) -> bool {
+    // Windows can reset a socket held by a program that has just exited.
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+    )
 }
 
 #[derive(Deserialize)]

@@ -1,4 +1,4 @@
-# CodingPad
+# CodingPad technical reference
 
 A desktop scratchpad for running plain scripts and inspecting their values. This
 build supports Python with a Monaco editor, Python completions and hover,
@@ -43,8 +43,7 @@ if you built it locally. Choose the file ending in `_aarch64.dmg` for Apple
 silicon or `_x64.dmg` for Intel. Drag **CodingPad** into **Applications**, then
 eject the disk image.
 
-Once the first stable macOS release has been added to the tap, install
-CodingPad with [Homebrew](https://brew.sh/):
+Install CodingPad with [Homebrew](https://brew.sh/):
 
 ```sh
 brew tap joeizang/codingpad https://github.com/joeizang/codingpad.git
@@ -65,9 +64,9 @@ toolchains. Credentials stored in the macOS Keychain remain there.
 
 ### Linux
 
-- **AppImage**: `chmod +x CodingPad_0.1.0_amd64.AppImage`, then run the file.
-- **Debian/Ubuntu**: `sudo apt install ./CodingPad_0.1.0_amd64.deb`
-- **Fedora/RHEL**: `sudo dnf install ./CodingPad-0.1.0-1.x86_64.rpm`
+- **AppImage**: `chmod +x CodingPad_0.2.0_amd64.AppImage`, then run the file.
+- **Debian/Ubuntu**: `sudo apt install ./CodingPad_0.2.0_amd64.deb`
+- **Fedora/RHEL**: `sudo dnf install ./CodingPad-0.2.0-1.x86_64.rpm`
 
 Use the version and architecture of the file you downloaded. The `.deb` and
 `.rpm` install for all users; the AppImage is a single file and needs no install.
@@ -77,7 +76,7 @@ manager install them.
 
 ### Windows
 
-Run `CodingPad_0.1.0_x64-setup.exe`. The build is unsigned, so SmartScreen may
+Run `CodingPad_0.2.0_x64-setup.exe`. The build is unsigned, so SmartScreen may
 show **Windows protected your PC**: choose **More info**, then **Run anyway**.
 The setup installs for the current user and needs no administrator rights, and
 it installs the WebView2 runtime when it is missing (which needs an internet

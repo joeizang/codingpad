@@ -1,9 +1,9 @@
 cask "codingpad" do
   arch arm: "aarch64", intel: "x64"
 
-  version "0.1.0"
-  sha256 arm:   "e195a23a5a0f8f41049fb9d81029b4c9e088080a933b3235185dbc114aebc7e4",
-         intel: "8b7b06750d5f231345a83a4cc3d5ecfbe1e3de0ae14b37775bcf0b5af0cbc2d5"
+  version "0.2.0"
+  sha256 arm:   "d0d4a9b610be4c426653828d6964495edb5687a779572d964108e6587f0e7a19",
+         intel: "f62fb8b5a80374274b986181eb3802498e439b92d983c649366accb789ba6f04"
 
   url "https://github.com/joeizang/codingpad/releases/download/v#{version}/CodingPad_#{version}_#{arch}.dmg"
   name "CodingPad"

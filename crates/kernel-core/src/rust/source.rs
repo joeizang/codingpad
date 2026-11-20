@@ -11,13 +11,15 @@ pub(super) struct Source<'a> {
 
 impl<'a> Source<'a> {
     pub(super) fn new(original: &'a str) -> Self {
+        let _spans = SpanScope;
+        let prefix = source_prefix_len(original);
         let mut staged = Self {
             original,
             generated: String::new(),
             segments: Vec::new(),
         };
         // Native Rust programs retain their entry point and crate-level items.
-        if let Some(entry) = native_entry(original) {
+        if let Some(entry) = native_entry(&original[prefix..]).map(|entry| prefix + entry) {
             staged.copy(0, entry);
             staged.generated.push_str(" ::codingpad::__start(); ");
             staged.copy(entry, original.len());
@@ -29,16 +31,21 @@ impl<'a> Source<'a> {
             let statements = input.call(syn::Block::parse_within)?;
             Ok((attrs, statements))
         };
-        let (body, tail) = syn::parse::Parser::parse_str(parse, original)
+        let (body, tail) = syn::parse::Parser::parse_str(parse, &original[prefix..])
             .map(|(attrs, statements)| {
-                let body = attrs.last().map_or(0, |attr| attr.span().byte_range().end);
+                let body = attrs
+                    .last()
+                    .map_or(prefix, |attr| prefix + attr.span().byte_range().end);
                 let tail = match statements.last() {
-                    Some(Stmt::Expr(expr, None)) if plain(expr) => Some(expr.span().byte_range()),
+                    Some(Stmt::Expr(expr, None)) if plain(expr) => {
+                        let range = expr.span().byte_range();
+                        Some(prefix + range.start..prefix + range.end)
+                    }
                     _ => None,
                 };
                 (body, tail)
             })
-            .unwrap_or((0, None));
+            .unwrap_or((prefix, None));
         staged.copy(0, body);
         staged
             .generated
@@ -110,14 +117,7 @@ impl<'a> Source<'a> {
 }
 
 fn native_entry(source: &str) -> Option<usize> {
-    // parse_file strips a BOM and shebang before parsing. Account for the
-    // prefix when translating the entry point's span back into the snapshot.
-    let bom = source
-        .strip_prefix('\u{feff}')
-        .map_or(0, |_| '\u{feff}'.len_utf8());
-    let source = &source[bom..];
-    let file = syn::parse_file(source).ok()?;
-    let shebang = file.shebang.as_ref().map_or(0, String::len);
+    let file = syn::parse_str::<syn::File>(source).ok()?;
     let main = file.items.iter().find_map(|item| match item {
         Item::Fn(function) if function.sig.ident == "main" => Some(function),
         _ => None,
@@ -131,7 +131,30 @@ fn native_entry(source: &str) -> Option<usize> {
             || main.block.brace_token.span.open().byte_range().end,
             |attr| attr.span().byte_range().end,
         );
-    Some(bom + shebang + entry)
+    Some(entry)
+}
+
+// Rust allows a BOM and a shebang only at the start of the file.
+fn source_prefix_len(source: &str) -> usize {
+    let rest = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let bom = source.len() - rest.len();
+    if rest
+        .strip_prefix("#!")
+        .is_some_and(|after| !after.trim_start().starts_with('['))
+    {
+        return bom + rest.find('\n').unwrap_or(rest.len());
+    }
+    bom
+}
+
+struct SpanScope;
+
+impl Drop for SpanScope {
+    fn drop(&mut self) {
+        // All spans are local to the synchronous parse. The generated source
+        // keeps only byte offsets, so release proc-macro2's thread-local map.
+        proc_macro2::extra::invalidate_current_thread_spans();
+    }
 }
 
 fn plain(expression: &Expr) -> bool {

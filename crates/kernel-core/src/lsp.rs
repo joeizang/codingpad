@@ -1106,7 +1106,7 @@ impl LspServer {
             .await
             .is_err()
         {
-            kill_process_tree(&mut child);
+            crate::kill_process_tree(&mut child);
         }
     }
 }
@@ -1115,7 +1115,7 @@ impl Drop for LspServer {
     fn drop(&mut self) {
         if let Ok(mut child) = self.child.try_lock() {
             if !matches!(child.try_wait(), Ok(Some(_))) {
-                kill_process_tree(&mut child);
+                crate::kill_process_tree(&mut child);
             }
         }
     }
@@ -1361,26 +1361,6 @@ fn server_command(uv: &Path, dependencies: &[String]) -> Command {
     }
     command.args(["--", "basedpyright-langserver", "--stdio"]);
     command
-}
-
-fn kill_process_tree(child: &mut Child) {
-    #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        // The server was started in its own process group, so this also stops
-        // basedpyright's Python and Node descendants.
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-        }
-    }
-    #[cfg(windows)]
-    if let Some(pid) = child.id() {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    let _ = child.start_kill();
 }
 
 fn error_message(error: &Value) -> String {

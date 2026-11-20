@@ -563,7 +563,8 @@ status.value = "Ready";
 
 CodingPad builds the editor snapshot in a fresh Cargo shadow project. It uses
 the installed stable Rust toolchain (1.85 or later for edition 2024) and a
-bundled, dependency-free `codingpad` crate. The build works offline. Saved
+bundled, dependency-free `codingpad` crate. Each run uses an offline debug
+build to retain source information. Shared build caching is scoped to M6.4. Saved
 scripts run with their directory as the working directory. The script on disk
 is untouched.
 

@@ -116,9 +116,9 @@ fn send(fields: &[(&str, &str)]) -> bool {
     let Ok(mut output) = OUTPUT.get_or_init(|| Mutex::new(connect())).lock() else {
         return false;
     };
-    let Some(socket) = output.as_mut() else {
+    if output.is_none() {
         return false;
-    };
+    }
     let _ = io::stdout().flush();
     let _ = io::stderr().flush();
     let mut line = String::from("{");
@@ -131,8 +131,22 @@ fn send(fields: &[(&str, &str)]) -> bool {
         quoted(&mut line, value);
     }
     line.push_str("}\n");
+    send_frame(&mut output, &line)
+}
+
+fn send_frame(output: &mut Option<TcpStream>, line: &str) -> bool {
+    let Some(socket) = output.as_mut() else {
+        return false;
+    };
+    let written = socket.write_all(line.as_bytes()).is_ok();
     let mut ack = [0];
-    socket.write_all(line.as_bytes()).is_ok() && socket.read_exact(&mut ack).is_ok() && ack == *b"1"
+    if !written || socket.read_exact(&mut ack).is_err() || ack != *b"1" {
+        // A late ack must never be accepted for a subsequent frame.
+        *output = None;
+    }
+    // The host may already have rendered a complete frame. Avoid echoing it
+    // to stdout even if its ack was lost.
+    written
 }
 
 // The built-in crate compiles offline and uses only the standard library.
@@ -152,4 +166,29 @@ fn quoted(output: &mut String, text: &str) {
         }
     }
     output.push('"');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    #[test]
+    fn a_missing_ack_retires_the_channel_without_echoing_the_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut host, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut output = Some(socket);
+
+        assert!(send_frame(&mut output, "first\n"));
+        assert!(output.is_none());
+        assert!(!send_frame(&mut output, "second\n"));
+        let mut received = String::new();
+        host.read_to_string(&mut received).unwrap();
+        assert_eq!(received, "first\n");
+    }
 }

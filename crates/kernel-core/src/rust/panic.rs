@@ -34,7 +34,7 @@ impl Panic {
         // from a library which has no editor buffer.
         let line = self.line.parse().unwrap_or(0);
         let column = self.column.parse().unwrap_or(0);
-        if let Some(top) = frame(source, name, function, &self.file, line, column) {
+        if let Some(top) = frame(source, name, "<panic>", &self.file, line, column) {
             // Symbolized return addresses can point past the actual panic
             // site. The hook has the exact span supplied by the compiler.
             if frames
@@ -61,11 +61,16 @@ impl Panic {
 }
 
 fn split_location(location: &str) -> Option<(&str, usize, usize)> {
-    // Split from the right to preserve a Windows drive letter.
-    let mut parts = location.rsplitn(3, ':');
-    let column = parts.next()?.parse().ok()?;
-    let line = parts.next()?.parse().ok()?;
-    Some((parts.next()?, line, column))
+    // Symbolizers can omit columns. Parse only numeric suffixes to preserve
+    // Windows drive letters in absolute paths.
+    let (prefix, last) = location.rsplit_once(':')?;
+    let last = last.parse().ok()?;
+    if let Some((file, line)) = prefix.rsplit_once(':') {
+        if let Ok(line) = line.parse() {
+            return Some((file, line, last));
+        }
+    }
+    Some((prefix, last, 0))
 }
 
 fn frame(
@@ -85,4 +90,16 @@ fn frame(
         "file": name, "line": line, "column": column, "function": function,
         "text": source.line(line), "script": true,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_location;
+
+    #[test]
+    fn parses_windows_backtrace_locations_with_or_without_columns() {
+        let path = r"C:\scratch\src\main.rs";
+        assert_eq!(split_location(&format!("{path}:8:12")), Some((path, 8, 12)));
+        assert_eq!(split_location(&format!("{path}:8")), Some((path, 8, 0)));
+    }
 }

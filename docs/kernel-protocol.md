@@ -578,7 +578,8 @@ dump("An explicit dump");
 ```
 
 Declare crates in cargo-script frontmatter after any shebang and before the
-optional `// codingpad:` script header. The script header is a Rust comment
+optional `// codingpad:` script header. Use the explicit `---cargo` fence when
+a script header follows it. The script header is a Rust comment
 after the closing fence, so the same file works under Cargo.
 CodingPad fetches missing crates before building offline. Cargo reuses
 downloaded crates in its local package cache. Compiled artifacts use a fresh

@@ -146,7 +146,7 @@ pub(super) async fn run(
             return Ok((stopped(), events.dumps));
         },
         build = async {
-            if manifest.needs_packages && !prepare_dependencies(&cargo, project.root(), &mut events).await? {
+            if manifest.needs_packages && !prepare_dependencies(&cargo, project.root(), manifest.dependency_line, &mut events).await? {
                 return Ok(None);
             }
             compile(&cargo, project.root(), &source, name, &mut events).await
@@ -327,6 +327,7 @@ async fn build_cargo(cargo: &Path, root: &Path) -> Result<CargoOutput, String> {
 async fn prepare_dependencies(
     cargo: &Path,
     root: &Path,
+    line: usize,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
 ) -> Result<bool, String> {
     let fetch = |offline| {
@@ -344,19 +345,22 @@ async fn prepare_dependencies(
 
     let online = fetch(false).await?;
     if !online.status.success() {
-        events.send("diagnostics", json!({"diagnostics": []}));
-        let fallback = String::from_utf8_lossy(&offline.stderr);
-        let failure = String::from_utf8_lossy(&online.stderr);
-        let failure = if failure.trim().is_empty() {
-            fallback.trim()
-        } else {
-            failure.trim()
-        };
-        events.error(
-            "Build error",
-            &format!("Could not resolve Rust dependencies. {failure}"),
-            Vec::new(),
+        let offline_error = String::from_utf8_lossy(&offline.stderr);
+        let online_error = String::from_utf8_lossy(&online.stderr);
+        let mut message = "Could not resolve Rust dependencies.".to_owned();
+        for detail in [offline_error.trim(), online_error.trim()] {
+            if !detail.is_empty() && !message.contains(detail) {
+                message.push('\n');
+                message.push_str(detail);
+            }
+        }
+        events.send(
+            "diagnostics",
+            json!({"diagnostics": [
+                {"message": message, "line": line, "column": 1, "endLine": line, "endColumn": 2}
+            ]}),
         );
+        events.error("Build error", &message, Vec::new());
     }
     Ok(online.status.success())
 }

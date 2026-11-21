@@ -9,6 +9,7 @@ pub(crate) struct Manifest {
     pub(super) frontmatter: Range<usize>,
     pub(super) needs_packages: bool,
     pub(super) declared_runtime: bool,
+    pub(super) dependency_line: usize,
 }
 
 #[derive(Debug)]
@@ -43,11 +44,17 @@ impl std::fmt::Display for ManifestError {
 impl Manifest {
     pub(crate) fn parse(source: &str, path: Option<&Path>) -> Result<Self, ManifestError> {
         let (embedded, frontmatter) = frontmatter(source)?;
-        let error = |message| ManifestError::at(source, frontmatter.start, message);
         let body = frontmatter.start
             + source[frontmatter.start..]
                 .find('\n')
                 .map_or(0, |end| end + 1);
+        let error = |issue: ManifestIssue| {
+            let offset = toml_edit::Document::parse(embedded)
+                .ok()
+                .and_then(|manifest| field_offset(manifest.as_table(), &issue.field))
+                .map_or(frontmatter.start, |offset| body + offset);
+            ManifestError::at(source, offset, issue.message)
+        };
         let mut cargo = embedded.parse::<Table>().map_err(|failure| {
             let offset = body + failure.span().map_or(0, |span| span.start);
             ManifestError::at(source, offset, failure.message())
@@ -75,16 +82,72 @@ impl Manifest {
             )])),
         );
         cargo.insert("workspace".to_owned(), Value::Table(Table::new()));
+        let first_dependency = needs_packages
+            .then(|| toml_edit::Document::parse(embedded).ok())
+            .flatten()
+            .and_then(|manifest| {
+                DEPENDENCY_SECTIONS
+                    .iter()
+                    .copied()
+                    .chain(["target", "patch", "replace"])
+                    .filter_map(|section| field_offset(manifest.as_table(), &[section.to_owned()]))
+                    .min()
+            });
+        let dependency_line = ManifestError::at(
+            source,
+            first_dependency.map_or(frontmatter.start, |offset| body + offset),
+            "",
+        )
+        .line;
         Ok(Self {
             cargo: cargo.to_string(),
             frontmatter,
             needs_packages,
             declared_runtime,
+            dependency_line,
         })
     }
 }
 
-fn set_package_defaults(cargo: &mut Table) -> Result<(), String> {
+struct ManifestIssue {
+    field: Vec<String>,
+    message: String,
+}
+
+impl ManifestIssue {
+    fn new(field: &[&str], message: impl Into<String>) -> Self {
+        Self {
+            field: field.iter().map(|key| (*key).to_owned()).collect(),
+            message: message.into(),
+        }
+    }
+
+    fn prepend(mut self, path: &[&str]) -> Self {
+        self.field
+            .splice(..0, path.iter().map(|key| (*key).to_owned()));
+        self
+    }
+}
+
+impl std::fmt::Display for ManifestIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+fn field_offset(mut table: &dyn toml_edit::TableLike, field: &[String]) -> Option<usize> {
+    let mut path = field.iter().peekable();
+    while let Some(part) = path.next() {
+        let (key, item) = table.get_key_value(part)?;
+        if path.peek().is_none() {
+            return key.span().or_else(|| item.span()).map(|span| span.start);
+        }
+        table = item.as_table_like()?;
+    }
+    None
+}
+
+fn set_package_defaults(cargo: &mut Table) -> Result<(), ManifestIssue> {
     const ROOT_FIELDS: &[&str] = &[
         "workspace",
         "lib",
@@ -106,9 +169,9 @@ fn set_package_defaults(cargo: &mut Table) -> Result<(), String> {
         "autotests",
         "autobenches",
     ];
-    reject_fields(cargo, ROOT_FIELDS, "")?;
+    reject_fields(cargo, ROOT_FIELDS, &[])?;
     let package = table_or_insert(cargo, "package")?;
-    reject_fields(package, PACKAGE_FIELDS, "package.")?;
+    reject_fields(package, PACKAGE_FIELDS, &["package"])?;
     for (key, value) in [
         ("name", "codingpad-script"),
         ("version", "0.0.0"),
@@ -119,79 +182,99 @@ fn set_package_defaults(cargo: &mut Table) -> Result<(), String> {
     Ok(())
 }
 
-fn reject_fields(table: &Table, fields: &[&str], prefix: &str) -> Result<(), String> {
+fn reject_fields(table: &Table, fields: &[&str], path: &[&str]) -> Result<(), ManifestIssue> {
     if let Some(field) = fields.iter().find(|&&field| table.contains_key(field)) {
-        return Err(format!(
-            "{prefix}{field} is unavailable in single-file packages"
-        ));
+        let issue = ManifestIssue::new(&[field], "").prepend(path);
+        return Err(ManifestIssue {
+            message: format!(
+                "{} is unavailable in single-file packages",
+                issue.field.join(".")
+            ),
+            ..issue
+        });
     }
     Ok(())
 }
 
-fn resolve_dependencies(cargo: &mut Table, path: Option<&Path>) -> Result<(), String> {
-    let script = path
-        .map(std::path::absolute)
-        .transpose()
-        .map_err(|error| format!("Could not resolve the script path: {error}"))?;
+fn resolve_dependencies(cargo: &mut Table, path: Option<&Path>) -> Result<(), ManifestIssue> {
+    let script = path.map(std::path::absolute).transpose().map_err(|error| {
+        ManifestIssue::new(&[], format!("Could not resolve the script path: {error}"))
+    })?;
     let directory = script.as_deref().and_then(Path::parent);
     dependency_paths(cargo, directory)?;
     if let Some(targets) = cargo.get_mut("target").and_then(Value::as_table_mut) {
-        for target in targets
+        for (name, target) in targets
             .iter_mut()
-            .filter_map(|(_, value)| value.as_table_mut())
+            .filter_map(|(key, value)| value.as_table_mut().map(|table| (key, table)))
         {
             reject_fields(
                 target,
                 &["build-dependencies", "build_dependencies"],
-                "target.",
+                &["target", name],
             )?;
-            dependency_paths(target, directory)?;
+            dependency_paths(target, directory)
+                .map_err(|error| error.prepend(&["target", name]))?;
         }
     }
     if let Some(patch) = cargo.get_mut("patch").and_then(Value::as_table_mut) {
-        for registry in patch
+        for (name, registry) in patch
             .iter_mut()
-            .filter_map(|(_, value)| value.as_table_mut())
+            .filter_map(|(key, value)| value.as_table_mut().map(|table| (key, table)))
         {
-            make_paths_absolute(registry, directory)?;
+            make_paths_absolute(registry, directory)
+                .map_err(|error| error.prepend(&["patch", name]))?;
         }
     }
     if let Some(replace) = cargo.get_mut("replace").and_then(Value::as_table_mut) {
-        make_paths_absolute(replace, directory)?;
+        make_paths_absolute(replace, directory).map_err(|error| error.prepend(&["replace"]))?;
     }
     Ok(())
 }
 
-fn table_or_insert<'a>(root: &'a mut Table, key: &str) -> Result<&'a mut Table, String> {
+fn table_or_insert<'a>(root: &'a mut Table, key: &str) -> Result<&'a mut Table, ManifestIssue> {
     root.entry(key)
         .or_insert_with(|| Value::Table(Table::new()))
         .as_table_mut()
-        .ok_or_else(|| format!("{key} must be a table"))
+        .ok_or_else(|| ManifestIssue::new(&[key], format!("{key} must be a table")))
 }
 
-fn dependency_paths(root: &mut Table, directory: Option<&Path>) -> Result<(), String> {
+fn dependency_paths(root: &mut Table, directory: Option<&Path>) -> Result<(), ManifestIssue> {
     for &key in DEPENDENCY_SECTIONS {
         if let Some(dependencies) = root.get_mut(key).and_then(Value::as_table_mut) {
-            make_paths_absolute(dependencies, directory)?;
+            make_paths_absolute(dependencies, directory).map_err(|error| error.prepend(&[key]))?;
         }
     }
     Ok(())
 }
 
-fn make_paths_absolute(dependencies: &mut Table, directory: Option<&Path>) -> Result<(), String> {
+fn make_paths_absolute(
+    dependencies: &mut Table,
+    directory: Option<&Path>,
+) -> Result<(), ManifestIssue> {
     for (name, dependency) in dependencies {
         let Some(value) = dependency.get_mut("path") else {
             continue;
         };
         let Some(path) = value.as_str().map(Path::new) else {
-            return Err(format!("{name}.path must be a string"));
+            return Err(ManifestIssue::new(
+                &[name, "path"],
+                format!("{name}.path must be a string"),
+            ));
         };
         if path.is_relative() {
             let directory = directory.ok_or_else(|| {
-                format!("Save the Rust script before using a relative path for dependency {name}.")
+                ManifestIssue::new(
+                    &[name, "path"],
+                    format!(
+                        "Save the Rust script before using a relative path for dependency {name}."
+                    ),
+                )
             })?;
             *value = Value::from(directory.join(path).to_str().ok_or_else(|| {
-                format!("The path for Rust dependency {name} is not valid UTF-8.")
+                ManifestIssue::new(
+                    &[name, "path"],
+                    format!("The path for Rust dependency {name} is not valid UTF-8."),
+                )
             })?);
         }
     }
@@ -251,6 +334,21 @@ pub(crate) fn frontmatter(source: &str) -> Result<(&str, Range<usize>), Manifest
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn points_to_the_rejected_key_and_invalid_path() {
+        let error = Manifest::parse("---cargo\n[package]\n'default-run' = 'demo'\n---", None)
+            .err()
+            .unwrap();
+        assert_eq!(error.line, 3);
+        let error = Manifest::parse(
+            "---cargo\n[dependencies]\nthing = { path = 'relative' }\n---",
+            None,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.line, 3);
+    }
 
     #[test]
     fn underscored_dev_dependencies_require_package_resolution() {

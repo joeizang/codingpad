@@ -742,6 +742,11 @@ async fn relative_frontmatter_dependencies_resolve_from_the_saved_script() {
     let error = dumps(&events)[0];
     assert_eq!(error["type"], "Build error");
     assert!(error["message"].as_str().unwrap().contains("missing-crate"));
+    let diagnostic = events
+        .iter()
+        .find(|event| event.method == "diagnostics")
+        .unwrap();
+    assert_eq!(diagnostic.params["diagnostics"][0]["line"], 2);
 }
 
 #[tokio::test]

@@ -142,9 +142,10 @@ some native calls (including Windows sleep) may delay signal handling.
 
 After two seconds without a run response, the supervisor kills the process and
 discards it; the next Run starts a fresh kernel. The desktop `run_script` result
-adds `stopped` and `cacheCleared` booleans to the kernel's `ok` result. A forced stop sets both flags,
-reports the cleared cache, and retains output already received. Cooperative Stop
-sets only `stopped`, retaining the kernel and cache. A successful response remains
+adds `stopped` and `cacheCleared` booleans to the kernel's `ok` result. A forced
+stop sets `stopped` and retains output already received. It also sets
+`cacheCleared` when it discards a warm kernel or clears a Rust disk cache.
+Cooperative Stop sets only `stopped`, retaining the cache. A successful response remains
 Finished even when Stop was requested concurrently. Idle Stop cannot cancel a
 later run because new watch subscribers start with the current version consumed.
 
@@ -583,6 +584,28 @@ Compiler errors block execution and are sent as `diagnostics` and error dumps
 with ranges mapped to the original editor snapshot. Stdout and stderr use
 `stream` notifications. Dump messages travel over a separate authenticated
 loopback connection, so native output can contain arbitrary text.
+
+Use `codingpad::cache("key", || value)` to reuse a value across runs of
+this script. The `codingpad` runtime library supports numeric types, booleans,
+strings, vectors and options, and custom types can implement `CacheValue`.
+Each script keeps up to 32 stored keys of at most 96 UTF-8 bytes, with up to
+1 MiB per entry. A vector holds at most 1,048,576 elements. The limits bound storage even when scripts generate new keys
+on each run. Oversize keys fail the script and report the actual size and limit.
+Oversize values, encoding failures, and filesystem errors include the key.
+Reset removes these values, and closing the script attempts the same cleanup.
+
+Desktop cache entries belong to the open tab and survive reruns in that tab.
+Reopening a saved script or restarting CodingPad starts with an empty cache.
+Hosts configured with a data directory can keep entries across host launches
+when they reuse the same script ID. These hosts manage cleanup for retired
+script IDs.
+
+Stop makes `codingpad::is_cancelled()` return true so scripts can release
+resources and exit. A script that completes without acknowledging Stop keeps
+its exit result. After two seconds, CodingPad forcibly stops the process tree
+and detaches that script's cache when it exists. Detached entries are no longer
+available to the script. A filesystem error during final deletion is reported
+in Results.
 
 Derived `Debug` values render as structured data. Structs and data-bearing enum
 variants show their fields, `None` appears as null, and collections of records

@@ -1,5 +1,8 @@
 //! Rust helpers available in CodingPad and in standalone Cargo programs.
+mod cache;
 mod rich;
+
+pub use cache::{cache, CacheValue};
 
 pub use rich::{html, image, image_bytes, live, Html, Image, Live};
 
@@ -8,6 +11,22 @@ use std::fmt::{self, Debug};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::{Mutex, OnceLock};
+
+/// Whether CodingPad has asked this run to stop. Long-running scripts can
+/// poll this during their work and return to release resources before exiting.
+pub fn is_cancelled() -> bool {
+    let Some(cancel) = std::env::var_os("CODINGPAD_RUST_CANCEL").map(std::path::PathBuf::from)
+    else {
+        return false;
+    };
+    if !cancel.is_file() {
+        return false;
+    }
+    // Distinguish a cooperative exit from one that was already finishing
+    // independently when the host requested Stop.
+    let _ = std::fs::write(cancel.with_extension("observed"), []);
+    true
+}
 
 /// Display a Rust value in Results, or pretty-print it in a terminal.
 pub fn dump<T: Debug>(value: T) {
@@ -110,6 +129,17 @@ impl Drop for PanicGuard {
 pub fn __start() -> PanicGuard {
     if !in_app() {
         return PanicGuard(false);
+    }
+    #[cfg(windows)]
+    if let Some(ready) = std::env::var_os("CODINGPAD_RUST_START") {
+        let ready = std::path::PathBuf::from(ready);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.is_file() {
+            if std::time::Instant::now() >= deadline {
+                std::process::exit(1);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
     let main = std::thread::current().id();
     let previous = std::panic::take_hook();

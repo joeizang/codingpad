@@ -49,6 +49,10 @@ impl ShadowProjects {
             )?;
             fs::write(root.join("codingpad/src/lib.rs"), crate::rust::RUNTIME)?;
             fs::write(
+                root.join("codingpad/src/cache.rs"),
+                crate::rust::CACHE_RUNTIME,
+            )?;
+            fs::write(
                 root.join("codingpad/src/rich.rs"),
                 crate::rust::RICH_RUNTIME,
             )?;

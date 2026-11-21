@@ -308,6 +308,8 @@ pub struct Supervisor {
     kernels: Mutex<HashMap<String, SharedSlot>>,
     shadow_projects: Arc<shadow::ShadowProjects>,
     csharp: OnceCell<csharp::Installation>,
+    rust_cache: OnceCell<TempDir>,
+    rust_cache_data: Option<PathBuf>,
     secrets: Option<Arc<SecretStore>>,
     connections: Option<Arc<databases::ConnectionStore>>,
     eager_dumps: bool,
@@ -363,6 +365,8 @@ impl Supervisor {
             kernels: Mutex::new(HashMap::new()),
             shadow_projects: Arc::default(),
             csharp: OnceCell::new(),
+            rust_cache: OnceCell::new(),
+            rust_cache_data: None,
             secrets: None,
             connections: None,
             eager_dumps: false,
@@ -380,6 +384,8 @@ impl Supervisor {
             kernels: Mutex::new(HashMap::new()),
             shadow_projects: Arc::default(),
             csharp: OnceCell::new(),
+            rust_cache: OnceCell::new(),
+            rust_cache_data: None,
             secrets: None,
             connections: None,
             eager_dumps: false,
@@ -412,6 +418,7 @@ impl Supervisor {
     pub fn with_data_dir(data_dir: PathBuf) -> Self {
         Self {
             data_dir: Some(data_dir.clone()),
+            rust_cache_data: Some(data_dir.join("rust-cache")),
             shadow_projects: Arc::new(shadow::ShadowProjects::with_data_dir(data_dir)),
             ..Self::default()
         }
@@ -423,6 +430,12 @@ impl Supervisor {
             secrets: Some(secrets),
             ..Self::with_data_dir(data_dir)
         }
+    }
+
+    /// Keep Rust values for this host session when script IDs are temporary.
+    pub fn with_session_rust_cache(mut self) -> Self {
+        self.rust_cache_data = None;
+        self
     }
 
     /// Use the same live connection store as the desktop connection editor.
@@ -468,6 +481,28 @@ impl Supervisor {
         // Surface the same message a missing Bun produces so Results offers
         // Install Bun and run on this run rather than the next one.
         typescript::BUN_NOT_FOUND.to_owned()
+    }
+
+    fn rust_cache_path_if_initialized(&self, script_id: &str) -> Option<PathBuf> {
+        let root = self
+            .rust_cache_data
+            .as_deref()
+            .or_else(|| self.rust_cache.get().map(TempDir::path))?;
+        Some(root.join(rust::cache_key(script_id)))
+    }
+
+    async fn rust_cache_path(&self, script_id: &str) -> Result<PathBuf, String> {
+        if let Some(path) = self.rust_cache_path_if_initialized(script_id) {
+            return Ok(path);
+        }
+        let root = self
+            .rust_cache
+            .get_or_try_init(|| async {
+                tempfile::tempdir()
+                    .map_err(|error| format!("Could not create the Rust cache: {error}"))
+            })
+            .await?;
+        Ok(root.path().join(rust::cache_key(script_id)))
     }
 
     pub async fn run(
@@ -532,6 +567,7 @@ impl Supervisor {
         let mut closed = slot.closed.subscribe();
         let mut stop = slot.stop.subscribe();
         if language == Language::Rust {
+            let cache = self.rust_cache_path(script_id).await?;
             let mut guard = tokio::select! {
                 biased;
                 _ = closed.changed() => return Err("Script was closed".into()),
@@ -545,8 +581,7 @@ impl Supervisor {
             return tokio::select! {
                 biased;
                 _ = closed.changed() => Err("Script was closed".into()),
-                _ = stop.changed() => Ok(rust::stopped()),
-                result = rust::run(&self.shadow_projects, source, path, self.eager_dumps, &mut emit) => {
+                result = rust::run(&self.shadow_projects, source, path, &cache, self.eager_dumps, &mut stop, &mut emit) => {
                     let (result, dumps) = result?;
                     guard.rust_dumps = Some(dumps);
                     Ok(result)
@@ -787,24 +822,49 @@ impl Supervisor {
     }
 
     pub async fn reset(&self, script_id: &str) -> Result<(), String> {
-        self.stop(script_id).await;
-        let slot = self.kernels.lock().await.get(script_id).cloned();
-        if let Some(slot) = slot {
-            let mut guard = slot.state.lock().await;
-            if *slot.closed.borrow() {
-                return Err("Script was closed".into());
+        let slots = self.kernels.lock().await;
+        let cache = self.rust_cache_path_if_initialized(script_id);
+        let retired = match slots.get(script_id).cloned() {
+            Some(slot) => {
+                drop(slots);
+                slot.stop.send_modify(|version| *version += 1);
+                let mut guard = slot.state.lock().await;
+                if *slot.closed.borrow() {
+                    return Err("Script was closed".into());
+                }
+                *guard = SlotState::default();
+                rust::retire_cache(cache.as_deref())?
             }
-            *guard = SlotState::default();
-        }
-        Ok(())
+            None => {
+                // Exclude registration of a new run until its old cache has
+                // been moved out of the way, without creating an idle slot.
+                let retired = rust::retire_cache(cache.as_deref())?;
+                drop(slots);
+                retired
+            }
+        };
+        rust::remove_retired_cache(retired).await
     }
 
     pub async fn close(&self, script_id: &str) {
-        if let Some(slot) = self.kernels.lock().await.remove(script_id) {
+        let slot = self.kernels.lock().await.get(script_id).cloned();
+        let mut retired = None;
+        if let Some(slot) = slot {
             slot.closed.send_replace(true);
             *slot.state.lock().await = SlotState::default();
+            let mut slots = self.kernels.lock().await;
+            if slots
+                .get(script_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &slot))
+            {
+                let cache = self.rust_cache_path_if_initialized(script_id);
+                retired = rust::retire_cache(cache.as_deref()).unwrap_or_default();
+                slots.remove(script_id);
+            }
         }
         self.shadow_projects.close(script_id).await;
+        // Cache maintenance should never prevent closing a script.
+        let _ = rust::remove_retired_cache(retired).await;
     }
 
     pub async fn expand(

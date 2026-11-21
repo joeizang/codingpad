@@ -149,6 +149,12 @@ impl Manifest {
         }
         self.dependency_line
     }
+
+    // A changed Cargo table requires rust-analyzer to reload the project.
+    pub(crate) fn editor_restart_key(&self) -> String {
+        self.cargo.to_string()
+    }
+
     pub(super) fn for_project(&self, runtime: &Path, binary: &str) -> Result<String, String> {
         let runtime = runtime
             .to_str()

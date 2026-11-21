@@ -2,13 +2,16 @@
 mod build_cache;
 mod debug;
 mod dumps;
+mod editor;
 mod manifest;
 mod panic;
 mod source;
 
 pub(crate) use build_cache::BuildCache;
 pub(crate) use dumps::Dumps;
+pub(crate) use editor::{analyzer_command, RustShadowProject, MISSING_ANALYZER};
 pub(crate) use manifest::{frontmatter, Manifest};
+pub(crate) use source::Source;
 pub(crate) use source::FILE as SCRIPT_FILE;
 
 use crate::{shadow::ShadowProject, KernelEvent, RunResult};
@@ -17,7 +20,6 @@ use panic::Panic;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use source::Source;
 use std::{
     collections::VecDeque,
     ffi::OsString,
@@ -87,12 +89,20 @@ pub(super) async fn remove_retired_cache(retired: Option<tempfile::TempDir>) -> 
 }
 
 fn cargo() -> PathBuf {
-    let name = if cfg!(windows) { "cargo.exe" } else { "cargo" };
+    rust_tool("cargo")
+}
+
+fn rust_tool(name: &str) -> PathBuf {
+    let name = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    };
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path)
         .chain(std::env::var_os("CARGO_HOME").map(|path| PathBuf::from(path).join("bin")))
         .chain(dirs::home_dir().map(|home| home.join(".cargo/bin")))
-        .map(|dir| dir.join(name))
+        .map(|dir| dir.join(&name))
         .find(|path| path.is_file())
         .and_then(|path| std::path::absolute(path).ok())
         .unwrap_or_else(|| PathBuf::from(name))
@@ -281,7 +291,7 @@ async fn compile(
     cargo: &Path,
     root: &Path,
     target: &Path,
-    source: &Source<'_>,
+    source: &Source,
     name: &str,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
 ) -> Result<Option<PathBuf>, String> {
@@ -475,7 +485,7 @@ async fn cargo_output(mut command: Command) -> Result<CargoOutput, String> {
     })
 }
 
-fn diagnostic_range(span: &Value, source: &Source<'_>) -> Option<(usize, usize, usize, usize)> {
+fn diagnostic_range(span: &Value, source: &Source) -> Option<(usize, usize, usize, usize)> {
     if span["file_name"].as_str()?.replace('\\', "/") == source::FILE {
         let start = span["byte_start"].as_u64()?;
         let end = span["byte_end"].as_u64()?;

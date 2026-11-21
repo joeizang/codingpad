@@ -266,7 +266,7 @@ pub(super) fn stage(
     write_if_changed(&root.join(super::source::FILE), source).map_err(cache_error)
 }
 
-fn write_if_changed(path: &Path, content: &str) -> io::Result<()> {
+pub(super) fn write_if_changed(path: &Path, content: &str) -> io::Result<()> {
     if fs::read(path).is_ok_and(|current| current == content.as_bytes()) {
         return Ok(());
     }

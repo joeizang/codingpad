@@ -187,6 +187,12 @@ pub fn __finish<T: Debug>(value: T) {
     }
 }
 
+/// The named-secret API is available for Rust type checking. Vault access is
+/// pending the Rust database and secrets milestone.
+pub fn secret(_name: &str) -> String {
+    panic!("Named secrets are not available to Rust scripts yet.")
+}
+
 fn connect() -> Option<TcpStream> {
     let address = std::env::var("CODINGPAD_RUST_OUTPUT").ok()?;
     let token = std::env::var("CODINGPAD_RUST_TOKEN").ok()?;

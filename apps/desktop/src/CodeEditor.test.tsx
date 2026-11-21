@@ -118,6 +118,50 @@ test("C# reports compiler diagnostics and starts Roslyn for the same script", as
 });
 
 
+test("Rust keeps compiler errors when rust-analyzer reports no diagnostics", async () => {
+  const uri = "file:///shadow/src/main.rs";
+  let publish: ((event: unknown) => void) | undefined;
+  invoke.mockImplementation(async (command, args) => {
+    if (command === "start_language_server") {
+      publish = (event) => args.onEvent.onmessage(event);
+      return { uri };
+    }
+  });
+  const diagnostics = vi.fn();
+  const props = {
+    id: "rust",
+    language: "rust" as const,
+    source: "missing();",
+    onChange: vi.fn(),
+    onRun: vi.fn(),
+    onDiagnostics: diagnostics,
+  };
+  const compilerError = {
+    message: "E0425: cannot find function", line: 1, column: 1, endLine: 1, endColumn: 8,
+  };
+  const view = render(<CodeEditor {...props} compileDiagnostics={[compilerError]} />);
+  mountEditor();
+  await waitFor(() => expect(publish).toBeDefined());
+  view.rerender(<CodeEditor {...props} compileDiagnostics={[]} />);
+  expect(diagnostics).toHaveBeenLastCalledWith({ errors: 0, warnings: 0, message: undefined });
+  view.rerender(<CodeEditor {...props} compileDiagnostics={[compilerError]} />);
+  act(() => publish?.({ method: "textDocument/publishDiagnostics", params: { uri, diagnostics: [] } }));
+  expect(diagnostics).toHaveBeenLastCalledWith({ errors: 1, warnings: 0, message: undefined });
+  act(() => publish?.({
+    method: "textDocument/publishDiagnostics",
+    params: {
+      uri,
+      diagnostics: [{
+        code: "E0425",
+        severity: 1,
+        message: "different wording from rustc",
+        range: { start: { line: 0, character: 2 }, end: { line: 0, character: 7 } },
+      }],
+    },
+  }));
+  expect(diagnostics).toHaveBeenLastCalledWith({ errors: 1, warnings: 0, message: undefined });
+});
+
 test("TypeScript starts the TS7 language server on the script", async () => {
   invoke.mockClear();
   invoke.mockImplementation(async (command) =>

@@ -1,3 +1,4 @@
+import { cargoScriptFrontmatter, parseHeader } from "./library";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import Editor from "./MonacoEditor";
@@ -144,21 +145,34 @@ function toCompletionItem(
   };
 }
 
-const directiveKey = (source: string, language: string) =>
-  language === "csharp" ? csharpDirectiveKey(source) : inlineDependencyKey(source);
+function matchesRustCompilerError(live: LspDiagnostic, compiled: CompileDiagnostic): boolean {
+  if (live.severity !== 1) return false;
+  const code = /^(E\d{4}): /.exec(compiled.message)?.[1];
+  if (code ? live.code !== code : live.message.split("\n", 1)[0] !== compiled.message) {
+    return false;
+  }
+  const { start, end } = live.range;
+  const startLine = start.line + 1;
+  const endLine = end.line + 1;
+  return (
+    (startLine < compiled.endLine ||
+      (startLine === compiled.endLine && start.character + 1 <= compiled.endColumn)) &&
+    (endLine > compiled.line ||
+      (endLine === compiled.line && end.character + 1 >= compiled.column))
+  );
+}
+
+const directiveKey = (source: string, language: string) => {
+  if (language === "rust") return cargoScriptFrontmatter(source)?.key ?? "";
+  if (language === "csharp") return csharpDirectiveKey(source);
+  return inlineDependencyKey(source);
+};
 
 const supportsCodeIntelligence = (language: string) =>
   language === "python" ||
   language === "csharp" ||
-  language === "typescript";
-
-function attachedConnection(source: string): string {
-  const first = source.split(/\r?\n/, 1)[0] ?? "";
-  const header = first.match(/^\s*(?:#|\/\/|--)\s*codingpad:\s*(.*)$/);
-  if (!header) return "";
-  const setting = header[1].match(/(?:^|\s)connection=(\"[^\"]*\"|'[^']*'|\S+)/);
-  return setting ? setting[1].replace(/^[\"']|[\"']$/g, "") : "";
-}
+  language === "typescript" ||
+  language === "rust";
 
 export default function CodeEditor({
   id,
@@ -182,13 +196,17 @@ export default function CodeEditor({
   completeSqlRef.current = completeSql;
   const generation = useRef(0);
   const [interactive, setInteractive] = useState(false);
-  const connectionKey = attachedConnection(source);
+  const connectionKey = parseHeader(source)?.settings.connection ?? "";
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const lsp = useRef<{ id: string; uri: string; ready: boolean } | null>(null);
   const pendingDiagnostics = useRef<LspDiagnostic[] | null>(null);
   const pendingChange = useRef<string | null>(null);
   const changeTimer = useRef<number | null>(null);
   const seenDiagnostics = useRef(false);
+  const hadCompilerDiagnostics = useRef(false);
+  const rustDiagnostics = useRef<LspDiagnostic[] | null>(null);
+  const compileDiagnosticsRef = useRef(compileDiagnostics);
+  compileDiagnosticsRef.current = compileDiagnostics;
   const onDiagnosticsRef = useRef(onDiagnostics);
   const cleanup = useRef<(() => void) | null>(null);
 
@@ -230,7 +248,12 @@ export default function CodeEditor({
       : "";
 
   const applyDiagnostics = (diagnostics: LspDiagnostic[]) => {
-    onDiagnosticsRef.current?.(summarizeDiagnostics(diagnostics));
+    if (language === "rust") {
+      rustDiagnostics.current = diagnostics;
+      applyCompileDiagnostics();
+    } else {
+      onDiagnosticsRef.current?.(summarizeDiagnostics(diagnostics));
+    }
     const model = editorRef.current?.getModel();
     if (!model) {
       pendingDiagnostics.current = diagnostics;
@@ -245,18 +268,27 @@ export default function CodeEditor({
           ? "csharp"
           : language === "typescript"
             ? "typescript"
-            : "basedpyright",
+            : language === "rust"
+              ? "rust-analyzer"
+              : "basedpyright",
       ) as monaco.editor.IMarkerData[],
     );
   };
 
   const applyCompileDiagnostics = () => {
+    const live = language === "rust" ? rustDiagnostics.current : null;
+    const compiled = compileDiagnosticsRef.current;
+    const visible = compiled.filter((error) =>
+      !live?.some((diagnostic) => matchesRustCompilerError(diagnostic, error)),
+    );
+    const clearedCompilerDiagnostics = hadCompilerDiagnostics.current && !compiled.length;
+    hadCompilerDiagnostics.current = compiled.length > 0;
     const model = editorRef.current?.getModel();
     if (model) {
       monaco.editor.setModelMarkers(
         model,
         "codingpad-compiler",
-        compileDiagnostics.map((diagnostic) => ({
+        visible.map((diagnostic) => ({
           severity: monaco.MarkerSeverity.Error,
           message: diagnostic.message,
           startLineNumber: diagnostic.line,
@@ -268,11 +300,14 @@ export default function CodeEditor({
         })),
       );
     }
-    onDiagnosticsRef.current?.({
-      errors: compileDiagnostics.length,
-      warnings: 0,
-      message: compileDiagnostics.length ? undefined : "Compile diagnostics on Run",
-    });
+    if (live || visible.length || clearedCompilerDiagnostics || language === "csharp") {
+      const summary = summarizeDiagnostics(live ?? []);
+      onDiagnosticsRef.current?.({
+        errors: summary.errors + visible.length,
+        warnings: summary.warnings,
+        message: language === "csharp" && !visible.length ? "Compile diagnostics on Run" : undefined,
+      });
+    }
   };
 
   useEffect(() => {
@@ -338,6 +373,7 @@ export default function CodeEditor({
     const initial = source;
     pendingChange.current = null;
     seenDiagnostics.current = false;
+    rustDiagnostics.current = null;
     pendingDiagnostics.current = null;
     lsp.current = null;
 
@@ -511,7 +547,7 @@ export default function CodeEditor({
         const completion = monaco.languages.registerCompletionItemProvider(
           language,
           {
-            triggerCharacters: COMPLETION_TRIGGERS,
+            triggerCharacters: language === "rust" ? [".", ":"] : COMPLETION_TRIGGERS,
             provideCompletionItems: async (model, position) => {
               const endpoint = lsp.current;
               if (!endpoint) return { suggestions: [] };

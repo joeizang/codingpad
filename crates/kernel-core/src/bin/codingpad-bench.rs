@@ -159,6 +159,76 @@ async fn rust_warm_rerun() -> Result<Duration, String> {
     Ok(elapsed)
 }
 
+async fn rust_completion_latency() -> Result<Duration, String> {
+    let servers = LanguageServers::default();
+    let source = concat!(
+        "---cargo\n[dependencies]\nserde_json = \"1\"\n---\n",
+        "let _ = codingpad::du;\n",
+        "let _: Option<serde_json::Valu> = None;",
+    );
+    servers.begin_session("rust-bench").await;
+    let started = servers
+        .start_rust("rust-bench", source, None, "rust-bench", |_| {})
+        .await?;
+    let servers_ref = &servers;
+    let uri = &started.uri;
+    let request = |line, character, expected| async move {
+        let start = Instant::now();
+        let result = servers_ref
+            .request(
+                "rust-bench",
+                "textDocument/completion",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                    "context": { "triggerKind": 1 },
+                }),
+            )
+            .await?;
+        Ok::<_, String>(
+            result["items"]
+                .as_array()
+                .is_some_and(|items| {
+                    items
+                        .iter()
+                        .any(|item| item["filterText"] == expected || item["label"] == expected)
+                })
+                .then(|| start.elapsed()),
+        )
+    };
+    let cases = [("du;", "dump"), ("Valu>", "Value")].map(|(token, expected)| {
+        let (line, text) = source
+            .lines()
+            .enumerate()
+            .find(|(_, text)| text.contains(token))
+            .unwrap();
+        (line, text.find(token).unwrap() + token.len() - 1, expected)
+    });
+    let measured = tokio::time::timeout(Duration::from_secs(90), async {
+        for (line, column, expected) in cases {
+            while request(line, column, expected).await?.is_none() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        servers
+            .did_change("rust-bench", &format!("{source}\n// edited"))
+            .await?;
+        let mut slowest = Duration::ZERO;
+        for (line, column, expected) in cases {
+            let elapsed = request(line, column, expected).await?.ok_or_else(|| {
+                format!("Rust completion for {expected} disappeared after warmup")
+            })?;
+            slowest = slowest.max(elapsed);
+        }
+        Ok(slowest)
+    })
+    .await;
+    servers.stop("rust-bench").await;
+    measured.map_err(|_| {
+        "rust-analyzer did not resolve dump and serde_json::Value during warmup".to_owned()
+    })?
+}
+
 async fn run_once() -> bool {
     let mut rows = Vec::new();
     let mut failures = Vec::new();
@@ -276,6 +346,14 @@ async fn run_once() -> bool {
             TARGET_RUST_RERUN,
         )),
         Err(error) => rows.push(Row::failed("Rust rerun after edit", "< 3000 ms", error)),
+    }
+
+    match rust_completion_latency().await {
+        Ok(measured) => rows.push(Row::time("Rust completion", measured, TARGET_COMPLETION)),
+        Err(error) if error.contains("rust-analyzer was not found") => {
+            rows.push(Row::skipped("Rust completion", "< 300 ms", error));
+        }
+        Err(error) => rows.push(Row::failed("Rust completion", "< 300 ms", error)),
     }
 
     report(&rows);

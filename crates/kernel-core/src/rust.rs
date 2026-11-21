@@ -1,4 +1,4 @@
-//! Builds and runs an editor snapshot in a fresh Cargo project.
+//! Builds and runs an editor snapshot in a reusable Cargo shadow project.
 mod build_cache;
 mod debug;
 mod dumps;

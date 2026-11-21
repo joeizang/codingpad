@@ -153,6 +153,7 @@ pub(super) async fn run(
     let cancel = run_files.path().join("cancel");
     let cargo = cargo();
     let root = project.root();
+    // Separate binaries for scripts sharing a target directory.
     let binary = format!(
         "codingpad-{:x}",
         Sha256::digest(root.as_os_str().as_encoded_bytes())
@@ -163,7 +164,7 @@ pub(super) async fn run(
             project,
             &source.generated,
             &manifest,
-            &builds.runtime().await?,
+            &builds.stage_runtime().await?,
             &binary,
         )?;
         if manifest.needs_packages

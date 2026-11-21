@@ -20,6 +20,7 @@ use tokio::{
     sync::{watch, OnceCell},
 };
 
+const TARGET_DIR: &str = "rust-build";
 const POPULAR_CRATES: &[(&str, &str)] = &[
     ("serde", "1"),
     ("serde_json", "1"),
@@ -29,7 +30,7 @@ const POPULAR_CRATES: &[(&str, &str)] = &[
 
 #[derive(Clone, Copy)]
 enum Access {
-    Build,
+    Shared,
     Exclusive,
 }
 
@@ -62,7 +63,7 @@ impl BuildCache {
     }
 
     pub(super) async fn acquire(&self) -> Result<BuildLease, String> {
-        self.lock(Access::Build).await
+        self.lock(Access::Shared).await
     }
 
     async fn lock(&self, access: Access) -> Result<BuildLease, String> {
@@ -73,7 +74,7 @@ impl BuildCache {
             match try_acquire(&lock, access) {
                 Ok(true) => {
                     return Ok(BuildLease {
-                        target: root.join("rust-build"),
+                        target: root.join(TARGET_DIR),
                         _lock: lock,
                     })
                 }
@@ -84,7 +85,7 @@ impl BuildCache {
     }
 
     pub(crate) async fn size(&self) -> Result<u64, String> {
-        let target = self.data_root().await?.join("rust-build");
+        let target = self.data_root().await?.join(TARGET_DIR);
         tokio::task::spawn_blocking(move || size(&target).map_err(cache_error))
             .await
             .map_err(cache_error)?
@@ -138,10 +139,10 @@ impl BuildCache {
             return Ok(false);
         }
         let lease = BuildLease {
-            target: root.join("rust-build"),
+            target: root.join(TARGET_DIR),
             _lock: lock,
         };
-        let runtime = self.runtime().await?;
+        let runtime = self.stage_runtime().await?;
         let project = ShadowProject::temporary(super::source::FILE)?;
         let result = tokio::time::timeout(Duration::from_secs(120), async {
             let mut all_compiled = true;
@@ -180,7 +181,7 @@ impl BuildCache {
         result.unwrap_or(Ok(false))
     }
 
-    pub(super) async fn runtime(&self) -> Result<PathBuf, String> {
+    pub(super) async fn stage_runtime(&self) -> Result<PathBuf, String> {
         let root = self.data_root().await?;
         let mut hash = Sha256::new();
         for source in [RUNTIME_MANIFEST, RUNTIME, RICH_RUNTIME, CACHE_RUNTIME] {
@@ -216,7 +217,7 @@ impl BuildLease {
 
 fn try_acquire(lock: &File, access: Access) -> io::Result<bool> {
     match match access {
-        Access::Build => lock.try_lock_shared(),
+        Access::Shared => lock.try_lock_shared(),
         Access::Exclusive => lock.try_lock(),
     } {
         Ok(()) => Ok(true),

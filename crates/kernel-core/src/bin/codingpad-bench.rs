@@ -133,7 +133,8 @@ async fn main() {
 }
 
 async fn rust_warm_rerun() -> Result<Duration, String> {
-    let supervisor = Supervisor::default();
+    let data = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let supervisor = Supervisor::with_data_dir(data.path().to_owned()).with_session_rust_cache();
     let mut elapsed = Duration::ZERO;
     for expected in [41, 42] {
         let source = format!(
@@ -282,7 +283,7 @@ async fn run_once() -> bool {
         println!("\nAll measured performance targets pass.");
         true
     } else {
-        eprintln!("\nSome M1, M2 or M5 targets did not pass or could not be measured.");
+        eprintln!("\nSome performance targets did not pass or could not be measured.");
         false
     }
 }

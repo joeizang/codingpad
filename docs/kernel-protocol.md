@@ -567,8 +567,8 @@ the installed stable Rust toolchain (1.85 or later for edition 2024) and a
 bundled, dependency-free `codingpad` crate. Each run uses an offline debug
 build to retain source information. Cargo shares compiled dependencies across
 Rust scripts, and small edits reuse the open script's shadow project and
-lockfile. After a Rust run, CodingPad precompiles common
-crates already available to Cargo when idle. **Build cache…** in the Rust
+lockfile. For hosts configured with an application data directory, a successful Rust
+run schedules offline precompilation of common cached crates during idle time. **Build cache…** in the Rust
 context actions shows and clears the shared Cargo target directory.
 That directory persists for hosts with an application data directory.
 Other supervisors share a temporary target directory across their scripts. Script values stored with `cache()` are managed

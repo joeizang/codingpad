@@ -13,7 +13,7 @@ use tokio::sync::{watch, Mutex, OnceCell};
 
 use crate::lsp::path_to_uri;
 
-/// Projects shared by the editor and kernel supervisor for the lifetime of a tab.
+/// Shadow projects and build caches shared by the editor and kernel supervisor.
 pub struct ShadowProjects {
     pub(crate) rust_build: Arc<BuildCache>,
     typescript: Mutex<HashMap<String, Arc<TypescriptSlot>>>,

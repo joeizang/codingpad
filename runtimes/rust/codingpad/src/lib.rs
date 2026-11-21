@@ -1,8 +1,11 @@
 //! Rust helpers available in CodingPad and in standalone Cargo programs.
 mod cache;
+mod database;
 mod rich;
+mod wire;
 
 pub use cache::{cache, CacheValue};
+pub use database::{db, secret, Database, DbParameter, DbRows, DbValue};
 
 pub use rich::{html, image, image_bytes, live, Html, Image, Live};
 
@@ -187,12 +190,6 @@ pub fn __finish<T: Debug>(value: T) {
     }
 }
 
-/// The named-secret API is available for Rust type checking. Vault access is
-/// pending the Rust database and secrets milestone.
-pub fn secret(_name: &str) -> String {
-    panic!("Named secrets are not available to Rust scripts yet.")
-}
-
 fn connect() -> Option<TcpStream> {
     let address = std::env::var("CODINGPAD_RUST_OUTPUT").ok()?;
     let token = std::env::var("CODINGPAD_RUST_TOKEN").ok()?;
@@ -205,16 +202,26 @@ fn connect() -> Option<TcpStream> {
     Some(socket)
 }
 
+static OUTPUT: OnceLock<Mutex<Option<TcpStream>>> = OnceLock::new();
+const MAX_REPLY: usize = 8 * 1024 * 1024;
+
 fn send(fields: &[(&str, &str)]) -> bool {
-    static OUTPUT: OnceLock<Mutex<Option<TcpStream>>> = OnceLock::new();
     let Ok(mut output) = OUTPUT.get_or_init(|| Mutex::new(connect())).lock() else {
         return false;
     };
     if output.is_none() {
         return false;
     }
+    flush_streams();
+    send_frame(&mut output, &frame(fields))
+}
+
+fn flush_streams() {
     let _ = io::stdout().flush();
     let _ = io::stderr().flush();
+}
+
+fn frame(fields: &[(&str, &str)]) -> String {
     let mut line = String::from("{");
     for (index, (key, value)) in fields.iter().enumerate() {
         if index > 0 {
@@ -225,7 +232,50 @@ fn send(fields: &[(&str, &str)]) -> bool {
         quoted(&mut line, value);
     }
     line.push_str("}\n");
-    send_frame(&mut output, &line)
+    line
+}
+
+fn request(kind: &str, value: &str, parameters: &str) -> Result<Vec<u8>, String> {
+    if value.len().saturating_add(parameters.len()) > 1024 * 1024 {
+        return Err("The Rust request exceeds 1 MiB.".into());
+    }
+    let disconnected = "The CodingPad host connection is unavailable.";
+    let mut output = OUTPUT
+        .get_or_init(|| Mutex::new(connect()))
+        .lock()
+        .map_err(|_| disconnected)?;
+    let socket = output.as_mut().ok_or(disconnected)?;
+    flush_streams();
+    let line = frame(&[
+        ("kind", "request"),
+        ("operation", kind),
+        ("value", value),
+        ("parameters", parameters),
+    ]);
+    let mut exchange = || -> io::Result<(u8, Vec<u8>)> {
+        // Wait as long as the host stays connected. Stop interrupts the request
+        // through the host and closing the script drops the socket.
+        socket.set_read_timeout(None)?;
+        socket.write_all(line.as_bytes())?;
+        let mut header = [0; 5];
+        socket.read_exact(&mut header)?;
+        let length = u32::from_le_bytes(header[1..].try_into().unwrap()) as usize;
+        if length > MAX_REPLY || header[0] > 1 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let mut bytes = vec![0; length];
+        socket.read_exact(&mut bytes)?;
+        socket.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        Ok((header[0], bytes))
+    };
+    match exchange() {
+        Ok((0, bytes)) => Ok(bytes),
+        Ok((_, bytes)) => Err(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(error) => {
+            *output = None;
+            Err(format!("{disconnected} {error}"))
+        }
+    }
 }
 
 fn send_frame(output: &mut Option<TcpStream>, line: &str) -> bool {

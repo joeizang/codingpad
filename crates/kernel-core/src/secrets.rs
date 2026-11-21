@@ -203,6 +203,15 @@ impl SecretStore {
         }
     }
 
+    /// Named credentials for database connections are reserved for the host.
+    pub(crate) fn get_for_script(&self, name: &str) -> Result<String, String> {
+        let name = validate_name(name)?;
+        if is_connection_secret(name) {
+            return Err(missing_secret(name));
+        }
+        self.get(name)
+    }
+
     /// `Ok(None)` means the vault has no entry; `Err` means the vault refused or
     /// failed. Callers report those differently.
     fn resolve(&self, name: &str) -> Result<Option<String>, String> {
@@ -288,7 +297,7 @@ impl SecretStore {
         let entries: Vec<SecretEntry> = match names {
             Some(names) => names
                 .iter()
-                .filter(|name| !name.starts_with("connection:"))
+                .filter(|name| !is_connection_secret(name))
                 .map(|name| SecretEntry {
                     name: name.clone(),
                     origin: SecretOrigin::Vault,
@@ -297,7 +306,7 @@ impl SecretStore {
             None => self
                 .entries()
                 .into_iter()
-                .filter(|entry| !entry.name.starts_with("connection:"))
+                .filter(|entry| !is_connection_secret(&entry.name))
                 .collect(),
         };
         for entry in entries {
@@ -313,6 +322,10 @@ impl SecretStore {
         }
         snapshot
     }
+}
+
+fn is_connection_secret(name: &str) -> bool {
+    name.starts_with("connection:")
 }
 
 fn missing_secret(name: &str) -> String {

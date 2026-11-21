@@ -67,18 +67,10 @@ test("SQL falls back to the bundled sample database", async () => {
   expect(onCreate).toHaveBeenCalledWith("sql", SAMPLE_CONNECTION);
 });
 
-test("Rust creates an unconnected script even after choosing a database", async () => {
-  const { onCreate } = renderMenu();
-  fireEvent.click(await screen.findByRole("button", { name: /^shop/ }));
-  fireEvent.keyDown(screen.getByRole("dialog"), { key: "r" });
-  expect(screen.queryByRole("group", { name: "Connection" })).toBeNull();
-  fireEvent.click(screen.getByRole("button", { name: "Create Rust script" }));
-  expect(onCreate).toHaveBeenCalledWith("rust", undefined);
-});
-
 test.each([
   { name: "C#", key: "c", language: "csharp" },
   { name: "TypeScript", key: "t", language: "typescript" },
+  { name: "Rust", key: "r", language: "rust" },
 ])("$name can attach an optional connection", async ({ name, key, language }) => {
   const { onCreate } = renderMenu();
   fireEvent.keyDown(screen.getByRole("dialog"), { key });

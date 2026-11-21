@@ -1,5 +1,5 @@
 use super::debug::{Index, Node, Snapshot, ValueNode};
-use crate::export::ExportPage;
+use crate::{databases::TableData, export::ExportPage};
 use serde_json::{json, Value};
 use std::{
     collections::{HashSet, VecDeque},
@@ -16,12 +16,21 @@ pub(crate) struct Dumps {
     next_snapshot: u64,
     bytes: usize,
     snapshots: VecDeque<Stored>,
+    queries: VecDeque<StoredQuery>,
+    query_bytes: usize,
+    next_query: u64,
 }
 
 struct Stored {
     id: u64,
     bytes: usize,
     snapshot: Snapshot,
+}
+
+struct StoredQuery {
+    id: u64,
+    bytes: usize,
+    table: TableData,
 }
 
 impl Dumps {
@@ -34,6 +43,9 @@ impl Dumps {
             next_snapshot: 0,
             bytes: 0,
             snapshots: VecDeque::new(),
+            queries: VecDeque::new(),
+            query_bytes: 0,
+            next_query: 0,
         }
     }
 
@@ -43,6 +55,22 @@ impl Dumps {
 
     pub(super) fn id(&mut self) -> String {
         id(self.run, &mut self.next_node)
+    }
+
+    pub(super) fn next_query(&mut self) -> u64 {
+        self.next_query += 1;
+        self.next_query
+    }
+
+    pub(super) fn store_query(&mut self, id: u64, table: TableData, bytes: usize) {
+        while self.queries.len() >= 64 || self.query_bytes + bytes > 32 * 1024 * 1024 {
+            let Some(oldest) = self.queries.pop_front() else {
+                break;
+            };
+            self.query_bytes -= oldest.bytes;
+        }
+        self.queries.push_back(StoredQuery { id, table, bytes });
+        self.query_bytes += bytes;
     }
 
     pub(super) fn insert(&mut self, snapshot: Snapshot, bytes: usize) -> u64 {
@@ -89,8 +117,14 @@ impl Dumps {
             .rev()
             .find(|entry| entry.id == group)?;
         Some(
-            Renderer::new(self.run, self.eager, &mut self.next_node, entry)
-                .node(index, 0, PAGE, 0, false, id),
+            Renderer::new(
+                self.run,
+                self.eager,
+                &mut self.next_node,
+                entry,
+                &self.queries,
+            )
+            .node(index, 0, PAGE, 0, false, id),
         )
     }
 
@@ -105,18 +139,6 @@ impl Dumps {
             .next()
             .and_then(|part| part.parse().ok())
             .ok_or(EXPIRED)?;
-        let index: Index = parts
-            .next()
-            .and_then(|part| part.parse().ok())
-            .ok_or(EXPIRED)?;
-        if run != self.run || parts.next().is_some() {
-            return Err(EXPIRED.into());
-        }
-        let entry = self
-            .snapshots
-            .iter()
-            .find(|entry| entry.id == group && index < entry.snapshot.nodes.len())
-            .ok_or(EXPIRED)?;
         let start = match params["cursor"].as_str() {
             Some(cursor) => cursor
                 .parse::<usize>()
@@ -127,9 +149,43 @@ impl Dumps {
             .as_u64()
             .unwrap_or(PAGE as u64)
             .clamp(1, 1_000) as usize;
+        if run != self.run {
+            return Err(EXPIRED.into());
+        }
+        if parts.clone().eq(["query"]) {
+            let table = self
+                .queries
+                .iter()
+                .find(|query| query.id == group)
+                .ok_or(EXPIRED)?;
+            let limit = limit.min((16_000 / table.table.column_names().count().max(1)).max(1));
+            return Ok(if method == "expand" {
+                json!({ "node": table.table.node(handle, start, limit) })
+            } else {
+                json!(table.table.export_page(start, limit))
+            });
+        }
+        let index: Index = parts
+            .next()
+            .and_then(|part| part.parse().ok())
+            .ok_or(EXPIRED)?;
+        if parts.next().is_some() {
+            return Err(EXPIRED.into());
+        }
+        let entry = self
+            .snapshots
+            .iter()
+            .find(|entry| entry.id == group && index < entry.snapshot.nodes.len())
+            .ok_or(EXPIRED)?;
         if method == "expand" {
-            let node = Renderer::new(self.run, self.eager, &mut self.next_node, entry)
-                .node(index, start, limit, 0, false, None);
+            let node = Renderer::new(
+                self.run,
+                self.eager,
+                &mut self.next_node,
+                entry,
+                &self.queries,
+            )
+            .node(index, start, limit, 0, false, None);
             return Ok(json!({ "node": node }));
         }
         let Some((items, columns)) = table(&entry.snapshot, index, usize::MAX) else {
@@ -171,15 +227,23 @@ struct Renderer<'a> {
     ids: &'a mut u64,
     eager: bool,
     remaining: usize,
+    queries: &'a VecDeque<StoredQuery>,
     text_bytes: usize,
 }
 
 impl<'a> Renderer<'a> {
-    fn new(run: u64, eager: bool, ids: &'a mut u64, entry: &'a Stored) -> Self {
+    fn new(
+        run: u64,
+        eager: bool,
+        ids: &'a mut u64,
+        entry: &'a Stored,
+        queries: &'a VecDeque<StoredQuery>,
+    ) -> Self {
         Self {
             run,
             group: entry.id,
             snapshot: &entry.snapshot,
+            queries,
             ids,
             eager,
             remaining: 1_000,
@@ -230,6 +294,19 @@ impl<'a> Renderer<'a> {
                 let truncated = end < text.len() || truncated;
                 json!({"id": id, "kind": "string", "type": label, "v": &text[..end],
                     "truncated": truncated, "total": text.chars().count()})
+            }
+            ValueNode::Query(query_id) => {
+                let Some(query) = self.queries.iter().find(|query| query.id == *query_id) else {
+                    return json!({"id": id, "kind": "string", "type": "query", "v": EXPIRED});
+                };
+                let columns = query.table.column_names().count().max(1);
+                let limit = limit.min((16_000 / columns).max(1));
+                let mut table =
+                    query
+                        .table
+                        .node(&format!("{}:{query_id}:query", self.run), start, limit);
+                table["id"] = json!(id);
+                table
             }
             ValueNode::Html(html) => json!({"id": id, "kind": "html", "html": html}),
             ValueNode::Image { mime, name, data } => {
@@ -380,6 +457,7 @@ fn export_value(snapshot: &Snapshot, index: Index) -> Value {
     let node = &snapshot.nodes[index];
     match &node.value {
         ValueNode::Null => Value::Null,
+        ValueNode::Query(_) => Value::String("Query result".into()),
         ValueNode::Scalar(value) => value.clone(),
         ValueNode::Text(text) | ValueNode::Html(text) => Value::String(text.clone()),
         ValueNode::List(items) => Value::Array(

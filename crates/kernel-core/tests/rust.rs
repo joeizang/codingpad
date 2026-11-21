@@ -867,3 +867,346 @@ async fn separate_rust_scripts_reuse_artifacts_and_warmup_compiles_cached_crates
     .await
     .expect("background warmup did not compile the locally available serde_json");
 }
+
+mod database {
+    use super::*;
+    use codingpad_kernel_core::{
+        databases::{Connection, ConnectionStore, DatabaseKind, TlsMode},
+        secrets::{SecretStore, Vault},
+    };
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
+    use tokio::{sync::oneshot, time::timeout};
+
+    struct TestVault(BTreeMap<String, String>);
+
+    impl Vault for TestVault {
+        fn get(&self, name: &str) -> Result<Option<String>, String> {
+            Ok(self.0.get(name).cloned())
+        }
+
+        fn set(&self, _: &str, _: &str) -> Result<(), String> {
+            Err("Read-only test vault".into())
+        }
+
+        fn delete(&self, _: &str) -> Result<(), String> {
+            Err("Read-only test vault".into())
+        }
+    }
+
+    fn sqlite() -> Connection {
+        Connection {
+            id: String::new(),
+            name: "test".into(),
+            kind: DatabaseKind::Sqlite,
+            path: Some(":memory:".into()),
+            host: None,
+            port: None,
+            database: None,
+            user: None,
+            secret: None,
+            tls: TlsMode::default(),
+            trust_server_certificate: false,
+        }
+    }
+
+    fn supervisor(
+        data: &tempfile::TempDir,
+        connection: Connection,
+        mut secrets: TestVault,
+    ) -> Supervisor {
+        secrets
+            .0
+            .insert("greeting".into(), "Hello ☕\n\"Rust\"".into());
+        let secrets = Arc::new(SecretStore::with_vault(data.path(), Arc::new(secrets)));
+        let connections = Arc::new(ConnectionStore::new(data.path()));
+        connections.save(connection).unwrap();
+        Supervisor::with_data_dir_and_secrets(data.path().to_owned(), secrets)
+            .with_connections(connections)
+    }
+
+    #[tokio::test]
+    async fn sqlite_queries_keep_the_connection_and_dump_rows_for_paging_and_export() {
+        let data = tempfile::tempdir().unwrap();
+        let supervisor = supervisor(
+            &data,
+            sqlite(),
+            TestVault(BTreeMap::from([(
+                "connection:hidden".into(),
+                "private".into(),
+            )])),
+        );
+        let (result, events) = run(&supervisor, r#"// codingpad: connection=test
+            use codingpad::{db, dump, secret, DbParameter, DbValue};
+            let name = format!("greet{}", "ing");
+            assert_eq!(secret(&name), "Hello ☕\n\"Rust\"");
+            let hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let reserved = std::panic::catch_unwind(|| secret(" connection:hidden "));
+            std::panic::set_hook(hook);
+            assert!(reserved.is_err());
+            db.query("CREATE TEMP TABLE items (id INT, label TEXT)", &[]).unwrap();
+            let changed = db.execute(
+                "INSERT INTO items VALUES (?, ?), (?, ?)",
+                &[DbParameter::Integer(9007199254740993), DbParameter::Text("D'Angelo"),
+                  DbParameter::Integer(2), DbParameter::Null],
+            ).unwrap();
+            assert_eq!(changed, 2);
+            assert_eq!(db.query("SELECT label FROM items WHERE id = ?", &[DbParameter::Integer(2)]).unwrap().rows()[0][0], DbValue::Null);
+            let rows = db.query("SELECT id AS value, label AS value, 0 AS value_2 FROM items ORDER BY id DESC", &[]).unwrap();
+            assert_eq!(rows.columns(), &["value", "value_2", "value_2_2"]);
+            assert_eq!(rows.rows()[0], [DbValue::Integer(9007199254740993), DbValue::Text("D'Angelo".into()), DbValue::Integer(0)]);
+            assert_eq!(rows.rows()[1][1], DbValue::Null);
+            dump(rows);
+            db.query("SELECT id FROM items WHERE 0", &[]).unwrap()
+        "#).await;
+        assert!(result.ok, "{events:?}");
+        let nodes = dumps(&events);
+        assert_eq!(nodes[0]["kind"], "table");
+        assert_eq!(nodes[0]["columns"][1]["name"], "value_2");
+        assert_eq!(nodes[0]["rows"][0][0]["v"], "9007199254740993");
+        assert_eq!(nodes[1]["kind"], "table");
+        assert_eq!(nodes[1]["total"], 0);
+
+        let handle = nodes[0]["handle"].as_str().unwrap();
+        let page = supervisor
+            .expand("rust-script", handle, Some("1"), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(page.node["rows"][0][0]["v"], 2);
+        let page = supervisor
+            .export_page("rust-script", handle, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(page.rows[0][0]["n"], "9007199254740993");
+        assert_eq!(page.next.as_deref(), Some("1"));
+        supervisor.reset("rust-script").await.unwrap();
+        assert!(supervisor
+            .expand("rust-script", handle, None, None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_unblocks_rust_waiting_for_a_query() {
+        let data = tempfile::tempdir().unwrap();
+        let supervisor = supervisor(&data, sqlite(), TestVault(BTreeMap::new()));
+        let (ready, started) = oneshot::channel();
+        let mut ready = Some(ready);
+        let run = supervisor.run_language("query", r#"// codingpad: connection=test
+            use codingpad::{db, is_cancelled};
+            println!("query starting");
+            let result = db.query("WITH RECURSIVE t(i) AS (VALUES(0) UNION ALL SELECT i + 1 FROM t) SELECT SUM(i) FROM t", &[]);
+            assert!(result.is_err());
+            assert!(is_cancelled());
+        "#, Language::Rust, |event| {
+            if event.params["text"] == "query starting\n" {
+                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            }
+        });
+        let stop = async {
+            started.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            supervisor.stop("query").await;
+        };
+        let (result, ()) = timeout(Duration::from_secs(30), async { tokio::join!(run, stop) })
+            .await
+            .unwrap();
+        let result = result.unwrap();
+        assert!(result.stopped && !result.cache_cleared);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODINGPAD_TEST_POSTGRES_* and CODINGPAD_TEST_SQLSERVER_* connections"]
+    async fn rust_queries_postgres_and_sql_server_with_vault_passwords() {
+        for (kind, prefix, setup, parameter) in [
+            (
+                DatabaseKind::Postgres,
+                "POSTGRES",
+                "CREATE TEMP TABLE items (id INT)",
+                "$1",
+            ),
+            (
+                DatabaseKind::SqlServer,
+                "SQLSERVER",
+                "CREATE TABLE #items (id INT)",
+                "@P1",
+            ),
+        ] {
+            let env = |key| {
+                let variable = format!("CODINGPAD_TEST_{prefix}_{key}");
+                std::env::var(&variable).unwrap_or_else(|_| panic!("Set {variable} for this test"))
+            };
+            let data = tempfile::tempdir().unwrap();
+            let password = "connection:server";
+            let supervisor = supervisor(
+                &data,
+                Connection {
+                    kind,
+                    path: None,
+                    host: Some(env("HOST")),
+                    port: Some(env("PORT").parse().unwrap()),
+                    database: Some(env("DATABASE")),
+                    user: Some(env("USER")),
+                    secret: Some(password.into()),
+                    trust_server_certificate: std::env::var(format!(
+                        "CODINGPAD_TEST_{prefix}_TRUST"
+                    ))
+                    .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+                    ..sqlite()
+                },
+                TestVault(BTreeMap::from([(password.into(), env("PASSWORD"))])),
+            );
+            let table = if kind == DatabaseKind::Postgres {
+                "items"
+            } else {
+                "#items"
+            };
+            let source = format!(
+                r#"// codingpad: connection=test
+                use codingpad::{{db, dump, secret, DbParameter, DbValue}};
+                let hook = std::panic::take_hook();
+                std::panic::set_hook(Box::new(|_| {{}}));
+                let reserved = std::panic::catch_unwind(|| secret("{password}"));
+                std::panic::set_hook(hook);
+                assert!(reserved.is_err());
+                db.query("{setup}", &[]).unwrap();
+                assert_eq!(db.execute("INSERT INTO {table} VALUES ({parameter})", &[DbParameter::Integer(42)]).unwrap(), 1);
+                let rows = db.query("SELECT id, id FROM {table} WHERE id = {parameter}", &[DbParameter::Integer(42)]).unwrap();
+                assert_eq!(rows.columns(), &["id", "id_2"]);
+                assert_eq!(rows.rows()[0][0], DbValue::Integer(42));
+                dump(rows);
+            "#
+            );
+            let (result, events) = timeout(Duration::from_secs(60), run(&supervisor, &source))
+                .await
+                .unwrap();
+            assert!(result.ok, "{prefix}: {events:?}");
+            let nodes = dumps(&events);
+            assert_eq!(nodes[0]["kind"], "table");
+            assert_eq!(nodes[0]["columns"][0]["name"], "id");
+            assert_eq!(nodes[0]["rows"][0][0]["v"], 42);
+
+            if kind == DatabaseKind::Postgres {
+                let (result, events) = run(&supervisor, r#"// codingpad: connection=test
+                    use codingpad::{db, dump, DbParameter, DbValue};
+                    db.execute("SET TIME ZONE 'America/New_York'", &[]).unwrap();
+                    db.execute("SET intervalstyle TO 'postgres_verbose'", &[]).unwrap();
+                    assert!(db.execute("SELECT 1; SELECT 2", &[]).is_err());
+                    let sql = "SELECT 123456789012345678901234567890.123456789::numeric AS price,
+                                      '-0.000123'::numeric AS small, NULL::numeric AS empty,
+                                      '2026-01-02T03:04:05+00:00'::timestamptz AS stamp,
+                                      '2026-01-02'::date AS day,
+                                      '1 month 2 days 3 seconds'::interval AS duration,
+                                      '[0:1][1:2]={{1,NULL},{3,4}}'::int[] AS numbers,
+                                      '127.0.0.1/24'::inet AS address, 12.50::money AS amount,
+                                      ARRAY['04:03:02'::time] AS times, ARRAY['NaN'::real, 0.1::real] AS floats,
+                                      9007199254740993::int8 AS large, $2::text AS label, $3::text IS NULL AS missing
+                               WHERE $1::integer = 1";
+                    let rows = db.query(sql, &[DbParameter::Integer(1), DbParameter::Text("D'Angelo"), DbParameter::Null]).unwrap();
+                    let unbound = db.query(&sql.replace("$1", "1").replace("$2", "'D''Angelo'").replace("$3", "NULL"), &[]).unwrap();
+                    assert_eq!(rows.rows(), unbound.rows());
+                    let row = &rows.rows()[0];
+                    assert_eq!(row[0], DbValue::Decimal("123456789012345678901234567890.123456789".into()));
+                    assert_eq!(row[1], DbValue::Decimal("-0.000123".into()));
+                    assert_eq!(row[2], DbValue::Null);
+                    assert_eq!(row[3], DbValue::Text("2026-01-01 22:04:05-05".into()));
+                    assert_eq!(row[4], DbValue::Text("2026-01-02".into()));
+                    assert_eq!(row[5], DbValue::Text("@ 1 mon 2 days 3 secs".into()));
+                    assert_eq!(row[6], DbValue::Text("[0:1][1:2]={{1,NULL},{3,4}}".into()));
+                    assert_eq!(row[7], DbValue::Text("127.0.0.1/24".into()));
+                    assert_eq!(row[9], DbValue::Text("{04:03:02}".into()));
+                    assert_eq!(row[10], DbValue::Text("{NaN,0.1}".into()));
+                    assert_eq!(row[11], DbValue::Integer(9007199254740993));
+                    assert_eq!(row[12], DbValue::Text("D'Angelo".into()));
+                    assert_eq!(row[13], DbValue::Bool(true));
+                    let explain = db.query("EXPLAIN SELECT 'example'::text", &[]).unwrap();
+                    assert_eq!(explain.columns(), &["QUERY PLAN"]);
+                    let bound_explain = db.query(
+                        "-- a utility statement
+                         EXPLAIN SELECT $1::text",
+                        &[DbParameter::Text("example")],
+                    ).unwrap();
+                    assert_eq!(bound_explain.columns(), explain.columns());
+                    assert_eq!(bound_explain.rows(), explain.rows());
+                    db.execute("CREATE TEMP TABLE cpad_fixture (id INT)", &[]).unwrap();
+                    db.execute("CREATE PROCEDURE pg_temp.cpad_double(IN number integer, OUT doubled integer) LANGUAGE SQL AS $$ SELECT number * 2 $$", &[]).unwrap();
+                    let called = db.query("CALL pg_temp.cpad_double($1, NULL)", &[DbParameter::Integer(21)]).unwrap();
+                    assert_eq!(called.rows()[0][0], DbValue::Integer(42));
+                    dump(rows);
+                "#).await;
+                assert!(result.ok, "{events:?}");
+                let nodes = dumps(&events);
+                assert_eq!(nodes[0]["kind"], "table");
+                assert_eq!(
+                    nodes[0]["rows"][0][0]["v"],
+                    "123456789012345678901234567890.123456789"
+                );
+                assert_eq!(nodes[0]["rows"][0][2]["kind"], "null");
+            }
+
+            let table = format!("cpad_rust_cancel_{}", std::process::id());
+            let setup = format!(
+                r#"// codingpad: connection=test
+                codingpad::db.query("CREATE TABLE {table} (id INT)", &[]).unwrap();
+            "#
+            );
+            let (result, events) = run(&supervisor, &setup).await;
+            assert!(result.ok, "{prefix}: {events:?}");
+            let statement = if kind == DatabaseKind::Postgres {
+                format!("INSERT INTO {table} SELECT 1 FROM pg_sleep(3)")
+            } else {
+                format!("WAITFOR DELAY '00:00:03'; INSERT INTO {table} VALUES (1)")
+            };
+            let source = format!(
+                r#"// codingpad: connection=test
+                use codingpad::{{db, is_cancelled}};
+                db.query("SELECT 1", &[]).unwrap();
+                println!("server query starting");
+                assert!(db.execute("{statement}", &[]).is_err());
+                assert!(is_cancelled());
+            "#
+            );
+            let (ready, started) = oneshot::channel();
+            let mut ready = Some(ready);
+            let mut cancellation_errors = Vec::new();
+            let run_cancelled =
+                supervisor.run_language("cancel-server", &source, Language::Rust, |event| {
+                    if event.params["text"] == "server query starting\n" {
+                        if let Some(ready) = ready.take() {
+                            let _ = ready.send(());
+                        }
+                    } else if event.params["stream"] == "stderr" {
+                        cancellation_errors.push(event);
+                    }
+                });
+            let stop = async {
+                started.await.unwrap();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                supervisor.stop("cancel-server").await;
+            };
+            let (result, ()) = timeout(Duration::from_secs(30), async {
+                tokio::join!(run_cancelled, stop)
+            })
+            .await
+            .unwrap();
+            assert!(result.unwrap().stopped, "{prefix}: query did not stop");
+            if kind == DatabaseKind::Postgres {
+                assert!(
+                    cancellation_errors.is_empty(),
+                    "{prefix}: {cancellation_errors:?}"
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let check = format!(
+                r#"// codingpad: connection=test
+                use codingpad::{{db, DbValue}};
+                let rows = db.query("SELECT COUNT(*) FROM {table}", &[]).unwrap();
+                db.query("DROP TABLE {table}", &[]).unwrap();
+                assert_eq!(rows.rows()[0][0], DbValue::Integer(0));
+            "#
+            );
+            let (result, events) = run(&supervisor, &check).await;
+            assert!(result.ok, "{prefix}: {events:?}");
+        }
+    }
+}

@@ -5,6 +5,7 @@ mod dumps;
 mod editor;
 mod manifest;
 mod panic;
+mod services;
 mod source;
 
 pub(crate) use build_cache::BuildCache;
@@ -23,6 +24,7 @@ use debug::{Snapshot, ValueNode};
 use panic::Panic;
 use serde::Deserialize;
 use serde_json::{json, Value};
+pub(super) use services::Services;
 use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
@@ -42,12 +44,34 @@ use tokio::{
     time::Instant,
 };
 
-pub(super) const RUNTIME_MANIFEST: &str =
-    include_str!("../../../runtimes/rust/codingpad/Cargo.toml");
-pub(super) const RUNTIME: &str = include_str!("../../../runtimes/rust/codingpad/src/lib.rs");
-pub(super) const CACHE_RUNTIME: &str =
-    include_str!("../../../runtimes/rust/codingpad/src/cache.rs");
-pub(super) const RICH_RUNTIME: &str = include_str!("../../../runtimes/rust/codingpad/src/rich.rs");
+const RUNTIME_FILES: &[(&str, &str)] = &[
+    (
+        "Cargo.toml",
+        include_str!("../../../runtimes/rust/codingpad/Cargo.toml"),
+    ),
+    (
+        "src/lib.rs",
+        include_str!("../../../runtimes/rust/codingpad/src/lib.rs"),
+    ),
+    (
+        "src/cache.rs",
+        include_str!("../../../runtimes/rust/codingpad/src/cache.rs"),
+    ),
+    (
+        "src/rich.rs",
+        include_str!("../../../runtimes/rust/codingpad/src/rich.rs"),
+    ),
+    (
+        "src/database.rs",
+        include_str!("../../../runtimes/rust/codingpad/src/database.rs"),
+    ),
+    (
+        "src/wire.rs",
+        include_str!("../../../runtimes/rust/codingpad/src/wire.rs"),
+    ),
+];
+#[path = "../../../runtimes/rust/codingpad/src/wire.rs"]
+mod wire;
 const STOP_GRACE: Duration = Duration::from_secs(2);
 pub(super) fn stopped() -> RunResult {
     RunResult {
@@ -102,6 +126,7 @@ pub(super) struct RunPaths<'a> {
     pub(super) project: &'a ShadowProject,
     pub(super) script: Option<&'a Path>,
     pub(super) values: &'a Path,
+    pub(super) services: Services,
 }
 
 pub(super) async fn run(
@@ -116,6 +141,7 @@ pub(super) async fn run(
         project,
         script,
         values,
+        services,
     } = paths;
     let name = script
         .and_then(Path::file_name)
@@ -206,9 +232,12 @@ pub(super) async fn run(
         let exit = execute(
             &executable.path,
             script,
-            run_files.path(),
-            &cancel,
-            values,
+            ExecutionPaths {
+                root: run_files.path(),
+                cancel: &cancel,
+                cache: values,
+            },
+            &services,
             stop,
             &mut events,
         )
@@ -628,15 +657,25 @@ enum ScriptExit {
     Killed,
 }
 
+struct ExecutionPaths<'a> {
+    root: &'a Path,
+    cancel: &'a Path,
+    cache: &'a Path,
+}
+
 async fn execute(
     executable: &Path,
     script: Option<&Path>,
-    root: &Path,
-    cancel: &Path,
-    cache: &Path,
+    paths: ExecutionPaths<'_>,
+    services: &Services,
     stop: &mut watch::Receiver<u64>,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
 ) -> Result<ScriptExit, String> {
+    let ExecutionPaths {
+        root,
+        cancel,
+        cache,
+    } = paths;
     let (token, secret) = token()?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -668,9 +707,16 @@ async fn execute(
     #[cfg(windows)]
     std::fs::write(ready, [])
         .map_err(|error| format!("Could not start the Rust script: {error}"))?;
-    read_output(&mut child, &listener, &token, events, stop, cancel)
-        .await
-        .map_err(|error| format!("Could not run the Rust script: {error}"))
+    read_output(
+        &mut child,
+        OutputChannel { listener, token },
+        events,
+        stop,
+        cancel,
+        services,
+    )
+    .await
+    .map_err(|error| format!("Could not run the Rust script: {error}"))
 }
 
 async fn spawn_script(command: &mut Command) -> io::Result<RunningChild> {
@@ -688,17 +734,23 @@ async fn spawn_script(command: &mut Command) -> io::Result<RunningChild> {
     spawn(command)
 }
 
+struct OutputChannel {
+    listener: TcpListener,
+    token: [u8; 32],
+}
+
 async fn read_output(
     child: &mut RunningChild,
-    listener: &TcpListener,
-    token: &[u8; 32],
+    channel: OutputChannel,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
     stop: &mut watch::Receiver<u64>,
     cancel: &Path,
+    services: &Services,
 ) -> io::Result<ScriptExit> {
     let mut stdout = BufReader::new(child.process.stdout.take().unwrap());
     let mut stderr = BufReader::new(child.process.stderr.take().unwrap());
     let mut runtime: Option<Lines<BufReader<TcpStream>>> = None;
+    let mut request: Option<futures_util::future::BoxFuture<'_, services::Reply>> = None;
     let mut connected = false;
     let mut stdout_open = true;
     let mut stderr_open = true;
@@ -707,7 +759,7 @@ async fn read_output(
     let mut exit = None;
     let mut deadline = Instant::now();
     let mut stopping = false;
-    let connect = crate::accept_kernel(listener, token);
+    let connect = crate::accept_kernel(&channel.listener, &channel.token);
     tokio::pin!(connect);
     loop {
         tokio::select! {
@@ -715,6 +767,7 @@ async fn read_output(
             // Observe exit even if subprocesses inherit a pipe and keep writing.
             result = child.process.wait(), if exit.is_none() => {
                 exit = Some(result?);
+                if request.take().is_some() { runtime = None; }
                 if stopping {
                     child.kill_tree()?;
                 }
@@ -723,6 +776,15 @@ async fn read_output(
             _ = stop.changed(), if exit.is_none() && !stopping => {
                 std::fs::write(cancel, [])?;
                 stopping = true;
+                if let Some(pending) = request.take() {
+                    drop(pending);
+                    if let Err(error) = services.close_database().await {
+                        events.stream("stderr", &format!("{error}\n"));
+                    }
+                    if !write_runtime_reply(&mut runtime, &services::error_reply("The Rust run was stopped.")).await? {
+                        runtime = None;
+                    }
+                }
                 deadline = Instant::now() + STOP_GRACE;
             }
             _ = tokio::time::sleep_until(deadline), if exit.is_none() && stopping => {
@@ -747,16 +809,32 @@ async fn read_output(
                 if stderr_open { events.stream("stderr", &String::from_utf8_lossy(&stderr_line)); }
                 stderr_line.clear();
             }
-            line = async { runtime.as_mut().unwrap().next_line().await }, if runtime.is_some() => {
+            reply = async { request.as_mut().unwrap().await }, if request.is_some() => {
+                request = None;
+                let reply = reply.into_frame(&mut events.dumps);
+                if !write_runtime_reply(&mut runtime, &reply).await? {
+                    runtime = None;
+                }
+            }
+            line = async { runtime.as_mut().unwrap().next_line().await }, if runtime.is_some() && request.is_none() => {
                 match line {
                     Ok(Some(line)) => {
-                        events.runtime(&line)?;
-                        // The child may exit as soon as dump() returns. Acknowledge
-                        // the complete event before allowing that to happen.
-                        let channel = runtime.as_mut().unwrap().get_mut();
-                        if let Err(error) = channel.write_all(b"1").await {
-                            if !peer_closed(&error) { return Err(error); }
-                            runtime = None;
+                        match RuntimeMessage::parse(&line)? {
+                            RuntimeMessage::Request(event) if !stopping && exit.is_none() => {
+                                request = Some(services.request(event));
+                            }
+                            RuntimeMessage::Request(_) => {
+                                if !write_runtime_reply(&mut runtime, &services::error_reply("The Rust run has ended.")).await? {
+                                    runtime = None;
+                                }
+                            }
+                            RuntimeMessage::Event(event) => {
+                                events.runtime(event);
+                                // The child may exit as soon as dump() returns.
+                                if !write_runtime_reply(&mut runtime, b"1").await? {
+                                    runtime = None;
+                                }
+                            }
                         }
                     }
                     Ok(None) => runtime = None,
@@ -777,6 +855,19 @@ async fn read_output(
     })
 }
 
+async fn write_runtime_reply(
+    runtime: &mut Option<Lines<BufReader<TcpStream>>>,
+    reply: &[u8],
+) -> io::Result<bool> {
+    let channel = runtime.as_mut().unwrap().get_mut();
+    let timeout = Duration::from_secs(1 + reply.len().div_ceil(256 * 1024) as u64);
+    match tokio::time::timeout(timeout, channel.write_all(reply)).await {
+        Ok(Ok(())) => Ok(true),
+        Ok(Err(error)) if !peer_closed(&error) => Err(error),
+        _ => Ok(false),
+    }
+}
+
 fn peer_closed(error: &io::Error) -> bool {
     // Windows can reset a socket held by a program that has just exited.
     matches!(
@@ -785,6 +876,26 @@ fn peer_closed(error: &io::Error) -> bool {
             | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::BrokenPipe
     )
+}
+
+enum RuntimeMessage {
+    Request(services::Request),
+    Event(RuntimeEvent),
+}
+
+impl RuntimeMessage {
+    fn parse(line: &str) -> serde_json::Result<Self> {
+        #[derive(Deserialize)]
+        struct Header<'a> {
+            #[serde(borrow)]
+            kind: std::borrow::Cow<'a, str>,
+        }
+        let header: Header<'_> = serde_json::from_str(line)?;
+        match header.kind.as_ref() {
+            "request" => serde_json::from_str(line).map(Self::Request),
+            _ => serde_json::from_str(line).map(Self::Event),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -862,8 +973,8 @@ impl<F: FnMut(KernelEvent)> Events<'_, F> {
         self.send("stream", json!({"stream": stream, "text": text}));
     }
 
-    fn runtime(&mut self, line: &str) -> io::Result<()> {
-        match serde_json::from_str(line)? {
+    fn runtime(&mut self, event: RuntimeEvent) {
+        match event {
             RuntimeEvent::Debug(value) => self.dump(value),
             RuntimeEvent::LiveUpdate {
                 key,
@@ -881,7 +992,6 @@ impl<F: FnMut(KernelEvent)> Events<'_, F> {
             }
             RuntimeEvent::MainUnwound => self.main_unwound = true,
         }
-        Ok(())
     }
 
     fn dump(&mut self, value: DebugValue) {

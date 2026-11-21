@@ -1,4 +1,4 @@
-use super::{manifest::Manifest, spawn, CACHE_RUNTIME, RICH_RUNTIME, RUNTIME, RUNTIME_MANIFEST};
+use super::{manifest::Manifest, spawn, RUNTIME_FILES};
 use crate::{
     shadow::ShadowProject,
     toolchains::{RustTool, RustToolchain, RustToolchainError},
@@ -211,20 +211,17 @@ impl BuildCache {
     pub(super) async fn stage_runtime(&self) -> Result<PathBuf, String> {
         let root = self.data_root().await?;
         let mut hash = Sha256::new();
-        for source in [RUNTIME_MANIFEST, RUNTIME, RICH_RUNTIME, CACHE_RUNTIME] {
-            hash.update(source.len().to_le_bytes());
-            hash.update(source);
+        for (path, source) in RUNTIME_FILES {
+            for value in [path, source] {
+                hash.update(value.len().to_le_bytes());
+                hash.update(value);
+            }
         }
         let runtime = root
             .join("rust-runtime")
             .join(format!("{:x}", hash.finalize()));
         fs::create_dir_all(runtime.join("src")).map_err(cache_error)?;
-        for (file, content) in [
-            ("Cargo.toml", RUNTIME_MANIFEST),
-            ("src/lib.rs", RUNTIME),
-            ("src/rich.rs", RICH_RUNTIME),
-            ("src/cache.rs", CACHE_RUNTIME),
-        ] {
+        for (file, content) in RUNTIME_FILES {
             write_if_changed(&runtime.join(file), content).map_err(cache_error)?;
         }
         Ok(runtime)

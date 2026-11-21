@@ -92,7 +92,7 @@ jobs:
       - name: TypeScript package code intelligence
         run: cargo test -p codingpad-kernel-core --test language_server typescript_code_intelligence_resolves_versioned_packages --locked -- --ignored
 
-      - name: TypeScript server database integration
+      - name: TypeScript and Rust server database integration
         if: runner.os == 'Linux'
         shell: bash
         run: |
@@ -115,3 +115,4 @@ jobs:
           export CODINGPAD_TEST_SQLSERVER_PORT="$(docker port codingpad-test-sqlserver 1433 | cut -d: -f2)"
           export CODINGPAD_TEST_SQLSERVER_TRUST=1
           cargo test -p codingpad-kernel-core --test typescript typescript_queries_postgres_and_sql_server_with_vault_passwords --locked -- --ignored
+          cargo test -p codingpad-kernel-core --test rust rust_queries_postgres_and_sql_server_with_vault_passwords --locked -- --ignored

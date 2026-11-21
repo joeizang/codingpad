@@ -13,4 +13,4 @@ Every language gets **Level 2** in the MVP: a ready-connected `db` client that r
 - **linq2db** (C#): lighter and faster than EF Core, but far less familiar to C# developers.
 
 ## Consequences
-- SQL Server support in Rust is weak (no SQLx/Diesel support, and SeaORM's is not free). The Rust Level 2/3 choice is deferred to phase 2.
+- For Rust Level 2, the host opens the connection named in the script header with rusqlite, tokio-postgres, or Tiberius. This reuses the SQL runner's SQLite, PostgreSQL and SQL Server drivers and keeps connection passwords in the host. The owner approved the driver choice in [D73](../04-open-questions.md). Rust Level 3 is deferred to phase 2.

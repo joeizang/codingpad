@@ -51,9 +51,8 @@ export function NewScriptMenu({ open, anchor, lastConnection, onCreate, onClose 
   const fallback =
     choices.find((choice) => choice.name === lastConnection)?.name ?? choices[0].name;
   const current = scriptLanguageDetails(language)!;
-  const picked = current.connection === "none"
-    ? undefined
-    : current.connection === "required" ? connection ?? fallback : connection;
+  const requiresConnection = current.connection === "required";
+  const picked = requiresConnection ? connection ?? fallback : connection;
 
   async function loadConnections() {
     try {
@@ -196,22 +195,22 @@ export function NewScriptMenu({ open, anchor, lastConnection, onCreate, onClose 
           </button>
         ))}
       </div>
-      {current.connection !== "none" && <div className="new-script-connection" role="group" aria-label="Connection">
+      <div className="new-script-connection" role="group" aria-label="Connection">
         <p>
-          {current.connection === "required" ? (
+          {requiresConnection ? (
             <>
               <em>SQL runs against a connection.</em> Pick one.
             </>
           ) : (
             <>
-              Attach a connection to get <code>db</code> in your script.
+              Attach a connection to query it with <code>{language === "rust" ? "codingpad::db" : "db"}</code>.
             </>
           )}
         </p>
         <div className="connection-choices">
           <button
             aria-pressed={picked === undefined}
-            disabled={current.connection === "required"}
+            disabled={requiresConnection}
             onClick={() => setConnection(undefined)}
           >
             None
@@ -235,7 +234,7 @@ export function NewScriptMenu({ open, anchor, lastConnection, onCreate, onClose 
             {error}
           </p>
         )}
-      </div>}
+      </div>
       <div className="new-script-footer">
         <span>
           <kbd>Ctrl N</kbd> opens this. <kbd>Esc</kbd> closes.

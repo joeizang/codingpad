@@ -246,7 +246,12 @@ fn request(kind: &str, value: &str, parameters: &str) -> Result<Vec<u8>, String>
         .map_err(|_| disconnected)?;
     let socket = output.as_mut().ok_or(disconnected)?;
     flush_streams();
-    let line = frame(&[("kind", kind), ("value", value), ("parameters", parameters)]);
+    let line = frame(&[
+        ("kind", "request"),
+        ("operation", kind),
+        ("value", value),
+        ("parameters", parameters),
+    ]);
     let mut exchange = || -> io::Result<(u8, Vec<u8>)> {
         // Wait as long as the host stays connected. Stop interrupts the request
         // through the host and closing the script drops the socket.

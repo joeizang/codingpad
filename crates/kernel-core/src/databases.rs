@@ -3,7 +3,6 @@
 //! SQL scripts run through their connection without starting a kernel. Passwords
 //! are referenced by secret name and read from the vault at connection time, so
 //! connection settings never contain them.
-mod postgres_value;
 pub mod schema;
 mod script;
 
@@ -1475,7 +1474,7 @@ async fn postgres_tables(
                 .iter()
                 .all(|column| supported_pg_type(column.type_()))
             {
-                postgres_query(client, &statement, &[]).await
+                postgres_query(client, &statement).await
             } else {
                 // A type we cannot decode still has a text form; use the simple
                 // protocol so values and NULLs are shown instead of placeholders.
@@ -1500,7 +1499,6 @@ async fn postgres_tables(
 async fn postgres_query(
     client: &tokio_postgres::Client,
     statement: &tokio_postgres::Statement,
-    parameters: &[&(dyn tokio_postgres::types::ToSql + Sync)],
 ) -> Result<Vec<TableData>, String> {
     use futures_util::TryStreamExt;
 
@@ -1510,7 +1508,7 @@ async fn postgres_query(
         .map(|column| (column.name().to_owned(), column.type_().clone()))
         .collect();
     let rows = client
-        .query_raw(statement, parameters.iter().copied())
+        .query_raw(statement, std::iter::empty::<&str>())
         .await
         .map_err(|error| pg_error("PostgreSQL could not run the query", error))?;
     tokio::pin!(rows);
@@ -1532,7 +1530,7 @@ async fn postgres_query(
         }
         let mut cells = Vec::with_capacity(columns.len());
         for (index, (_, kind)) in columns.iter().enumerate() {
-            cells.push(pg_cell(&row, index, kind, values.len())?);
+            cells.push(pg_cell(&row, index, kind, values.len()));
         }
         values.push(cells);
     }
@@ -1744,35 +1742,35 @@ fn pg_cell(
     column: usize,
     kind: &tokio_postgres::types::Type,
     row_index: usize,
-) -> Result<Value, String> {
+) -> Value {
     let id = format!("sql:r{row_index}c{column}");
     if let Ok(value) = row.try_get::<_, Option<bool>>(column) {
-        return Ok(value.map_or_else(|| null_node(&id), |value| primitive_node(&id, json!(value))));
+        return value.map_or_else(|| null_node(&id), |value| primitive_node(&id, json!(value)));
     }
     if let Ok(value) = row.try_get::<_, Option<i16>>(column) {
-        return Ok(value.map_or_else(|| null_node(&id), |value| integer_node(&id, value as i64)));
+        return value.map_or_else(|| null_node(&id), |value| integer_node(&id, value as i64));
     }
     if let Ok(value) = row.try_get::<_, Option<i32>>(column) {
-        return Ok(value.map_or_else(|| null_node(&id), |value| integer_node(&id, value as i64)));
+        return value.map_or_else(|| null_node(&id), |value| integer_node(&id, value as i64));
     }
     if let Ok(value) = row.try_get::<_, Option<i64>>(column) {
-        return Ok(value.map_or_else(|| null_node(&id), |value| integer_node(&id, value)));
+        return value.map_or_else(|| null_node(&id), |value| integer_node(&id, value));
     }
     if let Ok(value) = row.try_get::<_, Option<u32>>(column) {
-        return Ok(value.map_or_else(|| null_node(&id), |value| integer_node(&id, value as i64)));
+        return value.map_or_else(|| null_node(&id), |value| integer_node(&id, value as i64));
     }
     if let Ok(value) = row.try_get::<_, Option<f32>>(column) {
-        return Ok(match value {
+        return match value {
             None => null_node(&id),
             Some(value) if !value.is_finite() => bounded_text(&id, value.to_string(), None),
             Some(value) => primitive_node(
                 &id,
                 json!(value.to_string().parse::<f64>().unwrap_or(value as f64)),
             ),
-        });
+        };
     }
     if let Ok(value) = row.try_get::<_, Option<f64>>(column) {
-        return Ok(match value {
+        return match value {
             None => null_node(&id),
             Some(value) if value.is_nan() => bounded_text(&id, "NaN".into(), None),
             Some(value) if value.is_infinite() => bounded_text(
@@ -1785,59 +1783,39 @@ fn pg_cell(
                 None,
             ),
             Some(value) => primitive_node(&id, json!(value)),
-        });
+        };
     }
     if let Ok(value) = row.try_get::<_, Option<chrono::NaiveTime>>(column) {
-        return Ok(value.map_or_else(
+        return value.map_or_else(
             || null_node(&id),
             |value| bounded_text(&id, value.to_string(), Some("time")),
-        ));
+        );
     }
     if let Ok(value) = row.try_get::<_, Option<uuid::Uuid>>(column) {
-        return Ok(value.map_or_else(
+        return value.map_or_else(
             || null_node(&id),
             |value| bounded_text(&id, value.to_string(), Some("uuid")),
-        ));
+        );
     }
     if let Ok(value) = row.try_get::<_, Option<serde_json::Value>>(column) {
-        return Ok(value.map_or_else(
+        return value.map_or_else(
             || null_node(&id),
             |value| bounded_text(&id, value.to_string(), Some(kind.name())),
-        ));
+        );
     }
     if let Ok(value) = row.try_get::<_, Option<Vec<u8>>>(column) {
-        return Ok(value.map_or_else(
+        return value.map_or_else(
             || null_node(&id),
             |value| bounded_text(&id, hex(&value), Some("bytea")),
-        ));
+        );
     }
     if let Ok(value) = row.try_get::<_, Option<String>>(column) {
-        return Ok(value.map_or_else(
+        return value.map_or_else(
             || null_node(&id),
             |value| bounded_text(&id, value, Some(kind.name())),
-        ));
+        );
     }
-    let raw = row
-        .try_get::<_, Option<postgres_value::RawValue<'_>>>(column)
-        .map_err(|error| format!("Could not read PostgreSQL column {}: {error}", column + 1))?;
-    let Some(raw) = raw else {
-        return Ok(null_node(&id));
-    };
-    let value = postgres_value::decode(kind, raw.0).map_err(|error| {
-        format!(
-            "Could not decode PostgreSQL column {} ({}): {error}",
-            column + 1,
-            kind.name()
-        )
-    })?;
-    Ok(match value {
-        Value::String(text) => bounded_text(&id, text, Some(kind.name())),
-        Value::Null => null_node(&id),
-        Value::Array(_) | Value::Object(_) => {
-            bounded_text(&id, value.to_string(), Some(kind.name()))
-        }
-        _ => primitive_node(&id, value),
-    })
+    bounded_text(&id, format!("<{}>", kind.name()), None)
 }
 
 fn pg_text_cell(
@@ -1877,7 +1855,10 @@ fn pg_text_cell(
         }
         _ => {}
     }
-    bounded_text(&id, text.to_owned(), None)
+    let type_name = kind
+        .filter(|kind| kind.name() == "numeric")
+        .map(|kind| kind.name());
+    bounded_text(&id, text.to_owned(), type_name)
 }
 
 fn is_interrupted(error: &rusqlite::Error) -> bool {

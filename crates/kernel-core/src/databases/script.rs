@@ -1,6 +1,6 @@
 //! A database session owned by a single native Rust script run.
 use super::{
-    affected_rows_table, execute_sqlite, has_go_batch, pg_error, postgres_query, postgres_tables,
+    affected_rows_table, execute_sqlite, has_go_batch, pg_error, postgres_simple_tables,
     read_sqlserver_tables, sqlite_error, sqlite_path, sqlite_statement, Connection, DatabaseKind,
     PostgresSession, SecretStore, SqlManager, SqlServerClient, SqliteConnection, TableData,
     STOPPED,
@@ -8,8 +8,9 @@ use super::{
 use bytes::BytesMut;
 use serde::Deserialize;
 use std::{
+    borrow::Cow,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -39,23 +40,26 @@ enum Parameter {
     Text(String),
 }
 
+impl Parameter {
+    fn postgres_text(&self) -> Option<Cow<'_, str>> {
+        Some(match self {
+            Self::Null => return None,
+            Self::Bool(value) => Cow::Owned(value.to_string()),
+            Self::Integer(value) => Cow::Owned(value.to_string()),
+            Self::Float(value) => Cow::Owned(value.to_string()),
+            Self::Text(value) => Cow::Borrowed(value),
+        })
+    }
+}
+
 impl ToSql for Parameter {
     fn to_sql(
         &self,
         _: &Type,
         output: &mut BytesMut,
     ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
-        // Parameter text is sent in a PostgreSQL Bind message. The server's
-        // type input function handles the conversion and validates the value.
-        let value = match self {
-            Self::Null => return Ok(IsNull::Yes),
-            Self::Bool(value) => value.to_string(),
-            Self::Integer(value) => value.to_string(),
-            Self::Float(value) => value.to_string(),
-            Self::Text(text) => {
-                output.extend_from_slice(text.as_bytes());
-                return Ok(IsNull::No);
-            }
+        let Some(value) = self.postgres_text() else {
+            return Ok(IsNull::Yes);
         };
         output.extend_from_slice(value.as_bytes());
         Ok(IsNull::No)
@@ -295,55 +299,88 @@ async fn postgres(
     parameters: &[Parameter],
     execute: bool,
 ) -> Result<ScriptResult, String> {
-    if parameters.is_empty() {
-        if !execute {
-            return postgres_tables(client, sql).await.map(last_table);
-        }
-
-        use futures_util::TryStreamExt;
-        let messages = client
-            .simple_query_raw(sql)
-            .await
-            .map_err(|error| pg_error("PostgreSQL could not run the batch", error))?;
-        tokio::pin!(messages);
-        let mut affected = 0u64;
-        while let Some(message) = messages
-            .as_mut()
-            .try_next()
-            .await
-            .map_err(|error| pg_error("PostgreSQL could not read the batch results", error))?
-        {
-            if let tokio_postgres::SimpleQueryMessage::CommandComplete(count) = message {
-                affected = affected.saturating_add(count);
-            }
-        }
-        return Ok(ScriptResult::Affected(affected));
-    }
-    let params: Vec<&(dyn ToSql + Sync)> =
-        parameters.iter().map(|parameter| parameter as _).collect();
+    // Execute uses the driver's statement count. A batch in the simple
+    // protocol loses command tags, so SELECT row counts cannot be separated
+    // from write counts.
     if execute {
-        client
+        let params: Vec<&(dyn ToSql + Sync)> =
+            parameters.iter().map(|parameter| parameter as _).collect();
+        return client
             .execute(sql, &params)
             .await
             .map(ScriptResult::Affected)
-            .map_err(|error| pg_error("PostgreSQL could not run the statement", error))
-    } else {
-        let statement = client
-            .prepare(sql)
-            .await
-            .map_err(|error| pg_error("PostgreSQL could not prepare the statement", error))?;
-        if statement.columns().is_empty() {
-            let count = client
-                .execute(&statement, &params)
-                .await
-                .map_err(|error| pg_error("PostgreSQL could not run the statement", error))?;
-            Ok(ScriptResult::Rows(affected_rows_table(count)))
-        } else {
-            postgres_query(client, &statement, &params)
-                .await
-                .map(last_table)
-        }
+            .map_err(|error| pg_error("PostgreSQL could not run the statement", error));
     }
+    let statement = client.prepare(sql).await;
+    if parameters.is_empty() {
+        let columns = statement
+            .as_ref()
+            .map_or(&[][..], tokio_postgres::Statement::columns);
+        return postgres_simple_tables(client, sql, columns)
+            .await
+            .map(last_table);
+    }
+    let statement =
+        statement.map_err(|error| pg_error("PostgreSQL could not prepare the statement", error))?;
+    if parameters.len() != statement.params().len() {
+        return Err(format!(
+            "PostgreSQL expected {} parameters, received {}.",
+            statement.params().len(),
+            parameters.len()
+        ));
+    }
+    if statement.columns().is_empty() {
+        let params: Vec<&(dyn ToSql + Sync)> =
+            parameters.iter().map(|parameter| parameter as _).collect();
+        let count = client
+            .execute(&statement, &params)
+            .await
+            .map_err(|error| pg_error("PostgreSQL could not run the statement", error))?;
+        return Ok(ScriptResult::Rows(affected_rows_table(count)));
+    }
+    postgres_bound_text(client, sql, parameters, statement.columns())
+        .await
+        .map(last_table)
+}
+
+async fn postgres_bound_text(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    parameters: &[Parameter],
+    columns: &[tokio_postgres::Column],
+) -> Result<Vec<TableData>, String> {
+    static NEXT_STATEMENT: AtomicU64 = AtomicU64::new(1);
+    let name = format!(
+        "codingpad_rust_{}",
+        NEXT_STATEMENT.fetch_add(1, Ordering::Relaxed)
+    );
+    let values: Vec<_> = parameters.iter().map(Parameter::postgres_text).collect();
+    let quoted = client
+        .query(
+            "SELECT pg_catalog.quote_nullable(value) FROM pg_catalog.unnest($1::text[]) \
+         WITH ORDINALITY AS args(value, position) ORDER BY position",
+            &[&values],
+        )
+        .await
+        .map_err(|error| pg_error("PostgreSQL could not bind the values", error))?;
+    let arguments = quoted
+        .iter()
+        .map(|row| row.get::<_, &str>(0))
+        .collect::<Vec<_>>();
+    // tokio-postgres's extended protocol always requests binary result
+    // columns. Use a server-prepared statement and SQL EXECUTE to request the
+    // server's text output. Only server-quoted values enter the argument list.
+    // The extended protocol rejects more than one statement in PREPARE.
+    client
+        .execute(&format!("PREPARE {name} AS {sql}"), &[])
+        .await
+        .map_err(|error| pg_error("PostgreSQL could not prepare the text query", error))?;
+    let command = format!("EXECUTE {name}({})", arguments.join(", "));
+    let result = postgres_simple_tables(client, &command, columns).await;
+    // A failed statement can put an explicit transaction in the failed
+    // state. The plan is also released when this run's connection closes.
+    let _ = client.batch_execute(&format!("DEALLOCATE {name}")).await;
+    result
 }
 
 async fn sqlserver(

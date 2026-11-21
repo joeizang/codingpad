@@ -24,7 +24,7 @@ pub(crate) struct Services {
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "operation", rename_all = "snake_case")]
 pub(super) enum Request {
     Query { value: String, parameters: String },
     Execute { value: String, parameters: String },

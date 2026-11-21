@@ -1089,25 +1089,36 @@ mod database {
             if kind == DatabaseKind::Postgres {
                 let (result, events) = run(&supervisor, r#"// codingpad: connection=test
                     use codingpad::{db, dump, DbParameter, DbValue};
-                    assert_eq!(db.execute("CREATE TEMP TABLE batch_test (id INT); INSERT INTO batch_test VALUES (1), (2)", &[]).unwrap(), 2);
-                    let rows = db.query(
-                        "SELECT 123456789012345678901234567890.123456789::numeric AS price,
-                                '-0.000123'::numeric AS small, NULL::numeric AS empty,
-                                '2026-01-02T03:04:05+00:00'::timestamptz AS stamp,
-                                '2026-01-02'::date AS day,
-                                '1 month 2 days 3 seconds'::interval AS duration,
-                                ARRAY[[1, NULL], [3, 4]]::int[] AS numbers
-                         WHERE $1::integer = 1",
-                        &[DbParameter::Integer(1)],
-                    ).unwrap();
+                    db.execute("SET TIME ZONE 'America/New_York'", &[]).unwrap();
+                    db.execute("SET intervalstyle TO 'postgres_verbose'", &[]).unwrap();
+                    assert!(db.execute("SELECT 1; SELECT 2", &[]).is_err());
+                    let sql = "SELECT 123456789012345678901234567890.123456789::numeric AS price,
+                                      '-0.000123'::numeric AS small, NULL::numeric AS empty,
+                                      '2026-01-02T03:04:05+00:00'::timestamptz AS stamp,
+                                      '2026-01-02'::date AS day,
+                                      '1 month 2 days 3 seconds'::interval AS duration,
+                                      '[0:1][1:2]={{1,NULL},{3,4}}'::int[] AS numbers,
+                                      '127.0.0.1/24'::inet AS address, 12.50::money AS amount,
+                                      ARRAY['04:03:02'::time] AS times, ARRAY['NaN'::real, 0.1::real] AS floats,
+                                      9007199254740993::int8 AS large, $2::text AS label, $3::text IS NULL AS missing
+                               WHERE $1::integer = 1";
+                    let rows = db.query(sql, &[DbParameter::Integer(1), DbParameter::Text("D'Angelo"), DbParameter::Null]).unwrap();
+                    let unbound = db.query(&sql.replace("$1", "1").replace("$2", "'D''Angelo'").replace("$3", "NULL"), &[]).unwrap();
+                    assert_eq!(rows.rows(), unbound.rows());
                     let row = &rows.rows()[0];
                     assert_eq!(row[0], DbValue::Decimal("123456789012345678901234567890.123456789".into()));
                     assert_eq!(row[1], DbValue::Decimal("-0.000123".into()));
                     assert_eq!(row[2], DbValue::Null);
-                    assert_eq!(row[3], DbValue::Text("2026-01-02T03:04:05+00:00".into()));
+                    assert_eq!(row[3], DbValue::Text("2026-01-01 22:04:05-05".into()));
                     assert_eq!(row[4], DbValue::Text("2026-01-02".into()));
-                    assert_eq!(row[5], DbValue::Text("1 months 2 days 3000000 microseconds".into()));
-                    assert_eq!(row[6], DbValue::Text("[[1,null],[3,4]]".into()));
+                    assert_eq!(row[5], DbValue::Text("@ 1 mon 2 days 3 secs".into()));
+                    assert_eq!(row[6], DbValue::Text("[0:1][1:2]={{1,NULL},{3,4}}".into()));
+                    assert_eq!(row[7], DbValue::Text("127.0.0.1/24".into()));
+                    assert_eq!(row[9], DbValue::Text("{04:03:02}".into()));
+                    assert_eq!(row[10], DbValue::Text("{NaN,0.1}".into()));
+                    assert_eq!(row[11], DbValue::Integer(9007199254740993));
+                    assert_eq!(row[12], DbValue::Text("D'Angelo".into()));
+                    assert_eq!(row[13], DbValue::Bool(true));
                     dump(rows);
                 "#).await;
                 assert!(result.ok, "{events:?}");

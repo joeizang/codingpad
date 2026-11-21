@@ -678,9 +678,10 @@ Bind values with SQLite `?`, PostgreSQL `$1`, or SQL Server `@P1` placeholders.
 Pass `&[]` when no values need binding. `db.execute(sql, parameters)` returns the
 affected-row count. Use `query` to create a SQL Server session-local temporary
 table. Columns stay in query order and preserve headers for empty results.
-Duplicate names receive suffixes such as `id_2`. Unbound PostgreSQL batches sum
-the affected-row counts. For a bound PostgreSQL result using a custom type
-the runtime cannot decode, cast that column to `text` in the query.
+Duplicate names receive suffixes such as `id_2`. PostgreSQL uses the session's
+text representation for dates, arrays and other database-specific types in
+bound and unbound result sets. PostgreSQL `db.execute` takes one statement
+per call. Use `db.query` for batches and row-producing statements.
 CodingPad retains up to 10,000 rows per result and accepts results up to 8 MiB
 per query. Dump the result directly or leave it as the script's final
 expression to display a paged table.

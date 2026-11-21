@@ -892,7 +892,7 @@ impl RuntimeMessage {
         }
         let header: Header<'_> = serde_json::from_str(line)?;
         match header.kind.as_ref() {
-            "query" | "execute" | "secret" => serde_json::from_str(line).map(Self::Request),
+            "request" => serde_json::from_str(line).map(Self::Request),
             _ => serde_json::from_str(line).map(Self::Event),
         }
     }

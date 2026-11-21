@@ -1,4 +1,6 @@
-use super::{manifest::Manifest, spawn, CACHE_RUNTIME, RICH_RUNTIME, RUNTIME, RUNTIME_MANIFEST};
+use super::{
+    manifest::Manifest, spawn, CACHE_RUNTIME, DB_RUNTIME, RICH_RUNTIME, RUNTIME, RUNTIME_MANIFEST,
+};
 use crate::{
     shadow::ShadowProject,
     toolchains::{RustTool, RustToolchain, RustToolchainError},
@@ -211,7 +213,13 @@ impl BuildCache {
     pub(super) async fn stage_runtime(&self) -> Result<PathBuf, String> {
         let root = self.data_root().await?;
         let mut hash = Sha256::new();
-        for source in [RUNTIME_MANIFEST, RUNTIME, RICH_RUNTIME, CACHE_RUNTIME] {
+        for source in [
+            RUNTIME_MANIFEST,
+            RUNTIME,
+            RICH_RUNTIME,
+            CACHE_RUNTIME,
+            DB_RUNTIME,
+        ] {
             hash.update(source.len().to_le_bytes());
             hash.update(source);
         }
@@ -224,6 +232,7 @@ impl BuildCache {
             ("src/lib.rs", RUNTIME),
             ("src/rich.rs", RICH_RUNTIME),
             ("src/cache.rs", CACHE_RUNTIME),
+            ("src/database.rs", DB_RUNTIME),
         ] {
             write_if_changed(&runtime.join(file), content).map_err(cache_error)?;
         }

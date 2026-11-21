@@ -4,6 +4,9 @@
 //! are referenced by secret name and read from the vault at connection time, so
 //! connection settings never contain them.
 pub mod schema;
+mod script;
+
+pub(crate) use script::ScriptDatabase;
 
 use crate::{
     secrets::SecretStore,
@@ -255,7 +258,7 @@ fn save_connections(path: &Path, connections: &[Connection]) -> Result<(), Strin
 }
 
 #[derive(Clone, Debug)]
-struct TableData {
+pub(crate) struct TableData {
     columns: Vec<Column>,
     rows: Vec<Vec<Value>>,
     truncated: bool,
@@ -276,6 +279,13 @@ pub struct SqlRunResult {
 }
 
 type Interrupt = Arc<Mutex<Option<rusqlite::InterruptHandle>>>;
+
+type SqlServerClient = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
+type PostgresSession = (
+    tokio_postgres::Client,
+    postgres_native_tls::MakeTlsConnector,
+    tokio::task::JoinHandle<()>,
+);
 
 pub struct SqlManager {
     connections: Arc<ConnectionStore>,
@@ -521,6 +531,14 @@ impl SqlManager {
         ),
         String,
     > {
+        let (client, tls, _) = Self::open_postgres(connection, Some(&self.secrets)).await?;
+        Ok((client, tls))
+    }
+
+    async fn open_postgres(
+        connection: &Connection,
+        secrets: Option<&Arc<SecretStore>>,
+    ) -> Result<PostgresSession, String> {
         let mut config = tokio_postgres::Config::new();
         config
             .host(postgres_host(connection))
@@ -538,7 +556,9 @@ impl SqlManager {
             .map(str::trim)
             .filter(|secret| !secret.is_empty())
         {
-            let store = self.secrets.clone();
+            let store = secrets
+                .cloned()
+                .ok_or("The password vault is unavailable")?;
             let secret = secret.to_owned();
             let password = tokio::task::spawn_blocking(move || store.get(&secret))
                 .await
@@ -568,10 +588,10 @@ impl SqlManager {
                 detail
             )
         })?;
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let _ = connection.await;
         });
-        Ok((client, tls))
+        Ok((client, tls, task))
     }
 
     async fn run_postgres(
@@ -674,10 +694,14 @@ impl SqlManager {
         })
     }
 
-    async fn connect_sqlserver(
-        &self,
+    async fn connect_sqlserver(&self, connection: &Connection) -> Result<SqlServerClient, String> {
+        Self::open_sqlserver(connection, Some(&self.secrets)).await
+    }
+
+    async fn open_sqlserver(
         connection: &Connection,
-    ) -> Result<tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>, String> {
+        secrets: Option<&Arc<SecretStore>>,
+    ) -> Result<SqlServerClient, String> {
         use tokio_util::compat::TokioAsyncWriteCompatExt;
         let mut config = tiberius::Config::new();
         config.host(server_host(connection));
@@ -691,7 +715,9 @@ impl SqlManager {
             .filter(|secret| !secret.is_empty())
         {
             Some(secret) => {
-                let store = self.secrets.clone();
+                let store = secrets
+                    .cloned()
+                    .ok_or("The password vault is unavailable")?;
                 let secret = secret.to_owned();
                 tokio::task::spawn_blocking(move || store.get(&secret))
                     .await
@@ -903,22 +929,48 @@ impl SqlManager {
                 .parse::<usize>()
                 .map_err(|_| "cursor must be a non-negative integer".to_owned())?,
             None => 0,
+        };
+        Ok(table.export_page(offset, limit.max(1) as usize))
+    }
+}
+
+impl TableData {
+    pub(crate) fn node(&self, handle: &str, offset: usize, limit: usize) -> Value {
+        table_node(self, handle, offset, limit)
+    }
+
+    pub(crate) fn column_names(&self) -> impl Iterator<Item = &str> {
+        self.columns.iter().map(|column| column.name.as_str())
+    }
+
+    pub(crate) fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub(crate) fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    pub(crate) fn plain_rows(&self) -> impl Iterator<Item = impl Iterator<Item = Value> + '_> + '_ {
+        self.rows
+            .iter()
+            .map(|row| row.iter().map(crate::export::plain_cell))
+    }
+
+    pub(crate) fn export_page(&self, offset: usize, limit: usize) -> crate::export::ExportPage {
+        let offset = offset.min(self.rows.len());
+        let end = offset.saturating_add(limit).min(self.rows.len());
+        crate::export::ExportPage {
+            columns: self.column_names().map(str::to_owned).collect(),
+            rows: self
+                .plain_rows()
+                .skip(offset)
+                .take(end - offset)
+                .map(Iterator::collect)
+                .collect(),
+            next: (end < self.rows.len()).then(|| end.to_string()),
+            total: Some(self.rows.len() as u64),
         }
-        .min(table.rows.len());
-        let end = (offset + limit.max(1) as usize).min(table.rows.len());
-        Ok(crate::export::ExportPage {
-            columns: table
-                .columns
-                .iter()
-                .map(|column| column.name.clone())
-                .collect(),
-            rows: table.rows[offset..end]
-                .iter()
-                .map(|row| row.iter().map(crate::export::plain_cell).collect())
-                .collect(),
-            next: (end < table.rows.len()).then(|| end.to_string()),
-            total: Some(table.rows.len() as u64),
-        })
     }
 }
 
@@ -1137,15 +1189,19 @@ fn server_port(connection: &Connection, default: u16) -> u16 {
 }
 
 async fn sqlserver_tables(
-    client: &mut tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>,
+    client: &mut SqlServerClient,
     source: &str,
+) -> Result<Vec<TableData>, String> {
+    read_sqlserver_tables(client.query(source, &[]).await).await
+}
+
+async fn read_sqlserver_tables(
+    stream: tiberius::Result<tiberius::QueryStream<'_>>,
 ) -> Result<Vec<TableData>, String> {
     use futures_util::TryStreamExt;
 
-    let stream = client
-        .query(source, &[])
-        .await
-        .map_err(|error| format!("SQL Server could not run the statement: {error}"))?;
+    let stream =
+        stream.map_err(|error| format!("SQL Server could not run the statement: {error}"))?;
     tokio::pin!(stream);
     let mut tables: Vec<TableData> = Vec::new();
     let mut current: Option<(Vec<Column>, Vec<Vec<Value>>, bool)> = None;

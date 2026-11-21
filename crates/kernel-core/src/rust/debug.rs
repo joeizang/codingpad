@@ -12,6 +12,7 @@ pub(super) enum ValueNode {
     List(Vec<Index>),
     Record(Vec<(String, Index)>),
     Html(String),
+    Query(u64),
     Image {
         mime: String,
         name: String,
@@ -277,6 +278,10 @@ impl<'a> Parser<'a> {
             _ => None,
         };
         match (name, values.as_slice()) {
+            ("__CodingPadQuery", [index]) => match &self.nodes[*index].value {
+                ValueNode::Scalar(value) => value.as_u64().map(ValueNode::Query),
+                _ => None,
+            },
             ("__CodingPadHtml", [markup]) => Some(ValueNode::Html(text(*markup)?)),
             ("__CodingPadImage", [mime, name, data]) => {
                 let mime = text(*mime)?;

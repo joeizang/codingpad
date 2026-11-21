@@ -352,7 +352,7 @@ export default function App() {
     ? active.compilation.diagnostics
     : EMPTY_DIAGNOSTICS;
   const activeHeader = parseHeader(active.source);
-  const connectionName = runnable && language !== "rust"
+  const connectionName = runnable
     ? activeHeader?.settings.connection || undefined
     : undefined;
   const [schemaRevision, setSchemaRevision] = useState(0);

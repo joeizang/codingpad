@@ -658,6 +658,24 @@ The first database call opens the connection using the saved settings and vault
 password. CodingPad closes it when the run ends. SQLite and PostgreSQL use Bun's
 built-in clients. PostgreSQL requires Bun 1.4.4 or later for column metadata.
 The first run with a SQL Server connection installs the `mssql` driver through Bun.
+Rust scripts use the host's SQLite, PostgreSQL, and SQL Server drivers.
+
+```rust
+// codingpad: connection=codingpad-sample
+use codingpad::{db, dump};
+
+let rows = db.query("SELECT id, name FROM customers ORDER BY id").unwrap();
+dump(rows);
+```
+
+The first query opens the saved connection, using its password from the vault
+when configured. The connection stays open until the run ends. A batch returns
+its final result set. `DbRows` exposes `columns()`, `rows()` and `is_truncated()`.
+Columns stay in query order, including duplicate names and empty results.
+CodingPad retains up to 10,000 rows per result and accepts results up to 8 MiB
+per query. Dump the result directly or leave it as the script's final
+expression to display a paged table.
+
 Relative SQLite connection paths resolve against the CodingPad process's
 working directory across script languages.
 
@@ -773,9 +791,8 @@ unavailable, the dialog offers an explicit **Store for this session only** actio
 those values disappear when CodingPad exits.
 
 Python and TypeScript scripts read a secret with `secret("name")` (also importable
-from `codingpad`). C# scripts use `Secret("name")`. Rust code intelligence
-can resolve `codingpad::secret("name")`. Vault access for Rust is scheduled for
-the Rust database and secrets milestone.
+from `codingpad`). C# scripts use `Secret("name")`. Rust scripts call
+`codingpad::secret("name")`, which resolves each name on demand.
 
 ```python
 from codingpad import secret

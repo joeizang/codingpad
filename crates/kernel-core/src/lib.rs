@@ -596,6 +596,11 @@ impl Supervisor {
                 project,
                 script: path.map(Path::new),
                 values: &cache,
+                services: rust::Services::new(
+                    source,
+                    self.connections.as_deref(),
+                    self.secrets.clone(),
+                ),
             };
             return tokio::select! {
                 biased;

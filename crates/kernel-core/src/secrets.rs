@@ -203,6 +203,15 @@ impl SecretStore {
         }
     }
 
+    /// Named credentials for database connections are reserved for the host.
+    pub(crate) fn get_for_script(&self, name: &str) -> Result<String, String> {
+        let name = validate_name(name)?;
+        if name.starts_with("connection:") {
+            return Err(missing_secret(name));
+        }
+        self.get(name)
+    }
+
     /// `Ok(None)` means the vault has no entry; `Err` means the vault refused or
     /// failed. Callers report those differently.
     fn resolve(&self, name: &str) -> Result<Option<String>, String> {

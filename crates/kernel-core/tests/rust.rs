@@ -867,3 +867,215 @@ async fn separate_rust_scripts_reuse_artifacts_and_warmup_compiles_cached_crates
     .await
     .expect("background warmup did not compile the locally available serde_json");
 }
+
+mod database {
+    use super::*;
+    use codingpad_kernel_core::{
+        databases::{Connection, ConnectionStore, DatabaseKind, TlsMode},
+        secrets::{SecretStore, Vault},
+    };
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
+    use tokio::{sync::oneshot, time::timeout};
+
+    struct TestVault(BTreeMap<String, String>);
+
+    impl Vault for TestVault {
+        fn get(&self, name: &str) -> Result<Option<String>, String> {
+            Ok(self.0.get(name).cloned())
+        }
+
+        fn set(&self, _: &str, _: &str) -> Result<(), String> {
+            Err("Read-only test vault".into())
+        }
+
+        fn delete(&self, _: &str) -> Result<(), String> {
+            Err("Read-only test vault".into())
+        }
+    }
+
+    fn sqlite() -> Connection {
+        Connection {
+            id: String::new(),
+            name: "test".into(),
+            kind: DatabaseKind::Sqlite,
+            path: Some(":memory:".into()),
+            host: None,
+            port: None,
+            database: None,
+            user: None,
+            secret: None,
+            tls: TlsMode::default(),
+            trust_server_certificate: false,
+        }
+    }
+
+    fn supervisor(
+        data: &tempfile::TempDir,
+        connection: Connection,
+        mut secrets: TestVault,
+    ) -> Supervisor {
+        secrets
+            .0
+            .insert("greeting".into(), "Hello ☕\n\"Rust\"".into());
+        let secrets = Arc::new(SecretStore::with_vault(data.path(), Arc::new(secrets)));
+        let connections = Arc::new(ConnectionStore::new(data.path()));
+        connections.save(connection).unwrap();
+        Supervisor::with_data_dir_and_secrets(data.path().to_owned(), secrets)
+            .with_connections(connections)
+    }
+
+    #[tokio::test]
+    async fn sqlite_queries_keep_the_connection_and_dump_rows_for_paging_and_export() {
+        let data = tempfile::tempdir().unwrap();
+        let supervisor = supervisor(
+            &data,
+            sqlite(),
+            TestVault(BTreeMap::from([(
+                "connection:hidden".into(),
+                "private".into(),
+            )])),
+        );
+        let (result, events) = run(&supervisor, r#"// codingpad: connection=test
+            use codingpad::{db, dump, secret, DbValue};
+            let name = format!("greet{}", "ing");
+            assert_eq!(secret(&name), "Hello ☕\n\"Rust\"");
+            let hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let reserved = std::panic::catch_unwind(|| secret(" connection:hidden "));
+            std::panic::set_hook(hook);
+            assert!(reserved.is_err());
+            db.query("CREATE TEMP TABLE items (id INT, label TEXT)").unwrap();
+            db.query("INSERT INTO items VALUES (9007199254740993, 'café'), (2, NULL)").unwrap();
+            let rows = db.query("SELECT id AS value, label AS value FROM items ORDER BY id DESC").unwrap();
+            assert_eq!(rows.columns(), &["value", "value"]);
+            assert_eq!(rows.rows()[0], [DbValue::Integer(9007199254740993), DbValue::Text("café".into())]);
+            assert_eq!(rows.rows()[1][1], DbValue::Null);
+            dump(rows);
+            db.query("SELECT id FROM items WHERE 0").unwrap()
+        "#).await;
+        assert!(result.ok, "{events:?}");
+        let nodes = dumps(&events);
+        assert_eq!(nodes[0]["kind"], "table");
+        assert_eq!(nodes[0]["columns"][1]["name"], "value");
+        assert_eq!(nodes[0]["rows"][0][0]["v"], "9007199254740993");
+        assert_eq!(nodes[1]["kind"], "table");
+        assert_eq!(nodes[1]["total"], 0);
+
+        let handle = nodes[0]["handle"].as_str().unwrap();
+        let page = supervisor
+            .expand("rust-script", handle, Some("1"), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(page.node["rows"][0][0]["v"], 2);
+        let page = supervisor
+            .export_page("rust-script", handle, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(page.rows[0][0]["n"], "9007199254740993");
+        assert_eq!(page.next.as_deref(), Some("1"));
+        supervisor.reset("rust-script").await.unwrap();
+        assert!(supervisor
+            .expand("rust-script", handle, None, None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_unblocks_rust_waiting_for_a_query() {
+        let data = tempfile::tempdir().unwrap();
+        let supervisor = supervisor(&data, sqlite(), TestVault(BTreeMap::new()));
+        let (ready, started) = oneshot::channel();
+        let mut ready = Some(ready);
+        let run = supervisor.run_language("query", r#"// codingpad: connection=test
+            use codingpad::{db, is_cancelled};
+            println!("query starting");
+            let result = db.query("WITH RECURSIVE t(i) AS (VALUES(0) UNION ALL SELECT i + 1 FROM t) SELECT SUM(i) FROM t");
+            assert!(result.is_err());
+            assert!(is_cancelled());
+        "#, Language::Rust, |event| {
+            if event.params["text"] == "query starting\n" {
+                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            }
+        });
+        let stop = async {
+            started.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            supervisor.stop("query").await;
+        };
+        let (result, ()) = timeout(Duration::from_secs(30), async { tokio::join!(run, stop) })
+            .await
+            .unwrap();
+        let result = result.unwrap();
+        assert!(result.stopped && !result.cache_cleared);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODINGPAD_TEST_POSTGRES_* and CODINGPAD_TEST_SQLSERVER_* connections"]
+    async fn rust_queries_postgres_and_sql_server_with_vault_passwords() {
+        for (kind, prefix, setup) in [
+            (
+                DatabaseKind::Postgres,
+                "POSTGRES",
+                "CREATE TEMP TABLE items (id INT)",
+            ),
+            (
+                DatabaseKind::SqlServer,
+                "SQLSERVER",
+                "CREATE TABLE #items (id INT)",
+            ),
+        ] {
+            let env = |key| {
+                let variable = format!("CODINGPAD_TEST_{prefix}_{key}");
+                std::env::var(&variable).unwrap_or_else(|_| panic!("Set {variable} for this test"))
+            };
+            let data = tempfile::tempdir().unwrap();
+            let password = "connection:server";
+            let supervisor = supervisor(
+                &data,
+                Connection {
+                    kind,
+                    path: None,
+                    host: Some(env("HOST")),
+                    port: Some(env("PORT").parse().unwrap()),
+                    database: Some(env("DATABASE")),
+                    user: Some(env("USER")),
+                    secret: Some(password.into()),
+                    trust_server_certificate: std::env::var(format!(
+                        "CODINGPAD_TEST_{prefix}_TRUST"
+                    ))
+                    .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+                    ..sqlite()
+                },
+                TestVault(BTreeMap::from([(password.into(), env("PASSWORD"))])),
+            );
+            let table = if kind == DatabaseKind::Postgres {
+                "items"
+            } else {
+                "#items"
+            };
+            let source = format!(
+                r#"// codingpad: connection=test
+                use codingpad::{{db, dump, secret, DbValue}};
+                let hook = std::panic::take_hook();
+                std::panic::set_hook(Box::new(|_| {{}}));
+                let reserved = std::panic::catch_unwind(|| secret("{password}"));
+                std::panic::set_hook(hook);
+                assert!(reserved.is_err());
+                db.query("{setup}").unwrap();
+                db.query("INSERT INTO {table} VALUES (42)").unwrap();
+                let rows = db.query("SELECT id FROM {table}").unwrap();
+                assert_eq!(rows.rows()[0][0], DbValue::Integer(42));
+                dump(rows);
+            "#
+            );
+            let (result, events) = timeout(Duration::from_secs(60), run(&supervisor, &source))
+                .await
+                .unwrap();
+            assert!(result.ok, "{prefix}: {events:?}");
+            let nodes = dumps(&events);
+            assert_eq!(nodes[0]["kind"], "table");
+            assert_eq!(nodes[0]["columns"][0]["name"], "id");
+            assert_eq!(nodes[0]["rows"][0][0]["v"], 42);
+        }
+    }
+}

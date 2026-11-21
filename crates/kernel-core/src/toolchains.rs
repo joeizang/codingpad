@@ -19,7 +19,7 @@ pub const UV_VERSION: &str = "0.13.6";
 pub const BUN_VERSION: &str = "1.4.4";
 
 // SHA-256 digests from https://github.com/oven-sh/bun/releases/tag/bun-v1.4.4
-// Update BUN_VERSION, all asset digests, the CI Bun pin and README together.
+// Update BUN_VERSION, all asset digests, the CI Bun pin and TECHNICAL_REFERENCE.md together.
 // macOS assets mirror the uv manifest so a future macOS build (D62) has them;
 // only the current platform's asset is downloaded.
 const BUN_RELEASES: &[(&str, &str)] = &[
@@ -75,7 +75,7 @@ const BUN_RELEASES: &[(&str, &str)] = &[
 
 // Pinned official .NET install script from dotnet/install-scripts tag
 // v2026.07.21. The tag is immutable, so the URLs and digests never change under
-// us. Update the tag, both digests, and README together.
+// us. Update the tag, both digests, and TECHNICAL_REFERENCE.md together.
 #[cfg(test)]
 const DOTNET_SCRIPTS_COMMIT: &str = "da3ce11ba63f3dbb0fb835d41bda2665d5c48e84";
 const DOTNET_INSTALL_SH: (&str, &str) = (
@@ -93,7 +93,7 @@ const DOTNET_SCRIPT_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const DOTNET_INSTALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 // SHA-256 digests from https://github.com/astral-sh/uv/releases/tag/0.13.6
-// Update UV_VERSION, all asset digests, and README together.
+// Update UV_VERSION, all asset digests, and TECHNICAL_REFERENCE.md together.
 const RELEASES: &[(&str, &str)] = &[
     (
         "uv-aarch64-apple-darwin.tar.gz",

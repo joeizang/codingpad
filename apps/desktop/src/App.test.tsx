@@ -81,7 +81,7 @@ beforeEach(() => {
 });
 
 /** Opens the new-script panel and creates a script in `language`. */
-function createScript(language: "Python" | "C#" | "TypeScript" | "SQL" = "Python") {
+function createScript(language: "Python" | "C#" | "TypeScript" | "Rust" | "SQL" = "Python") {
   fireEvent.click(screen.getByRole("button", { name: "New script" }));
   fireEvent.click(screen.getByRole("radio", { name: language }));
   fireEvent.click(screen.getByRole("button", { name: /^Create / }));

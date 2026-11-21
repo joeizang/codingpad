@@ -571,7 +571,10 @@ lockfile. A successful Rust run in a host with an application data directory
 schedules idle precompilation for anyhow, regex, serde, and serde_json. The
 job compiles crates already available in Cargo's local package cache without
 network access. A foreground build or Clear cancels the job. **Build cache…** in the Rust context actions shows
-and clears Cargo's compiled artifacts. Other hosts share a temporary target
+and clears the compiled artifacts in the shared target directory. Cargo's
+registry package downloads are managed separately by Cargo. A Clear request
+while the cache stays in use returns a message to finish or stop the active
+Rust scripts. Other hosts share a temporary target
 directory across their scripts. Reset and forced Stop can clear the script
 values stored by `cache()`. Saved scripts run with their directory as the
 working directory, and the script on disk is untouched.

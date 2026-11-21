@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc,
     },
     time::Duration,
@@ -21,12 +21,15 @@ use tokio::{
 };
 
 const TARGET_DIR: &str = "rust-build";
+const CLEAR_WAIT: Duration = Duration::from_secs(1);
 const POPULAR_CRATES: &[(&str, &str)] = &[
     ("serde", "1"),
     ("serde_json", "1"),
     ("regex", "1"),
     ("anyhow", "1"),
 ];
+
+const POPULAR_CRATES_MASK: u8 = (1 << POPULAR_CRATES.len()) - 1;
 
 #[derive(Clone, Copy)]
 enum Access {
@@ -38,7 +41,8 @@ pub(crate) struct BuildCache {
     data: Option<PathBuf>,
     temporary: OnceCell<TempDir>,
     activity: watch::Sender<()>,
-    warmup_scheduled_or_complete: AtomicBool,
+    warmup_scheduled: AtomicBool,
+    warmed_crates: AtomicU8,
 }
 
 impl BuildCache {
@@ -47,7 +51,8 @@ impl BuildCache {
             data: data.map(Path::to_owned),
             temporary: OnceCell::new(),
             activity: watch::channel(()).0,
-            warmup_scheduled_or_complete: AtomicBool::new(false),
+            warmup_scheduled: AtomicBool::new(false),
+            warmed_crates: AtomicU8::new(0),
         }
     }
 
@@ -68,20 +73,11 @@ impl BuildCache {
 
     async fn lock(&self, access: Access) -> Result<BuildLease, String> {
         self.activity.send_replace(());
-        let root = self.data_root().await?;
-        let lock = open_lock(root).map_err(cache_error)?;
-        loop {
-            match try_acquire(&lock, access) {
-                Ok(true) => {
-                    return Ok(BuildLease {
-                        target: root.join(TARGET_DIR),
-                        _lock: lock,
-                    })
-                }
-                Ok(false) => tokio::time::sleep(Duration::from_millis(25)).await,
-                Err(error) => return Err(cache_error(error)),
-            }
+        let lease = BuildLease::open(self.data_root().await?).map_err(cache_error)?;
+        while !lease.try_acquire(access).map_err(cache_error)? {
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        Ok(lease)
     }
 
     pub(crate) async fn size(&self) -> Result<u64, String> {
@@ -92,61 +88,58 @@ impl BuildCache {
     }
 
     pub(crate) async fn clear(&self) -> Result<(), String> {
-        let lease = self.lock(Access::Exclusive).await?;
+        let lease = tokio::time::timeout(CLEAR_WAIT, self.lock(Access::Exclusive))
+            .await
+            .map_err(|_| {
+                "The Rust build cache is in use. Finish or stop active Rust scripts and try again."
+                    .to_owned()
+            })??;
+        // Reset progress under the lease so an older warmup cannot write it back.
+        self.warmed_crates.store(0, Ordering::Release);
         tokio::task::spawn_blocking(move || match fs::remove_dir_all(lease.target()) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(cache_error(error)),
         })
         .await
-        .map_err(cache_error)??;
-        self.warmup_scheduled_or_complete
-            .store(false, Ordering::Release);
-        Ok(())
+        .map_err(cache_error)?
     }
 
     pub(super) fn schedule_warmup(self: &Arc<Self>) {
         if self.data.is_none()
-            || self
-                .warmup_scheduled_or_complete
-                .swap(true, Ordering::AcqRel)
+            || self.warmed_crates.load(Ordering::Acquire) == POPULAR_CRATES_MASK
+            || self.warmup_scheduled.swap(true, Ordering::AcqRel)
         {
             return;
         }
         let cache = self.clone();
         let mut activity = cache.activity.subscribe();
         tokio::spawn(async move {
-            let completed = tokio::select! {
+            tokio::select! {
                 biased;
-                _ = activity.changed() => false,
-                result = async {
+                _ = activity.changed() => {}
+                _ = async {
                     tokio::time::sleep(Duration::from_secs(5)).await;
-                    cache.precompile().await
-                } => result.unwrap_or(false),
-            };
-            if !completed {
-                cache
-                    .warmup_scheduled_or_complete
-                    .store(false, Ordering::Release);
+                    let _ = cache.precompile().await;
+                } => {}
             }
+            cache.warmup_scheduled.store(false, Ordering::Release);
         });
     }
 
-    async fn precompile(&self) -> Result<bool, String> {
-        let root = self.data_root().await?;
-        let lock = open_lock(root).map_err(cache_error)?;
-        if !try_acquire(&lock, Access::Exclusive).map_err(cache_error)? {
-            return Ok(false);
+    async fn precompile(&self) -> Result<(), String> {
+        let lease = BuildLease::open(self.data_root().await?).map_err(cache_error)?;
+        if !lease.try_acquire(Access::Exclusive).map_err(cache_error)? {
+            return Ok(());
         }
-        let lease = BuildLease {
-            target: root.join(TARGET_DIR),
-            _lock: lock,
-        };
         let runtime = self.stage_runtime().await?;
         let project = ShadowProject::temporary(super::source::FILE)?;
-        let result = tokio::time::timeout(Duration::from_secs(120), async {
-            let mut all_compiled = true;
-            for (name, version) in POPULAR_CRATES {
+        tokio::time::timeout(Duration::from_secs(120), async {
+            for (index, (name, version)) in POPULAR_CRATES.iter().enumerate() {
+                let crate_bit = 1 << index;
+                if self.warmed_crates.load(Ordering::Acquire) & crate_bit != 0 {
+                    continue;
+                }
                 let source = format!("---cargo\n[dependencies]\n{name} = {version:?}\n---\n");
                 let manifest = Manifest::parse(&source, None).map_err(|error| error.to_string())?;
                 stage(
@@ -157,24 +150,22 @@ impl BuildCache {
                     "codingpad-warmup",
                 )?;
                 let mut command = Command::new(cargo());
-                command
-                    .current_dir(project.root())
-                    .args([
-                        "build",
-                        "--offline",
-                        "--quiet",
-                        "--jobs",
-                        "1",
-                        "--target-dir",
-                    ])
-                    .arg(lease.target())
-                    .env("CARGO_BUILD_BUILD_DIR", lease.target());
-                all_compiled &= run_in_background(command).await?;
+                command.current_dir(project.root()).args([
+                    "build",
+                    "--offline",
+                    "--quiet",
+                    "--jobs",
+                    "1",
+                ]);
+                use_shared_target(&mut command, lease.target());
+                if run_in_background(command).await? {
+                    self.warmed_crates.fetch_or(crate_bit, Ordering::AcqRel);
+                }
             }
-            Ok(all_compiled)
+            Ok(())
         })
-        .await;
-        result.unwrap_or(Ok(false))
+        .await
+        .map_err(|_| "Rust build cache warmup timed out".to_owned())?
     }
 
     pub(super) async fn stage_runtime(&self) -> Result<PathBuf, String> {
@@ -210,24 +201,40 @@ async fn run_in_background(mut command: Command) -> Result<bool, String> {
 
 pub(super) struct BuildLease {
     target: PathBuf,
-    _lock: File,
+    file: File,
 }
 
 impl BuildLease {
+    fn open(root: &Path) -> io::Result<Self> {
+        Ok(Self {
+            target: root.join(TARGET_DIR),
+            file: open_lock(root)?,
+        })
+    }
+
+    fn try_acquire(&self, access: Access) -> io::Result<bool> {
+        match match access {
+            Access::Shared => self.file.try_lock_shared(),
+            Access::Exclusive => self.file.try_lock(),
+        } {
+            Ok(()) => Ok(true),
+            Err(TryLockError::WouldBlock) => Ok(false),
+            Err(TryLockError::Error(error)) => Err(error),
+        }
+    }
+
     pub(super) fn target(&self) -> &Path {
         &self.target
     }
 }
 
-fn try_acquire(lock: &File, access: Access) -> io::Result<bool> {
-    match match access {
-        Access::Shared => lock.try_lock_shared(),
-        Access::Exclusive => lock.try_lock(),
-    } {
-        Ok(()) => Ok(true),
-        Err(TryLockError::WouldBlock) => Ok(false),
-        Err(TryLockError::Error(error)) => Err(error),
-    }
+pub(super) fn use_shared_target(command: &mut Command, target: &Path) {
+    // Cargo can place intermediate and final artifacts in different directories.
+    // Keep both in the cache even when the user's config sets a build directory.
+    command
+        .arg("--target-dir")
+        .arg(target)
+        .env("CARGO_BUILD_BUILD_DIR", target);
 }
 
 pub(super) fn stage(
@@ -293,4 +300,29 @@ fn size(path: &Path) -> io::Result<u64> {
 
 fn cache_error(error: impl std::fmt::Display) -> String {
     format!("Rust build cache: {error}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn clear_reports_a_busy_cache_and_can_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = BuildCache::new(Some(directory.path()));
+        let lease = cache.acquire().await.unwrap();
+        fs::create_dir(lease.target()).unwrap();
+        fs::write(lease.target().join("artifact"), b"compiled").unwrap();
+
+        let failure = cache.clear().await.unwrap_err();
+        assert!(
+            failure.contains("The Rust build cache is in use"),
+            "{failure}"
+        );
+        assert_eq!(cache.size().await.unwrap(), 8);
+        drop(lease);
+
+        cache.clear().await.unwrap();
+        assert_eq!(cache.size().await.unwrap(), 0);
+    }
 }

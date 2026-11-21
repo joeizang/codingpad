@@ -938,6 +938,9 @@ The TypeScript completion metric needs the TypeScript 7 native server and Bun;
 install `@typescript/native-preview` or set `CODINGPAD_TS_LSP`. It is skipped
 when the server is not found.
 C# runs use no NuGet packages, so the measurements exclude package downloads.
+Rust reruns use the shared target directory. Idle precompilation runs after a
+successful Rust run on hosts with an application data directory. Temporary
+hosts share their own target directory for runs and skip background warmup.
 App readiness requires a mounted, writable Monaco model and registered editor
 commands/providers after a paint. Process entry, Tauri setup, WebView loading,
 frontend evaluation and editor creation/mount timestamps are printed separately.

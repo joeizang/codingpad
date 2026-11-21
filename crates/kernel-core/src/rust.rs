@@ -98,6 +98,15 @@ fn cargo() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
+// A 96-bit project fingerprint separates scripts while keeping Windows paths short.
+const SCRIPT_BINARY_HASH_LENGTH: usize = 24;
+
+struct StagedExecutable {
+    path: PathBuf,
+    #[cfg(windows)]
+    _lease: build_cache::BuildLease,
+}
+
 pub(super) struct RunPaths<'a> {
     pub(super) project: &'a ShadowProject,
     pub(super) script: Option<&'a Path>,
@@ -154,8 +163,8 @@ pub(super) async fn run(
     let cargo = cargo();
     let root = project.root();
     // Separate binaries for scripts sharing a target directory.
-    let project_hash = Sha256::digest(root.as_os_str().as_encoded_bytes());
-    let binary = format!("codingpad-{}", &format!("{project_hash:x}")[..24]);
+    let project_hash = format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()));
+    let binary = format!("codingpad-{}", &project_hash[..SCRIPT_BINARY_HASH_LENGTH]);
     let prepare = async {
         let lease = builds.acquire().await?;
         build_cache::stage(
@@ -178,12 +187,15 @@ pub(super) async fn run(
         {
             // Run from Cargo's output path so Windows can use its original
             // debug-symbol layout. The lease protects the executable until exit.
-            Ok::<_, String>(Some((executable, lease)))
+            Ok::<_, String>(Some(StagedExecutable {
+                path: executable,
+                _lease: lease,
+            }))
         }
         #[cfg(not(windows))]
         {
             let copy = stage_executable(&executable, run_files.path())?;
-            Ok::<_, String>(Some((copy, ())))
+            Ok::<_, String>(Some(StagedExecutable { path: copy }))
         }
     };
     let build = tokio::select! {
@@ -194,9 +206,9 @@ pub(super) async fn run(
         },
         build = prepare => build?,
     };
-    let ok = if let Some((executable, _lease)) = build {
+    let ok = if let Some(executable) = build {
         let exit = execute(
-            &executable,
+            &executable.path,
             script,
             run_files.path(),
             &cancel,
@@ -380,15 +392,8 @@ async fn build_cargo(cargo: &Path, root: &Path, target: &Path) -> Result<CargoOu
     let mut command = Command::new(cargo);
     command
         .current_dir(root)
-        .args([
-            "build",
-            "--offline",
-            "--message-format=json",
-            "--quiet",
-            "--target-dir",
-        ])
-        .arg(target)
-        .env("CARGO_BUILD_BUILD_DIR", target);
+        .args(["build", "--offline", "--message-format=json", "--quiet"]);
+    build_cache::use_shared_target(&mut command, target);
     cargo_output(command).await
 }
 

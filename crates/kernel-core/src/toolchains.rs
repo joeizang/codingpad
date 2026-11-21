@@ -1,4 +1,7 @@
 //! Toolchain release manifests and app-private installation lifecycle.
+mod rust;
+pub(crate) use rust::{RustToolchain, MISSING as MISSING_RUST};
+
 use crate::{
     find_uv,
     installer::{self, Archive, Artifact},
@@ -700,10 +703,10 @@ impl Drop for ProcessGroup {
     }
 }
 
-async fn promote_dotnet(stage: PathBuf, destination: &Path) -> Result<(), String> {
+async fn promote_directory(stage: &Path, destination: &Path, name: &str) -> Result<(), String> {
     let mut last = None;
     for attempt in 0..6 {
-        match std::fs::rename(&stage, destination) {
+        match std::fs::rename(stage, destination) {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last = Some(error);
@@ -715,7 +718,7 @@ async fn promote_dotnet(stage: PathBuf, destination: &Path) -> Result<(), String
         }
     }
     Err(format!(
-        "Could not finish the .NET installation: {}",
+        "Could not finish the {name} installation: {}",
         last.unwrap()
     ))
 }
@@ -770,7 +773,7 @@ async fn install_private_dotnet(
         .ok_or("The .NET SDK was installed but could not be started. Retry installation.")?;
     // Promote only a verified, complete SDK so an interrupted copy is never
     // mistaken for an installed one on the next attempt.
-    promote_dotnet(stage.keep(), &destination).await?;
+    promote_directory(stage.path(), &destination, ".NET").await?;
     progress(&format!(".NET SDK {version} installed. Starting script…"));
     Ok(executable)
 }
@@ -1104,7 +1107,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1000)).await;
             drop(lock);
         });
-        promote_dotnet(stage, &destination).await.unwrap();
+        promote_directory(&stage, &destination, ".NET")
+            .await
+            .unwrap();
         release.await.unwrap();
         assert_eq!(
             std::fs::read(destination.join("dotnet.exe")).unwrap(),

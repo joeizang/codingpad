@@ -1,29 +1,25 @@
-use super::{build_cache, cargo, manifest, rust_tool, BuildCache, Manifest, Source, SCRIPT_FILE};
-use crate::shadow::ShadowProject;
-use std::{path::PathBuf, sync::Arc};
+use super::{build_cache, manifest, BuildCache, Manifest, Source, SCRIPT_FILE};
+use crate::{shadow::ShadowProject, toolchains::RustToolchain};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::process::Command;
 
 pub(crate) const MISSING_ANALYZER: &str =
     "rust-analyzer was not found. Install it with `rustup component add rust-analyzer rust-src` or set CODINGPAD_RUST_LSP.";
 
-pub(crate) fn analyzer_command() -> Result<Command, String> {
+pub(crate) async fn analyzer_command(data: Option<&Path>) -> Result<Command, String> {
+    let toolchain = RustToolchain::resolve(data).await.unwrap_or_default();
     let executable = std::env::var_os("CODINGPAD_RUST_LSP")
         .map(PathBuf::from)
-        .unwrap_or_else(|| rust_tool("rust-analyzer"));
+        .unwrap_or_else(|| toolchain.executable("rust-analyzer"));
     let executable = std::path::absolute(executable).map_err(|error| error.to_string())?;
     if !executable.is_file() {
         return Err(MISSING_ANALYZER.into());
     }
     let mut command = Command::new(executable);
-    let cargo = cargo();
-    if let Some(bin) = cargo.parent().filter(|path| path.is_absolute()) {
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let path = std::env::join_paths(
-            std::iter::once(bin.to_owned()).chain(std::env::split_paths(&path)),
-        )
-        .map_err(|error| format!("Could not add Cargo to the rust-analyzer PATH: {error}"))?;
-        command.env("PATH", path);
-    }
+    toolchain.configure(&mut command);
     Ok(command)
 }
 

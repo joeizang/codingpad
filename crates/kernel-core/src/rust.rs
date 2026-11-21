@@ -14,7 +14,11 @@ pub(crate) use manifest::{frontmatter, Manifest};
 pub(crate) use source::Source;
 pub(crate) use source::FILE as SCRIPT_FILE;
 
-use crate::{shadow::ShadowProject, KernelEvent, RunResult};
+use crate::{
+    shadow::ShadowProject,
+    toolchains::{RustToolchain, MISSING_RUST},
+    KernelEvent, RunResult,
+};
 use debug::{Snapshot, ValueNode};
 use panic::Panic;
 use serde::Deserialize;
@@ -45,9 +49,6 @@ pub(super) const CACHE_RUNTIME: &str =
     include_str!("../../../runtimes/rust/codingpad/src/cache.rs");
 pub(super) const RICH_RUNTIME: &str = include_str!("../../../runtimes/rust/codingpad/src/rich.rs");
 const STOP_GRACE: Duration = Duration::from_secs(2);
-const MISSING: &str =
-    "Rust was not found. Install the stable Rust toolchain (Cargo and rustc) from https://rustup.rs/ and run the script again.";
-
 pub(super) fn stopped() -> RunResult {
     RunResult {
         ok: false,
@@ -86,26 +87,6 @@ pub(super) async fn remove_retired_cache(retired: Option<tempfile::TempDir>) -> 
             .map_err(|error| format!("Could not clear the Rust script cache: {error}"))?;
     }
     Ok(())
-}
-
-fn cargo() -> PathBuf {
-    rust_tool("cargo")
-}
-
-fn rust_tool(name: &str) -> PathBuf {
-    let name = if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_owned()
-    };
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path)
-        .chain(std::env::var_os("CARGO_HOME").map(|path| PathBuf::from(path).join("bin")))
-        .chain(dirs::home_dir().map(|home| home.join(".cargo/bin")))
-        .map(|dir| dir.join(&name))
-        .find(|path| path.is_file())
-        .and_then(|path| std::path::absolute(path).ok())
-        .unwrap_or_else(|| PathBuf::from(name))
 }
 
 // A 96-bit project fingerprint separates scripts while keeping Windows paths short.
@@ -170,12 +151,14 @@ pub(super) async fn run(
     let run_files = tempfile::tempdir_in(project.root())
         .map_err(|error| format!("Could not prepare the Rust run: {error}"))?;
     let cancel = run_files.path().join("cancel");
-    let cargo = cargo();
     let root = project.root();
     // Separate binaries for scripts sharing a target directory.
     let project_hash = format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()));
     let binary = format!("codingpad-{}", &project_hash[..SCRIPT_BINARY_HASH_LENGTH]);
     let prepare = async {
+        let cargo = RustToolchain::resolve(builds.data_dir())
+            .await
+            .ok_or(MISSING_RUST)?;
         let lease = builds.acquire().await?;
         build_cache::stage(
             project,
@@ -288,7 +271,7 @@ fn stage_executable(executable: &Path, destination: &Path) -> Result<PathBuf, St
 }
 
 async fn compile(
-    cargo: &Path,
+    cargo: &RustToolchain,
     root: &Path,
     target: &Path,
     source: &Source,
@@ -379,7 +362,7 @@ async fn compile(
         if stderr.contains("no default is configured")
             || stderr.contains("could not execute process `rustc")
         {
-            return Err(format!("{MISSING}\n{}", stderr.trim()));
+            return Err(format!("{MISSING_RUST}\n{}", stderr.trim()));
         }
         if !stderr.is_empty() {
             events.stream("stderr", &stderr);
@@ -398,8 +381,12 @@ async fn compile(
     }
 }
 
-async fn build_cargo(cargo: &Path, root: &Path, target: &Path) -> Result<CargoOutput, String> {
-    let mut command = Command::new(cargo);
+async fn build_cargo(
+    cargo: &RustToolchain,
+    root: &Path,
+    target: &Path,
+) -> Result<CargoOutput, String> {
+    let mut command = cargo.command("cargo");
     command
         .current_dir(root)
         .args(["build", "--offline", "--message-format=json", "--quiet"]);
@@ -408,13 +395,13 @@ async fn build_cargo(cargo: &Path, root: &Path, target: &Path) -> Result<CargoOu
 }
 
 async fn prepare_dependencies(
-    cargo: &Path,
+    cargo: &RustToolchain,
     root: &Path,
     manifest: &Manifest,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
 ) -> Result<bool, String> {
     let fetch = |offline| {
-        let mut command = Command::new(cargo);
+        let mut command = cargo.command("cargo");
         command.current_dir(root).args(["fetch", "--quiet"]);
         if offline {
             command.arg("--offline");
@@ -461,7 +448,7 @@ async fn cargo_output(mut command: Command) -> Result<CargoOutput, String> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = spawn(&mut command).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
-            MISSING.to_owned()
+            MISSING_RUST.to_owned()
         } else {
             format!("Could not start Cargo: {error}")
         }

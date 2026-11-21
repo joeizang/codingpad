@@ -1,7 +1,8 @@
-use super::{
-    cargo, manifest::Manifest, spawn, CACHE_RUNTIME, RICH_RUNTIME, RUNTIME, RUNTIME_MANIFEST,
+use super::{manifest::Manifest, spawn, CACHE_RUNTIME, RICH_RUNTIME, RUNTIME, RUNTIME_MANIFEST};
+use crate::{
+    shadow::ShadowProject,
+    toolchains::{RustToolchain, MISSING_RUST},
 };
-use crate::shadow::ShadowProject;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
@@ -53,6 +54,10 @@ impl BuildCache {
             warmup_scheduled: AtomicBool::new(false),
             precompiled_crates: Mutex::default(),
         }
+    }
+
+    pub(super) fn data_dir(&self) -> Option<&Path> {
+        self.data.as_deref()
     }
 
     async fn data_root(&self) -> Result<&Path, String> {
@@ -136,6 +141,9 @@ impl BuildCache {
     }
 
     async fn precompile(&self) -> Result<(), String> {
+        let cargo = RustToolchain::resolve(self.data_dir())
+            .await
+            .ok_or(MISSING_RUST)?;
         let lease = BuildLease::open(self.data_root().await?).map_err(cache_error)?;
         if !lease.try_acquire(Access::Exclusive).map_err(cache_error)? {
             return Ok(());
@@ -161,7 +169,7 @@ impl BuildCache {
                     &runtime,
                     "codingpad-warmup",
                 )?;
-                let mut command = Command::new(cargo());
+                let mut command = cargo.command("cargo");
                 command.current_dir(project.root()).args([
                     "build",
                     "--offline",

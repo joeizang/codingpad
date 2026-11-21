@@ -1119,6 +1119,19 @@ mod database {
                     assert_eq!(row[11], DbValue::Integer(9007199254740993));
                     assert_eq!(row[12], DbValue::Text("D'Angelo".into()));
                     assert_eq!(row[13], DbValue::Bool(true));
+                    let explain = db.query("EXPLAIN SELECT 'example'::text", &[]).unwrap();
+                    assert_eq!(explain.columns(), &["QUERY PLAN"]);
+                    let bound_explain = db.query(
+                        "-- a utility statement
+                         EXPLAIN SELECT $1::text",
+                        &[DbParameter::Text("example")],
+                    ).unwrap();
+                    assert_eq!(bound_explain.columns(), explain.columns());
+                    assert_eq!(bound_explain.rows(), explain.rows());
+                    db.execute("CREATE TEMP TABLE cpad_fixture (id INT)", &[]).unwrap();
+                    db.execute("CREATE PROCEDURE pg_temp.cpad_double(IN number integer, OUT doubled integer) LANGUAGE SQL AS $$ SELECT number * 2 $$", &[]).unwrap();
+                    let called = db.query("CALL pg_temp.cpad_double($1, NULL)", &[DbParameter::Integer(21)]).unwrap();
+                    assert_eq!(called.rows()[0][0], DbValue::Integer(42));
                     dump(rows);
                 "#).await;
                 assert!(result.ok, "{events:?}");

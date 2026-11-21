@@ -311,8 +311,8 @@ async fn postgres(
             .map(ScriptResult::Affected)
             .map_err(|error| pg_error("PostgreSQL could not run the statement", error));
     }
-    let statement = client.prepare(sql).await;
     if parameters.is_empty() {
+        let statement = client.prepare(sql).await;
         let columns = statement
             .as_ref()
             .map_or(&[][..], tokio_postgres::Statement::columns);
@@ -320,8 +320,15 @@ async fn postgres(
             .await
             .map(last_table);
     }
-    let statement =
-        statement.map_err(|error| pg_error("PostgreSQL could not prepare the statement", error))?;
+    static NEXT_STATEMENT: AtomicU64 = AtomicU64::new(1);
+    // Match the protocol-prepared plan in pg_prepared_statements without
+    // relying on private driver state or on the session's other plans.
+    let id = NEXT_STATEMENT.fetch_add(1, Ordering::Relaxed);
+    let source = format!("/* codingpad Rust query {id} */\n{sql}");
+    let statement = client
+        .prepare(&source)
+        .await
+        .map_err(|error| pg_error("PostgreSQL could not prepare the statement", error))?;
     if parameters.len() != statement.params().len() {
         return Err(format!(
             "PostgreSQL expected {} parameters, received {}.",
@@ -329,58 +336,36 @@ async fn postgres(
             parameters.len()
         ));
     }
-    if statement.columns().is_empty() {
-        let params: Vec<&(dyn ToSql + Sync)> =
-            parameters.iter().map(|parameter| parameter as _).collect();
-        let count = client
-            .execute(&statement, &params)
-            .await
-            .map_err(|error| pg_error("PostgreSQL could not run the statement", error))?;
-        return Ok(ScriptResult::Rows(affected_rows_table(count)));
-    }
-    postgres_bound_text(client, sql, parameters, statement.columns())
+    postgres_bound_text(client, &source, parameters, statement.columns())
         .await
         .map(last_table)
 }
 
 async fn postgres_bound_text(
     client: &tokio_postgres::Client,
-    sql: &str,
+    prepared_source: &str,
     parameters: &[Parameter],
     columns: &[tokio_postgres::Column],
 ) -> Result<Vec<TableData>, String> {
-    static NEXT_STATEMENT: AtomicU64 = AtomicU64::new(1);
-    let name = format!(
-        "codingpad_rust_{}",
-        NEXT_STATEMENT.fetch_add(1, Ordering::Relaxed)
-    );
     let values: Vec<_> = parameters.iter().map(Parameter::postgres_text).collect();
-    let quoted = client
-        .query(
-            "SELECT pg_catalog.quote_nullable(value) FROM pg_catalog.unnest($1::text[]) \
-         WITH ORDINALITY AS args(value, position) ORDER BY position",
-            &[&values],
-        )
-        .await
-        .map_err(|error| pg_error("PostgreSQL could not bind the values", error))?;
-    let arguments = quoted
-        .iter()
-        .map(|row| row.get::<_, &str>(0))
-        .collect::<Vec<_>>();
-    // tokio-postgres's extended protocol always requests binary result
-    // columns. Use a server-prepared statement and SQL EXECUTE to request the
-    // server's text output. Only server-quoted values enter the argument list.
-    // The extended protocol rejects more than one statement in PREPARE.
-    client
-        .execute(&format!("PREPARE {name} AS {sql}"), &[])
-        .await
-        .map_err(|error| pg_error("PostgreSQL could not prepare the text query", error))?;
-    let command = format!("EXECUTE {name}({})", arguments.join(", "));
-    let result = postgres_simple_tables(client, &command, columns).await;
-    // A failed statement can put an explicit transaction in the failed
-    // state. The plan is also released when this run's connection closes.
-    let _ = client.batch_execute(&format!("DEALLOCATE {name}")).await;
-    result
+    // The extended protocol prepares utility statements too, but the driver
+    // always asks it for binary rows. Use SQL EXECUTE on that same plan for
+    // text rows. The extra trip lets the server quote the bound arguments and
+    // plan name using the session's own SQL settings.
+    let quoted = client.query_one(
+        "SELECT pg_catalog.quote_ident(plan.name),
+                (SELECT pg_catalog.string_agg(pg_catalog.quote_nullable(value), ', ' ORDER BY position)
+                 FROM pg_catalog.unnest($2::text[]) WITH ORDINALITY AS args(value, position))
+         FROM pg_catalog.pg_prepared_statements AS plan
+         WHERE NOT plan.from_sql AND plan.statement = $1",
+        &[&prepared_source, &values],
+    ).await.map_err(|error| pg_error("PostgreSQL could not bind the values", error))?;
+    let name = quoted.get::<_, &str>(0);
+    let arguments = quoted.get::<_, &str>(1);
+    let command = format!("EXECUTE {name}({arguments})");
+    // The driver releases the protocol-prepared statement when its handle
+    // goes out of scope, even if the query fails inside a transaction.
+    postgres_simple_tables(client, &command, columns).await
 }
 
 async fn sqlserver(

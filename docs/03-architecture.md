@@ -50,7 +50,7 @@ run into the window over a per-user Unix socket on Linux or a named pipe on Wind
 |---|---|---|---|---|
 | Python | Warm process per script; `exec` of the compiled AST; last expression auto-dumped | PEP 723 via `uv`, cached venv per dependency set | basedpyright (→ ty) | SQLAlchemy 2.0 (MVP) |
 | C# | Roslyn in-memory compile into a collectible `AssemblyLoadContext` ([ADR 0006](adr/0006-csharp-in-memory-roslyn.md)) | `#:package`, restored by the kernel via NuGet client libraries | Roslyn LSP | EF Core (MVP) |
-| Rust | Shadow cargo project per script, shared `target/`, idle precompilation of selected common crates in hosts with an application data directory (D19) | cargo-script frontmatter | rust-analyzer on the shadow project | Post-1.0 (SQL Server gap noted) |
+| Rust | Shadow cargo project per script, shared `target/`, idle precompilation of selected common crates (D19) | cargo-script frontmatter | rust-analyzer on the shadow project | Post-1.0 (SQL Server gap noted) |
 | TypeScript | Bun ([ADR 0002](adr/0002-bun-for-typescript.md)) | Versioned imports (`zod@3`), mirrored into a shadow project | TypeScript 7 native LSP on the shadow project | Drizzle, post-1.0 ([ADR 0003](adr/0003-database-access-levels.md)) |
 | SQL | Run directly through the connection; no kernel (D35) | none | Schema-aware completion | n/a |
 

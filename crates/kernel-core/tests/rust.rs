@@ -796,7 +796,11 @@ async fn rust_build_cache_reuses_artifacts_and_clears_without_resetting_values()
 
     let start = std::time::Instant::now();
     let (result, events) = run(&supervisor, r#"codingpad::cache("answer", || 43)"#).await;
-    eprintln!("Edited Rust rerun took {:?}", start.elapsed());
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "Edited Rust rerun took {elapsed:?}"
+    );
     assert!(result.ok);
     assert_eq!(dumps(&events)[0]["v"], 42);
 

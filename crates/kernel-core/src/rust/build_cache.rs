@@ -4,13 +4,14 @@ use super::{
 use crate::shadow::ShadowProject;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fs::{self, File, TryLockError},
     io,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicBool, AtomicU8, Ordering},
-        Arc,
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -29,8 +30,6 @@ const POPULAR_CRATES: &[(&str, &str)] = &[
     ("anyhow", "1"),
 ];
 
-const POPULAR_CRATES_MASK: u8 = (1 << POPULAR_CRATES.len()) - 1;
-
 #[derive(Clone, Copy)]
 enum Access {
     Shared,
@@ -42,7 +41,7 @@ pub(crate) struct BuildCache {
     temporary: OnceCell<TempDir>,
     activity: watch::Sender<()>,
     warmup_scheduled: AtomicBool,
-    warmed_crates: AtomicU8,
+    precompiled_crates: Mutex<HashSet<&'static str>>,
 }
 
 impl BuildCache {
@@ -52,7 +51,7 @@ impl BuildCache {
             temporary: OnceCell::new(),
             activity: watch::channel(()).0,
             warmup_scheduled: AtomicBool::new(false),
-            warmed_crates: AtomicU8::new(0),
+            precompiled_crates: Mutex::default(),
         }
     }
 
@@ -95,7 +94,10 @@ impl BuildCache {
                     .to_owned()
             })??;
         // Reset progress under the lease so an older warmup cannot write it back.
-        self.warmed_crates.store(0, Ordering::Release);
+        self.precompiled_crates
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
         tokio::task::spawn_blocking(move || match fs::remove_dir_all(lease.target()) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -106,8 +108,12 @@ impl BuildCache {
     }
 
     pub(super) fn schedule_warmup(self: &Arc<Self>) {
-        if self.data.is_none()
-            || self.warmed_crates.load(Ordering::Acquire) == POPULAR_CRATES_MASK
+        if self
+            .precompiled_crates
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len()
+            == POPULAR_CRATES.len()
             || self.warmup_scheduled.swap(true, Ordering::AcqRel)
         {
             return;
@@ -120,7 +126,9 @@ impl BuildCache {
                 _ = activity.changed() => {}
                 _ = async {
                     tokio::time::sleep(Duration::from_secs(5)).await;
-                    let _ = cache.precompile().await;
+                    if let Err(error) = cache.precompile().await {
+                        eprintln!("Rust build cache precompilation: {error}");
+                    }
                 } => {}
             }
             cache.warmup_scheduled.store(false, Ordering::Release);
@@ -135,9 +143,13 @@ impl BuildCache {
         let runtime = self.stage_runtime().await?;
         let project = ShadowProject::temporary(super::source::FILE)?;
         tokio::time::timeout(Duration::from_secs(120), async {
-            for (index, (name, version)) in POPULAR_CRATES.iter().enumerate() {
-                let crate_bit = 1 << index;
-                if self.warmed_crates.load(Ordering::Acquire) & crate_bit != 0 {
+            for &(name, version) in POPULAR_CRATES {
+                if self
+                    .precompiled_crates
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .contains(name)
+                {
                     continue;
                 }
                 let source = format!("---cargo\n[dependencies]\n{name} = {version:?}\n---\n");
@@ -159,7 +171,10 @@ impl BuildCache {
                 ]);
                 use_shared_target(&mut command, lease.target());
                 if run_in_background(command).await? {
-                    self.warmed_crates.fetch_or(crate_bit, Ordering::AcqRel);
+                    self.precompiled_crates
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .insert(name);
                 }
             }
             Ok(())
@@ -312,14 +327,15 @@ mod tests {
         let cache = BuildCache::new(Some(directory.path()));
         let lease = cache.acquire().await.unwrap();
         fs::create_dir(lease.target()).unwrap();
-        fs::write(lease.target().join("artifact"), b"compiled").unwrap();
+        let artifact = b"compiled";
+        fs::write(lease.target().join("artifact"), artifact).unwrap();
 
         let failure = cache.clear().await.unwrap_err();
         assert!(
             failure.contains("The Rust build cache is in use"),
             "{failure}"
         );
-        assert_eq!(cache.size().await.unwrap(), 8);
+        assert_eq!(cache.size().await.unwrap(), artifact.len() as u64);
         drop(lease);
 
         cache.clear().await.unwrap();

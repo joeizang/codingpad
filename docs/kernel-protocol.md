@@ -567,8 +567,7 @@ the installed stable Rust toolchain (1.85 or later for edition 2024) and a
 bundled, dependency-free `codingpad` crate. Each run uses an offline debug
 build to retain source information. Cargo shares compiled dependencies across
 Rust scripts, and small edits reuse the open script's shadow project and
-lockfile. A successful Rust run in a host with an application data directory
-schedules idle precompilation for anyhow, regex, serde, and serde_json. The
+lockfile. A successful Rust run schedules idle precompilation for anyhow, regex, serde, and serde_json. The
 job compiles crates already available in Cargo's local package cache without
 network access. A foreground build or Clear cancels the job. **Build cache…** in the Rust context actions shows
 and clears the compiled artifacts in the shared target directory. Cargo's

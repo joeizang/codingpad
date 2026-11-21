@@ -135,7 +135,7 @@ const SCRIPT_STARTERS: Record<ScriptLanguage, string> = {
   sql: SQL_SAMPLE,
 };
 
-type Toolchain = "uv" | "dotnet" | "bun";
+type Toolchain = "uv" | "dotnet" | "bun" | "rust";
 
 const TOOLCHAIN_INSTALL: Record<
   Toolchain,
@@ -170,6 +170,14 @@ const TOOLCHAIN_INSTALL: Record<
     description:
       "Install Bun privately for CodingPad to run TypeScript scripts. This needs an internet connection.",
     notFoundPrefix: "Bun was not found.",
+  },
+  rust: {
+    command: "install_rust",
+    name: "Rust",
+    downloading: "Downloading and verifying rustup…",
+    description:
+      "Install Rust privately for CodingPad to run Rust scripts. This needs an internet connection.",
+    notFoundPrefix: "Rust was not found.",
   },
 };
 

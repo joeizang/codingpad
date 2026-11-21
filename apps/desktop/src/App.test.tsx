@@ -81,7 +81,7 @@ beforeEach(() => {
 });
 
 /** Opens the new-script panel and creates a script in `language`. */
-function createScript(language: "Python" | "C#" | "TypeScript" | "SQL" = "Python") {
+function createScript(language: "Python" | "C#" | "TypeScript" | "Rust" | "SQL" = "Python") {
   fireEvent.click(screen.getByRole("button", { name: "New script" }));
   fireEvent.click(screen.getByRole("radio", { name: language }));
   fireEvent.click(screen.getByRole("button", { name: /^Create / }));
@@ -1044,6 +1044,34 @@ test("missing Bun offers one-click installation and reruns the latest source", a
   expect(screen.getByLabelText("Code")).toHaveAttribute("data-toolchain-version", "1");
   expect(invoke).toHaveBeenLastCalledWith("run_script", expect.objectContaining({ source: 'console.log("hi");' }));
   expect(screen.queryByRole("button", { name: "Install Bun and run" })).not.toBeInTheDocument();
+});
+
+test("missing Rust offers one-click installation and reruns the latest source", async () => {
+  let installed = false;
+  let finish!: () => void;
+  invoke.mockImplementation(async (command, args) => {
+    if (command === "run_script") {
+      if (!installed) throw "Rust was not found. Choose Install Rust and run.";
+      return { ok: true };
+    }
+    if (command === "install_rust") {
+      args.onProgress.onmessage("Downloading and verifying Rust…");
+      await new Promise<void>((resolve) => { finish = resolve; });
+      installed = true;
+    }
+  });
+  render(<App />);
+  createScript("Rust");
+  fireEvent.click(screen.getByRole("button", { name: "▶ Run" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Install Rust and run" }));
+  expect(screen.getByRole("button", { name: "Installing Rust…" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "▶ Run" })).toBeDisabled();
+  fireEvent.change(screen.getByLabelText("Code"), { target: { value: 'println!("hi");' } });
+  await act(async () => finish());
+  await screen.findByText("Finished");
+  expect(screen.getByLabelText("Code")).toHaveAttribute("data-toolchain-version", "1");
+  expect(invoke).toHaveBeenLastCalledWith("run_script", expect.objectContaining({ source: 'println!("hi");' }));
+  expect(screen.queryByRole("button", { name: "Install Rust and run" })).not.toBeInTheDocument();
 });
 
 test("failed Bun installation can be retried without rerunning prematurely", async () => {

@@ -1,7 +1,8 @@
-use super::{
-    cargo, manifest::Manifest, spawn, CACHE_RUNTIME, RICH_RUNTIME, RUNTIME, RUNTIME_MANIFEST,
+use super::{manifest::Manifest, spawn, CACHE_RUNTIME, RICH_RUNTIME, RUNTIME, RUNTIME_MANIFEST};
+use crate::{
+    shadow::ShadowProject,
+    toolchains::{RustTool, RustToolchain, RustToolchainError},
 };
-use crate::shadow::ShadowProject;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
@@ -13,7 +14,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tempfile::TempDir;
 use tokio::{
@@ -22,6 +23,7 @@ use tokio::{
 };
 
 const TARGET_DIR: &str = "rust-build";
+const PRIVATE_TOOLCHAIN_RECHECK: Duration = Duration::from_secs(30);
 const CLEAR_WAIT: Duration = Duration::from_secs(1);
 const POPULAR_CRATES: &[(&str, &str)] = &[
     ("serde", "1"),
@@ -41,6 +43,7 @@ pub(crate) struct BuildCache {
     temporary: OnceCell<TempDir>,
     activity: watch::Sender<()>,
     warmup_scheduled: AtomicBool,
+    toolchain: tokio::sync::Mutex<Option<(RustToolchain, Instant)>>,
     precompiled_crates: Mutex<HashSet<&'static str>>,
 }
 
@@ -51,8 +54,29 @@ impl BuildCache {
             temporary: OnceCell::new(),
             activity: watch::channel(()).0,
             warmup_scheduled: AtomicBool::new(false),
+            toolchain: tokio::sync::Mutex::default(),
             precompiled_crates: Mutex::default(),
         }
+    }
+
+    pub(super) async fn toolchain(&self) -> Result<RustToolchain, RustToolchainError> {
+        let mut cached = self.toolchain.lock().await;
+        if let Some((toolchain, resolved)) = &*cached {
+            // Recheck a private selection periodically so new user installs
+            // can take precedence. Missing files always trigger a recheck.
+            if toolchain.still_present()
+                && (!toolchain.is_private() || resolved.elapsed() < PRIVATE_TOOLCHAIN_RECHECK)
+            {
+                return Ok(toolchain.clone());
+            }
+        }
+        let toolchain = RustToolchain::resolve(self.data.as_deref()).await?;
+        *cached = Some((toolchain.clone(), Instant::now()));
+        Ok(toolchain)
+    }
+
+    pub(super) async fn invalidate_toolchain(&self) {
+        self.toolchain.lock().await.take();
     }
 
     async fn data_root(&self) -> Result<&Path, String> {
@@ -136,6 +160,7 @@ impl BuildCache {
     }
 
     async fn precompile(&self) -> Result<(), String> {
+        let toolchain = self.toolchain().await?;
         let lease = BuildLease::open(self.data_root().await?).map_err(cache_error)?;
         if !lease.try_acquire(Access::Exclusive).map_err(cache_error)? {
             return Ok(());
@@ -161,7 +186,7 @@ impl BuildCache {
                     &runtime,
                     "codingpad-warmup",
                 )?;
-                let mut command = Command::new(cargo());
+                let mut command = toolchain.command(RustTool::Cargo);
                 command.current_dir(project.root()).args([
                     "build",
                     "--offline",

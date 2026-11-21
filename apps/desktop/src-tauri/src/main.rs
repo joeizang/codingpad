@@ -277,6 +277,19 @@ async fn install_bun(
 }
 
 #[tauri::command]
+async fn install_rust(
+    tools: State<'_, Toolchains>,
+    on_progress: Channel<String>,
+) -> Result<(), String> {
+    tools
+        .install_rust(|message| {
+            let _ = on_progress.send(message.to_owned());
+        })
+        .await?;
+    Ok(())
+}
+
+#[tauri::command]
 async fn run_script(
     supervisor: State<'_, Supervisor>,
     sql: State<'_, Arc<SqlManager>>,
@@ -655,6 +668,7 @@ fn main() {
             install_uv,
             install_dotnet,
             install_bun,
+            install_rust,
             run_script,
             stop_script,
             reset_script,

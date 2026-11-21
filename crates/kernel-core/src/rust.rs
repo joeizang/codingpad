@@ -9,12 +9,16 @@ mod source;
 
 pub(crate) use build_cache::BuildCache;
 pub(crate) use dumps::Dumps;
-pub(crate) use editor::{analyzer_command, RustShadowProject, MISSING_ANALYZER};
+pub(crate) use editor::{analyzer_command, RustShadowProject};
 pub(crate) use manifest::{frontmatter, Manifest};
 pub(crate) use source::Source;
 pub(crate) use source::FILE as SCRIPT_FILE;
 
-use crate::{shadow::ShadowProject, KernelEvent, RunResult};
+use crate::{
+    shadow::ShadowProject,
+    toolchains::{RustTool, RustToolchain, RustToolchainError},
+    KernelEvent, RunResult,
+};
 use debug::{Snapshot, ValueNode};
 use panic::Panic;
 use serde::Deserialize;
@@ -45,9 +49,6 @@ pub(super) const CACHE_RUNTIME: &str =
     include_str!("../../../runtimes/rust/codingpad/src/cache.rs");
 pub(super) const RICH_RUNTIME: &str = include_str!("../../../runtimes/rust/codingpad/src/rich.rs");
 const STOP_GRACE: Duration = Duration::from_secs(2);
-const MISSING: &str =
-    "Rust was not found. Install the stable Rust toolchain (Cargo and rustc) from https://rustup.rs/ and run the script again.";
-
 pub(super) fn stopped() -> RunResult {
     RunResult {
         ok: false,
@@ -86,26 +87,6 @@ pub(super) async fn remove_retired_cache(retired: Option<tempfile::TempDir>) -> 
             .map_err(|error| format!("Could not clear the Rust script cache: {error}"))?;
     }
     Ok(())
-}
-
-fn cargo() -> PathBuf {
-    rust_tool("cargo")
-}
-
-fn rust_tool(name: &str) -> PathBuf {
-    let name = if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_owned()
-    };
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path)
-        .chain(std::env::var_os("CARGO_HOME").map(|path| PathBuf::from(path).join("bin")))
-        .chain(dirs::home_dir().map(|home| home.join(".cargo/bin")))
-        .map(|dir| dir.join(&name))
-        .find(|path| path.is_file())
-        .and_then(|path| std::path::absolute(path).ok())
-        .unwrap_or_else(|| PathBuf::from(name))
 }
 
 // A 96-bit project fingerprint separates scripts while keeping Windows paths short.
@@ -170,12 +151,12 @@ pub(super) async fn run(
     let run_files = tempfile::tempdir_in(project.root())
         .map_err(|error| format!("Could not prepare the Rust run: {error}"))?;
     let cancel = run_files.path().join("cancel");
-    let cargo = cargo();
     let root = project.root();
     // Separate binaries for scripts sharing a target directory.
     let project_hash = format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()));
     let binary = format!("codingpad-{}", &project_hash[..SCRIPT_BINARY_HASH_LENGTH]);
     let prepare = async {
+        let toolchain = builds.toolchain().await?;
         let lease = builds.acquire().await?;
         build_cache::stage(
             project,
@@ -185,11 +166,12 @@ pub(super) async fn run(
             &binary,
         )?;
         if manifest.needs_packages
-            && !prepare_dependencies(&cargo, root, &manifest, &mut events).await?
+            && !prepare_dependencies(&toolchain, root, &manifest, &mut events).await?
         {
             return Ok(None);
         }
-        let executable = compile(&cargo, root, lease.target(), &source, name, &mut events).await?;
+        let executable =
+            compile(&toolchain, root, lease.target(), &source, name, &mut events).await?;
         let Some(executable) = executable else {
             return Ok(None);
         };
@@ -197,7 +179,7 @@ pub(super) async fn run(
         {
             // Run from Cargo's output path so Windows can use its original
             // debug-symbol layout. The lease protects the executable until exit.
-            Ok::<_, String>(Some(StagedExecutable {
+            Ok::<_, RustToolchainError>(Some(StagedExecutable {
                 path: executable,
                 _lease: lease,
             }))
@@ -205,7 +187,7 @@ pub(super) async fn run(
         #[cfg(not(windows))]
         {
             let copy = stage_executable(&executable, run_files.path())?;
-            Ok::<_, String>(Some(StagedExecutable { path: copy }))
+            Ok::<_, RustToolchainError>(Some(StagedExecutable { path: copy }))
         }
     };
     let build = tokio::select! {
@@ -214,8 +196,12 @@ pub(super) async fn run(
             events.send("run_finished", json!({"ok": false}));
             return Ok((stopped(), events.dumps));
         },
-        build = prepare => build?,
+        build = prepare => build,
     };
+    if matches!(build, Err(RustToolchainError::Missing(_))) {
+        builds.invalidate_toolchain().await;
+    }
+    let build = build?;
     let ok = if let Some(executable) = build {
         let exit = execute(
             &executable.path,
@@ -288,18 +274,18 @@ fn stage_executable(executable: &Path, destination: &Path) -> Result<PathBuf, St
 }
 
 async fn compile(
-    cargo: &Path,
+    toolchain: &RustToolchain,
     root: &Path,
     target: &Path,
     source: &Source,
     name: &str,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<PathBuf>, RustToolchainError> {
     let CargoOutput {
         status,
         stdout,
         stderr,
-    } = build_cargo(cargo, root, target).await?;
+    } = build_cargo(toolchain, root, target).await?;
 
     let root_source = root.join(source::FILE);
     let canonical_source = std::fs::canonicalize(&root_source).ok();
@@ -371,16 +357,11 @@ async fn compile(
     }
     events.send("diagnostics", json!({"diagnostics": diagnostics}));
     if status.success() {
-        executable
-            .map(Some)
-            .ok_or_else(|| "Cargo did not produce a runnable Rust executable.".into())
+        executable.map(Some).ok_or_else(|| {
+            RustToolchainError::Other("Cargo did not produce a runnable Rust executable.".into())
+        })
     } else {
         let stderr = String::from_utf8_lossy(&stderr);
-        if stderr.contains("no default is configured")
-            || stderr.contains("could not execute process `rustc")
-        {
-            return Err(format!("{MISSING}\n{}", stderr.trim()));
-        }
         if !stderr.is_empty() {
             events.stream("stderr", &stderr);
         }
@@ -398,8 +379,12 @@ async fn compile(
     }
 }
 
-async fn build_cargo(cargo: &Path, root: &Path, target: &Path) -> Result<CargoOutput, String> {
-    let mut command = Command::new(cargo);
+async fn build_cargo(
+    toolchain: &RustToolchain,
+    root: &Path,
+    target: &Path,
+) -> Result<CargoOutput, RustToolchainError> {
+    let mut command = toolchain.command(RustTool::Cargo);
     command
         .current_dir(root)
         .args(["build", "--offline", "--message-format=json", "--quiet"]);
@@ -408,13 +393,13 @@ async fn build_cargo(cargo: &Path, root: &Path, target: &Path) -> Result<CargoOu
 }
 
 async fn prepare_dependencies(
-    cargo: &Path,
+    toolchain: &RustToolchain,
     root: &Path,
     manifest: &Manifest,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
-) -> Result<bool, String> {
+) -> Result<bool, RustToolchainError> {
     let fetch = |offline| {
-        let mut command = Command::new(cargo);
+        let mut command = toolchain.command(RustTool::Cargo);
         command.current_dir(root).args(["fetch", "--quiet"]);
         if offline {
             command.arg("--offline");
@@ -457,13 +442,13 @@ struct CargoOutput {
     stderr: Vec<u8>,
 }
 
-async fn cargo_output(mut command: Command) -> Result<CargoOutput, String> {
+async fn cargo_output(mut command: Command) -> Result<CargoOutput, RustToolchainError> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = spawn(&mut command).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
-            MISSING.to_owned()
+            RustToolchainError::Missing(None)
         } else {
-            format!("Could not start Cargo: {error}")
+            format!("Could not start Cargo: {error}").into()
         }
     })?;
     let mut stdout = Vec::new();
@@ -478,6 +463,16 @@ async fn cargo_output(mut command: Command) -> Result<CargoOutput, String> {
     .map_err(|error| format!("Could not read Cargo output: {error}"))?;
 
     child.finished = true;
+    if !status.success() {
+        let message = String::from_utf8_lossy(&stderr);
+        if message.contains("no default is configured")
+            || message.lines().any(|line| {
+                line.starts_with("error: could not execute process ") && line.contains("rustc")
+            })
+        {
+            return Err(RustToolchainError::Missing(Some(message.trim().to_owned())));
+        }
+    }
     Ok(CargoOutput {
         status,
         stdout,

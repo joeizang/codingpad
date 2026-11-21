@@ -86,6 +86,9 @@ jobs:
       - name: just check
         run: just check
 
+      - name: Private Rust installation
+        run: cargo test -p codingpad-kernel-core --lib private_install_recovers_and_compiles_after_promotion --locked -- --ignored
+
       - name: TypeScript package code intelligence
         run: cargo test -p codingpad-kernel-core --test language_server typescript_code_intelligence_resolves_versioned_packages --locked -- --ignored
 

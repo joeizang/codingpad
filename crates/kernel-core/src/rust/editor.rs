@@ -1,30 +1,30 @@
-use super::{build_cache, cargo, manifest, rust_tool, BuildCache, Manifest, Source, SCRIPT_FILE};
+use super::{build_cache, manifest, BuildCache, Manifest, Source, SCRIPT_FILE};
 use crate::shadow::ShadowProject;
 use std::{path::PathBuf, sync::Arc};
 use tokio::process::Command;
 
-pub(crate) const MISSING_ANALYZER: &str =
-    "rust-analyzer was not found. Install it with `rustup component add rust-analyzer rust-src` or set CODINGPAD_RUST_LSP.";
+pub(crate) struct AnalyzerCommand {
+    pub(crate) command: Command,
+    pub(crate) help: String,
+}
 
-pub(crate) fn analyzer_command() -> Result<Command, String> {
-    let executable = std::env::var_os("CODINGPAD_RUST_LSP")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| rust_tool("rust-analyzer"));
+pub(crate) async fn analyzer_command(builds: &BuildCache) -> Result<AnalyzerCommand, String> {
+    let toolchain = builds.toolchain().await.unwrap_or_default();
+    let help = toolchain.analyzer_help();
+    let executable = match std::env::var_os("CODINGPAD_RUST_LSP") {
+        Some(path) => PathBuf::from(path),
+        None => toolchain
+            .find_analyzer()
+            .await?
+            .ok_or_else(|| help.clone())?,
+    };
     let executable = std::path::absolute(executable).map_err(|error| error.to_string())?;
     if !executable.is_file() {
-        return Err(MISSING_ANALYZER.into());
+        return Err(help);
     }
     let mut command = Command::new(executable);
-    let cargo = cargo();
-    if let Some(bin) = cargo.parent().filter(|path| path.is_absolute()) {
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let path = std::env::join_paths(
-            std::iter::once(bin.to_owned()).chain(std::env::split_paths(&path)),
-        )
-        .map_err(|error| format!("Could not add Cargo to the rust-analyzer PATH: {error}"))?;
-        command.env("PATH", path);
-    }
-    Ok(command)
+    toolchain.configure(&mut command);
+    Ok(AnalyzerCommand { command, help })
 }
 
 pub(crate) struct RustShadowProject {

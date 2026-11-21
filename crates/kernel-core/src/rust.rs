@@ -245,9 +245,19 @@ struct RunningChild(Child);
 
 impl Drop for RunningChild {
     fn drop(&mut self) {
-        if self.0.id().is_some() {
-            crate::kill_process_tree(&mut self.0);
+        if self.0.id().is_none() {
+            return;
         }
+        #[cfg(windows)]
+        if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        }) {
+            // Keep the parent alive until taskkill can find its descendants.
+            // Tokio can move other tasks off this worker while we wait.
+            tokio::task::block_in_place(|| crate::kill_process_tree(&mut self.0));
+            return;
+        }
+        crate::kill_process_tree(&mut self.0);
     }
 }
 

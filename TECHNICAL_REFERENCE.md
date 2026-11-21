@@ -908,16 +908,18 @@ The shared project prefers real `@types/bun` types and falls back to a small
 checked-in declaration file when it cannot install them.
 
 CodingPad uses your installed Cargo and rustc first. If they are missing,
-**Install Rust and run** in Results installs stable Rust, rust-analyzer, and
-rust-src under the app data folder (`toolchains/rust/stable`). CodingPad verifies
-the pinned rustup 1.29.3 bootstrap and tests compilation before publishing the
-installation. Retrying removes abandoned staging files. The private install
-leaves your shell profile, PATH and existing toolchain alone. On Windows x64
-it uses the Rust GNU distribution, which includes the linker. On Linux and
-macOS, linking requires the platform's C development tools.
+**Install Rust and run** in Results installs stable Rust under the app data
+folder (`toolchains/rust/stable`). CodingPad verifies the pinned rustup 1.29.3
+bootstrap and tests compilation before publishing the installation. Retrying removes abandoned staging files. The private install
+leaves your shell profile, PATH and existing toolchain alone. Windows x64 uses
+the Rust GNU distribution, which includes the linker. Windows ARM64 uses an
+existing toolchain. On Linux and macOS, CodingPad checks for working C
+development tools before downloading Rust. This includes the Xcode Command
+Line Tools on macOS.
 
-Rust completions, hover and diagnostics come from **rust-analyzer**. Install
-the `rust-analyzer` and `rust-src` toolchain components with rustup.
+Rust completions, hover and diagnostics come from **rust-analyzer**. The private
+installer also attempts to install the editor components. For a user-installed
+toolchain, add the `rust-analyzer` and `rust-src` toolchain components with rustup.
 `CODINGPAD_RUST_LSP` can point to a different rust-analyzer executable.
 CodingPad translates diagnostics and completion edits from the editor shadow
 project back to the script.

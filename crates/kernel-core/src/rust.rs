@@ -16,7 +16,7 @@ pub(crate) use source::FILE as SCRIPT_FILE;
 
 use crate::{
     shadow::ShadowProject,
-    toolchains::{RustToolchain, MISSING_RUST},
+    toolchains::{RustTool, RustToolchain, MISSING_RUST},
     KernelEvent, RunResult,
 };
 use debug::{Snapshot, ValueNode};
@@ -156,9 +156,7 @@ pub(super) async fn run(
     let project_hash = format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()));
     let binary = format!("codingpad-{}", &project_hash[..SCRIPT_BINARY_HASH_LENGTH]);
     let prepare = async {
-        let cargo = RustToolchain::resolve(builds.data_dir())
-            .await
-            .ok_or(MISSING_RUST)?;
+        let toolchain = builds.toolchain().await?;
         let lease = builds.acquire().await?;
         build_cache::stage(
             project,
@@ -168,11 +166,12 @@ pub(super) async fn run(
             &binary,
         )?;
         if manifest.needs_packages
-            && !prepare_dependencies(&cargo, root, &manifest, &mut events).await?
+            && !prepare_dependencies(&toolchain, root, &manifest, &mut events).await?
         {
             return Ok(None);
         }
-        let executable = compile(&cargo, root, lease.target(), &source, name, &mut events).await?;
+        let executable =
+            compile(&toolchain, root, lease.target(), &source, name, &mut events).await?;
         let Some(executable) = executable else {
             return Ok(None);
         };
@@ -197,8 +196,15 @@ pub(super) async fn run(
             events.send("run_finished", json!({"ok": false}));
             return Ok((stopped(), events.dumps));
         },
-        build = prepare => build?,
+        build = prepare => build,
     };
+    if build
+        .as_ref()
+        .is_err_and(|error| error.starts_with(MISSING_RUST))
+    {
+        builds.invalidate_toolchain().await;
+    }
+    let build = build?;
     let ok = if let Some(executable) = build {
         let exit = execute(
             &executable.path,
@@ -271,7 +277,7 @@ fn stage_executable(executable: &Path, destination: &Path) -> Result<PathBuf, St
 }
 
 async fn compile(
-    cargo: &RustToolchain,
+    toolchain: &RustToolchain,
     root: &Path,
     target: &Path,
     source: &Source,
@@ -282,7 +288,7 @@ async fn compile(
         status,
         stdout,
         stderr,
-    } = build_cargo(cargo, root, target).await?;
+    } = build_cargo(toolchain, root, target).await?;
 
     let root_source = root.join(source::FILE);
     let canonical_source = std::fs::canonicalize(&root_source).ok();
@@ -359,11 +365,6 @@ async fn compile(
             .ok_or_else(|| "Cargo did not produce a runnable Rust executable.".into())
     } else {
         let stderr = String::from_utf8_lossy(&stderr);
-        if stderr.contains("no default is configured")
-            || stderr.contains("could not execute process `rustc")
-        {
-            return Err(format!("{MISSING_RUST}\n{}", stderr.trim()));
-        }
         if !stderr.is_empty() {
             events.stream("stderr", &stderr);
         }
@@ -382,11 +383,11 @@ async fn compile(
 }
 
 async fn build_cargo(
-    cargo: &RustToolchain,
+    toolchain: &RustToolchain,
     root: &Path,
     target: &Path,
 ) -> Result<CargoOutput, String> {
-    let mut command = cargo.command("cargo");
+    let mut command = toolchain.command(RustTool::Cargo);
     command
         .current_dir(root)
         .args(["build", "--offline", "--message-format=json", "--quiet"]);
@@ -395,13 +396,13 @@ async fn build_cargo(
 }
 
 async fn prepare_dependencies(
-    cargo: &RustToolchain,
+    toolchain: &RustToolchain,
     root: &Path,
     manifest: &Manifest,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
 ) -> Result<bool, String> {
     let fetch = |offline| {
-        let mut command = cargo.command("cargo");
+        let mut command = toolchain.command(RustTool::Cargo);
         command.current_dir(root).args(["fetch", "--quiet"]);
         if offline {
             command.arg("--offline");
@@ -465,6 +466,16 @@ async fn cargo_output(mut command: Command) -> Result<CargoOutput, String> {
     .map_err(|error| format!("Could not read Cargo output: {error}"))?;
 
     child.finished = true;
+    if !status.success() {
+        let message = String::from_utf8_lossy(&stderr);
+        if message.contains("no default is configured")
+            || message.lines().any(|line| {
+                line.starts_with("error: could not execute process ") && line.contains("rustc")
+            })
+        {
+            return Err(format!("{MISSING_RUST}\n{}", message.trim()));
+        }
+    }
     Ok(CargoOutput {
         status,
         stdout,

@@ -109,6 +109,10 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal && rustup default stable
 
+      - name: Verify the private Rust installation on macOS
+        if: runner.os == 'macOS'
+        run: cargo test -p codingpad-kernel-core --lib private_install_recovers_and_compiles_after_promotion --locked -- --ignored
+
       - name: just bundle
         run: just bundle
 

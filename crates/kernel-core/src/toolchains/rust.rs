@@ -1,4 +1,7 @@
-use super::{installer, prepare_install, promote_directory, Artifact, Toolchains, MAX_TOOL_BYTES};
+use super::{
+    installer, prepare_install, prepare_tool_command, promote_directory, Artifact, Toolchains,
+    MAX_TOOL_BYTES,
+};
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
@@ -9,7 +12,7 @@ use tokio::process::Command;
 const RUSTUP_VERSION: &str = "1.29.3";
 
 // Published SHA-256 digests from the corresponding rustup archive directory.
-const RELEASES: &[(&str, &str)] = &[
+const RUSTUP_RELEASES: &[(&str, &str)] = &[
     (
         "x86_64-unknown-linux-gnu",
         "b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55",
@@ -38,52 +41,98 @@ const RELEASES: &[(&str, &str)] = &[
         "x86_64-pc-windows-msvc",
         "38027d51d69a5d05493627a0634dbea52d6cd793c8f072d2373d3f4163eec7db",
     ),
-    (
-        "aarch64-pc-windows-msvc",
-        "407e0d72f81d26a01f9d032b8317908cbb2917ba22765474b682b41390792ad9",
-    ),
 ];
 
 pub(crate) const MISSING: &str = "Rust was not found. Install Rust from Results in CodingPad, or install a stable toolchain from https://rustup.rs/ and try again.";
 
-#[derive(Default)]
+#[derive(Clone, Copy)]
+pub(crate) enum RustTool {
+    Cargo,
+    Compiler,
+    Analyzer,
+    Rustup,
+}
+
+impl RustTool {
+    fn filename(self) -> String {
+        executable_name(match self {
+            Self::Cargo => "cargo",
+            Self::Compiler => "rustc",
+            Self::Analyzer => "rust-analyzer",
+            Self::Rustup => "rustup",
+        })
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct RustToolchain {
     private: Option<PathBuf>,
+    cargo: PathBuf,
+    compiler: PathBuf,
+}
+
+impl Default for RustToolchain {
+    fn default() -> Self {
+        Self {
+            private: None,
+            cargo: find_user_tool(RustTool::Cargo),
+            compiler: find_user_tool(RustTool::Compiler),
+        }
+    }
 }
 
 impl RustToolchain {
     fn private(root: PathBuf) -> Self {
+        let bin = root.join("cargo/bin");
         Self {
             private: Some(root),
+            cargo: bin.join(RustTool::Cargo.filename()),
+            compiler: bin.join(RustTool::Compiler.filename()),
         }
     }
 
-    pub(crate) async fn resolve(data: Option<&Path>) -> Option<Self> {
+    pub(crate) fn is_private(&self) -> bool {
+        self.private.is_some()
+    }
+
+    pub(crate) fn still_present(&self) -> bool {
+        self.cargo.is_file() && self.compiler.is_file()
+    }
+
+    pub(crate) async fn resolve(data: Option<&Path>) -> Result<Self, String> {
         let user = Self::default();
-        if user.is_available().await {
-            return Some(user);
+        let user_ready = user.is_available().await;
+        if user_ready == Some(true) {
+            return Ok(user);
         }
-        let private = Self::private(std::path::absolute(private_dir(data?)).ok()?);
-        private.is_available().await.then_some(private)
+        if let Some(data) = data {
+            let private =
+                Self::private(std::path::absolute(private_dir(data)).map_err(|e| e.to_string())?);
+            match private.is_available().await {
+                Some(true) => return Ok(private),
+                None => return Err(PROBE_TIMEOUT.into()),
+                Some(false) => {}
+            }
+        }
+        if user_ready.is_none() {
+            return Err(PROBE_TIMEOUT.into());
+        }
+        Err(MISSING.into())
     }
 
-    pub(crate) fn executable(&self, name: &str) -> PathBuf {
-        let name = executable_name(name);
-        if let Some(root) = &self.private {
-            return root.join("cargo/bin").join(name);
+    pub(crate) fn executable(&self, tool: RustTool) -> PathBuf {
+        match tool {
+            RustTool::Cargo => self.cargo.clone(),
+            RustTool::Compiler => self.compiler.clone(),
+            _ => self.private.as_ref().map_or_else(
+                || find_user_tool(tool),
+                |root| root.join("cargo/bin").join(tool.filename()),
+            ),
         }
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        std::env::split_paths(&path)
-            .chain(std::env::var_os("CARGO_HOME").map(|path| PathBuf::from(path).join("bin")))
-            .chain(dirs::home_dir().map(|home| home.join(".cargo/bin")))
-            .map(|dir| dir.join(&name))
-            .find(|path| path.is_file())
-            .and_then(|path| std::path::absolute(path).ok())
-            .unwrap_or_else(|| PathBuf::from(name))
     }
 
-    pub(crate) fn command(&self, name: &str) -> Command {
-        let mut command = Command::new(self.executable(name));
+    pub(crate) fn command(&self, tool: RustTool) -> Command {
+        let mut command = Command::new(self.executable(tool));
         self.configure(&mut command);
         command
     }
@@ -93,8 +142,6 @@ impl RustToolchain {
             private_homes(command, root);
             for key in [
                 "RUSTUP_TOOLCHAIN",
-                "RUSTC",
-                "RUSTDOC",
                 "RUSTC_WRAPPER",
                 "RUSTC_WORKSPACE_WRAPPER",
                 "RUSTFLAGS",
@@ -104,34 +151,58 @@ impl RustToolchain {
             ] {
                 command.env_remove(key);
             }
+            command.env("RUSTC", &self.compiler);
+            command.env(
+                "RUSTDOC",
+                root.join("cargo/bin").join(executable_name("rustdoc")),
+            );
         }
-        let cargo = self.executable("cargo");
-        if let Some(bin) = cargo.parent().filter(|path| path.is_absolute()) {
+        if let Some(bin) = self.cargo.parent().filter(|path| path.is_absolute()) {
             let path = std::env::var_os("PATH").unwrap_or_default();
             if let Ok(paths) = std::env::join_paths(
                 std::iter::once(bin.to_owned()).chain(std::env::split_paths(&path)),
             ) {
                 command.env("PATH", paths);
             }
-            if self.private.is_some() {
-                command.env("RUSTC", self.executable("rustc"));
-                command.env("RUSTDOC", self.executable("rustdoc"));
-            }
         }
     }
 
-    async fn is_available(&self) -> bool {
+    async fn is_available(&self) -> Option<bool> {
+        if !self.still_present() {
+            return Some(false);
+        }
         let (cargo, rustc) = tokio::join!(
-            version(self.command("cargo")),
-            version(self.command("rustc"))
+            version(self.command(RustTool::Cargo), VERSION_TIMEOUT),
+            version(self.command(RustTool::Compiler), VERSION_TIMEOUT)
         );
-        cargo && rustc
+        Some(cargo? && rustc?)
     }
 }
 
-async fn version(mut command: Command) -> bool {
+const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
+const PROBE_TIMEOUT: &str =
+    "The Rust toolchain took too long to respond. Wait for it to finish starting, then try again.";
+
+async fn version(mut command: Command, timeout: Duration) -> Option<bool> {
     command.arg("--version");
-    run(command, Duration::from_secs(10)).await.is_ok()
+    prepare_tool_command(&mut command);
+    match tokio::time::timeout(timeout, command.output()).await {
+        Ok(Ok(output)) => Some(output.status.success()),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        _ => None,
+    }
+}
+
+fn find_user_tool(tool: RustTool) -> PathBuf {
+    let name = tool.filename();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .chain(std::env::var_os("CARGO_HOME").map(|path| PathBuf::from(path).join("bin")))
+        .chain(dirs::home_dir().map(|home| home.join(".cargo/bin")))
+        .map(|dir| dir.join(&name))
+        .find(|path| path.is_file())
+        .and_then(|path| std::path::absolute(path).ok())
+        .unwrap_or_else(|| PathBuf::from(name))
 }
 
 fn private_dir(data: &Path) -> PathBuf {
@@ -148,55 +219,76 @@ fn executable_name(name: &str) -> String {
     format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
+fn release(
+    os: &str,
+    arch: &str,
+    musl: bool,
+) -> Result<(&'static str, &'static str, &'static str), String> {
+    let unsupported = || {
+        format!("Private Rust installation is unavailable on {os}/{arch}. Install a Rust toolchain from https://rustup.rs/ and try again.")
+    };
+    let platform = match os {
+        "linux" if musl => "unknown-linux-musl",
+        "linux" => "unknown-linux-gnu",
+        "macos" => "apple-darwin",
+        "windows" if arch == "x86_64" => "pc-windows-msvc",
+        _ => return Err(unsupported()),
+    };
+    let platform = format!("{arch}-{platform}");
+    let (triple, sha256) = RUSTUP_RELEASES
+        .iter()
+        .copied()
+        .find(|(target, _)| *target == platform)
+        .ok_or_else(unsupported)?;
+    // The x64 GNU distribution includes its linker and Windows import libraries.
+    let host = if os == "windows" {
+        "x86_64-pc-windows-gnu"
+    } else {
+        triple
+    };
+    Ok((triple, host, sha256))
+}
+
 impl Toolchains {
-    pub async fn install_rust(&self, progress: impl FnMut(&str) + Send) -> Result<PathBuf, String> {
+    pub async fn install_rust(&self, progress: impl FnMut(&str) + Send) -> Result<(), String> {
         let _guard = self.install.lock().await;
-        if let Some(toolchain) = RustToolchain::resolve(Some(&self.data_dir)).await {
-            return Ok(toolchain.executable("cargo"));
+        match RustToolchain::resolve(Some(&self.data_dir)).await {
+            Ok(_) => Ok(()),
+            Err(error) if error == MISSING => install_private_rust(&self.data_dir, progress).await,
+            Err(error) => Err(error),
         }
-        install_private_rust(&self.data_dir, progress).await
     }
 }
 
 async fn install_private_rust(
     data_dir: &Path,
     mut progress: impl FnMut(&str) + Send,
-) -> Result<PathBuf, String> {
+) -> Result<(), String> {
+    let (triple, host, sha256) = release(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cfg!(target_env = "musl"),
+    )?;
     let destination = std::path::absolute(private_dir(data_dir)).map_err(|e| e.to_string())?;
     let root = destination.parent().ok_or("Missing Rust tool directory")?;
     let _lock = prepare_install(root)?;
     let private = RustToolchain::private(destination.clone());
-    if private.is_available().await {
-        return Ok(private.executable("cargo"));
+    match private.is_available().await {
+        Some(true) => return Ok(()),
+        None => return Err(PROBE_TIMEOUT.into()),
+        Some(false) => {}
     }
     if destination.exists() {
         std::fs::remove_dir_all(&destination)
             .map_err(|e| format!("Could not remove the unusable private Rust toolchain: {e}"))?;
     }
 
-    let triple = match std::env::consts::OS {
-        "linux" if cfg!(target_env = "musl") => "unknown-linux-musl",
-        "linux" => "unknown-linux-gnu",
-        "macos" => "apple-darwin",
-        "windows" => "pc-windows-msvc",
-        os => return Err(format!("Private Rust installation is unavailable on {os}.")),
-    };
-    let triple = format!("{}-{triple}", std::env::consts::ARCH);
-    let (_, sha256) = RELEASES
-        .iter()
-        .find(|(target, _)| *target == triple)
-        .ok_or_else(|| format!("Private Rust installation is unavailable on {triple}."))?;
-    // The x64 GNU toolchain ships its own linker and Windows import libs.
-    let host = if triple == "x86_64-pc-windows-msvc" {
-        "x86_64-pc-windows-gnu"
-    } else {
-        &triple
-    };
-
     let stage = tempfile::Builder::new()
         .prefix(".codingpad-install-rust-")
         .tempdir_in(root)
         .map_err(|e| format!("Could not create the Rust staging directory: {e}"))?;
+    progress("Checking the system linker…");
+    verify_linker(stage.path()).await?;
     let name = executable_name("rustup-init");
     progress("Downloading and verifying rustup…");
     let bootstrap = installer::download_verified(
@@ -240,48 +332,80 @@ async fn install_private_rust(
             "stable",
             "--profile",
             "minimal",
-            "--component",
-            "rust-analyzer,rust-src",
         ]);
 
-    progress("Installing stable Rust and rust-analyzer…");
+    progress("Installing stable Rust…");
     run(command, Duration::from_secs(30 * 60)).await?;
     progress("Checking that Rust can compile and run a script…");
     let staged = RustToolchain::private(stage.path().to_owned());
     verify_install(&staged, stage.path()).await?;
+    progress("Installing Rust editor support…");
+    let mut components = staged.command(RustTool::Rustup);
+    components
+        .current_dir(stage.path())
+        .env_remove("RUSTUP_DIST_SERVER")
+        .args(["component", "add", "rust-analyzer", "rust-src"]);
+    let editor = run(components, Duration::from_secs(5 * 60)).await.is_ok();
     std::fs::remove_file(stage.path().join(name))
         .map_err(|error| format!("Could not remove the rustup bootstrap: {error}"))?;
     promote_directory(stage.path(), &destination, "Rust").await?;
-    progress("Rust installed. Starting script…");
-    Ok(private.executable("cargo"))
+    progress(if editor {
+        "Rust installed. Starting script…"
+    } else {
+        "Rust installed. Editor support could not be installed. Starting script…"
+    });
+    Ok(())
+}
+
+async fn verify_linker(directory: &Path) -> Result<(), String> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+    let message = if cfg!(target_os = "macos") {
+        "Install the Xcode Command Line Tools with xcode-select --install, then retry."
+    } else {
+        "Install a C compiler and linker (for example, build-essential on Debian or Ubuntu), then retry."
+    };
+    if cfg!(target_os = "macos") {
+        let mut xcode = Command::new("xcode-select");
+        xcode.arg("-p");
+        run(xcode, VERSION_TIMEOUT).await.map_err(|_| message)?;
+    }
+    let probe = tempfile::tempdir_in(directory).map_err(|e| e.to_string())?;
+    let source = probe.path().join("linker.c");
+    std::fs::write(&source, "int main(void) { return 0; }").map_err(|e| e.to_string())?;
+    let mut link = Command::new("cc");
+    link.current_dir(probe.path())
+        .arg(source)
+        .arg("-o")
+        .arg(probe.path().join("linker"));
+    run(link, VERSION_TIMEOUT)
+        .await
+        .map_err(|error| format!("{message} {error}"))
 }
 
 async fn verify_install(toolchain: &RustToolchain, directory: &Path) -> Result<(), String> {
     let probe = tempfile::tempdir_in(directory).map_err(|e| e.to_string())?;
-    let source = probe.path().join("main.rs");
-    let executable = probe.path().join(executable_name("hello"));
-    std::fs::write(&source, "fn main() {}").map_err(|e| e.to_string())?;
-    let mut compile = toolchain.command("rustc");
-    compile
+    let src = probe.path().join("src");
+    std::fs::create_dir(&src).map_err(|e| e.to_string())?;
+    std::fs::write(
+        probe.path().join("Cargo.toml"),
+        "[package]\nname = \"codingpad-rust-probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(src.join("main.rs"), "fn main() {}").map_err(|e| e.to_string())?;
+    let mut cargo = toolchain.command(RustTool::Cargo);
+    cargo
         .current_dir(probe.path())
-        .arg(source)
-        .arg("-o")
-        .arg(&executable);
-    run(compile, Duration::from_secs(60)).await
-        .map_err(|error| format!("Rust could not compile a test script. Check that your system linker is installed and retry. {error}"))?;
-    run(Command::new(executable), Duration::from_secs(10)).await?;
-    if !toolchain.is_available().await || !version(toolchain.command("rust-analyzer")).await {
-        return Err(
-            "The private Rust toolchain did not pass its startup check. Retry installation.".into(),
-        );
-    }
-    Ok(())
+        .args(["run", "--offline", "--quiet"]);
+    run(cargo, Duration::from_secs(60))
+        .await
+        .map_err(|error| format!("Rust could not compile and run a test script. {error}"))
 }
 
 async fn run(mut command: Command, timeout: Duration) -> Result<(), String> {
-    command.stdin(Stdio::null()).kill_on_drop(true);
-    #[cfg(windows)]
-    command.creation_flags(0x08000000);
+    command.stdin(Stdio::null());
+    prepare_tool_command(&mut command);
     let output = tokio::time::timeout(timeout, command.output())
         .await
         .map_err(|_| "The Rust command timed out.")?
@@ -311,34 +435,50 @@ mod tests {
         std::fs::write(abandoned.join("partial"), b"interrupted").unwrap();
         std::fs::create_dir_all(root.join("cargo/bin")).unwrap();
 
-        let cargo = install_private_rust(data.path(), |message| eprintln!("{message}"))
+        install_private_rust(data.path(), |message| eprintln!("{message}"))
             .await
             .unwrap();
         assert!(!abandoned.exists());
         let private = RustToolchain::private(root);
-        assert_eq!(cargo, private.executable("cargo"));
         verify_install(&private, data.path()).await.unwrap();
+        assert_eq!(
+            version(private.command(RustTool::Analyzer), VERSION_TIMEOUT).await,
+            Some(true)
+        );
+    }
 
-        let probe = tempfile::tempdir().unwrap();
-        std::fs::create_dir(probe.path().join("src")).unwrap();
-        std::fs::write(
-            probe.path().join("Cargo.toml"),
-            r#"[package]
-name = "private-install-probe"
-version = "0.1.0"
-edition = "2021"
-"#,
-        )
-        .unwrap();
-        std::fs::write(
-            probe.path().join("src/main.rs"),
-            "fn main() { println!(\"private Rust\"); }",
-        )
-        .unwrap();
-        let mut command = private.command("cargo");
-        command
-            .current_dir(probe.path())
-            .args(["run", "--offline", "--quiet"]);
-        run(command, Duration::from_secs(60)).await.unwrap();
+    #[test]
+    fn supported_platforms_have_pinned_rustup_artifacts() {
+        for (os, arch, musl) in [
+            ("linux", "x86_64", false),
+            ("linux", "x86_64", true),
+            ("linux", "aarch64", false),
+            ("linux", "aarch64", true),
+            ("macos", "x86_64", false),
+            ("macos", "aarch64", false),
+            ("windows", "x86_64", false),
+        ] {
+            let (bootstrap, host, digest) = release(os, arch, musl).unwrap();
+            assert!(bootstrap.starts_with(arch));
+            assert_eq!(digest.len(), 64);
+            assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            if os == "windows" {
+                assert_eq!(host, "x86_64-pc-windows-gnu");
+            } else {
+                assert_eq!(bootstrap, host);
+            }
+        }
+        assert!(release("windows", "aarch64", false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn version_checks_distinguish_timeout_from_failure() {
+        let mut slow = Command::new("sh");
+        slow.args(["-c", "exec sleep 1"]);
+        let mut broken = Command::new("sh");
+        broken.args(["-c", "exit 1"]);
+        assert_eq!(version(slow, Duration::from_millis(10)).await, None);
+        assert_eq!(version(broken, VERSION_TIMEOUT).await, Some(false));
     }
 }

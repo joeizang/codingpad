@@ -1,19 +1,16 @@
 use super::{build_cache, manifest, BuildCache, Manifest, Source, SCRIPT_FILE};
-use crate::{shadow::ShadowProject, toolchains::RustToolchain};
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use crate::{shadow::ShadowProject, toolchains::RustTool};
+use std::{path::PathBuf, sync::Arc};
 use tokio::process::Command;
 
 pub(crate) const MISSING_ANALYZER: &str =
     "rust-analyzer was not found. Install it with `rustup component add rust-analyzer rust-src` or set CODINGPAD_RUST_LSP.";
 
-pub(crate) async fn analyzer_command(data: Option<&Path>) -> Result<Command, String> {
-    let toolchain = RustToolchain::resolve(data).await.unwrap_or_default();
+pub(crate) async fn analyzer_command(builds: &BuildCache) -> Result<Command, String> {
+    let toolchain = builds.toolchain().await.unwrap_or_default();
     let executable = std::env::var_os("CODINGPAD_RUST_LSP")
         .map(PathBuf::from)
-        .unwrap_or_else(|| toolchain.executable("rust-analyzer"));
+        .unwrap_or_else(|| toolchain.executable(RustTool::Analyzer));
     let executable = std::path::absolute(executable).map_err(|error| error.to_string())?;
     if !executable.is_file() {
         return Err(MISSING_ANALYZER.into());

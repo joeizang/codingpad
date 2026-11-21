@@ -1,6 +1,6 @@
 //! Toolchain release manifests and app-private installation lifecycle.
 mod rust;
-pub(crate) use rust::{RustToolchain, MISSING as MISSING_RUST};
+pub(crate) use rust::{RustTool, RustToolchain, MISSING as MISSING_RUST};
 
 use crate::{
     find_uv,
@@ -344,11 +344,16 @@ pub(crate) fn newest_sdk_version(output: &str) -> Option<String> {
     )
 }
 
+fn prepare_tool_command(command: &mut tokio::process::Command) {
+    command.kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+}
+
 async fn list_dotnet(executable: &Path, argument: &str) -> Result<String, String> {
     let mut command = tokio::process::Command::new(executable);
-    command.arg(argument).kill_on_drop(true);
-    #[cfg(windows)]
-    command.creation_flags(0x08000000);
+    command.arg(argument);
+    prepare_tool_command(&mut command);
     let output = command.output().await.map_err(|e| e.to_string())?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
@@ -644,9 +649,8 @@ async fn bun_version(path: &Path, deadline: Duration) -> Option<bool> {
         return Some(false);
     }
     let mut command = tokio::process::Command::new(path);
-    command.arg("--version").kill_on_drop(true);
-    #[cfg(windows)]
-    command.creation_flags(0x08000000);
+    command.arg("--version");
+    prepare_tool_command(&mut command);
     match tokio::time::timeout(deadline, command.output()).await {
         Ok(Ok(output)) => Some(output.status.success()),
         Ok(Err(_)) => Some(false),

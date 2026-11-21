@@ -507,7 +507,7 @@ impl LanguageServers {
             return Ok(started);
         }
 
-        let command = rust::analyzer_command(self.data_dir.as_deref()).await?;
+        let command = rust::analyzer_command(&self.shadow_projects.rust_build).await?;
         let workspace =
             RustShadowProject::create(&self.shadow_projects.rust_build, &manifest, source).await?;
         let server = LspServer::start(

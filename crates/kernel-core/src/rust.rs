@@ -1,11 +1,19 @@
 //! Builds and runs an editor snapshot in a fresh Cargo project.
+mod debug;
+mod dumps;
+mod panic;
 mod source;
 
+pub(crate) use dumps::Dumps;
+
 use crate::{shadow::ShadowProjects, KernelEvent, RunResult};
+use debug::{Snapshot, ValueNode};
+use panic::Panic;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use source::Source;
 use std::{
+    collections::VecDeque,
     ffi::OsString,
     io,
     net::Ipv4Addr,
@@ -34,6 +42,7 @@ codingpad = { path = "codingpad" }
 pub(super) const RUNTIME_MANIFEST: &str =
     include_str!("../../../runtimes/rust/codingpad/Cargo.toml");
 pub(super) const RUNTIME: &str = include_str!("../../../runtimes/rust/codingpad/src/lib.rs");
+pub(super) const RICH_RUNTIME: &str = include_str!("../../../runtimes/rust/codingpad/src/rich.rs");
 const MISSING: &str =
     "Rust was not found. Install the stable Rust toolchain (Cargo and rustc) from https://rustup.rs/ and run the script again.";
 
@@ -61,8 +70,9 @@ pub(super) async fn run(
     projects: &ShadowProjects,
     source: &str,
     path: Option<&str>,
+    eager: bool,
     emit: &mut (impl FnMut(KernelEvent) + Send),
-) -> Result<RunResult, String> {
+) -> Result<(RunResult, Dumps), String> {
     let source = Source::new(source);
     let project = projects.prepare_rust(&source.generated)?;
     let script = path.map(Path::new);
@@ -70,19 +80,47 @@ pub(super) async fn run(
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
         .unwrap_or("script.rs");
-    let mut events = Events { emit, next_id: 0 };
+    let mut events = Events {
+        emit,
+        dumps: Dumps::new(eager),
+        views: VecDeque::new(),
+        latest: VecDeque::new(),
+        panic: None,
+        main_unwound: false,
+    };
     let build = compile(&cargo(), project.root(), &source, name, &mut events).await?;
     let ok = if let Some(executable) = build {
-        execute(&executable, script, project.root(), &mut events).await?
+        let status = execute(&executable, script, project.root(), &mut events).await?;
+        let panic = events.panic.take();
+        if let Some(panic) = panic.as_ref() {
+            if status.success() || !events.main_unwound {
+                events.stream("stderr", &panic.stderr());
+            }
+        }
+        if !status.success() {
+            if let Some(panic) = panic.filter(|_| events.main_unwound) {
+                events.error("Rust panic", &panic.message, panic.frames(&source, name));
+            } else {
+                events.error(
+                    "Rust script failed",
+                    &format!("The script exited with {status}."),
+                    Vec::new(),
+                );
+            }
+        }
+        status.success()
     } else {
         false
     };
     events.send("run_finished", json!({"ok": ok}));
-    Ok(RunResult {
-        ok,
-        stopped: false,
-        cache_cleared: false,
-    })
+    Ok((
+        RunResult {
+            ok,
+            stopped: false,
+            cache_cleared: false,
+        },
+        events.dumps,
+    ))
 }
 
 async fn compile(
@@ -123,6 +161,7 @@ async fn compile(
 
     let mut executable = None;
     let mut diagnostics = Vec::new();
+    let mut had_error = false;
     for line in stdout.split(|&byte| byte == b'\n') {
         let Ok(message) = serde_json::from_slice::<Value>(line) else {
             continue;
@@ -134,6 +173,7 @@ async fn compile(
         } else if message["reason"] == "compiler-message" {
             let diagnostic = &message["message"];
             if diagnostic["level"] == "error" {
+                had_error = true;
                 let text = diagnostic["message"]
                     .as_str()
                     .unwrap_or("Compilation failed");
@@ -176,7 +216,7 @@ async fn compile(
         if !stderr.is_empty() {
             events.stream("stderr", &stderr);
         }
-        if events.next_id == 0 {
+        if !had_error {
             events.error(
                 "Build error",
                 "Cargo could not build the Rust script.",
@@ -249,7 +289,7 @@ async fn execute(
     script: Option<&Path>,
     root: &Path,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
-) -> Result<bool, String> {
+) -> Result<ExitStatus, String> {
     let (token, secret) = token()?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -268,14 +308,7 @@ async fn execute(
     let status = read_output(&mut child.0, &listener, &token, events)
         .await
         .map_err(|error| format!("Could not read Rust script output: {error}"))?;
-    if !status.success() {
-        events.error(
-            "Rust script failed",
-            &format!("The script exited with {status}."),
-            Vec::new(),
-        );
-    }
-    Ok(status.success())
+    Ok(status)
 }
 
 async fn read_output(
@@ -302,7 +335,7 @@ async fn read_output(
             // Observe exit even if subprocesses inherit a pipe and keep writing.
             result = child.wait(), if exit.is_none() => {
                 exit = Some(result?);
-                deadline = Instant::now() + Duration::from_millis(250);
+                deadline = Instant::now() + Duration::from_millis(500);
             }
             _ = tokio::time::sleep_until(deadline), if exit.is_some() => break,
             socket = &mut connect, if !connected => {
@@ -361,21 +394,59 @@ fn peer_closed(error: &io::Error) -> bool {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum RuntimeEvent {
-    Debug {
-        #[serde(rename = "type")]
-        type_name: String,
-        text: String,
+    Debug(DebugValue),
+    LiveUpdate {
+        key: String,
+        revision: String,
+        #[serde(flatten)]
+        value: DebugValue,
     },
+    Panic(Panic),
+    MainUnwound,
+}
+
+#[derive(Deserialize)]
+struct DebugValue {
+    #[serde(rename = "type")]
+    name: String,
+    text: String,
+    truncated: String,
+}
+
+impl DebugValue {
+    fn snapshot(self) -> (Snapshot, usize) {
+        let size = self.text.len();
+        let snapshot = Snapshot::new(self.text, self.name, self.truncated == "true");
+        let bytes = snapshot.retained_bytes(size);
+        (snapshot, bytes)
+    }
+}
+
+struct LiveView {
+    node: String,
+    current: LiveSnapshot,
+}
+
+#[derive(Clone, Copy)]
+struct LiveSnapshot {
+    key: u64,
+    revision: u64,
+    group: u64,
+    index: debug::Index,
 }
 
 struct Events<'a, F> {
     emit: &'a mut F,
-    next_id: u64,
+    dumps: Dumps,
+    views: VecDeque<LiveView>,
+    latest: VecDeque<LiveSnapshot>,
+    panic: Option<Panic>,
+    main_unwound: bool,
 }
 
 impl<F: FnMut(KernelEvent)> Events<'_, F> {
     fn send(&mut self, method: &str, mut params: Value) {
-        params["runId"] = json!(1);
+        params["runId"] = json!(self.dumps.run_id());
         (self.emit)(KernelEvent {
             method: method.into(),
             params,
@@ -387,28 +458,115 @@ impl<F: FnMut(KernelEvent)> Events<'_, F> {
     }
 
     fn runtime(&mut self, line: &str) -> io::Result<()> {
-        let RuntimeEvent::Debug { type_name, text } = serde_json::from_str(line)?;
-        let id = self.id();
-        let node = match serde_json::from_str::<Value>(&text) {
-            Ok(v @ (Value::Number(_) | Value::Bool(_))) => {
-                json!({"id": id, "kind": "primitive", "v": v})
+        match serde_json::from_str(line)? {
+            RuntimeEvent::Debug(value) => self.dump(value),
+            RuntimeEvent::LiveUpdate {
+                key,
+                revision,
+                value,
+            } => {
+                if let (Ok(key), Ok(revision)) = (key.parse(), revision.parse()) {
+                    self.update(key, revision, value);
+                }
             }
-            Ok(Value::String(v)) => json!({"id": id, "kind": "string", "v": v}),
-            _ => json!({"id": id, "kind": "string", "type": type_name, "v": text}),
-        };
-        self.send("dump", json!({"node": node}));
+            RuntimeEvent::Panic(panic) => {
+                if let Some(recovered) = self.panic.replace(panic) {
+                    self.stream("stderr", &recovered.stderr());
+                }
+            }
+            RuntimeEvent::MainUnwound => self.main_unwound = true,
+        }
         Ok(())
     }
 
+    fn dump(&mut self, value: DebugValue) {
+        let (snapshot, bytes) = value.snapshot();
+        let root = snapshot.root;
+        let live = match snapshot.nodes[root].value {
+            ValueNode::Live {
+                key,
+                revision,
+                value,
+            } => Some((key, revision, value)),
+            _ => None,
+        };
+        let group = self.dumps.insert(snapshot, bytes);
+        let node = if let Some((key, revision, index)) = live {
+            let id = self.dumps.id();
+            let mut current = LiveSnapshot {
+                key,
+                revision,
+                index,
+                group,
+            };
+            // The initial Debug snapshot can arrive after a concurrent set().
+            // Render the newer value when its update already reached Results.
+            let newer = self
+                .latest
+                .iter()
+                .find(|entry| entry.key == key && entry.revision > revision);
+            let updated = newer.and_then(|entry| {
+                let node = self
+                    .dumps
+                    .current(entry.group, entry.index, Some(id.clone()))?;
+                current = *entry;
+                self.dumps.remove(group);
+                Some(node)
+            });
+            let child =
+                updated.unwrap_or_else(|| self.dumps.initial(group, index, Some(id.clone())));
+            if self.views.len() == 500 {
+                self.views.pop_front();
+            }
+            self.views.push_back(LiveView { node: id, current });
+            json!({"id": self.dumps.id(), "kind": "live", "node": child})
+        } else {
+            self.dumps.initial(group, root, None)
+        };
+        self.send("dump", json!({"node": node}));
+    }
+
+    fn update(&mut self, key: u64, revision: u64, value: DebugValue) {
+        if let Some(index) = self.latest.iter().position(|entry| entry.key == key) {
+            if self.latest[index].revision >= revision {
+                return;
+            }
+            let old = self.latest.remove(index).unwrap();
+            self.dumps.remove(old.group);
+        }
+        let (snapshot, bytes) = value.snapshot();
+        let index = snapshot.root;
+        let group = self.dumps.insert(snapshot, bytes);
+        let update = LiveSnapshot {
+            key,
+            revision,
+            group,
+            index,
+        };
+        if self.latest.len() == 500 {
+            self.latest.pop_front();
+        }
+        self.latest.push_back(update);
+
+        for position in 0..self.views.len() {
+            let view = &mut self.views[position];
+            if view.current.key != key || view.current.revision >= revision {
+                continue;
+            }
+            self.dumps.remove(view.current.group);
+            view.current = update;
+            let target = view.node.clone();
+            // The target stays stable, while the replacement gets a fresh
+            // identity so collection and table viewers reset their paging.
+            let node = self.dumps.initial(group, index, None);
+            self.send("dump_update", json!({"nodeId": target, "node": node}));
+        }
+    }
+
     fn error(&mut self, kind: &str, message: &str, frames: Vec<Value>) {
-        let id = self.id();
+        let id = self.dumps.id();
         self.send("dump", json!({"node": {
             "id": id, "kind": "error", "type": kind, "message": message, "traceback": frames, "causes": []
         }}));
-    }
-
-    fn id(&mut self) -> String {
-        self.next_id += 1;
-        format!("1:n{}", self.next_id)
     }
 }

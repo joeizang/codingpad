@@ -691,6 +691,7 @@ dependencies = [
  "tokio-postgres",
  "tokio-util",
  "toml 0.8.2",
+ "unicode-width",
  "url",
  "uuid",
  "zip 2.6.1",

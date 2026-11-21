@@ -2,8 +2,9 @@
 
 JSON-RPC 2.0 over UTF-8, one JSON object per line. The Rust supervisor writes
 requests to the kernel's stdin. It reads responses from stdout for Python and C#
-and from a dedicated loopback connection for TypeScript. Each open script keeps
-one warm kernel process.
+and from a dedicated loopback connection for TypeScript. Each open Python, C#
+or TypeScript script keeps one warm kernel process. Rust starts a fresh process
+for each run and the supervisor retains its dump snapshots.
 The kernel and its runtime are embedded in the Rust build and extracted to a
 private temporary directory for the process lifetime; installed apps do not need
 the source checkout or a registry package. Python starts with `-I -u -X utf8` and adds only
@@ -582,3 +583,30 @@ Compiler errors block execution and are sent as `diagnostics` and error dumps
 with ranges mapped to the original editor snapshot. Stdout and stderr use
 `stream` notifications. Dump messages travel over a separate authenticated
 loopback connection, so native output can contain arbitrary text.
+
+Derived `Debug` values render as structured data. Structs and data-bearing enum
+variants show their fields, `None` appears as null, and collections of records
+become paged tables. Other collections appear as lists or maps. Custom
+`Debug` output that has no recognizable structure appears as text. The host
+keeps captured values available for expansion and table export after the process
+exits. Live updates appear during the run. Expansion and paging wait for the
+run to finish. Handles expire on rerun, Reset, or Close. Large previews are bounded,
+and a table or list shows a truncation marker if only a prefix could be captured.
+
+```rust
+use codingpad::{dump, html, image, live};
+
+dump(html("<strong>Ready</strong>"));
+dump(image("plot.png").unwrap()); // Use image_bytes for encoded image data.
+let status = live("Starting");
+dump(&status);
+status.set("Ready");
+```
+
+`html` uses the existing sandboxed viewer. Images accept PNG, JPEG, GIF, WebP,
+BMP and SVG up to 4 MiB. To update a Results block during the run, dump a
+`Live` value by reference as its own block, then call `set`. Updates keep the
+original block and replace its contents, including its preview handles.
+Panics that fail the run appear as structured errors with clickable script
+frames mapped back to the editor snapshot. Panics from worker threads and
+recovered main-thread panics are visible on stderr.

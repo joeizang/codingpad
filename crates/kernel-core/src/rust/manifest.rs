@@ -2,10 +2,13 @@ use super::source::source_prefix_len;
 use std::{ops::Range, path::Path};
 use toml::{Table, Value};
 
+const DEPENDENCY_SECTIONS: &[&str] = &["dependencies", "dev-dependencies", "dev_dependencies"];
+
 pub(crate) struct Manifest {
     pub(crate) cargo: String,
     pub(super) frontmatter: Range<usize>,
     pub(super) needs_packages: bool,
+    pub(super) declared_runtime: bool,
 }
 
 #[derive(Debug)]
@@ -52,34 +55,31 @@ impl Manifest {
         set_package_defaults(&mut cargo).map_err(error)?;
         resolve_dependencies(&mut cargo, path).map_err(error)?;
 
-        let needs_packages = [
-            "dependencies",
-            "dev-dependencies",
-            "target",
-            "patch",
-            "replace",
-        ]
-        .into_iter()
-        .any(|key| {
-            cargo
-                .get(key)
-                .and_then(Value::as_table)
-                .is_some_and(|section| !section.is_empty())
-        });
-        table_or_insert(&mut cargo, "dependencies")
-            .map_err(error)?
-            .insert(
-                "codingpad".to_owned(),
-                Value::Table(Table::from_iter([(
-                    "path".to_owned(),
-                    Value::from("codingpad"),
-                )])),
-            );
+        let needs_packages = DEPENDENCY_SECTIONS
+            .iter()
+            .copied()
+            .chain(["target", "patch", "replace"])
+            .any(|key| {
+                cargo
+                    .get(key)
+                    .and_then(Value::as_table)
+                    .is_some_and(|section| !section.is_empty())
+            });
+        let dependencies = table_or_insert(&mut cargo, "dependencies").map_err(error)?;
+        let declared_runtime = dependencies.contains_key("codingpad");
+        dependencies.insert(
+            "codingpad".to_owned(),
+            Value::Table(Table::from_iter([(
+                "path".to_owned(),
+                Value::from("codingpad"),
+            )])),
+        );
         cargo.insert("workspace".to_owned(), Value::Table(Table::new()));
         Ok(Self {
             cargo: cargo.to_string(),
             frontmatter,
             needs_packages,
+            declared_runtime,
         })
     }
 }
@@ -170,7 +170,7 @@ fn table_or_insert<'a>(root: &'a mut Table, key: &str) -> Result<&'a mut Table, 
 }
 
 fn dependency_paths(root: &mut Table, directory: Option<&Path>) -> Result<(), String> {
-    for key in ["dependencies", "dev-dependencies", "dev_dependencies"] {
+    for &key in DEPENDENCY_SECTIONS {
         if let Some(dependencies) = root.get_mut(key).and_then(Value::as_table_mut) {
             make_paths_absolute(dependencies, directory)?;
         }
@@ -251,6 +251,13 @@ pub(crate) fn frontmatter(source: &str) -> Result<(&str, Range<usize>), Manifest
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn underscored_dev_dependencies_require_package_resolution() {
+        let manifest =
+            Manifest::parse("---cargo\n[dev_dependencies]\nserde = \"1\"\n---", None).unwrap();
+        assert!(manifest.needs_packages);
+    }
 
     #[test]
     fn reports_invalid_frontmatter_and_leaves_negative_expressions_alone() {

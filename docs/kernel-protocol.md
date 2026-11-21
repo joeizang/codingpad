@@ -582,7 +582,7 @@ optional `// codingpad:` script header. The script header is a Rust comment
 after the closing fence, so the same file works under Cargo.
 CodingPad fetches missing crates before building offline. Cargo reuses
 downloaded crates in its local package cache. Compiled artifacts use a fresh
-target directory per run until M6.4. Malformed frontmatter is
+target directory per run. Shared compiled artifacts are tracked in issue #71 (M6.4). Malformed frontmatter is
 reported at its script line. Relative path
 dependencies are resolved from the saved script's directory.
 

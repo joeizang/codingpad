@@ -132,6 +132,9 @@ pub(super) async fn run(
             return Ok((events.finish(false), events.dumps));
         }
     };
+    if manifest.declared_runtime {
+        events.stream("stderr", "CodingPad uses its bundled codingpad runtime library. The declared codingpad dependency is for standalone Cargo runs.\n");
+    }
     let source = Source::with_frontmatter(source, manifest.frontmatter);
     let project = projects.prepare_rust(&source.generated, &manifest.cargo)?;
     let cancel = project.root().join("cancel");

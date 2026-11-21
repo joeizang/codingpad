@@ -21,8 +21,8 @@ pub struct ScriptHeader {
 
 /// Read the `codingpad:` header, which follows cargo-script frontmatter when present.
 ///
-/// The header is the top line of the file, written as a Python `#` comment or
-/// a C#/Rust/TypeScript `//` comment. Settings are whitespace-separated
+/// The header uses a Python `#` comment, a C#/Rust/TypeScript `//` comment,
+/// or a SQL `--` comment. Settings are whitespace-separated
 /// `key=value` pairs, where a value may be quoted.
 pub fn parse_header(source: &str) -> Option<ScriptHeader> {
     let source = match crate::rust::frontmatter(source) {

@@ -156,18 +156,6 @@ impl BuildCache {
                     &runtime,
                     "codingpad-warmup",
                 )?;
-                let mut fetch = Command::new(cargo());
-                fetch
-                    .current_dir(project.root())
-                    .args(["fetch", "--offline", "--quiet"]);
-                if !run_in_background(fetch).await? {
-                    let mut fetch = Command::new(cargo());
-                    fetch.current_dir(project.root()).args(["fetch", "--quiet"]);
-                    if !run_in_background(fetch).await? {
-                        all_compiled = false;
-                        continue;
-                    }
-                }
                 let mut command = Command::new(cargo());
                 command
                     .current_dir(project.root())

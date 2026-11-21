@@ -154,10 +154,8 @@ pub(super) async fn run(
     let cargo = cargo();
     let root = project.root();
     // Separate binaries for scripts sharing a target directory.
-    let binary = format!(
-        "codingpad-{:x}",
-        Sha256::digest(root.as_os_str().as_encoded_bytes())
-    );
+    let project_hash = Sha256::digest(root.as_os_str().as_encoded_bytes());
+    let binary = format!("codingpad-{}", &format!("{project_hash:x}")[..24]);
     let prepare = async {
         let lease = builds.acquire().await?;
         build_cache::stage(
@@ -173,12 +171,20 @@ pub(super) async fn run(
             return Ok(None);
         }
         let executable = compile(&cargo, root, lease.target(), &source, name, &mut events).await?;
-        // The shared target may be cleared while this script runs. A private
-        // copy also avoids trying to replace an in-use executable on Windows.
         let Some(executable) = executable else {
             return Ok(None);
         };
-        stage_executable(&executable, run_files.path()).map(Some)
+        #[cfg(windows)]
+        {
+            // Run from Cargo's output path so Windows can use its original
+            // debug-symbol layout. The lease protects the executable until exit.
+            Ok::<_, String>(Some((executable, lease)))
+        }
+        #[cfg(not(windows))]
+        {
+            let copy = stage_executable(&executable, run_files.path())?;
+            Ok::<_, String>(Some((copy, ())))
+        }
     };
     let build = tokio::select! {
         biased;
@@ -188,7 +194,7 @@ pub(super) async fn run(
         },
         build = prepare => build?,
     };
-    let ok = if let Some(executable) = build {
+    let ok = if let Some((executable, _lease)) = build {
         let exit = execute(
             &executable,
             script,
@@ -248,6 +254,7 @@ pub(super) async fn run(
     Ok((events.finish(ok), events.dumps))
 }
 
+#[cfg(not(windows))]
 fn stage_executable(executable: &Path, destination: &Path) -> Result<PathBuf, String> {
     let name = executable
         .file_name()
@@ -255,16 +262,6 @@ fn stage_executable(executable: &Path, destination: &Path) -> Result<PathBuf, St
     let copy = destination.join(name);
     std::fs::copy(executable, &copy)
         .map_err(|error| format!("Could not stage the Rust executable: {error}"))?;
-    #[cfg(windows)]
-    {
-        // MSVC stores source locations in a companion PDB. Keep it beside the
-        // private executable so Windows can symbolize the panic stack.
-        match std::fs::copy(executable.with_extension("pdb"), copy.with_extension("pdb")) {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("Could not stage Rust debug symbols: {error}")),
-        }
-    }
     Ok(copy)
 }
 

@@ -569,8 +569,8 @@ build to retain source information. Cargo shares compiled dependencies across
 Rust scripts, and small edits reuse the open script's shadow project and
 lockfile. A successful Rust run in a host with an application data directory
 schedules idle precompilation for anyhow, regex, serde, and serde_json. The
-job reuses available crates and can fetch missing ones. A foreground build
-or Clear cancels the job. **Build cache…** in the Rust context actions shows
+job compiles crates already available in Cargo's local package cache without
+network access. A foreground build or Clear cancels the job. **Build cache…** in the Rust context actions shows
 and clears Cargo's compiled artifacts. Other hosts share a temporary target
 directory across their scripts. Reset and forced Stop can clear the script
 values stored by `cache()`. Saved scripts run with their directory as the

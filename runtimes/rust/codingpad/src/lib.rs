@@ -2,7 +2,7 @@
 mod cache;
 mod rich;
 
-pub use cache::{cache, is_cancelled};
+pub use cache::{cache, is_cancelled, CacheValue};
 
 pub use rich::{html, image, image_bytes, live, Html, Image, Live};
 
@@ -113,6 +113,13 @@ impl Drop for PanicGuard {
 pub fn __start() -> PanicGuard {
     if !in_app() {
         return PanicGuard(false);
+    }
+    #[cfg(windows)]
+    if let Some(ready) = std::env::var_os("CODINGPAD_RUST_START") {
+        let ready = std::path::PathBuf::from(ready);
+        while !ready.is_file() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
     let main = std::thread::current().id();
     let previous = std::panic::take_hook();

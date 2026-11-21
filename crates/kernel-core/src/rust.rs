@@ -57,12 +57,35 @@ pub(super) fn stopped() -> RunResult {
     }
 }
 
-pub(super) fn clear_cache(path: &Path) -> Result<(), String> {
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("Could not clear the Rust script cache: {error}")),
+pub(super) fn cache_key(script_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(script_id.as_bytes()))
+}
+
+pub(super) fn retire_cache(path: Option<&Path>) -> Result<Option<tempfile::TempDir>, String> {
+    let Some(path) = path else { return Ok(None) };
+    let error = |error| format!("Could not clear the Rust script cache: {error}");
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(failure) => return Err(error(failure)),
     }
+    let retired = tempfile::tempdir_in(path.parent().unwrap()).map_err(error)?;
+    match std::fs::rename(path, retired.path().join("cache")) {
+        Ok(()) => Ok(Some(retired)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(failure) => Err(error(failure)),
+    }
+}
+
+pub(super) async fn remove_retired_cache(retired: Option<tempfile::TempDir>) -> Result<(), String> {
+    if let Some(retired) = retired {
+        tokio::task::spawn_blocking(move || retired.close())
+            .await
+            .map_err(|error| format!("Could not clear the Rust script cache: {error}"))?
+            .map_err(|error| format!("Could not clear the Rust script cache: {error}"))?;
+    }
+    Ok(())
 }
 
 fn cargo() -> PathBuf {
@@ -105,20 +128,28 @@ pub(super) async fn run(
     let cargo = cargo();
     let build = tokio::select! {
         biased;
-        _ = stop.changed() => return Ok((stopped(), events.dumps)),
+        _ = stop.changed() => {
+            events.send("run_finished", json!({"ok": false}));
+            return Ok((stopped(), events.dumps));
+        },
         build = compile(&cargo, project.root(), &source, name, &mut events) => build?,
     };
     let ok = if let Some(executable) = build {
-        let (status, forced) =
-            execute(&executable, script, &cancel, cache, stop, &mut events).await?;
+        let (status, forced) = execute(
+            &executable,
+            script,
+            project.root(),
+            &cancel,
+            cache,
+            stop,
+            &mut events,
+        )
+        .await?;
         let Some(status) = status else {
             if forced {
-                clear_cache(cache)?;
+                remove_retired_cache(retire_cache(Some(cache))?).await?;
             }
-            events.send(
-                "run_finished",
-                json!({"ok": false, "stopped": true, "cacheCleared": forced}),
-            );
+            events.send("run_finished", json!({"ok": false}));
             return Ok((
                 RunResult {
                     cache_cleared: forced,
@@ -166,12 +197,7 @@ async fn compile(
     name: &str,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
 ) -> Result<Option<PathBuf>, String> {
-    let (status, stdout, stderr) = build_cargo(cargo, root, true).await?;
-    let (status, stdout, stderr) = if !status.success() && needs_network(&stderr) {
-        build_cargo(cargo, root, false).await?
-    } else {
-        (status, stdout, stderr)
-    };
+    let (status, stdout, stderr) = build_cargo(cargo, root).await?;
 
     let mut executable = None;
     let mut diagnostics = Vec::new();
@@ -241,24 +267,18 @@ async fn compile(
     }
 }
 
-fn needs_network(stderr: &[u8]) -> bool {
-    let stderr = String::from_utf8_lossy(stderr);
-    stderr.contains("offline mode") || stderr.contains("--offline was specified")
-}
-
-async fn build_cargo(
-    cargo: &Path,
-    root: &Path,
-    offline: bool,
-) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), String> {
+async fn build_cargo(cargo: &Path, root: &Path) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), String> {
     let mut command = Command::new(cargo);
     command
         .current_dir(root)
-        .args(["build", "--message-format=json", "--quiet", "--target-dir"])
+        .args([
+            "build",
+            "--offline",
+            "--message-format=json",
+            "--quiet",
+            "--target-dir",
+        ])
         .arg(root.join("target"));
-    if offline {
-        command.arg("--offline");
-    }
     let mut child = spawn(command).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             MISSING.to_owned()
@@ -268,15 +288,16 @@ async fn build_cargo(
     })?;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    let mut stdout_pipe = child.0.stdout.take().unwrap();
-    let mut stderr_pipe = child.0.stderr.take().unwrap();
+    let mut stdout_pipe = child.process.stdout.take().unwrap();
+    let mut stderr_pipe = child.process.stderr.take().unwrap();
     let (status, _, _) = tokio::try_join!(
-        child.0.wait(),
+        child.process.wait(),
         stdout_pipe.read_to_end(&mut stdout),
         stderr_pipe.read_to_end(&mut stderr),
     )
     .map_err(|error| format!("Could not read Cargo output: {error}"))?;
 
+    child.finished = true;
     Ok((status, stdout, stderr))
 }
 
@@ -293,31 +314,69 @@ fn diagnostic_range(span: &Value, source: &Source<'_>) -> Option<(usize, usize, 
     diagnostic_range(caller, source)
 }
 
-// Kill the process tree before the child handle or shadow project drops.
-struct RunningChild(Child);
+// Keep the process group or job even after the direct child has been reaped.
+struct RunningChild {
+    process: Child,
+    finished: bool,
+    #[cfg(unix)]
+    pid: u32,
+    #[cfg(windows)]
+    job: Option<std::os::windows::io::OwnedHandle>,
+}
 
 impl RunningChild {
-    fn kill_tree(&mut self) {
-        if self.0.id().is_none() {
-            return;
+    fn kill_tree(&mut self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            if unsafe { libc::kill(-(self.pid as i32), libc::SIGKILL) } == -1 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
+            }
         }
         #[cfg(windows)]
-        if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
-            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
-        }) {
-            // Keep the parent alive until taskkill can find its descendants.
-            // Tokio can move other tasks off this worker while we wait.
-            tokio::task::block_in_place(|| crate::kill_process_tree(&mut self.0));
-            return;
+        if let Some(job) = &self.job {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+            if unsafe { TerminateJobObject(job.as_raw_handle(), 1) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
-        crate::kill_process_tree(&mut self.0);
+        self.finished = true;
+        Ok(())
     }
 }
 
 impl Drop for RunningChild {
     fn drop(&mut self) {
-        self.kill_tree();
+        if !self.finished && self.kill_tree().is_err() {
+            let _ = self.process.start_kill();
+        }
     }
+}
+
+#[cfg(windows)]
+fn assign_job(process: &mut Child) -> io::Result<Option<std::os::windows::io::OwnedHandle>> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+
+    let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if handle.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let job = unsafe { OwnedHandle::from_raw_handle(handle) };
+    if let Some(child) = process.raw_handle() {
+        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), child) } == 0 {
+            let error = io::Error::last_os_error();
+            if process.try_wait()?.is_none() {
+                return Err(error);
+            }
+            return Ok(None);
+        }
+        return Ok(Some(job));
+    }
+    Ok(None)
 }
 
 fn spawn(mut command: Command) -> io::Result<RunningChild> {
@@ -330,7 +389,21 @@ fn spawn(mut command: Command) -> io::Result<RunningChild> {
     command.process_group(0);
     #[cfg(windows)]
     command.creation_flags(0x08000000 | 0x00000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
-    command.spawn().map(RunningChild)
+    let process = command.spawn()?;
+    #[cfg(windows)]
+    let (process, job) = {
+        let mut process = process;
+        let job = assign_job(&mut process)?;
+        (process, job)
+    };
+    Ok(RunningChild {
+        #[cfg(unix)]
+        pid: process.id().expect("a newly spawned child has a PID"),
+        #[cfg(windows)]
+        job,
+        process,
+        finished: false,
+    })
 }
 
 fn token() -> Result<([u8; 32], OsString), String> {
@@ -346,6 +419,7 @@ fn token() -> Result<([u8; 32], OsString), String> {
 async fn execute(
     executable: &Path,
     script: Option<&Path>,
+    root: &Path,
     cancel: &Path,
     cache: &Path,
     stop: &mut watch::Receiver<u64>,
@@ -361,50 +435,39 @@ async fn execute(
         .and_then(|path| std::path::absolute(path).ok())
         .and_then(|path| path.parent().map(Path::to_path_buf));
     command
-        .current_dir(cwd.as_deref().unwrap_or_else(|| cancel.parent().unwrap()))
+        .current_dir(cwd.as_deref().unwrap_or(root))
         .env("CODINGPAD_RUST_CANCEL", cancel)
         .env("CODINGPAD_RUST_CACHE", cache)
         .env("CODINGPAD_RUST_OUTPUT", address.to_string())
         .env("CODINGPAD_RUST_TOKEN", secret);
+    #[cfg(windows)]
+    let ready = {
+        // Let the generated entry point wait until the job is attached before
+        // it can start a subprocess.
+        let ready = root.join("start");
+        command.env("CODINGPAD_RUST_START", &ready);
+        ready
+    };
     let mut child =
         spawn(command).map_err(|error| format!("Could not start the Rust script: {error}"))?;
-    let outcome = {
-        let read = read_output(&mut child.0, &listener, &token, events);
-        tokio::pin!(read);
-        tokio::select! {
-            biased;
-            _ = stop.changed() => {
-                let _ = std::fs::write(cancel, []);
-                match tokio::time::timeout(Duration::from_secs(2), &mut read).await {
-                    Ok(Ok(_)) => return Ok((None, false)),
-                    _ => None,
-                }
-            }
-            status = &mut read => Some(status),
-        }
-    };
-    if let Some(status) = outcome {
-        return status
-            .map(|status| (Some(status), false))
-            .map_err(|error| format!("Could not read Rust script output: {error}"));
-    }
-    child.kill_tree();
-    child
-        .0
-        .wait()
+    #[cfg(windows)]
+    std::fs::write(ready, [])
+        .map_err(|error| format!("Could not start the Rust script: {error}"))?;
+    read_output(&mut child, &listener, &token, events, stop, cancel)
         .await
-        .map_err(|error| format!("Could not stop the Rust script: {error}"))?;
-    Ok((None, true))
+        .map_err(|error| format!("Could not run the Rust script: {error}"))
 }
 
 async fn read_output(
-    child: &mut Child,
+    child: &mut RunningChild,
     listener: &TcpListener,
     token: &[u8; 32],
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
-) -> io::Result<ExitStatus> {
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
-    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    stop: &mut watch::Receiver<u64>,
+    cancel: &Path,
+) -> io::Result<(Option<ExitStatus>, bool)> {
+    let mut stdout = BufReader::new(child.process.stdout.take().unwrap());
+    let mut stderr = BufReader::new(child.process.stderr.take().unwrap());
     let mut runtime: Option<Lines<BufReader<TcpStream>>> = None;
     let mut connected = false;
     let mut stdout_open = true;
@@ -413,15 +476,29 @@ async fn read_output(
     let mut stderr_line = Vec::new();
     let mut exit = None;
     let mut deadline = Instant::now();
+    let mut stopping = false;
     let connect = crate::accept_kernel(listener, token);
     tokio::pin!(connect);
     loop {
         tokio::select! {
             biased;
             // Observe exit even if subprocesses inherit a pipe and keep writing.
-            result = child.wait(), if exit.is_none() => {
+            result = child.process.wait(), if exit.is_none() => {
                 exit = Some(result?);
+                if stopping {
+                    child.kill_tree()?;
+                }
                 deadline = Instant::now() + Duration::from_millis(500);
+            }
+            _ = stop.changed(), if exit.is_none() && !stopping => {
+                std::fs::write(cancel, [])?;
+                stopping = true;
+                deadline = Instant::now() + Duration::from_secs(2);
+            }
+            _ = tokio::time::sleep_until(deadline), if exit.is_none() && stopping => {
+                child.kill_tree()?;
+                child.process.wait().await?;
+                return Ok((None, true));
             }
             _ = tokio::time::sleep_until(deadline), if exit.is_some() => break,
             socket = &mut connect, if !connected => {
@@ -460,11 +537,13 @@ async fn read_output(
         }
         if let Some(status) = exit {
             if !stdout_open && !stderr_open && runtime.is_none() {
-                return Ok(status);
+                child.finished = true;
+                return Ok(((!stopping).then_some(status), false));
             }
         }
     }
-    Ok(exit.unwrap())
+    child.finished = true;
+    Ok((exit.filter(|_| !stopping), false))
 }
 
 fn peer_closed(error: &io::Error) -> bool {

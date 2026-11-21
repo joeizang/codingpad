@@ -473,21 +473,27 @@ impl Supervisor {
         typescript::BUN_NOT_FOUND.to_owned()
     }
 
-    async fn rust_cache_path(&self, script_id: &str) -> Result<PathBuf, String> {
-        use sha2::{Digest, Sha256};
-        let root = match &self.data_dir {
-            Some(data) => data.join("rust-cache"),
-            None => self
-                .rust_cache
-                .get_or_try_init(|| async {
-                    tempfile::tempdir()
-                        .map_err(|error| format!("Could not create the Rust cache: {error}"))
-                })
-                .await?
-                .path()
-                .to_owned(),
+    fn existing_rust_cache_path(&self, script_id: &str) -> Option<PathBuf> {
+        let root = if let Some(data) = &self.data_dir {
+            data.join("rust-cache")
+        } else {
+            self.rust_cache.get()?.path().to_owned()
         };
-        Ok(root.join(format!("{:x}", Sha256::digest(script_id.as_bytes()))))
+        Some(root.join(rust::cache_key(script_id)))
+    }
+
+    async fn rust_cache_path(&self, script_id: &str) -> Result<PathBuf, String> {
+        if let Some(path) = self.existing_rust_cache_path(script_id) {
+            return Ok(path);
+        }
+        let root = self
+            .rust_cache
+            .get_or_try_init(|| async {
+                tempfile::tempdir()
+                    .map_err(|error| format!("Could not create the Rust cache: {error}"))
+            })
+            .await?;
+        Ok(root.path().join(rust::cache_key(script_id)))
     }
 
     pub async fn run(
@@ -552,6 +558,7 @@ impl Supervisor {
         let mut closed = slot.closed.subscribe();
         let mut stop = slot.stop.subscribe();
         if language == Language::Rust {
+            let cache = self.rust_cache_path(script_id).await?;
             let mut guard = tokio::select! {
                 biased;
                 _ = closed.changed() => return Err("Script was closed".into()),
@@ -562,7 +569,6 @@ impl Supervisor {
                 return Err("Script was closed".into());
             }
             *guard = SlotState::default();
-            let cache = self.rust_cache_path(script_id).await?;
             return tokio::select! {
                 biased;
                 _ = closed.changed() => Err("Script was closed".into()),
@@ -807,23 +813,26 @@ impl Supervisor {
     }
 
     pub async fn reset(&self, script_id: &str) -> Result<(), String> {
-        let slot = self
-            .kernels
-            .lock()
-            .await
-            .entry(script_id.into())
-            .or_insert_with(|| Arc::new(Slot::new()))
-            .clone();
-        slot.stop.send_modify(|version| *version += 1);
-        let mut guard = slot.state.lock().await;
-        if *slot.closed.borrow() {
-            return Err("Script was closed".into());
-        }
-        *guard = SlotState::default();
-        if self.data_dir.is_some() || self.rust_cache.initialized() {
-            rust::clear_cache(&self.rust_cache_path(script_id).await?)?;
-        }
-        Ok(())
+        let slots = self.kernels.lock().await;
+        let cache = self.existing_rust_cache_path(script_id);
+        let retired = match slots.get(script_id).cloned() {
+            Some(slot) => {
+                drop(slots);
+                slot.stop.send_modify(|version| *version += 1);
+                let mut guard = slot.state.lock().await;
+                if *slot.closed.borrow() {
+                    return Err("Script was closed".into());
+                }
+                *guard = SlotState::default();
+                rust::retire_cache(cache.as_deref())?
+            }
+            None => {
+                // Exclude registration of a new run until its old cache has
+                // been moved out of the way, without creating an idle slot.
+                rust::retire_cache(cache.as_deref())?
+            }
+        };
+        rust::remove_retired_cache(retired).await
     }
 
     pub async fn close(&self, script_id: &str) {

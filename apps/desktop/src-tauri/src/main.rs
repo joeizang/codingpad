@@ -506,7 +506,7 @@ async fn close_script(
     language_servers.close(&script_id).await;
     supervisor.close(&script_id).await;
     sql.reset(&script_id);
-    Ok(())
+    supervisor.reset(&script_id).await
 }
 
 fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {

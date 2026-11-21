@@ -577,6 +577,27 @@ dump("An explicit dump");
 6 * 7
 ```
 
+Declare crates in Cargo single-file frontmatter at the top of the script.
+Cargo reuses downloaded crates in its local package cache. Relative path
+dependencies are resolved from the saved script's directory.
+
+```rust
+---cargo
+[package]
+edition = "2024"
+
+[dependencies]
+serde_json = "1"
+---
+
+fn main() {
+    println!("{}", serde_json::json!({ "ready": true }));
+}
+```
+
+Save this example as `example.rs` and run it with
+`cargo +nightly -Zscript example.rs` outside CodingPad.
+
 An explicit `fn main()` runs as a normal Rust program. In a top-level script,
 CodingPad automatically dumps a final expression without a semicolon if it
 returns a non-unit value. Dumped values need Rust's `Debug` implementation.

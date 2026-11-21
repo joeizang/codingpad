@@ -10,7 +10,28 @@ pub(super) struct Source<'a> {
 }
 
 impl<'a> Source<'a> {
-    pub(super) fn new(original: &'a str) -> Self {
+    pub(super) fn with_frontmatter(original: &'a str, frontmatter: std::ops::Range<usize>) -> Self {
+        if frontmatter.is_empty() {
+            return Self::new(original);
+        }
+        // Keep byte offsets and line breaks so compiler spans still map back to
+        // the editor, including offsets after non-ASCII manifest comments.
+        let mut masked = original.as_bytes().to_vec();
+        for byte in &mut masked[frontmatter] {
+            if !matches!(byte, b'\n' | b'\r') {
+                *byte = b' ';
+            }
+        }
+        let masked = String::from_utf8(masked).expect("replacing a full range preserves UTF-8");
+        let staged = Source::new(&masked);
+        Self {
+            original,
+            generated: staged.generated,
+            segments: staged.segments,
+        }
+    }
+
+    fn new(original: &'a str) -> Self {
         let _spans = SpanScope;
         let prefix = source_prefix_len(original);
         let mut staged = Self {
@@ -148,7 +169,7 @@ fn native_entry(source: &str) -> Option<usize> {
 }
 
 // Rust allows a BOM and a shebang only at the start of the file.
-fn source_prefix_len(source: &str) -> usize {
+pub(super) fn source_prefix_len(source: &str) -> usize {
     let rest = source.strip_prefix('\u{feff}').unwrap_or(source);
     let bom = source.len() - rest.len();
     if rest

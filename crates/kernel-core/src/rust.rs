@@ -1,10 +1,12 @@
 //! Builds and runs an editor snapshot in a fresh Cargo project.
 mod debug;
 mod dumps;
+mod manifest;
 mod panic;
 mod source;
 
 pub(crate) use dumps::Dumps;
+pub(crate) use manifest::Manifest;
 
 use crate::{shadow::ShadowProjects, KernelEvent, RunResult};
 use debug::{Snapshot, ValueNode};
@@ -29,17 +31,6 @@ use tokio::{
     time::Instant,
 };
 
-pub(super) const SCRIPT_MANIFEST: &str = r#"
-[package]
-name = "codingpad-script"
-version = "0.0.0"
-edition = "2024"
-
-[dependencies]
-codingpad = { path = "codingpad" }
-
-[workspace]
-"#;
 pub(super) const RUNTIME_MANIFEST: &str =
     include_str!("../../../runtimes/rust/codingpad/Cargo.toml");
 pub(super) const RUNTIME: &str = include_str!("../../../runtimes/rust/codingpad/src/lib.rs");
@@ -111,9 +102,10 @@ pub(super) async fn run(
     stop: &mut watch::Receiver<u64>,
     emit: &mut (impl FnMut(KernelEvent) + Send),
 ) -> Result<(RunResult, Dumps), String> {
-    let source = Source::new(source);
-    let project = projects.prepare_rust(&source.generated)?;
     let script = path.map(Path::new);
+    let manifest = Manifest::parse(source, script)?;
+    let source = Source::with_frontmatter(source, manifest.frontmatter);
+    let project = projects.prepare_rust(&source.generated, &manifest.cargo)?;
     let name = script
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
@@ -214,6 +206,7 @@ async fn compile(
         stderr,
     } = build_cargo(cargo, root).await?;
 
+    let root_source = root.join(source::FILE);
     let mut executable = None;
     let mut diagnostics = Vec::new();
     let mut had_error = false;
@@ -221,7 +214,8 @@ async fn compile(
         let Ok(message) = serde_json::from_slice::<Value>(line) else {
             continue;
         };
-        if message["reason"] == "compiler-artifact" {
+        let is_script = message["target"]["src_path"].as_str().map(Path::new) == Some(&root_source);
+        if message["reason"] == "compiler-artifact" && is_script {
             if let Some(path) = message["executable"].as_str() {
                 executable = Some(root.join(path));
             }
@@ -239,7 +233,9 @@ async fn compile(
                     spans
                         .iter()
                         .filter(|span| span["is_primary"] == true)
-                        .find_map(|span| diagnostic_range(span, source))
+                        .find_map(|span| {
+                            is_script.then(|| diagnostic_range(span, source)).flatten()
+                        })
                 });
                 let frames = if let Some((line, column, end_line, end_column)) = span {
                     diagnostics.push(json!({
@@ -274,7 +270,10 @@ async fn compile(
         if !had_error {
             events.error(
                 "Build error",
-                "Cargo could not build the Rust script.",
+                match stderr.trim() {
+                    "" => "Cargo could not build the Rust script.",
+                    text => text.strip_prefix("error: ").unwrap_or(text),
+                },
                 Vec::new(),
             );
         }

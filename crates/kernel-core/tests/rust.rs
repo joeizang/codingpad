@@ -634,3 +634,83 @@ async fn cooperative_stop_keeps_the_cache_and_does_not_mask_an_independent_exit(
         assert_eq!(dumps(&events)[0]["v"], 42);
     }
 }
+
+#[tokio::test]
+async fn cargo_frontmatter_resolves_crates_and_preserves_editor_positions() {
+    let supervisor = Supervisor::default();
+    let source = concat!(
+        "#!/usr/bin/env -S cargo +nightly -Zscript\r\n",
+        "----cargo\r\n",
+        "# café\r\n",
+        "[package]\r\nedition = \"2021\"\r\n",
+        "[dependencies]\r\nserde_json = \"1\"\r\n",
+        "----\r\n",
+        "fn main() { println!(\"{}\", serde_json::json!(42)); }\r\n",
+    );
+    let (result, events) = run(&supervisor, source).await;
+    assert!(result.ok, "{events:?}");
+    assert!(events
+        .iter()
+        .any(|event| event.method == "stream" && event.params["text"] == "42\n"));
+
+    let bad = source.replace("serde_json::json!(42)", "missing()");
+    let (result, events) = run(&supervisor, &bad).await;
+    assert!(!result.ok);
+    let diagnostics = &events
+        .iter()
+        .find(|event| event.method == "diagnostics")
+        .unwrap()
+        .params["diagnostics"];
+    assert_eq!(diagnostics[0]["line"], 9);
+    assert_eq!(diagnostics[0]["column"], 28);
+}
+
+#[tokio::test]
+async fn relative_frontmatter_dependencies_resolve_from_the_saved_script() {
+    let base = tempfile::tempdir().unwrap();
+    let dependency = base.path().join("local-crate");
+    std::fs::create_dir_all(dependency.join("src")).unwrap();
+    std::fs::write(
+        dependency.join("Cargo.toml"),
+        "[package]\nname = \"local-crate\"\nversion = \"0.1.0\"\nedition = \"2021\"",
+    )
+    .unwrap();
+    std::fs::write(
+        dependency.join("src/lib.rs"),
+        "pub fn answer() -> i32 { 42 }",
+    )
+    .unwrap();
+    let supervisor = Supervisor::default();
+    let source = "---cargo\n[dependencies]\nlocal-crate = { path = \"local-crate\" }\n---\nlocal_crate::answer()";
+    let script = base.path().join("saved.rs");
+    let mut events = Vec::new();
+    let result = supervisor
+        .run_language_at(
+            "relative",
+            source,
+            Language::Rust,
+            script.to_str(),
+            |event| events.push(event),
+        )
+        .await
+        .unwrap();
+    assert!(result.ok, "{events:?}");
+    assert_eq!(dumps(&events)[0]["v"], 42);
+
+    let source = source.replace("path = \"local-crate\"", "path = \"missing-crate\"");
+    let mut events = Vec::new();
+    let result = supervisor
+        .run_language_at(
+            "relative",
+            &source,
+            Language::Rust,
+            script.to_str(),
+            |event| events.push(event),
+        )
+        .await
+        .unwrap();
+    assert!(!result.ok);
+    let error = dumps(&events)[0];
+    assert_eq!(error["type"], "Build error");
+    assert!(error["message"].as_str().unwrap().contains("missing-crate"));
+}

@@ -578,7 +578,8 @@ dump("An explicit dump");
 ```
 
 Declare crates in Cargo single-file frontmatter at the top of the script.
-Cargo reuses downloaded crates in its local package cache. Relative path
+CodingPad fetches missing crates before building offline. Cargo reuses
+downloaded crates in its local package cache. Relative path
 dependencies are resolved from the saved script's directory.
 
 ```rust

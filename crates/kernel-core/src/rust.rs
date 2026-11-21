@@ -126,7 +126,12 @@ pub(super) async fn run(
             events.send("run_finished", json!({"ok": false}));
             return Ok((stopped(), events.dumps));
         },
-        build = compile(&cargo, project.root(), &source, name, &mut events) => build?,
+        build = async {
+            if manifest.packages && !prepare_dependencies(&cargo, project.root(), &mut events).await? {
+                return Ok(None);
+            }
+            compile(&cargo, project.root(), &source, name, &mut events).await
+        } => build?,
     };
     let ok = if let Some(executable) = build {
         let exit = execute(
@@ -299,6 +304,39 @@ async fn build_cargo(cargo: &Path, root: &Path) -> Result<CargoOutput, String> {
             "--target-dir",
         ])
         .arg(root.join("target"));
+    cargo_output(command).await
+}
+
+async fn prepare_dependencies(
+    cargo: &Path,
+    root: &Path,
+    events: &mut Events<'_, impl FnMut(KernelEvent)>,
+) -> Result<bool, String> {
+    let mut command = Command::new(cargo);
+    command
+        .current_dir(root)
+        .args(["fetch", "--quiet", "--offline"]);
+    if cargo_output(command).await?.0.success() {
+        return Ok(true);
+    }
+
+    let mut command = Command::new(cargo);
+    command.current_dir(root).args(["fetch", "--quiet"]);
+    let (status, _, stderr) = cargo_output(command).await?;
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
+        events.send("diagnostics", json!({"diagnostics": []}));
+        events.stream("stderr", &stderr);
+        events.error(
+            "Build error",
+            &format!("Could not resolve Rust dependencies. {}", stderr.trim()),
+            Vec::new(),
+        );
+    }
+    Ok(status.success())
+}
+
+async fn cargo_output(command: Command) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), String> {
     let mut child = spawn(command).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             MISSING.to_owned()

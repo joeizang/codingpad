@@ -5,6 +5,7 @@ use toml::{Table, Value};
 pub(crate) struct Manifest {
     pub(crate) cargo: String,
     pub(super) frontmatter: Range<usize>,
+    pub(super) packages: bool,
 }
 
 impl Manifest {
@@ -72,6 +73,21 @@ impl Manifest {
             make_paths_absolute(replace, directories)?;
         }
 
+        let packages = [
+            "dependencies",
+            "dev-dependencies",
+            "build-dependencies",
+            "target",
+            "patch",
+            "replace",
+        ]
+        .into_iter()
+        .any(|key| {
+            cargo
+                .get(key)
+                .and_then(Value::as_table)
+                .is_some_and(|section| !section.is_empty())
+        });
         table(&mut cargo, "dependencies")?.insert(
             "codingpad".to_owned(),
             Value::Table(Table::from_iter([(
@@ -83,6 +99,7 @@ impl Manifest {
         Ok(Self {
             cargo: cargo.to_string(),
             frontmatter,
+            packages,
         })
     }
 }

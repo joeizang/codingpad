@@ -1,18 +1,22 @@
-//! Builds and runs an editor snapshot in a fresh Cargo project.
+//! Builds and runs an editor snapshot in a reusable Cargo shadow project.
+mod build_cache;
 mod debug;
 mod dumps;
 mod manifest;
 mod panic;
 mod source;
 
+pub(crate) use build_cache::BuildCache;
 pub(crate) use dumps::Dumps;
 pub(crate) use manifest::{frontmatter, Manifest};
+pub(crate) use source::FILE as SCRIPT_FILE;
 
-use crate::{shadow::ShadowProjects, KernelEvent, RunResult};
+use crate::{shadow::ShadowProject, KernelEvent, RunResult};
 use debug::{Snapshot, ValueNode};
 use panic::Panic;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use source::Source;
 use std::{
     collections::VecDeque,
@@ -21,6 +25,7 @@ use std::{
     net::Ipv4Addr,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -93,16 +98,34 @@ fn cargo() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
+// A 96-bit project fingerprint separates scripts while keeping Windows paths short.
+const SCRIPT_BINARY_HASH_LENGTH: usize = 24;
+
+struct StagedExecutable {
+    path: PathBuf,
+    #[cfg(windows)]
+    _lease: build_cache::BuildLease,
+}
+
+pub(super) struct RunPaths<'a> {
+    pub(super) project: &'a ShadowProject,
+    pub(super) script: Option<&'a Path>,
+    pub(super) values: &'a Path,
+}
+
 pub(super) async fn run(
-    projects: &ShadowProjects,
+    builds: &Arc<BuildCache>,
     source: &str,
-    path: Option<&str>,
-    cache: &Path,
+    paths: RunPaths<'_>,
     eager: bool,
     stop: &mut watch::Receiver<u64>,
     emit: &mut (impl FnMut(KernelEvent) + Send),
 ) -> Result<(RunResult, Dumps), String> {
-    let script = path.map(Path::new);
+    let RunPaths {
+        project,
+        script,
+        values,
+    } = paths;
     let name = script
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
@@ -134,29 +157,62 @@ pub(super) async fn run(
     };
     let source =
         Source::with_frontmatter(source, manifest.frontmatter.clone(), &manifest.runtime_name);
-    let project = projects.prepare_rust(&source.generated, &manifest.cargo)?;
-    let cancel = project.root().join("cancel");
+    let run_files = tempfile::tempdir_in(project.root())
+        .map_err(|error| format!("Could not prepare the Rust run: {error}"))?;
+    let cancel = run_files.path().join("cancel");
     let cargo = cargo();
+    let root = project.root();
+    // Separate binaries for scripts sharing a target directory.
+    let project_hash = format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()));
+    let binary = format!("codingpad-{}", &project_hash[..SCRIPT_BINARY_HASH_LENGTH]);
+    let prepare = async {
+        let lease = builds.acquire().await?;
+        build_cache::stage(
+            project,
+            &source.generated,
+            &manifest,
+            &builds.stage_runtime().await?,
+            &binary,
+        )?;
+        if manifest.needs_packages
+            && !prepare_dependencies(&cargo, root, &manifest, &mut events).await?
+        {
+            return Ok(None);
+        }
+        let executable = compile(&cargo, root, lease.target(), &source, name, &mut events).await?;
+        let Some(executable) = executable else {
+            return Ok(None);
+        };
+        #[cfg(windows)]
+        {
+            // Run from Cargo's output path so Windows can use its original
+            // debug-symbol layout. The lease protects the executable until exit.
+            Ok::<_, String>(Some(StagedExecutable {
+                path: executable,
+                _lease: lease,
+            }))
+        }
+        #[cfg(not(windows))]
+        {
+            let copy = stage_executable(&executable, run_files.path())?;
+            Ok::<_, String>(Some(StagedExecutable { path: copy }))
+        }
+    };
     let build = tokio::select! {
         biased;
         _ = stop.changed() => {
             events.send("run_finished", json!({"ok": false}));
             return Ok((stopped(), events.dumps));
         },
-        build = async {
-            if manifest.needs_packages && !prepare_dependencies(&cargo, project.root(), &manifest, &mut events).await? {
-                return Ok(None);
-            }
-            compile(&cargo, project.root(), &source, name, &mut events).await
-        } => build?,
+        build = prepare => build?,
     };
     let ok = if let Some(executable) = build {
         let exit = execute(
-            &executable,
+            &executable.path,
             script,
-            project.root(),
+            run_files.path(),
             &cancel,
-            cache,
+            values,
             stop,
             &mut events,
         )
@@ -164,7 +220,7 @@ pub(super) async fn run(
         let ScriptExit::Completed(status) = exit else {
             let mut cache_cleared = false;
             if matches!(exit, ScriptExit::Killed) {
-                match retire_cache(Some(cache)) {
+                match retire_cache(Some(values)) {
                     Ok(retired) => {
                         cache_cleared = retired.is_some();
                         if let Err(error) = remove_retired_cache(retired).await {
@@ -204,12 +260,27 @@ pub(super) async fn run(
     } else {
         false
     };
+    if ok {
+        builds.schedule_warmup();
+    }
     Ok((events.finish(ok), events.dumps))
+}
+
+#[cfg(not(windows))]
+fn stage_executable(executable: &Path, destination: &Path) -> Result<PathBuf, String> {
+    let name = executable
+        .file_name()
+        .ok_or("Cargo returned an invalid executable path")?;
+    let copy = destination.join(name);
+    std::fs::copy(executable, &copy)
+        .map_err(|error| format!("Could not stage the Rust executable: {error}"))?;
+    Ok(copy)
 }
 
 async fn compile(
     cargo: &Path,
     root: &Path,
+    target: &Path,
     source: &Source<'_>,
     name: &str,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
@@ -218,7 +289,7 @@ async fn compile(
         status,
         stdout,
         stderr,
-    } = build_cargo(cargo, root).await?;
+    } = build_cargo(cargo, root, target).await?;
 
     let root_source = root.join(source::FILE);
     let canonical_source = std::fs::canonicalize(&root_source).ok();
@@ -317,18 +388,12 @@ async fn compile(
     }
 }
 
-async fn build_cargo(cargo: &Path, root: &Path) -> Result<CargoOutput, String> {
+async fn build_cargo(cargo: &Path, root: &Path, target: &Path) -> Result<CargoOutput, String> {
     let mut command = Command::new(cargo);
     command
         .current_dir(root)
-        .args([
-            "build",
-            "--offline",
-            "--message-format=json",
-            "--quiet",
-            "--target-dir",
-        ])
-        .arg(root.join("target"));
+        .args(["build", "--offline", "--message-format=json", "--quiet"]);
+    build_cache::use_shared_target(&mut command, target);
     cargo_output(command).await
 }
 
@@ -382,8 +447,9 @@ struct CargoOutput {
     stderr: Vec<u8>,
 }
 
-async fn cargo_output(command: Command) -> Result<CargoOutput, String> {
-    let mut child = spawn(command).map_err(|error| {
+async fn cargo_output(mut command: Command) -> Result<CargoOutput, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = spawn(&mut command).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             MISSING.to_owned()
         } else {
@@ -521,12 +587,9 @@ fn assign_job(process: &Child) -> Option<std::os::windows::io::OwnedHandle> {
     Some(job)
 }
 
-fn spawn(mut command: Command) -> io::Result<RunningChild> {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+// Callers choose whether to pipe output for Results or discard it for warmup.
+fn spawn(command: &mut Command) -> io::Result<RunningChild> {
+    command.stdin(Stdio::null()).kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
     #[cfg(windows)]
@@ -583,23 +646,41 @@ async fn execute(
         .env("CODINGPAD_RUST_CANCEL", cancel)
         .env("CODINGPAD_RUST_CACHE", cache)
         .env("CODINGPAD_RUST_OUTPUT", address.to_string())
-        .env("CODINGPAD_RUST_TOKEN", secret);
+        .env("CODINGPAD_RUST_TOKEN", secret)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     #[cfg(windows)]
     let ready = {
         // Let the generated entry point wait until the job is attached before
         // it can start a subprocess.
-        let ready = root.join("start");
+        let ready = cancel.with_file_name("start");
         command.env("CODINGPAD_RUST_START", &ready);
         ready
     };
-    let mut child =
-        spawn(command).map_err(|error| format!("Could not start the Rust script: {error}"))?;
+    let mut child = spawn_script(&mut command)
+        .await
+        .map_err(|error| format!("Could not start the Rust script: {error}"))?;
     #[cfg(windows)]
     std::fs::write(ready, [])
         .map_err(|error| format!("Could not start the Rust script: {error}"))?;
     read_output(&mut child, &listener, &token, events, stop, cancel)
         .await
         .map_err(|error| format!("Could not run the Rust script: {error}"))
+}
+
+async fn spawn_script(command: &mut Command) -> io::Result<RunningChild> {
+    #[cfg(unix)]
+    for _ in 0..5 {
+        match spawn(command) {
+            // A concurrent fork can briefly inherit the open file description
+            // from the executable copy before closing it on exec.
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            result => return result,
+        }
+    }
+    spawn(command)
 }
 
 async fn read_output(

@@ -5,7 +5,7 @@ use toml::{Table, Value};
 const DEPENDENCY_SECTIONS: &[&str] = &["dependencies", "dev-dependencies", "dev_dependencies"];
 
 pub(crate) struct Manifest {
-    pub(crate) cargo: String,
+    cargo: Table,
     pub(super) frontmatter: Range<usize>,
     pub(super) needs_packages: bool,
     pub(super) runtime_name: String,
@@ -85,10 +85,6 @@ impl Manifest {
                 "Use a Rust identifier for the codingpad dependency name.",
             )));
         }
-        dependencies.insert(
-            runtime_name.clone(),
-            runtime_dependency(&runtime_name, "codingpad"),
-        );
         cargo.insert("workspace".to_owned(), Value::Table(Table::new()));
 
         let mut dependency_line = line_at(source, frontmatter.start);
@@ -119,7 +115,7 @@ impl Manifest {
             }
         }
         Ok(Self {
-            cargo: cargo.to_string(),
+            cargo,
             frontmatter,
             needs_packages,
             runtime_name,
@@ -152,6 +148,28 @@ impl Manifest {
             }
         }
         self.dependency_line
+    }
+    pub(super) fn for_project(&self, runtime: &Path, binary: &str) -> Result<String, String> {
+        let runtime = runtime
+            .to_str()
+            .ok_or("The Rust runtime path is not valid UTF-8.")?;
+        let mut cargo = self.cargo.clone();
+        table_or_insert(&mut cargo, "dependencies")
+            .map_err(|error| error.to_string())?
+            .insert(
+                self.runtime_name.clone(),
+                runtime_dependency(&self.runtime_name, runtime),
+            );
+        let package = table_or_insert(&mut cargo, "package").map_err(|error| error.to_string())?;
+        package.insert("autobins".to_owned(), Value::Boolean(false));
+        cargo.insert(
+            "bin".to_owned(),
+            Value::Array(vec![Value::Table(Table::from_iter([
+                ("name".to_owned(), Value::from(binary)),
+                ("path".to_owned(), Value::from(super::source::FILE)),
+            ]))]),
+        );
+        Ok(cargo.to_string())
     }
 }
 

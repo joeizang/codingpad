@@ -911,7 +911,7 @@ stop **Run**; Python and TypeScript execute regardless.
 
 ## Performance checks
 
-`just bench` builds the release app and measures the M1, M2 and M5 targets from
+`just bench` builds the release app and measures performance targets from
 D38 on Linux:
 
 | Metric | Target |
@@ -927,6 +927,7 @@ D38 on Linux:
 | 100k-item `IEnumerable`, first page to host | < 1 s |
 | C# completion | < 300 ms |
 | TypeScript completion | < 300 ms |
+| Warm Rust rerun after an edit | < 3 s |
 
 The first completion run may download basedpyright; later runs reuse the cache.
 The C# completion metric needs Roslyn, from the VS Code C# extension or
@@ -937,6 +938,9 @@ The TypeScript completion metric needs the TypeScript 7 native server and Bun;
 install `@typescript/native-preview` or set `CODINGPAD_TS_LSP`. It is skipped
 when the server is not found.
 C# runs use no NuGet packages, so the measurements exclude package downloads.
+Rust reruns use the shared target directory. A successful Rust run schedules
+idle precompilation of selected common crates already available to Cargo.
+Temporary hosts use their own shared target directory.
 App readiness requires a mounted, writable Monaco model and registered editor
 commands/providers after a paint. Process entry, Tauri setup, WebView loading,
 frontend evaluation and editor creation/mount timestamps are printed separately.

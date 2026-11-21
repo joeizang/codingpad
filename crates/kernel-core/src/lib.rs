@@ -286,6 +286,7 @@ struct Slot {
     state: Mutex<SlotState>,
     closed: watch::Sender<bool>,
     stop: watch::Sender<u64>,
+    rust_project: OnceCell<shadow::ShadowProject>,
 }
 
 impl Slot {
@@ -294,6 +295,7 @@ impl Slot {
             state: Mutex::default(),
             closed: watch::channel(false).0,
             stop: watch::channel(0).0,
+            rust_project: OnceCell::new(),
         }
     }
 }
@@ -483,6 +485,14 @@ impl Supervisor {
         typescript::BUN_NOT_FOUND.to_owned()
     }
 
+    pub async fn rust_build_cache_size(&self) -> Result<u64, String> {
+        self.shadow_projects.rust_build.size().await
+    }
+
+    pub async fn clear_rust_build_cache(&self) -> Result<(), String> {
+        self.shadow_projects.rust_build.clear().await
+    }
+
     fn rust_cache_path_if_initialized(&self, script_id: &str) -> Option<PathBuf> {
         let root = self
             .rust_cache_data
@@ -578,10 +588,19 @@ impl Supervisor {
                 return Err("Script was closed".into());
             }
             *guard = SlotState::default();
+            let project = slot
+                .rust_project
+                .get_or_try_init(|| async { shadow::ShadowProject::temporary(rust::SCRIPT_FILE) })
+                .await?;
+            let paths = rust::RunPaths {
+                project,
+                script: path.map(Path::new),
+                values: &cache,
+            };
             return tokio::select! {
                 biased;
                 _ = closed.changed() => Err("Script was closed".into()),
-                result = rust::run(&self.shadow_projects, source, path, &cache, self.eager_dumps, &mut stop, &mut emit) => {
+                result = rust::run(&self.shadow_projects.rust_build, source, paths, self.eager_dumps, &mut stop, &mut emit) => {
                     let (result, dumps) = result?;
                     guard.rust_dumps = Some(dumps);
                     Ok(result)

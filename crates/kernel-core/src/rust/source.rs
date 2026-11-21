@@ -1,7 +1,7 @@
 use syn::{parse::ParseStream, spanned::Spanned, Attribute, Expr, Item, Stmt};
 use unicode_width::UnicodeWidthChar;
 
-pub(super) const FILE: &str = "src/main.rs";
+pub(crate) const FILE: &str = "src/main.rs";
 
 pub(super) struct Source<'a> {
     original: &'a str,

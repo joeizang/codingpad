@@ -784,3 +784,86 @@ async fn invalid_cargo_script_frontmatter_reports_its_original_line() {
     );
     assert!(!events.iter().any(|event| event.method == "stream"));
 }
+
+#[tokio::test]
+async fn rust_build_cache_reuses_artifacts_and_clears_without_resetting_values() {
+    let supervisor = Supervisor::default();
+    assert_eq!(supervisor.rust_build_cache_size().await.unwrap(), 0);
+    let (result, _) = run(&supervisor, r#"codingpad::cache("answer", || 42)"#).await;
+    assert!(result.ok);
+    let size = supervisor.rust_build_cache_size().await.unwrap();
+    assert!(size > 0);
+
+    let start = std::time::Instant::now();
+    let (result, events) = run(&supervisor, r#"codingpad::cache("answer", || 43)"#).await;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "Edited Rust rerun took {elapsed:?}"
+    );
+    assert!(result.ok);
+    assert_eq!(dumps(&events)[0]["v"], 42);
+
+    supervisor.clear_rust_build_cache().await.unwrap();
+    assert_eq!(supervisor.rust_build_cache_size().await.unwrap(), 0);
+    let (result, events) = run(&supervisor, r#"codingpad::cache("answer", || 44)"#).await;
+    assert!(result.ok);
+    assert_eq!(dumps(&events)[0]["v"], 42);
+    assert!(supervisor.rust_build_cache_size().await.unwrap() > 0);
+}
+
+#[tokio::test]
+async fn separate_rust_scripts_reuse_artifacts_and_warmup_compiles_cached_crates() {
+    use std::path::{Path, PathBuf};
+    use tokio::time::{sleep, timeout, Duration};
+
+    let data = tempfile::tempdir().unwrap();
+    let artifacts = data.path().join("rust-build");
+    let supervisor = Supervisor::with_data_dir(data.path().to_owned());
+    fn find_artifacts(directory: &Path, name: &str) -> Vec<PathBuf> {
+        let mut matches = Vec::new();
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return matches;
+        };
+        for file in entries.filter_map(Result::ok) {
+            let Ok(kind) = file.file_type() else { continue };
+            if kind.is_dir() {
+                matches.extend(find_artifacts(&file.path(), name));
+            } else if kind.is_file()
+                && file
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|file| file.starts_with(name) && file.ends_with(".rlib"))
+            {
+                matches.push(file.path());
+            }
+        }
+        matches
+    }
+
+    let first = supervisor
+        .run_language("first-script", "42", Language::Rust, |_| {})
+        .await
+        .unwrap();
+    assert!(first.ok);
+    let existing = find_artifacts(&artifacts, "libcodingpad-");
+    assert_eq!(existing.len(), 1, "{existing:?}");
+    let modified = existing[0].metadata().unwrap().modified().unwrap();
+    let second = supervisor
+        .run_language("second-script", "43", Language::Rust, |_| {})
+        .await
+        .unwrap();
+    assert!(second.ok);
+    assert_eq!(find_artifacts(&artifacts, "libcodingpad-"), existing);
+    assert_eq!(
+        existing[0].metadata().unwrap().modified().unwrap(),
+        modified
+    );
+    timeout(Duration::from_secs(90), async {
+        while find_artifacts(&artifacts, "libserde_json-").is_empty() {
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("background warmup did not compile the locally available serde_json");
+}

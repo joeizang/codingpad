@@ -28,6 +28,7 @@ import {
   NewScriptMenu,
   SAMPLE_CONNECTION,
 } from "./NewScriptMenu";
+import { RustBuildCacheDialog } from "./RustBuildCacheDialog";
 import { SecretsDialog } from "./SecretsDialog";
 import { SchemaPanel } from "./SchemaPanel";
 import { UpdateNotice } from "./UpdateNotice";
@@ -255,6 +256,7 @@ export default function App() {
   const counter = useRef(1);
   const opening = useRef(new Set<string>());
   const [closing, setClosing] = useState(false);
+  const [rustBuildCacheOpen, setRustBuildCacheOpen] = useState(false);
   const [secretsOpen, setSecretsOpen] = useState(false);
   const [connectionsOpen, setConnectionsOpen] = useState(false);
   const [pendingCrash, dismissPendingCrash] = usePendingCrash();
@@ -1121,6 +1123,9 @@ export default function App() {
           </span>
         )}
         <div className="context-actions">
+          {language === "rust" && (
+            <button onClick={() => setRustBuildCacheOpen(true)}>Build cache…</button>
+          )}
           <button aria-label="Save" onClick={() => void saveScript(active)}>
             Save
           </button>
@@ -1297,6 +1302,7 @@ export default function App() {
         }}
       />
       <SecretsDialog open={secretsOpen} onClose={() => setSecretsOpen(false)} />
+      {rustBuildCacheOpen && <RustBuildCacheDialog onClose={() => setRustBuildCacheOpen(false)} />}
       <footer className="statusbar">
         <span className={`state ${runState}`}>
           {active.running ? "running" : runState === "failed" ? "failed" : "ready"}

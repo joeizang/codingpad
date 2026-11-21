@@ -497,6 +497,16 @@ async fn request_language_server(
 }
 
 #[tauri::command]
+async fn rust_build_cache_size(supervisor: State<'_, Supervisor>) -> Result<u64, String> {
+    supervisor.rust_build_cache_size().await
+}
+
+#[tauri::command]
+async fn clear_rust_build_cache(supervisor: State<'_, Supervisor>) -> Result<(), String> {
+    supervisor.clear_rust_build_cache().await
+}
+
+#[tauri::command]
 async fn close_script(
     supervisor: State<'_, Supervisor>,
     language_servers: State<'_, LanguageServers>,
@@ -635,6 +645,8 @@ fn main() {
             run_script,
             stop_script,
             reset_script,
+            rust_build_cache_size,
+            clear_rust_build_cache,
             expand_node,
             export_table_dump,
             cancel_export,

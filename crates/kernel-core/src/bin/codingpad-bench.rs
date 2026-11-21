@@ -1,4 +1,4 @@
-//! Local M1, M2 and M5 performance checks (D38, D48, D55). Run with `just bench`.
+//! Local performance checks (D38, D48, D55). Run with `just bench`.
 
 use codingpad_kernel_core::{lsp::LanguageServers, KernelEvent, Language, Supervisor};
 use serde_json::json;
@@ -19,6 +19,7 @@ const TARGET_IDLE_MEMORY: u64 = 475 * 1024 * 1024;
 const TARGET_CSHARP_FIRST_KERNEL: Duration = Duration::from_millis(3_000);
 const TARGET_CSHARP_RERUN: Duration = Duration::from_millis(500);
 const TARGET_CSHARP_SEQUENCE: Duration = Duration::from_millis(1_000);
+const TARGET_RUST_RERUN: Duration = Duration::from_secs(3);
 const TARGET_CSHARP_COMPLETION: Duration = Duration::from_millis(300);
 
 /// Roslyn loads the shadow project in the background after it starts.
@@ -131,6 +132,33 @@ async fn main() {
     }
 }
 
+async fn rust_warm_rerun() -> Result<Duration, String> {
+    let data = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let supervisor = Supervisor::with_data_dir(data.path().to_owned()).with_session_rust_cache();
+    let mut elapsed = Duration::ZERO;
+    for expected in [41, 42] {
+        let source = format!(
+            "---cargo\n[dependencies]\nserde_json = \"1\"\n---\nserde_json::from_str::<i64>(\"{expected}\").unwrap()"
+        );
+        let start = Instant::now();
+        let mut dump = None;
+        let run = supervisor
+            .run_language("rust-benchmark", &source, Language::Rust, |event| {
+                if event.method == "dump" {
+                    dump = Some(event.params["node"].clone());
+                }
+            })
+            .await?;
+        elapsed = start.elapsed();
+        if !run.ok || dump.as_ref().and_then(|node| node["v"].as_i64()) != Some(expected) {
+            return Err(format!(
+                "Rust benchmark expected {expected}, received {dump:?}"
+            ));
+        }
+    }
+    Ok(elapsed)
+}
+
 async fn run_once() -> bool {
     let mut rows = Vec::new();
     let mut failures = Vec::new();
@@ -241,12 +269,21 @@ async fn run_once() -> bool {
         Err(error) => rows.push(Row::failed("TypeScript completion", "< 300 ms", error)),
     }
 
+    match rust_warm_rerun().await {
+        Ok(measured) => rows.push(Row::time(
+            "Rust rerun after edit",
+            measured,
+            TARGET_RUST_RERUN,
+        )),
+        Err(error) => rows.push(Row::failed("Rust rerun after edit", "< 3000 ms", error)),
+    }
+
     report(&rows);
     if failures.is_empty() && rows.iter().all(|row| row.status != Status::Fail) {
-        println!("\nAll measured M1, M2 and M5 targets pass.");
+        println!("\nAll measured performance targets pass.");
         true
     } else {
-        eprintln!("\nSome M1, M2 or M5 targets did not pass or could not be measured.");
+        eprintln!("\nSome performance targets did not pass or could not be measured.");
         false
     }
 }
@@ -601,7 +638,7 @@ fn report(rows: &[Row]) {
         .max("target".len());
 
     println!(
-        "CodingPad M1, M2 and M5 performance ({}, {} build)\n",
+        "CodingPad performance ({}, {} build)\n",
         std::env::consts::OS,
         if cfg!(debug_assertions) {
             "debug"

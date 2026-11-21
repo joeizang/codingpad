@@ -2,13 +2,13 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 export function RustBuildCacheDialog({ onClose }: { onClose: () => void }) {
-  const dialog = useRef<HTMLDialogElement>(null);
+  const dialog = useRef<HTMLElement>(null);
   const [bytes, setBytes] = useState<number | null>(null);
   const [error, setError] = useState("");
   const [clearing, setClearing] = useState(false);
 
   useEffect(() => {
-    dialog.current?.showModal();
+    dialog.current?.focus();
     let active = true;
     void invoke<number>("rust_build_cache_size").then(
       (size) => { if (active) setBytes(size); },
@@ -37,20 +37,36 @@ export function RustBuildCacheDialog({ onClose }: { onClose: () => void }) {
       : `${(bytes / (1024 * 1024)).toLocaleString(undefined, { maximumFractionDigits: 1 })} MiB`;
 
   return (
-    <dialog ref={dialog} className="modal rust-build-cache" aria-labelledby="rust-cache-title" onClose={onClose}>
-      <header className="modal-heading">
-        <h2 id="rust-cache-title">Rust build cache</h2>
-        <button autoFocus className="section-action" aria-label="Close Rust build cache" onClick={onClose}>×</button>
-      </header>
-      <p className="modal-note" aria-live="polite">
-        {clearing ? "Clearing build artifacts…" : size ? `${size} in compiled artifacts` : error ? "" : "Measuring build artifacts…"}
-      </p>
-      {error && <p role="alert">{error}</p>}
-      <div className="modal-actions">
-        <button disabled={clearing || bytes === 0 || (bytes === null && !error)} onClick={() => void clear()}>
-          Clear build cache
-        </button>
-      </div>
-    </dialog>
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) onClose();
+    }}>
+      <section
+        ref={dialog}
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="rust-cache-title"
+        tabIndex={-1}
+        onKeyDown={(event) => { if (event.key === "Escape") onClose(); }}
+      >
+        <header className="modal-heading">
+          <h2 id="rust-cache-title">Rust build cache</h2>
+          <button className="section-action" aria-label="Close Rust build cache" onClick={onClose}>×</button>
+        </header>
+        <p className="modal-note" aria-live="polite">
+          {clearing
+            ? "Clearing build artifacts…"
+            : bytes !== null
+              ? `${size} in compiled artifacts`
+              : error ? "" : "Measuring build artifacts…"}
+        </p>
+        {error && <p role="alert">{error}</p>}
+        <div className="modal-actions">
+          <button disabled={clearing || bytes === 0 || (bytes === null && !error)} onClick={() => void clear()}>
+            Clear build cache
+          </button>
+        </div>
+      </section>
+    </div>
   );
 }

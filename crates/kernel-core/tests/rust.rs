@@ -807,3 +807,58 @@ async fn rust_build_cache_reuses_artifacts_and_clears_without_resetting_values()
     assert_eq!(dumps(&events)[0]["v"], 42);
     assert!(supervisor.rust_build_cache_size().await.unwrap() > 0);
 }
+
+#[tokio::test]
+async fn separate_rust_scripts_reuse_artifacts_and_warmup_compiles_cached_crates() {
+    use std::path::Path;
+    use tokio::time::{sleep, timeout, Duration};
+
+    let data = tempfile::tempdir().unwrap();
+    let artifacts = data.path().join("rust-build/debug/deps");
+    let supervisor = Supervisor::with_data_dir(data.path().to_owned());
+    fn find_artifact(directory: &Path, name: &str) -> Option<std::fs::DirEntry> {
+        std::fs::read_dir(directory)
+            .ok()?
+            .filter_map(Result::ok)
+            .find(|file| {
+                let file = file.file_name();
+                file.to_str()
+                    .is_some_and(|file| file.starts_with(name) && file.ends_with(".rlib"))
+            })
+    }
+
+    let first = supervisor
+        .run_language("first-script", "42", Language::Rust, |_| {})
+        .await
+        .unwrap();
+    assert!(first.ok);
+    let runtime = find_artifact(&artifacts, "libcodingpad-").expect("runtime artifact");
+    let modified = runtime.metadata().unwrap().modified().unwrap();
+    let second = supervisor
+        .run_language("second-script", "43", Language::Rust, |_| {})
+        .await
+        .unwrap();
+    assert!(second.ok);
+    assert_eq!(runtime.metadata().unwrap().modified().unwrap(), modified);
+    let runtime_count = std::fs::read_dir(&artifacts)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|file| {
+            file.file_name()
+                .to_string_lossy()
+                .starts_with("libcodingpad-")
+                && file
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "rlib")
+        })
+        .count();
+    assert_eq!(runtime_count, 1);
+    timeout(Duration::from_secs(90), async {
+        while find_artifact(&artifacts, "libserde_json-").is_none() {
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("background warmup did not compile the locally available serde_json");
+}

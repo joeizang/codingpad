@@ -911,7 +911,7 @@ stop **Run**; Python and TypeScript execute regardless.
 
 ## Performance checks
 
-`just bench` builds the release app and measures the M1, M2 and M5 targets from
+`just bench` builds the release app and measures performance targets from
 D38 on Linux:
 
 | Metric | Target |
@@ -927,6 +927,7 @@ D38 on Linux:
 | 100k-item `IEnumerable`, first page to host | < 1 s |
 | C# completion | < 300 ms |
 | TypeScript completion | < 300 ms |
+| Warm Rust rerun after an edit | < 3 s |
 
 The first completion run may download basedpyright; later runs reuse the cache.
 The C# completion metric needs Roslyn, from the VS Code C# extension or

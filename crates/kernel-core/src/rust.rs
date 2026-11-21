@@ -101,7 +101,7 @@ fn cargo() -> PathBuf {
 pub(super) struct RunPaths<'a> {
     pub(super) project: &'a ShadowProject,
     pub(super) script: Option<&'a Path>,
-    pub(super) cache: &'a Path,
+    pub(super) values: &'a Path,
 }
 
 pub(super) async fn run(
@@ -115,7 +115,7 @@ pub(super) async fn run(
     let RunPaths {
         project,
         script,
-        cache,
+        values,
     } = paths;
     let name = script
         .and_then(Path::file_name)
@@ -163,7 +163,7 @@ pub(super) async fn run(
             project,
             &source.generated,
             &manifest,
-            &lease.runtime()?,
+            &builds.runtime().await?,
             &binary,
         )?;
         if manifest.needs_packages
@@ -171,7 +171,7 @@ pub(super) async fn run(
         {
             return Ok(None);
         }
-        let executable = compile(&cargo, root, &lease.target(), &source, name, &mut events).await?;
+        let executable = compile(&cargo, root, lease.target(), &source, name, &mut events).await?;
         // The shared target may be cleared while this script runs. A private
         // copy also avoids trying to replace an in-use executable on Windows.
         let Some(executable) = executable else {
@@ -196,7 +196,7 @@ pub(super) async fn run(
             script,
             run_files.path(),
             &cancel,
-            cache,
+            values,
             stop,
             &mut events,
         )
@@ -204,7 +204,7 @@ pub(super) async fn run(
         let ScriptExit::Completed(status) = exit else {
             let mut cache_cleared = false;
             if matches!(exit, ScriptExit::Killed) {
-                match retire_cache(Some(cache)) {
+                match retire_cache(Some(values)) {
                     Ok(retired) => {
                         cache_cleared = retired.is_some();
                         if let Err(error) = remove_retired_cache(retired).await {
@@ -566,6 +566,7 @@ fn assign_job(process: &Child) -> Option<std::os::windows::io::OwnedHandle> {
     Some(job)
 }
 
+// Callers choose whether to pipe output for Results or discard it for warmup.
 fn spawn(command: &mut Command) -> io::Result<RunningChild> {
     command.stdin(Stdio::null()).kill_on_drop(true);
     #[cfg(unix)]

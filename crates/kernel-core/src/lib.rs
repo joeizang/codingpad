@@ -595,7 +595,7 @@ impl Supervisor {
             let paths = rust::RunPaths {
                 project,
                 script: path.map(Path::new),
-                cache: &cache,
+                values: &cache,
             };
             return tokio::select! {
                 biased;

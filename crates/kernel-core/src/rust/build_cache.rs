@@ -20,34 +20,38 @@ use tokio::{
     sync::{watch, OnceCell},
 };
 
-const POPULAR_CRATES: &str = r#"---cargo
-[dependencies]
-anyhow = "1"
-regex = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
----
-"#;
+const POPULAR_CRATES: &[(&str, &str)] = &[
+    ("serde", "1"),
+    ("serde_json", "1"),
+    ("regex", "1"),
+    ("anyhow", "1"),
+];
+
+#[derive(Clone, Copy)]
+enum Access {
+    Build,
+    Exclusive,
+}
 
 pub(crate) struct BuildCache {
-    persistent: Option<PathBuf>,
+    data: Option<PathBuf>,
     temporary: OnceCell<TempDir>,
     activity: watch::Sender<()>,
-    warming: AtomicBool,
+    warmup_scheduled_or_complete: AtomicBool,
 }
 
 impl BuildCache {
     pub(crate) fn new(data: Option<&Path>) -> Self {
         Self {
-            persistent: data.map(|path| path.join("rust-build")),
+            data: data.map(Path::to_owned),
             temporary: OnceCell::new(),
             activity: watch::channel(()).0,
-            warming: AtomicBool::new(false),
+            warmup_scheduled_or_complete: AtomicBool::new(false),
         }
     }
 
-    async fn root(&self) -> Result<&Path, String> {
-        if let Some(root) = &self.persistent {
+    async fn data_root(&self) -> Result<&Path, String> {
+        if let Some(root) = &self.data {
             return Ok(root);
         }
         let temp = self
@@ -58,35 +62,36 @@ impl BuildCache {
     }
 
     pub(super) async fn acquire(&self) -> Result<BuildLease, String> {
-        // An interactive build or Clear can cancel an in-progress warmup.
+        self.lock(Access::Build).await
+    }
+
+    async fn lock(&self, access: Access) -> Result<BuildLease, String> {
         self.activity.send_replace(());
-        let root = self.root().await?;
+        let root = self.data_root().await?;
         let lock = open_lock(root).map_err(cache_error)?;
         loop {
-            match lock.try_lock() {
-                Ok(()) => {
+            match try_acquire(&lock, access) {
+                Ok(true) => {
                     return Ok(BuildLease {
-                        root: root.to_owned(),
+                        target: root.join("rust-build"),
                         _lock: lock,
                     })
                 }
-                Err(TryLockError::WouldBlock) => {
-                    tokio::time::sleep(Duration::from_millis(25)).await
-                }
-                Err(TryLockError::Error(error)) => return Err(cache_error(error)),
+                Ok(false) => tokio::time::sleep(Duration::from_millis(25)).await,
+                Err(error) => return Err(cache_error(error)),
             }
         }
     }
 
     pub(crate) async fn size(&self) -> Result<u64, String> {
-        let target = self.root().await?.join("target");
+        let target = self.data_root().await?.join("rust-build");
         tokio::task::spawn_blocking(move || size(&target).map_err(cache_error))
             .await
             .map_err(cache_error)?
     }
 
     pub(crate) async fn clear(&self) -> Result<(), String> {
-        let lease = self.acquire().await?;
+        let lease = self.lock(Access::Exclusive).await?;
         tokio::task::spawn_blocking(move || match fs::remove_dir_all(lease.target()) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -94,12 +99,17 @@ impl BuildCache {
         })
         .await
         .map_err(cache_error)??;
-        self.warming.store(false, Ordering::Release);
+        self.warmup_scheduled_or_complete
+            .store(false, Ordering::Release);
         Ok(())
     }
 
     pub(super) fn schedule_warmup(self: &Arc<Self>) {
-        if self.persistent.is_none() || self.warming.swap(true, Ordering::AcqRel) {
+        if self.data.is_none()
+            || self
+                .warmup_scheduled_or_complete
+                .swap(true, Ordering::AcqRel)
+        {
             return;
         }
         let cache = self.clone();
@@ -114,67 +124,72 @@ impl BuildCache {
                 } => result.unwrap_or(false),
             };
             if !completed {
-                cache.warming.store(false, Ordering::Release);
+                cache
+                    .warmup_scheduled_or_complete
+                    .store(false, Ordering::Release);
             }
         });
     }
 
     async fn precompile(&self) -> Result<bool, String> {
-        let root = self.root().await?;
+        let root = self.data_root().await?;
         let lock = open_lock(root).map_err(cache_error)?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Ok(false),
-            Err(TryLockError::Error(error)) => return Err(cache_error(error)),
+        if !try_acquire(&lock, Access::Exclusive).map_err(cache_error)? {
+            return Ok(false);
         }
         let lease = BuildLease {
-            root: root.to_owned(),
+            target: root.join("rust-build"),
             _lock: lock,
         };
-        let runtime = lease.runtime()?;
+        let runtime = self.runtime().await?;
         let project = ShadowProject::temporary(super::source::FILE)?;
-        let manifest = Manifest::parse(POPULAR_CRATES, None)?;
-        stage(
-            &project,
-            "fn main() {}",
-            &manifest,
-            &runtime,
-            "codingpad-warmup",
-        )?;
-        let mut command = Command::new(cargo());
-        command
-            .current_dir(project.root())
-            .args(["build", "--quiet", "--jobs", "1", "--target-dir"])
-            .arg(lease.target())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let mut child = spawn(&mut command).map_err(cache_error)?;
-        if let Ok(Ok(_)) =
-            tokio::time::timeout(Duration::from_secs(120), child.process.wait()).await
-        {
-            child.finished = true;
-        }
-        Ok(true)
+        let result = tokio::time::timeout(Duration::from_secs(120), async {
+            let mut all_compiled = true;
+            for (name, version) in POPULAR_CRATES {
+                let source = format!("---cargo\n[dependencies]\n{name} = {version:?}\n---\n");
+                let manifest = Manifest::parse(&source, None).map_err(|error| error.to_string())?;
+                stage(
+                    &project,
+                    "fn main() {}",
+                    &manifest,
+                    &runtime,
+                    "codingpad-warmup",
+                )?;
+                let mut command = Command::new(cargo());
+                command
+                    .current_dir(project.root())
+                    .args([
+                        "build",
+                        "--offline",
+                        "--quiet",
+                        "--jobs",
+                        "1",
+                        "--target-dir",
+                    ])
+                    .arg(lease.target())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                let mut child = spawn(&mut command).map_err(cache_error)?;
+                let status = child.process.wait().await.map_err(cache_error)?;
+                child.finished = true;
+                all_compiled &= status.success();
+            }
+            Ok(all_compiled)
+        })
+        .await;
+        result.unwrap_or(Ok(false))
     }
-}
 
-pub(super) struct BuildLease {
-    root: PathBuf,
-    _lock: File,
-}
-
-impl BuildLease {
-    pub(super) fn target(&self) -> PathBuf {
-        self.root.join("target")
-    }
-
-    pub(super) fn runtime(&self) -> Result<PathBuf, String> {
+    pub(super) async fn runtime(&self) -> Result<PathBuf, String> {
+        let root = self.data_root().await?;
         let mut hash = Sha256::new();
         for source in [RUNTIME_MANIFEST, RUNTIME, RICH_RUNTIME, CACHE_RUNTIME] {
             hash.update(source.len().to_le_bytes());
             hash.update(source);
         }
-        let runtime = self.root.join(format!("runtime-{:x}", hash.finalize()));
+        let runtime = root
+            .join("rust-runtime")
+            .join(format!("{:x}", hash.finalize()));
         fs::create_dir_all(runtime.join("src")).map_err(cache_error)?;
         for (file, content) in [
             ("Cargo.toml", RUNTIME_MANIFEST),
@@ -185,6 +200,28 @@ impl BuildLease {
             write_if_changed(&runtime.join(file), content).map_err(cache_error)?;
         }
         Ok(runtime)
+    }
+}
+
+pub(super) struct BuildLease {
+    target: PathBuf,
+    _lock: File,
+}
+
+impl BuildLease {
+    pub(super) fn target(&self) -> &Path {
+        &self.target
+    }
+}
+
+fn try_acquire(lock: &File, access: Access) -> io::Result<bool> {
+    match match access {
+        Access::Build => lock.try_lock_shared(),
+        Access::Exclusive => lock.try_lock(),
+    } {
+        Ok(()) => Ok(true),
+        Err(TryLockError::WouldBlock) => Ok(false),
+        Err(TryLockError::Error(error)) => Err(error),
     }
 }
 
@@ -220,7 +257,7 @@ fn open_lock(root: &Path) -> io::Result<File> {
         .truncate(false)
         .read(true)
         .write(true)
-        .open(root.join("cache.lock"))
+        .open(root.join("rust-build.lock"))
 }
 
 fn size(path: &Path) -> io::Result<u64> {

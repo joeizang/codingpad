@@ -279,7 +279,7 @@ async fn run_once() -> bool {
 
     report(&rows);
     if failures.is_empty() && rows.iter().all(|row| row.status != Status::Fail) {
-        println!("\nAll measured M1, M2 and M5 targets pass.");
+        println!("\nAll measured performance targets pass.");
         true
     } else {
         eprintln!("\nSome M1, M2 or M5 targets did not pass or could not be measured.");
@@ -637,7 +637,7 @@ fn report(rows: &[Row]) {
         .max("target".len());
 
     println!(
-        "CodingPad M1, M2 and M5 performance ({}, {} build)\n",
+        "CodingPad performance ({}, {} build)\n",
         std::env::consts::OS,
         if cfg!(debug_assertions) {
             "debug"

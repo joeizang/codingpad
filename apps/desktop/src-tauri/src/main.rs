@@ -473,6 +473,19 @@ async fn start_language_server(
                 })
                 .await
         }
+        "rust" => {
+            language_servers
+                .start_rust(
+                    &script_id,
+                    &source,
+                    path.as_deref().map(std::path::Path::new),
+                    &session,
+                    move |event| {
+                        let _ = on_event.send(event);
+                    },
+                )
+                .await
+        }
         _ => Err("Code intelligence is not available for this language".into()),
     }
 }

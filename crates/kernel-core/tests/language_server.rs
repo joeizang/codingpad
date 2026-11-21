@@ -551,3 +551,129 @@ async fn typescript_completion_is_under_300_ms() {
     );
     servers.stop("typescript-latency").await;
 }
+
+#[tokio::test]
+#[ignore = "requires rust-analyzer and rust-src; run with --ignored"]
+async fn rust_code_intelligence_maps_shadow_edits_and_compiler_errors() {
+    use codingpad_kernel_core::{Language, Supervisor};
+    use serde_json::Value;
+
+    let source = concat!(
+        "---cargo\n[dependencies]\nserde_json = \"1\"\n---\n",
+        "let _emoji = \"😀\"; let _ = codingpad::du;\n",
+        "let _ = codingpad::ca;\n",
+        "let _ = codingpad::se;\n",
+        "let _: Option<serde_json::Valu> = None;\n",
+    );
+    let servers = LanguageServers::default();
+    servers.begin_session("rust-test").await;
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let started = servers
+        .start_rust("one", source, None, "rust-test", move |event| {
+            let _ = sender.send(event);
+        })
+        .await
+        .expect("start rust-analyzer");
+    let complete = |line, character| {
+        servers.request(
+            "one",
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": started.uri },
+                "position": { "line": line, "character": character },
+                "context": { "triggerKind": 1 }
+            }),
+        )
+    };
+    let matches_item =
+        |item: &Value, expected: &str| item["label"] == expected || item["filterText"] == expected;
+    let positions = [
+        ("du;", "dump"),
+        ("ca;", "cache"),
+        ("se;", "secret"),
+        ("Valu>", "Value"),
+    ];
+    for (index, (token, expected)) in positions.into_iter().enumerate() {
+        let line = index + 4;
+        let text = source.lines().nth(line).unwrap();
+        let start = text.rfind(token).unwrap();
+        let end = start + token.len() - 1;
+        let column = text[..end].encode_utf16().count();
+        timeout(Duration::from_secs(90), async {
+            loop {
+                let result = complete(line, column).await.expect("Rust completion");
+                if result["items"]
+                    .as_array()
+                    .is_some_and(|items| items.iter().any(|item| matches_item(item, expected)))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("rust-analyzer did not resolve {expected}"));
+
+        let start_time = Instant::now();
+        let result = complete(line, column).await.unwrap();
+        let elapsed = start_time.elapsed();
+        eprintln!("Warm Rust {expected} completion took {elapsed:?}");
+        let item = result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| matches_item(item, expected))
+            .unwrap();
+        let edit = &item["textEdit"];
+        let range = edit.get("range").unwrap_or(&edit["replace"]);
+        assert_eq!(range["start"]["line"], line, "{item}");
+        assert_eq!(
+            range["start"]["character"],
+            text[..start].encode_utf16().count(),
+            "{item}"
+        );
+    }
+
+    let edited = concat!(
+        "---cargo\n[dependencies]\nserde_json = \"1\"\n---\n",
+        "let _: u32 = \"not a number\";\n"
+    );
+    servers.did_change("one", edited).await.unwrap();
+    let mut compiled = None;
+    let result = Supervisor::default()
+        .run_language("one", edited, Language::Rust, |event| {
+            if event.method == "diagnostics" {
+                compiled = event.params["diagnostics"]
+                    .as_array()
+                    .and_then(|items| items.first())
+                    .cloned();
+            }
+        })
+        .await
+        .unwrap();
+    assert!(!result.ok);
+    let compiled = compiled.expect("rustc diagnostics");
+    let received = timeout(Duration::from_secs(90), async {
+        loop {
+            let event = receiver.recv().await.expect("rust-analyzer diagnostics");
+            if let Some(diagnostic) = event.params["diagnostics"]
+                .as_array()
+                .and_then(|items| items.iter().find(|item| item["code"] == "E0308").cloned())
+            {
+                break diagnostic;
+            }
+        }
+    })
+    .await
+    .expect("rust-analyzer did not publish rustc's type mismatch");
+    let range = |key: &str| -> &Value { &received["range"][key] };
+    assert_eq!(
+        range("start")["line"].as_u64().unwrap() + 1,
+        compiled["line"].as_u64().unwrap()
+    );
+    assert_eq!(
+        range("start")["character"].as_u64().unwrap() + 1,
+        compiled["column"].as_u64().unwrap()
+    );
+    servers.close("one").await;
+}

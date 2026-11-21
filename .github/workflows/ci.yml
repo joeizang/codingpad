@@ -76,7 +76,7 @@ jobs:
           just-version: "1.59.0"
 
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy,rust-analyzer,rust-src && rustup default stable
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -85,6 +85,9 @@ jobs:
 
       - name: just check
         run: just check
+
+      - name: Rust package code intelligence
+        run: cargo test -p codingpad-kernel-core --test language_server rust_code_intelligence_maps_shadow_edits_and_compiler_errors --locked -- --ignored
 
       - name: TypeScript package code intelligence
         run: cargo test -p codingpad-kernel-core --test language_server typescript_code_intelligence_resolves_versioned_packages --locked -- --ignored

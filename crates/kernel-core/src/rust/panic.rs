@@ -19,7 +19,7 @@ impl Panic {
         )
     }
 
-    pub(super) fn frames(&self, source: &Source<'_>, name: &str) -> Vec<Value> {
+    pub(super) fn frames(&self, source: &Source, name: &str) -> Vec<Value> {
         let mut frames = Vec::new();
         let mut function = "<panic>";
         for entry in self.trace.lines().map(str::trim) {
@@ -93,7 +93,7 @@ fn split_location(location: &str) -> Option<(&str, usize, usize)> {
 }
 
 fn frame(
-    source: &Source<'_>,
+    source: &Source,
     name: &str,
     function: &str,
     file: &str,

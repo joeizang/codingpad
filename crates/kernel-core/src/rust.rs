@@ -2,22 +2,24 @@
 mod build_cache;
 mod debug;
 mod dumps;
+mod editor;
 mod manifest;
 mod panic;
 mod source;
 
 pub(crate) use build_cache::BuildCache;
 pub(crate) use dumps::Dumps;
+pub(crate) use editor::{analyzer_command, RustWorkspace, MISSING_ANALYZER};
 pub(crate) use manifest::{frontmatter, Manifest};
+pub(crate) use source::Source;
 pub(crate) use source::FILE as SCRIPT_FILE;
 
-use crate::{shadow::ShadowProject, KernelEvent, RunResult};
+use crate::{secrets::SecretStore, shadow::ShadowProject, KernelEvent, RunResult};
 use debug::{Snapshot, ValueNode};
 use panic::Panic;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use source::Source;
 use std::{
     collections::VecDeque,
     ffi::OsString,
@@ -87,12 +89,20 @@ pub(super) async fn remove_retired_cache(retired: Option<tempfile::TempDir>) -> 
 }
 
 fn cargo() -> PathBuf {
-    let name = if cfg!(windows) { "cargo.exe" } else { "cargo" };
+    rust_tool("cargo")
+}
+
+fn rust_tool(name: &str) -> PathBuf {
+    let name = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    };
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path)
         .chain(std::env::var_os("CARGO_HOME").map(|path| PathBuf::from(path).join("bin")))
         .chain(dirs::home_dir().map(|home| home.join(".cargo/bin")))
-        .map(|dir| dir.join(name))
+        .map(|dir| dir.join(&name))
         .find(|path| path.is_file())
         .and_then(|path| std::path::absolute(path).ok())
         .unwrap_or_else(|| PathBuf::from(name))
@@ -111,6 +121,7 @@ pub(super) struct RunPaths<'a> {
     pub(super) project: &'a ShadowProject,
     pub(super) script: Option<&'a Path>,
     pub(super) values: &'a Path,
+    pub(super) secrets: Option<Arc<SecretStore>>,
 }
 
 pub(super) async fn run(
@@ -125,6 +136,7 @@ pub(super) async fn run(
         project,
         script,
         values,
+        secrets,
     } = paths;
     let name = script
         .and_then(Path::file_name)
@@ -137,6 +149,7 @@ pub(super) async fn run(
         latest: VecDeque::new(),
         panic: None,
         main_unwound: false,
+        secrets,
     };
     let manifest = match Manifest::parse(source, script) {
         Ok(manifest) => manifest,
@@ -281,7 +294,7 @@ async fn compile(
     cargo: &Path,
     root: &Path,
     target: &Path,
-    source: &Source<'_>,
+    source: &Source,
     name: &str,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
 ) -> Result<Option<PathBuf>, String> {
@@ -475,7 +488,7 @@ async fn cargo_output(mut command: Command) -> Result<CargoOutput, String> {
     })
 }
 
-fn diagnostic_range(span: &Value, source: &Source<'_>) -> Option<(usize, usize, usize, usize)> {
+fn diagnostic_range(span: &Value, source: &Source) -> Option<(usize, usize, usize, usize)> {
     if span["file_name"].as_str()?.replace('\\', "/") == source::FILE {
         let start = span["byte_start"].as_u64()?;
         let end = span["byte_end"].as_u64()?;
@@ -695,6 +708,7 @@ async fn read_output(
     let mut stderr = BufReader::new(child.process.stderr.take().unwrap());
     let mut runtime: Option<Lines<BufReader<TcpStream>>> = None;
     let mut connected = false;
+    let mut secret_request: Option<tokio::task::JoinHandle<Result<String, String>>> = None;
     let mut stdout_open = true;
     let mut stderr_open = true;
     let mut stdout_line = Vec::new();
@@ -742,10 +756,31 @@ async fn read_output(
                 if stderr_open { events.stream("stderr", &String::from_utf8_lossy(&stderr_line)); }
                 stderr_line.clear();
             }
-            line = async { runtime.as_mut().unwrap().next_line().await }, if runtime.is_some() => {
+            secret = async { secret_request.as_mut().unwrap().await }, if secret_request.is_some() => {
+                secret_request = None;
+                let secret = secret.unwrap_or_else(|_| Err("Could not read the password vault".into()));
+                if let Some(runtime) = runtime.as_mut() {
+                    let frame = secret_reply(secret);
+                    if let Err(error) = runtime.get_mut().write_all(&frame).await {
+                        if !peer_closed(&error) { return Err(error); }
+                    }
+                }
+            }
+            line = async { runtime.as_mut().unwrap().next_line().await },
+                if runtime.is_some() && secret_request.is_none() => {
                 match line {
                     Ok(Some(line)) => {
-                        events.runtime(&line)?;
+                        if let Some(name) = events.runtime(&line)? {
+                            let store = events.secrets.clone();
+                            secret_request = Some(tokio::task::spawn_blocking(move || {
+                                let name = name.trim();
+                                if let Some(store) = store.filter(|_| !name.starts_with("connection:")) {
+                                    return store.get(name);
+                                }
+                                Err(format!("Secret {name:?} was not found. Add it in Secrets… or set it for this session."))
+                            }));
+                            continue;
+                        }
                         // The child may exit as soon as dump() returns. Acknowledge
                         // the complete event before allowing that to happen.
                         let channel = runtime.as_mut().unwrap().get_mut();
@@ -772,6 +807,20 @@ async fn read_output(
     })
 }
 
+fn secret_reply(mut reply: Result<String, String>) -> Vec<u8> {
+    if matches!(&reply, Ok(value) | Err(value) if value.len() > 1024 * 1024) {
+        reply = Err("The CodingPad vault reply is too large".into());
+    }
+    let (status, message) = match reply {
+        Ok(value) => (1, value),
+        Err(error) => (0, error),
+    };
+    let mut frame = vec![status];
+    frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
+    frame.extend_from_slice(message.as_bytes());
+    frame
+}
+
 fn peer_closed(error: &io::Error) -> bool {
     // Windows can reset a socket held by a program that has just exited.
     matches!(
@@ -794,6 +843,9 @@ enum RuntimeEvent {
     },
     Panic(Panic),
     MainUnwound,
+    Secret {
+        name: String,
+    },
 }
 
 #[derive(Deserialize)]
@@ -833,6 +885,7 @@ struct Events<'a, F> {
     latest: VecDeque<LiveSnapshot>,
     panic: Option<Panic>,
     main_unwound: bool,
+    secrets: Option<Arc<SecretStore>>,
 }
 
 impl<F: FnMut(KernelEvent)> Events<'_, F> {
@@ -857,7 +910,7 @@ impl<F: FnMut(KernelEvent)> Events<'_, F> {
         self.send("stream", json!({"stream": stream, "text": text}));
     }
 
-    fn runtime(&mut self, line: &str) -> io::Result<()> {
+    fn runtime(&mut self, line: &str) -> io::Result<Option<String>> {
         match serde_json::from_str(line)? {
             RuntimeEvent::Debug(value) => self.dump(value),
             RuntimeEvent::LiveUpdate {
@@ -875,8 +928,9 @@ impl<F: FnMut(KernelEvent)> Events<'_, F> {
                 }
             }
             RuntimeEvent::MainUnwound => self.main_unwound = true,
+            RuntimeEvent::Secret { name } => return Ok(Some(name)),
         }
-        Ok(())
+        Ok(None)
     }
 
     fn dump(&mut self, value: DebugValue) {

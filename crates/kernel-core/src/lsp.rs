@@ -34,6 +34,7 @@ use crate::{
     data_context::GeneratedContext,
     databases::SqlManager,
     find_uv, roslyn,
+    rust::{self, RustWorkspace, Source},
     shadow::{ShadowProject, ShadowProjects},
     toolchains, ts7, typescript, RUNTIME,
 };
@@ -505,6 +506,76 @@ impl LanguageServers {
             events,
         )
         .await?;
+        self.register_started(script_id, source, session, server)
+            .await
+    }
+
+    /// Start rust-analyzer against the same generated Cargo project as Run.
+    pub async fn start_rust(
+        &self,
+        script_id: &str,
+        source: &str,
+        path: Option<&Path>,
+        session: &str,
+        emit: impl Fn(LspEvent) + Send + Sync + 'static,
+    ) -> Result<LspStartResult, String> {
+        if script_id.is_empty() {
+            return Err("A script id is required".into());
+        }
+        let manifest = rust::Manifest::parse(source, path).map_err(|error| error.to_string())?;
+        let restart_key = manifest.editor_key();
+        let events: EventSink = Arc::new(emit);
+        let start = {
+            let mut starts = self.starts.lock().await;
+            starts
+                .entry(script_id.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _start = start.lock().await;
+        self.check_session(script_id, session).await?;
+        let existing = self.servers.lock().await.get(script_id).cloned();
+        if let Some(existing) = existing {
+            if existing.language_id == "rust"
+                && existing.restart_key == restart_key
+                && existing.alive()
+            {
+                existing.set_events(events.clone());
+                if existing.did_change(source).await.is_ok() {
+                    self.check_session(script_id, session).await?;
+                    return Ok(LspStartResult {
+                        uri: existing.document_uri.clone(),
+                    });
+                }
+            }
+            self.servers.lock().await.remove(script_id);
+            existing.stop().await;
+        }
+
+        let command = rust::analyzer_command()?;
+        let workspace =
+            RustWorkspace::create(&self.shadow_projects.rust_build, &manifest, source).await?;
+        let server = LspServer::start(
+            command,
+            Workspace::Rust(workspace),
+            "rust",
+            "rust-analyzer",
+            restart_key,
+            rust::MISSING_ANALYZER.to_owned(),
+            events,
+        )
+        .await?;
+        self.register_started(script_id, source, session, server)
+            .await
+    }
+
+    async fn register_started(
+        &self,
+        script_id: &str,
+        source: &str,
+        session: &str,
+        server: Arc<LspServer>,
+    ) -> Result<LspStartResult, String> {
         let previous = self
             .servers
             .lock()
@@ -672,6 +743,7 @@ struct LspServer {
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     diagnostics_notify: Arc<Notify>,
     diagnostics_last: Arc<StdMutex<Option<Value>>>,
+    rust_source: Arc<StdMutex<Option<Arc<Source>>>>,
     _workspace: Workspace,
 }
 
@@ -679,6 +751,7 @@ enum Workspace {
     Python(PythonWorkspace),
     Csharp(ShadowProject),
     TypeScript(Arc<typescript::Project>),
+    Rust(RustWorkspace),
 }
 
 impl Workspace {
@@ -687,6 +760,7 @@ impl Workspace {
             Workspace::Python(workspace) => &workspace.root,
             Workspace::Csharp(workspace) => workspace.root(),
             Workspace::TypeScript(project) => project.shadow.root(),
+            Workspace::Rust(project) => project.shadow.root(),
         }
     }
 
@@ -695,6 +769,7 @@ impl Workspace {
             Workspace::Python(workspace) => &workspace.document_uri,
             Workspace::Csharp(workspace) => workspace.document_uri(),
             Workspace::TypeScript(project) => project.shadow.document_uri(),
+            Workspace::Rust(project) => project.shadow.document_uri(),
         }
     }
 
@@ -703,13 +778,14 @@ impl Workspace {
             Workspace::Python(workspace) => &workspace.root_uri,
             Workspace::Csharp(workspace) => workspace.root_uri(),
             Workspace::TypeScript(project) => project.shadow.root_uri(),
+            Workspace::Rust(project) => project.shadow.root_uri(),
         }
     }
 
     fn extra_paths(&self) -> &[String] {
         match self {
             Workspace::Python(workspace) => &workspace.extra_paths,
-            Workspace::Csharp(_) | Workspace::TypeScript(_) => &[],
+            Workspace::Csharp(_) | Workspace::TypeScript(_) | Workspace::Rust(_) => &[],
         }
     }
 
@@ -801,6 +877,7 @@ impl LspServer {
             diagnostics_notify: Arc::new(Notify::new()),
             diagnostics_last: Arc::new(StdMutex::new(None)),
             _workspace: workspace,
+            rust_source: Arc::default(),
         });
 
         let response_config = ResponseConfig {
@@ -810,6 +887,7 @@ impl LspServer {
             extra_paths: server.extra_paths.clone(),
             server_name,
             version,
+            rust_source: server.rust_source.clone(),
         };
         tokio::spawn(read_loop(
             BufReader::new(stdout),
@@ -892,7 +970,7 @@ impl LspServer {
     }
 
     async fn initialize(&self) -> Result<(), String> {
-        let params = json!({
+        let mut params = json!({
             "processId": std::process::id(),
             "clientInfo": { "name": "CodingPad" },
             "locale": "en",
@@ -935,13 +1013,31 @@ impl LspServer {
                 }
             }
         });
+        if self.language_id == "rust" {
+            params["capabilities"]["general"] = json!({ "positionEncodings": ["utf-16"] });
+            params["initializationOptions"] = rust_analyzer_settings();
+        }
         self.request_with_timeout("initialize", params, INITIALIZE_TIMEOUT)
             .await?;
         self.notify("initialized", json!({})).await
     }
 
+    fn stage_rust(&self, source: &str) -> Result<Option<Arc<Source>>, String> {
+        let Workspace::Rust(workspace) = &self._workspace else {
+            return Ok(None);
+        };
+        let source = workspace.stage(source)?;
+        *self
+            .rust_source
+            .lock()
+            .map_err(|_| "Rust source mapping unavailable")? = Some(source.clone());
+        Ok(Some(source))
+    }
+
     async fn did_open(&self, source: &str) -> Result<(), String> {
         let mut version = self.version.lock().await;
+        let mapped = self.stage_rust(source)?;
+        let source = mapped.as_ref().map_or(source, |doc| &doc.generated);
         *version = 1;
         let notice = self.write(json!({
             "jsonrpc": "2.0",
@@ -963,6 +1059,8 @@ impl LspServer {
 
     async fn did_change(&self, source: &str) -> Result<(), String> {
         let mut version = self.version.lock().await;
+        let mapped = self.stage_rust(source)?;
+        let source = mapped.as_ref().map_or(source, |doc| &doc.generated);
         *version += 1;
         let notice = self.write(json!({
             "jsonrpc": "2.0",
@@ -975,7 +1073,15 @@ impl LspServer {
         if notice.is_ok() {
             self.diagnostics_notify.notify_one();
         }
-        notice
+        notice?;
+        if mapped.is_some() {
+            self.write(json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didSave",
+                "params": { "textDocument": { "uri": &self.document_uri } }
+            }))?;
+        }
+        Ok(())
     }
 
     /// Roslyn publishes document diagnostics on request rather than on edit.
@@ -1016,9 +1122,37 @@ impl LspServer {
         }
     }
 
-    async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
-        self.request_with_timeout(method, params, REQUEST_TIMEOUT)
-            .await
+    async fn request(&self, method: &str, mut params: Value) -> Result<Value, String> {
+        if self.language_id != "rust" {
+            return self
+                .request_with_timeout(method, params, REQUEST_TIMEOUT)
+                .await;
+        }
+
+        let (version, source) = {
+            let version = *self.version.lock().await;
+            let source = self
+                .rust_source
+                .lock()
+                .map_err(|_| "Rust source mapping unavailable")?
+                .clone()
+                .ok_or("The Rust editor document is not ready")?;
+            (version, source)
+        };
+        if let Some(position) = params.get_mut("position") {
+            let Some(mapped) = source.editor_to_shadow(position) else {
+                return Ok(Value::Null);
+            };
+            *position = mapped;
+        }
+        let mut response = self
+            .request_with_timeout(method, params, REQUEST_TIMEOUT)
+            .await?;
+        if *self.version.lock().await != version {
+            return Ok(Value::Null);
+        }
+        source.map_response(method, &mut response);
+        Ok(response)
     }
 
     async fn request_with_timeout(
@@ -1195,6 +1329,7 @@ struct ResponseConfig {
     extra_paths: Vec<String>,
     server_name: &'static str,
     version: Arc<Mutex<i64>>,
+    rust_source: Arc<StdMutex<Option<Arc<Source>>>>,
 }
 
 async fn read_loop(
@@ -1226,11 +1361,20 @@ async fn read_loop(
             (Some(method), None) => {
                 if method == DIAGNOSTICS_METHOD {
                     let params = &message["params"];
-                    let current = *config.version.lock().await;
-                    if diagnostics_are_current(params, &config.document_uri, current) {
+                    let current = config.version.lock().await;
+                    if diagnostics_are_current(params, &config.document_uri, *current) {
+                        let source = config
+                            .rust_source
+                            .lock()
+                            .ok()
+                            .and_then(|source| source.clone());
+                        drop(current);
                         let sink = events.lock().ok().map(|events| (*events).clone());
                         if let Some(sink) = sink {
                             let mut params = params.clone();
+                            if let Some(source) = source {
+                                source.map_diagnostics(&mut params, &config.document_uri);
+                            }
                             // The editor identifies this document by the URI we issued.
                             params["uri"] = config.document_uri.clone().into();
                             sink(LspEvent {
@@ -1325,11 +1469,24 @@ fn configuration_result(message: &Value, config: &ResponseConfig) -> Value {
                     // The TypeScript server uses its own defaults; an empty
                     // object answers the registration without overriding them.
                     "typescript" | "javascript" | "js/ts" => json!({}),
+                    "" | "rust-analyzer" if config.server_name == "rust-analyzer" => {
+                        rust_analyzer_settings()
+                    }
                     _ => Value::Null,
                 }
             })
             .collect(),
     )
+}
+
+fn rust_analyzer_settings() -> Value {
+    json!({
+        "numThreads": 2,
+        "cachePriming": { "numThreads": 2 },
+        "cargo": { "allTargets": false },
+        "check": { "allTargets": false },
+        "checkOnSave": true,
+    })
 }
 
 fn analysis_settings(config: &ResponseConfig) -> Value {
@@ -1516,6 +1673,7 @@ print("hi")
             extra_paths: vec!["/tmp/runtime".into()],
             server_name: "Python",
             version: Arc::new(Mutex::new(0)),
+            rust_source: Arc::default(),
         };
         let result = configuration_result(
             &json!({"params": {"items": [{"section": "python"}, {"section": "python.analysis"}, {"section": "typescript"}, {"section": "other"}]}}),

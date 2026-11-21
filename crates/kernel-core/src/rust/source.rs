@@ -3,46 +3,46 @@ use unicode_width::UnicodeWidthChar;
 
 pub(crate) const FILE: &str = "src/main.rs";
 
-pub(super) struct Source<'a> {
-    original: &'a str,
-    pub(super) generated: String,
-    segments: Vec<(usize, usize, usize)>,
+pub(crate) struct Source {
+    pub(super) original: String,
+    pub(crate) generated: String,
+    pub(super) segments: Vec<(usize, usize, usize)>,
+    pub(super) frontmatter: std::ops::Range<usize>,
 }
 
-impl<'a> Source<'a> {
+impl Source {
     pub(super) fn with_frontmatter(
-        original: &'a str,
+        original: &str,
         frontmatter: std::ops::Range<usize>,
         runtime: &str,
     ) -> Self {
         if frontmatter.is_empty() {
-            return Self::new(original, runtime);
+            return Self::build(original, 0, runtime);
         }
         // Keep byte offsets and line breaks so compiler spans still map back to
         // the editor, including offsets after non-ASCII manifest comments.
         let mut masked = original.as_bytes().to_vec();
-        for byte in &mut masked[frontmatter] {
+        for byte in &mut masked[frontmatter.clone()] {
             if !matches!(byte, b'\n' | b'\r') {
                 *byte = b' ';
             }
         }
         let masked = String::from_utf8(masked).expect("replacing a full range preserves UTF-8");
-        let staged = Source::new(&masked, runtime);
-        Self {
-            original,
-            generated: staged.generated,
-            segments: staged.segments,
-        }
+        let mut staged = Self::build(&masked, frontmatter.end, runtime);
+        staged.original = original.to_owned();
+        staged.frontmatter = frontmatter;
+        staged
     }
 
-    fn new(original: &'a str, runtime: &str) -> Self {
+    fn build(original: &str, frontmatter_end: usize, runtime: &str) -> Self {
         let _spans = SpanScope;
         let runtime = runtime.replace('-', "_");
-        let prefix = source_prefix_len(original);
+        let prefix = source_prefix_len(original).max(frontmatter_end);
         let mut staged = Self {
-            original,
+            original: original.to_owned(),
             generated: String::new(),
             segments: Vec::new(),
+            frontmatter: 0..0,
         };
         // Native Rust programs retain their entry point and crate-level items.
         if let Some(entry) = native_entry(&original[prefix..]).map(|entry| prefix + entry) {
@@ -100,7 +100,7 @@ impl<'a> Source<'a> {
             .push((destination, destination + end - start, start));
     }
 
-    fn original_offset(&self, offset: usize) -> Option<usize> {
+    pub(super) fn original_offset(&self, offset: usize) -> Option<usize> {
         self.segments.iter().find_map(|&(start, end, original)| {
             (start..=end)
                 .contains(&offset)
@@ -220,13 +220,13 @@ mod tests {
     #[test]
     fn stages_attributes_and_wraps_only_the_unterminated_expression() {
         let original = "#![allow(unused)]\nlet café = \"☕\";\ncafé.len() // dump\n";
-        let staged = Source::new(original, "codingpad");
+        let staged = Source::with_frontmatter(original, 0..0, "codingpad");
         assert!(staged.generated.starts_with("#![allow(unused)]\nfn main()"));
         let expr = "::codingpad::__finish(café.len()); // dump";
         assert!(staged.generated.contains(expr), "{}", staged.generated);
         let offset = staged.generated.find("café.len").unwrap();
         assert_eq!(staged.position(offset), Some((3, 1)));
-        assert!(!Source::new("42;", "codingpad")
+        assert!(!Source::with_frontmatter("42;", 0..0, "codingpad")
             .generated
             .contains("__finish"));
     }
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn adds_panic_capture_after_an_explicit_mains_inner_attributes() {
         let source = "#!/usr/bin/env rust-script\n#![allow(unused)]\nfn main() { #![allow(unused)] println!(\"hello\"); }";
-        let staged = Source::new(source, "codingpad");
+        let staged = Source::with_frontmatter(source, 0..0, "codingpad");
         assert!(staged
             .generated
             .contains("{ #![allow(unused)] let __codingpad_panic_guard = ::codingpad::__start();"));

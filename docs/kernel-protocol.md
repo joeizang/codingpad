@@ -615,6 +615,17 @@ fn main() {
 Save this example as `example.rs` and run it with
 `cargo +nightly -Zscript example.rs` outside CodingPad.
 
+Install the toolchain's `rust-analyzer` and `rust-src` components to enable
+completions, hover and live diagnostics. The language server sees the same
+generated source and dependencies as the Rust kernel. CodingPad translates
+its UTF-16 ranges back to the script, including edits and diagnostics after
+Cargo frontmatter. `CODINGPAD_RUST_LSP` can point to a specific rust-analyzer
+executable.
+
+`codingpad::secret("name")` retrieves that name from the configured vault or
+session over the authenticated loopback connection. Connection passwords
+remain in the host.
+
 An explicit `fn main()` runs as a normal Rust program. In a top-level script,
 CodingPad automatically dumps a final expression without a semicolon if it
 returns a non-unit value. Dumped values need Rust's `Debug` implementation.

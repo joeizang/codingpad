@@ -1,3 +1,4 @@
+import { cargoScriptFrontmatter, parseHeader } from "./library";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import Editor from "./MonacoEditor";
@@ -144,21 +145,17 @@ function toCompletionItem(
   };
 }
 
-const directiveKey = (source: string, language: string) =>
-  language === "csharp" ? csharpDirectiveKey(source) : inlineDependencyKey(source);
+const directiveKey = (source: string, language: string) => {
+  if (language === "rust") return cargoScriptFrontmatter(source)?.key ?? "";
+  if (language === "csharp") return csharpDirectiveKey(source);
+  return inlineDependencyKey(source);
+};
 
 const supportsCodeIntelligence = (language: string) =>
   language === "python" ||
   language === "csharp" ||
-  language === "typescript";
-
-function attachedConnection(source: string): string {
-  const first = source.split(/\r?\n/, 1)[0] ?? "";
-  const header = first.match(/^\s*(?:#|\/\/|--)\s*codingpad:\s*(.*)$/);
-  if (!header) return "";
-  const setting = header[1].match(/(?:^|\s)connection=(\"[^\"]*\"|'[^']*'|\S+)/);
-  return setting ? setting[1].replace(/^[\"']|[\"']$/g, "") : "";
-}
+  language === "typescript" ||
+  language === "rust";
 
 export default function CodeEditor({
   id,
@@ -182,7 +179,7 @@ export default function CodeEditor({
   completeSqlRef.current = completeSql;
   const generation = useRef(0);
   const [interactive, setInteractive] = useState(false);
-  const connectionKey = attachedConnection(source);
+  const connectionKey = parseHeader(source)?.settings.connection ?? "";
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const lsp = useRef<{ id: string; uri: string; ready: boolean } | null>(null);
   const pendingDiagnostics = useRef<LspDiagnostic[] | null>(null);
@@ -236,6 +233,7 @@ export default function CodeEditor({
       pendingDiagnostics.current = diagnostics;
       return;
     }
+    if (language === "rust") monaco.editor.setModelMarkers(model, "codingpad-compiler", []);
     monaco.editor.setModelMarkers(
       model,
       "codingpad-lsp",
@@ -245,12 +243,15 @@ export default function CodeEditor({
           ? "csharp"
           : language === "typescript"
             ? "typescript"
-            : "basedpyright",
+            : language === "rust"
+              ? "rust-analyzer"
+              : "basedpyright",
       ) as monaco.editor.IMarkerData[],
     );
   };
 
   const applyCompileDiagnostics = () => {
+    if (language === "rust" && seenDiagnostics.current) return;
     const model = editorRef.current?.getModel();
     if (model) {
       monaco.editor.setModelMarkers(
@@ -511,7 +512,7 @@ export default function CodeEditor({
         const completion = monaco.languages.registerCompletionItemProvider(
           language,
           {
-            triggerCharacters: COMPLETION_TRIGGERS,
+            triggerCharacters: language === "rust" ? [".", ":"] : COMPLETION_TRIGGERS,
             provideCompletionItems: async (model, position) => {
               const endpoint = lsp.current;
               if (!endpoint) return { suggestions: [] };

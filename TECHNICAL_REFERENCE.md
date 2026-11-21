@@ -928,6 +928,7 @@ D38 on Linux:
 | C# completion | < 300 ms |
 | TypeScript completion | < 300 ms |
 | Warm Rust rerun after an edit | < 3 s |
+| Rust completion | < 300 ms |
 
 The first completion run may download basedpyright; later runs reuse the cache.
 The C# completion metric needs Roslyn, from the VS Code C# extension or

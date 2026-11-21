@@ -159,6 +159,49 @@ async fn rust_warm_rerun() -> Result<Duration, String> {
     Ok(elapsed)
 }
 
+async fn rust_completion_latency() -> Result<Duration, String> {
+    let servers = LanguageServers::default();
+    let source = "let _ = codingpad::du;";
+    servers.begin_session("rust-bench").await;
+    let started = servers
+        .start_rust("rust-bench", source, None, "rust-bench", |_| {})
+        .await?;
+    let request = || async {
+        let start = Instant::now();
+        let result = servers
+            .request(
+                "rust-bench",
+                "textDocument/completion",
+                json!({
+                    "textDocument": { "uri": started.uri },
+                    "position": { "line": 0, "character": source.len() - 1 },
+                    "context": { "triggerKind": 1 },
+                }),
+            )
+            .await?;
+        if result["items"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["filterText"] == "dump" || item["label"] == "dump")
+        }) {
+            Ok(Some(start.elapsed()))
+        } else {
+            Ok::<_, String>(None)
+        }
+    };
+    let measured = tokio::time::timeout(Duration::from_secs(90), async {
+        while request().await?.is_none() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        request()
+            .await?
+            .ok_or_else(|| "Rust completion disappeared after warmup".to_owned())
+    })
+    .await;
+    servers.stop("rust-bench").await;
+    measured.map_err(|_| "rust-analyzer did not resolve dump during warmup".to_owned())?
+}
+
 async fn run_once() -> bool {
     let mut rows = Vec::new();
     let mut failures = Vec::new();
@@ -276,6 +319,14 @@ async fn run_once() -> bool {
             TARGET_RUST_RERUN,
         )),
         Err(error) => rows.push(Row::failed("Rust rerun after edit", "< 3000 ms", error)),
+    }
+
+    match rust_completion_latency().await {
+        Ok(measured) => rows.push(Row::time("Rust completion", measured, TARGET_COMPLETION)),
+        Err(error) if error.contains("rust-analyzer was not found") => {
+            rows.push(Row::skipped("Rust completion", "< 300 ms", error));
+        }
+        Err(error) => rows.push(Row::failed("Rust completion", "< 300 ms", error)),
     }
 
     report(&rows);

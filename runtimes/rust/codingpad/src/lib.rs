@@ -199,8 +199,52 @@ fn connect() -> Option<TcpStream> {
     Some(socket)
 }
 
+/// Return a named value from CodingPad's password vault or session.
+pub fn secret(name: &str) -> String {
+    assert!(!name.trim().is_empty(), "A secret name cannot be empty");
+    if !in_app() {
+        panic!("Secret {name:?} was not found. Add it in Secrets… or set it for this session.");
+    }
+    match request_secret(name) {
+        Ok(value) => value,
+        Err(message) => panic!("{message}"),
+    }
+}
+
+static OUTPUT: OnceLock<Mutex<Option<TcpStream>>> = OnceLock::new();
+
+fn request_secret(name: &str) -> Result<String, String> {
+    let unavailable = || "Could not read from the CodingPad password vault".to_owned();
+    let mut output = OUTPUT
+        .get_or_init(|| Mutex::new(connect()))
+        .lock()
+        .map_err(|_| unavailable())?;
+    let socket = output.as_mut().ok_or_else(unavailable)?;
+    let mut read = || -> io::Result<(bool, String)> {
+        socket.write_all(encode_fields(&[("kind", "secret"), ("name", name)]).as_bytes())?;
+        let mut header = [0; 5];
+        socket.read_exact(&mut header)?;
+        let length = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+        if length > 1024 * 1024 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let mut bytes = vec![0; length];
+        socket.read_exact(&mut bytes)?;
+        let value = String::from_utf8(bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok((header[0] == 1, value))
+    };
+    match read() {
+        Ok((true, value)) => Ok(value),
+        Ok((false, error)) => Err(error),
+        Err(_) => {
+            *output = None;
+            Err(unavailable())
+        }
+    }
+}
+
 fn send(fields: &[(&str, &str)]) -> bool {
-    static OUTPUT: OnceLock<Mutex<Option<TcpStream>>> = OnceLock::new();
     let Ok(mut output) = OUTPUT.get_or_init(|| Mutex::new(connect())).lock() else {
         return false;
     };
@@ -209,6 +253,10 @@ fn send(fields: &[(&str, &str)]) -> bool {
     }
     let _ = io::stdout().flush();
     let _ = io::stderr().flush();
+    send_frame(&mut output, &encode_fields(fields))
+}
+
+fn encode_fields(fields: &[(&str, &str)]) -> String {
     let mut line = String::from("{");
     for (index, (key, value)) in fields.iter().enumerate() {
         if index > 0 {
@@ -219,7 +267,7 @@ fn send(fields: &[(&str, &str)]) -> bool {
         quoted(&mut line, value);
     }
     line.push_str("}\n");
-    send_frame(&mut output, &line)
+    line
 }
 
 fn send_frame(output: &mut Option<TcpStream>, line: &str) -> bool {

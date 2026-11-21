@@ -53,14 +53,18 @@ pub enum SampleLanguage {
 }
 
 impl SampleLanguage {
-    pub fn extension(self) -> &'static str {
+    pub fn language(self) -> Option<Language> {
         match self {
-            Self::Python => Language::Python.extension(),
-            Self::Csharp => Language::Csharp.extension(),
-            Self::Typescript => Language::Typescript.extension(),
-            Self::Rust => Language::Rust.extension(),
-            Self::Sql => "sql",
+            Self::Python => Some(Language::Python),
+            Self::Csharp => Some(Language::Csharp),
+            Self::Typescript => Some(Language::Typescript),
+            Self::Rust => Some(Language::Rust),
+            Self::Sql => None,
         }
+    }
+
+    pub fn extension(self) -> &'static str {
+        self.language().map_or("sql", Language::extension)
     }
 }
 

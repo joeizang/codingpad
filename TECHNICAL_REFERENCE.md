@@ -267,9 +267,9 @@ cargo run --locked -p cpad -- run hello.py
 ```
 
 `cargo build --locked -p cpad` produces `target/debug/cpad` (`target/release/cpad`
-with `--release`). Python (`.py`), C# (`.cs`), TypeScript (`.ts`), and Rust (`.rs`) scripts
-use the app's kernels. TypeScript uses Bun on PATH or the private Bun installed
-by CodingPad. Rust also uses your installed toolchain first and can use the private
+with `--release`). Python (`.py`), C# (`.cs`), TypeScript (`.ts`) and
+Rust (`.rs`) scripts use the app's kernels. TypeScript uses Bun on PATH or the private Bun installed
+by CodingPad. Rust uses your installed toolchain first and can use the private
 copy installed by CodingPad. A `.sql` script runs through its header connection.
 Dumps print as text. Short values stay on one line, tables are aligned, and C#
 properties and deep Python values are materialised in the kernel so they appear
@@ -281,9 +281,8 @@ connections, secret names and private toolchains, so the same saved connection
 works in both places. Set `CODINGPAD_DATA_DIR` to use another folder. A script
 with a `codingpad: connection=<name>` header gets the same `db` client as the
 app, including typed data contexts for Python and C#. `secret()` reads the same
-vault values. `cache()` reuses a value for the same key within a run. For Rust,
-the cache also survives terminal runs of the same saved file in the same app
-data folder. Each `cpad run` starts a fresh kernel. Exit codes are 0 for success,
+vault values. `cache()` reuses a value for the same key within a run. Each
+`cpad run` starts a fresh kernel and cache. Exit codes are 0 for success,
 1 for a script failure, 2 for a usage or script-type error, and 130 when Ctrl-C
 stops the run.
 Output streams as it is produced. Live values print their
@@ -334,8 +333,8 @@ types remain editable and saveable.
 
 ## Samples and the sample database (M4.2)
 
-The sidebar's **Samples** section lists built-in Python, C#, TypeScript, Rust and SQL
-scripts. They cover values and tables, collections and LINQ, async work,
+The sidebar's **Samples** section lists built-in Python, C#, TypeScript, Rust
+and SQL scripts. They cover values and tables, collections and LINQ, async work,
 `cache()`, live values, HTML output and queries against the bundled database.
 Clicking a sample opens a fresh unsaved copy. The embedded original stays intact
 when you edit or save the copy. Saving writes an ordinary native file to the

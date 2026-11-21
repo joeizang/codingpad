@@ -178,6 +178,12 @@ pub enum Language {
 }
 
 impl Language {
+    pub fn from_extension(extension: &str) -> Option<Self> {
+        [Self::Python, Self::Csharp, Self::Typescript, Self::Rust]
+            .into_iter()
+            .find(|language| extension.eq_ignore_ascii_case(language.extension()))
+    }
+
     pub fn extension(self) -> &'static str {
         match self {
             Self::Python => "py",

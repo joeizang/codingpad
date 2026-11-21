@@ -7,5 +7,6 @@ db.query(
      JOIN categories c ON c.id = p.category_id
      ORDER BY p.price DESC, p.id
      LIMIT 8",
+    &[],
 )
 .unwrap()

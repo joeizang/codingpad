@@ -59,10 +59,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// The script types `cpad run` understands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScriptLanguage {
-    Python,
-    Csharp,
-    Typescript,
-    Rust,
+    Kernel(Language),
     Sql,
 }
 
@@ -97,22 +94,22 @@ pub fn language_for(path: &Path) -> Result<ScriptLanguage, String> {
         .and_then(|extension| extension.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    match extension.as_str() {
-        ext if ext == Language::Python.extension() => Ok(ScriptLanguage::Python),
-        ext if ext == Language::Csharp.extension() => Ok(ScriptLanguage::Csharp),
-        ext if ext == Language::Typescript.extension() => Ok(ScriptLanguage::Typescript),
-        ext if ext == Language::Rust.extension() => Ok(ScriptLanguage::Rust),
-        "sql" => Ok(ScriptLanguage::Sql),
-        ext => Err(format!(
-            "Cannot run \"{}\": expected a .py, .cs, .ts, .rs or .sql script{}.",
-            path.display(),
-            if ext.is_empty() {
-                String::new()
-            } else {
-                format!(", not .{ext}")
-            }
-        )),
+    if extension == "sql" {
+        return Ok(ScriptLanguage::Sql);
     }
+    Language::from_extension(&extension)
+        .map(ScriptLanguage::Kernel)
+        .ok_or_else(|| {
+            format!(
+                "Cannot run \"{}\": expected a .py, .cs, .ts, .rs or .sql script{}.",
+                path.display(),
+                if extension.is_empty() {
+                    String::new()
+                } else {
+                    format!(", not .{extension}")
+                }
+            )
+        })
 }
 
 /// Run one script and return the process exit code, printing dumps as text.
@@ -176,6 +173,7 @@ async fn run_file_in(
     let supervisor = Arc::new(
         Supervisor::with_data_dir_and_secrets(data_directory, secrets)
             .with_connections(connections)
+            .with_session_rust_cache()
             .with_eager_dumps(),
     );
 
@@ -223,10 +221,7 @@ async fn run_file_in(
             })
     };
     let result = match language {
-        ScriptLanguage::Python => run_kernel(Language::Python).await,
-        ScriptLanguage::Csharp => run_kernel(Language::Csharp).await,
-        ScriptLanguage::Typescript => run_kernel(Language::Typescript).await,
-        ScriptLanguage::Rust => run_kernel(Language::Rust).await,
+        ScriptLanguage::Kernel(language) => run_kernel(language).await,
         ScriptLanguage::Sql => {
             run_sql_script(&sql, &script_id, &source, &absolute, &mut recorder).await
         }
@@ -975,7 +970,7 @@ fn write_recorded(record: &Recorded) {
 
 #[cfg(test)]
 mod tests {
-    use super::{language_for, run_file_in, OutputFormat, ScriptLanguage};
+    use super::{language_for, run_file_in, Language, OutputFormat, ScriptLanguage};
     use codingpad_kernel_core::secrets::Vault;
     use std::{fs, path::Path, sync::Arc};
 
@@ -983,19 +978,19 @@ mod tests {
     fn extensions_pick_the_runner() {
         assert_eq!(
             language_for(Path::new("hello.py")),
-            Ok(ScriptLanguage::Python)
+            Ok(ScriptLanguage::Kernel(Language::Python))
         );
         assert_eq!(
             language_for(Path::new("Hello.CS")),
-            Ok(ScriptLanguage::Csharp)
+            Ok(ScriptLanguage::Kernel(Language::Csharp))
         );
         assert_eq!(
             language_for(Path::new("hello.TS")),
-            Ok(ScriptLanguage::Typescript)
+            Ok(ScriptLanguage::Kernel(Language::Typescript))
         );
         assert_eq!(
             language_for(Path::new("hello.RS")),
-            Ok(ScriptLanguage::Rust)
+            Ok(ScriptLanguage::Kernel(Language::Rust))
         );
         assert_eq!(
             language_for(Path::new("query.sql")),

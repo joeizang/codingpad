@@ -10,5 +10,6 @@ db.query(
      GROUP BY o.id, c.name, o.ordered_at
      ORDER BY total DESC, o.id
      LIMIT 8",
+    &[],
 )
 .unwrap()

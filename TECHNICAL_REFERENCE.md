@@ -662,16 +662,23 @@ Rust scripts use the host's SQLite, PostgreSQL, and SQL Server drivers.
 
 ```rust
 // codingpad: connection=codingpad-sample
-use codingpad::{db, dump};
+use codingpad::{db, dump, DbParameter};
 
-let rows = db.query("SELECT id, name FROM customers ORDER BY id").unwrap();
+let rows = db.query(
+    "SELECT id, name FROM customers WHERE id >= ? ORDER BY id",
+    &[DbParameter::Integer(1)],
+).unwrap();
 dump(rows);
 ```
 
 The first query opens the saved connection, using its password from the vault
 when configured. The connection stays open until the run ends. A batch returns
 its final result set. `DbRows` exposes `columns()`, `rows()` and `is_truncated()`.
-Columns stay in query order, including duplicate names and empty results.
+Bind values with SQLite `?`, PostgreSQL `$1`, or SQL Server `@P1` placeholders.
+Pass `&[]` when no values need binding. `db.execute(sql, parameters)` returns the
+affected-row count. Use `query` to create a SQL Server session-local temporary
+table. Columns stay in query order and preserve headers for empty results.
+Duplicate names receive suffixes such as `id_2`.
 CodingPad retains up to 10,000 rows per result and accepts results up to 8 MiB
 per query. Dump the result directly or leave it as the script's final
 expression to display a paged table.

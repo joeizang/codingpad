@@ -6,7 +6,7 @@
 pub mod schema;
 mod script;
 
-pub(crate) use script::ScriptDatabase;
+pub(crate) use script::{ScriptDatabase, ScriptQuery, ScriptResult};
 
 use crate::{
     secrets::SecretStore,
@@ -281,11 +281,11 @@ pub struct SqlRunResult {
 type Interrupt = Arc<Mutex<Option<rusqlite::InterruptHandle>>>;
 
 type SqlServerClient = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
-type PostgresSession = (
-    tokio_postgres::Client,
-    postgres_native_tls::MakeTlsConnector,
-    tokio::task::JoinHandle<()>,
-);
+struct PostgresSession {
+    client: tokio_postgres::Client,
+    tls: postgres_native_tls::MakeTlsConnector,
+    driver: tokio::task::JoinHandle<()>,
+}
 
 pub struct SqlManager {
     connections: Arc<ConnectionStore>,
@@ -531,7 +531,8 @@ impl SqlManager {
         ),
         String,
     > {
-        let (client, tls, _) = Self::open_postgres(connection, Some(&self.secrets)).await?;
+        let PostgresSession { client, tls, .. } =
+            Self::open_postgres(connection, Some(&self.secrets)).await?;
         Ok((client, tls))
     }
 
@@ -591,7 +592,11 @@ impl SqlManager {
         let task = tokio::spawn(async move {
             let _ = connection.await;
         });
-        Ok((client, tls, task))
+        Ok(PostgresSession {
+            client,
+            tls,
+            driver: task,
+        })
     }
 
     async fn run_postgres(
@@ -935,6 +940,23 @@ impl SqlManager {
 }
 
 impl TableData {
+    fn unique_column_names(&mut self) {
+        use std::collections::HashSet;
+        let original: HashSet<_> = self.column_names().map(str::to_owned).collect();
+        let mut used = HashSet::new();
+        for column in &mut self.columns {
+            if used.insert(column.name.clone()) {
+                continue;
+            }
+            let name = (2..)
+                .map(|index| format!("{}_{index}", column.name))
+                .find(|name| !original.contains(name) && !used.contains(name))
+                .unwrap();
+            used.insert(name.clone());
+            column.name = name;
+        }
+    }
+
     pub(crate) fn node(&self, handle: &str, offset: usize, limit: usize) -> Value {
         table_node(self, handle, offset, limit)
     }
@@ -1018,54 +1040,65 @@ fn execute_sqlite(
         let Some(mut statement) = statement else {
             break;
         };
-        if statement.column_count() > 0 {
-            let columns: Vec<Column> = statement
-                .column_names()
-                .map(|name| Column {
-                    name: name.to_owned(),
-                })
-                .collect();
-            let mut rows = statement.query([]).map_err(|error| sqlite_error(&error))?;
-            let mut values = Vec::new();
-            let mut truncated = false;
-            loop {
-                if cancelled.load(Ordering::Relaxed) {
-                    return Err(STOPPED.into());
-                }
-                let row = match rows.next() {
-                    Ok(Some(row)) => row,
-                    Ok(None) => break,
-                    Err(error) => return Err(sqlite_error(&error)),
-                };
-                if values.len() >= MAX_ROWS {
-                    truncated = true;
-                    break;
-                }
-                let mut cells = Vec::with_capacity(columns.len());
-                for index in 0..columns.len() {
-                    let value = row.get_ref(index).map_err(|error| sqlite_error(&error))?;
-                    cells.push(cell_node(value, values.len(), index));
-                }
-                values.push(cells);
-            }
-            tables.push(TableData {
-                columns,
-                rows: values,
-                truncated,
-            });
-        } else {
-            let before = database.total_changes();
-            statement
-                .execute([])
-                .map_err(|error| sqlite_error(&error))?;
-            let changed = database.total_changes().saturating_sub(before);
-            tables.push(affected_rows_table(changed));
-        }
+        tables.push(sqlite_statement(database, &mut statement, [], cancelled)?);
     }
     if tables.is_empty() {
         tables.push(affected_rows_table(0));
     }
     Ok(tables)
+}
+
+fn sqlite_statement(
+    database: &SqliteConnection,
+    statement: &mut rusqlite::Statement<'_>,
+    parameters: impl rusqlite::Params,
+    cancelled: &AtomicBool,
+) -> Result<TableData, String> {
+    if statement.column_count() > 0 {
+        let columns: Vec<Column> = statement
+            .column_names()
+            .map(|name| Column {
+                name: name.to_owned(),
+            })
+            .collect();
+        let mut rows = statement
+            .query(parameters)
+            .map_err(|error| sqlite_error(&error))?;
+        let mut values = Vec::new();
+        let mut truncated = false;
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(STOPPED.into());
+            }
+            let row = match rows.next() {
+                Ok(Some(row)) => row,
+                Ok(None) => break,
+                Err(error) => return Err(sqlite_error(&error)),
+            };
+            if values.len() >= MAX_ROWS {
+                truncated = true;
+                break;
+            }
+            let mut cells = Vec::with_capacity(columns.len());
+            for index in 0..columns.len() {
+                let value = row.get_ref(index).map_err(|error| sqlite_error(&error))?;
+                cells.push(cell_node(value, values.len(), index));
+            }
+            values.push(cells);
+        }
+        Ok(TableData {
+            columns,
+            rows: values,
+            truncated,
+        })
+    } else {
+        let before = database.total_changes();
+        statement
+            .execute(parameters)
+            .map_err(|error| sqlite_error(&error))?;
+        let changed = database.total_changes().saturating_sub(before);
+        Ok(affected_rows_table(changed))
+    }
 }
 
 fn affected_rows_table(changed: u64) -> TableData {
@@ -1442,7 +1475,7 @@ async fn postgres_tables(
                 .iter()
                 .all(|column| supported_pg_type(column.type_()))
             {
-                postgres_query(client, &statement).await
+                postgres_query(client, &statement, &[]).await
             } else {
                 // A type we cannot decode still has a text form; use the simple
                 // protocol so values and NULLs are shown instead of placeholders.
@@ -1467,6 +1500,7 @@ async fn postgres_tables(
 async fn postgres_query(
     client: &tokio_postgres::Client,
     statement: &tokio_postgres::Statement,
+    parameters: &[&(dyn tokio_postgres::types::ToSql + Sync)],
 ) -> Result<Vec<TableData>, String> {
     use futures_util::TryStreamExt;
 
@@ -1476,7 +1510,7 @@ async fn postgres_query(
         .map(|column| (column.name().to_owned(), column.type_().clone()))
         .collect();
     let rows = client
-        .query_raw(statement, std::iter::empty::<&str>())
+        .query_raw(statement, parameters.iter().copied())
         .await
         .map_err(|error| pg_error("PostgreSQL could not run the query", error))?;
     tokio::pin!(rows);

@@ -2,9 +2,10 @@
 mod cache;
 mod database;
 mod rich;
+mod wire;
 
 pub use cache::{cache, CacheValue};
-pub use database::{db, secret, Database, DbRows, DbValue};
+pub use database::{db, secret, Database, DbParameter, DbRows, DbValue};
 
 pub use rich::{html, image, image_bytes, live, Html, Image, Live};
 
@@ -234,8 +235,8 @@ fn frame(fields: &[(&str, &str)]) -> String {
     line
 }
 
-fn request(kind: &str, value: &str) -> Result<Vec<u8>, String> {
-    if value.len() > 1024 * 1024 {
+fn request(kind: &str, value: &str, parameters: &str) -> Result<Vec<u8>, String> {
+    if value.len().saturating_add(parameters.len()) > 1024 * 1024 {
         return Err("The Rust request exceeds 1 MiB.".into());
     }
     let disconnected = "The CodingPad host connection is unavailable.";
@@ -245,7 +246,7 @@ fn request(kind: &str, value: &str) -> Result<Vec<u8>, String> {
         .map_err(|_| disconnected)?;
     let socket = output.as_mut().ok_or(disconnected)?;
     flush_streams();
-    let line = frame(&[("kind", kind), ("value", value)]);
+    let line = frame(&[("kind", kind), ("value", value), ("parameters", parameters)]);
     let mut exchange = || -> io::Result<(u8, Vec<u8>)> {
         // Wait as long as the host stays connected. Stop interrupts the request
         // through the host and closing the script drops the socket.

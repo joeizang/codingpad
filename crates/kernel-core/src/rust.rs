@@ -44,14 +44,34 @@ use tokio::{
     time::Instant,
 };
 
-pub(super) const RUNTIME_MANIFEST: &str =
-    include_str!("../../../runtimes/rust/codingpad/Cargo.toml");
-pub(super) const RUNTIME: &str = include_str!("../../../runtimes/rust/codingpad/src/lib.rs");
-pub(super) const DB_RUNTIME: &str =
-    include_str!("../../../runtimes/rust/codingpad/src/database.rs");
-pub(super) const CACHE_RUNTIME: &str =
-    include_str!("../../../runtimes/rust/codingpad/src/cache.rs");
-pub(super) const RICH_RUNTIME: &str = include_str!("../../../runtimes/rust/codingpad/src/rich.rs");
+const RUNTIME_FILES: &[(&str, &str)] = &[
+    (
+        "Cargo.toml",
+        include_str!("../../../runtimes/rust/codingpad/Cargo.toml"),
+    ),
+    (
+        "src/lib.rs",
+        include_str!("../../../runtimes/rust/codingpad/src/lib.rs"),
+    ),
+    (
+        "src/cache.rs",
+        include_str!("../../../runtimes/rust/codingpad/src/cache.rs"),
+    ),
+    (
+        "src/rich.rs",
+        include_str!("../../../runtimes/rust/codingpad/src/rich.rs"),
+    ),
+    (
+        "src/database.rs",
+        include_str!("../../../runtimes/rust/codingpad/src/database.rs"),
+    ),
+    (
+        "src/wire.rs",
+        include_str!("../../../runtimes/rust/codingpad/src/wire.rs"),
+    ),
+];
+#[path = "../../../runtimes/rust/codingpad/src/wire.rs"]
+mod wire;
 const STOP_GRACE: Duration = Duration::from_secs(2);
 pub(super) fn stopped() -> RunResult {
     RunResult {
@@ -689,7 +709,7 @@ async fn execute(
         .map_err(|error| format!("Could not start the Rust script: {error}"))?;
     read_output(
         &mut child,
-        (&listener, &token),
+        OutputChannel { listener, token },
         events,
         stop,
         cancel,
@@ -714,9 +734,14 @@ async fn spawn_script(command: &mut Command) -> io::Result<RunningChild> {
     spawn(command)
 }
 
+struct OutputChannel {
+    listener: TcpListener,
+    token: [u8; 32],
+}
+
 async fn read_output(
     child: &mut RunningChild,
-    (listener, token): (&TcpListener, &[u8; 32]),
+    channel: OutputChannel,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
     stop: &mut watch::Receiver<u64>,
     cancel: &Path,
@@ -734,7 +759,7 @@ async fn read_output(
     let mut exit = None;
     let mut deadline = Instant::now();
     let mut stopping = false;
-    let connect = crate::accept_kernel(listener, token);
+    let connect = crate::accept_kernel(&channel.listener, &channel.token);
     tokio::pin!(connect);
     loop {
         tokio::select! {
@@ -751,14 +776,16 @@ async fn read_output(
             _ = stop.changed(), if exit.is_none() && !stopping => {
                 std::fs::write(cancel, [])?;
                 stopping = true;
-                deadline = Instant::now() + STOP_GRACE;
                 if let Some(pending) = request.take() {
                     drop(pending);
-                    services.close_database().await;
+                    if let Err(error) = services.close_database().await {
+                        events.stream("stderr", &format!("{error}\n"));
+                    }
                     if !write_runtime_reply(&mut runtime, &services::error_reply("The Rust run was stopped.")).await? {
                         runtime = None;
                     }
                 }
+                deadline = Instant::now() + STOP_GRACE;
             }
             _ = tokio::time::sleep_until(deadline), if exit.is_none() && stopping => {
                 child.kill_tree()?;
@@ -793,18 +820,15 @@ async fn read_output(
                 match line {
                     Ok(Some(line)) => {
                         match serde_json::from_str(&line)? {
-                            RuntimeEvent::Query { value } if !stopping && exit.is_none() => {
-                                request = Some(services.request(services::Request::Query(value)));
+                            RuntimeMessage::Request(event) if !stopping && exit.is_none() => {
+                                request = Some(services.request(event));
                             }
-                            RuntimeEvent::Secret { value } if !stopping && exit.is_none() => {
-                                request = Some(services.request(services::Request::Secret(value)));
-                            }
-                            RuntimeEvent::Query { .. } | RuntimeEvent::Secret { .. } => {
+                            RuntimeMessage::Request(_) => {
                                 if !write_runtime_reply(&mut runtime, &services::error_reply("The Rust run has ended.")).await? {
                                     runtime = None;
                                 }
                             }
-                            event => {
+                            RuntimeMessage::Event(event) => {
                                 events.runtime(event);
                                 // The child may exit as soon as dump() returns.
                                 if !write_runtime_reply(&mut runtime, b"1").await? {
@@ -836,7 +860,8 @@ async fn write_runtime_reply(
     reply: &[u8],
 ) -> io::Result<bool> {
     let channel = runtime.as_mut().unwrap().get_mut();
-    match tokio::time::timeout(Duration::from_secs(1), channel.write_all(reply)).await {
+    let timeout = Duration::from_secs(1 + reply.len().div_ceil(256 * 1024) as u64);
+    match tokio::time::timeout(timeout, channel.write_all(reply)).await {
         Ok(Ok(())) => Ok(true),
         Ok(Err(error)) if !peer_closed(&error) => Err(error),
         _ => Ok(false),
@@ -854,14 +879,15 @@ fn peer_closed(error: &io::Error) -> bool {
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum RuntimeMessage {
+    Request(services::Request),
+    Event(RuntimeEvent),
+}
+
+#[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum RuntimeEvent {
-    Query {
-        value: String,
-    },
-    Secret {
-        value: String,
-    },
     Debug(DebugValue),
     LiveUpdate {
         key: String,
@@ -936,7 +962,6 @@ impl<F: FnMut(KernelEvent)> Events<'_, F> {
 
     fn runtime(&mut self, event: RuntimeEvent) {
         match event {
-            RuntimeEvent::Query { .. } | RuntimeEvent::Secret { .. } => unreachable!(),
             RuntimeEvent::Debug(value) => self.dump(value),
             RuntimeEvent::LiveUpdate {
                 key,

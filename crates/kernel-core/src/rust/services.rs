@@ -1,10 +1,13 @@
-use super::Dumps;
+use super::{wire, Dumps};
 use crate::{
     attached_connection,
-    databases::{Connection, ConnectionStore, ScriptDatabase, TableData},
+    databases::{
+        Connection, ConnectionStore, ScriptDatabase, ScriptQuery, ScriptResult, TableData,
+    },
     secrets::SecretStore,
 };
 use futures_util::future::BoxFuture;
+use serde::Deserialize;
 use serde_json::Value;
 use std::{
     io::{self, Write},
@@ -20,13 +23,17 @@ pub(crate) struct Services {
     database: Mutex<Option<ScriptDatabase>>,
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum Request {
-    Query(String),
-    Secret(String),
+    Query { value: String, parameters: String },
+    Execute { value: String, parameters: String },
+    Secret { value: String },
 }
 
 pub(super) enum Reply {
     Rows(TableData),
+    Affected(u64),
     Secret(String),
     Error(String),
 }
@@ -59,24 +66,40 @@ impl Services {
     pub(super) fn request(&self, request: Request) -> BoxFuture<'_, Reply> {
         Box::pin(async move {
             let result = match request {
-                Request::Query(sql) => self.query(sql).await.map(Reply::Rows),
-                Request::Secret(name) => self.secret(name).await.map(Reply::Secret),
+                Request::Query { value, parameters } => self.query(value, parameters, false).await,
+                Request::Execute { value, parameters } => self.query(value, parameters, true).await,
+                Request::Secret { value } => self.secret(value).await.map(Reply::Secret),
             };
             result.unwrap_or_else(Reply::Error)
         })
     }
 
-    pub(super) async fn close_database(&self) {
-        self.database.lock().await.take();
+    pub(super) async fn close_database(&self) -> Result<(), String> {
+        if let Some(mut database) = self.database.lock().await.take() {
+            database.cancel().await?;
+        }
+        Ok(())
     }
 
-    async fn query(&self, sql: String) -> Result<TableData, String> {
+    async fn query(&self, sql: String, parameters: String, execute: bool) -> Result<Reply, String> {
         let connection = self.connection.as_ref().map_err(Clone::clone)?;
         let mut database = self.database.lock().await;
         if database.is_none() {
             *database = Some(ScriptDatabase::open(connection, self.secrets.as_ref()).await?);
         }
-        database.as_mut().unwrap().query(sql).await
+        match database
+            .as_mut()
+            .unwrap()
+            .run(ScriptQuery {
+                sql,
+                parameters,
+                execute,
+            })
+            .await?
+        {
+            ScriptResult::Rows(rows) => Ok(Reply::Rows(rows)),
+            ScriptResult::Affected(count) => Ok(Reply::Affected(count)),
+        }
     }
 
     async fn secret(&self, name: String) -> Result<String, String> {
@@ -105,6 +128,7 @@ impl Reply {
                     ),
                 }
             }
+            Self::Affected(count) => frame(0, &count.to_le_bytes()),
             Self::Secret(value) if value.len() <= MAX_REPLY => frame(0, value.as_bytes()),
             Self::Secret(_) => error_reply("The named secret exceeds the Rust reply size limit."),
             Self::Error(error) => error_reply(&error),
@@ -153,35 +177,35 @@ fn encode_rows(handle: u64, table: &TableData) -> io::Result<Vec<u8>> {
     for row in table.plain_rows() {
         for value in row {
             match value {
-                Value::Null => reply.write_all(&[0])?,
-                Value::Bool(value) => reply.write_all(&[1, u8::from(value)])?,
+                Value::Null => reply.write_all(&[wire::NULL])?,
+                Value::Bool(value) => reply.write_all(&[wire::BOOL, u8::from(value)])?,
                 Value::Number(number) => {
                     if let Some(value) = number.as_i64() {
-                        reply.write_all(&[2])?;
+                        reply.write_all(&[wire::INTEGER])?;
                         reply.write_all(&value.to_le_bytes())?;
                     } else if let Some(value) = number.as_u64() {
-                        reply.write_all(&[3])?;
+                        reply.write_all(&[wire::UNSIGNED])?;
                         reply.write_all(&value.to_le_bytes())?;
                     } else if let Some(value) = number.as_f64() {
-                        reply.write_all(&[4])?;
+                        reply.write_all(&[wire::FLOAT])?;
                         reply.write_all(&value.to_le_bytes())?;
                     }
                 }
                 Value::String(value) => {
-                    reply.write_all(&[6])?;
+                    reply.write_all(&[wire::TEXT])?;
                     text(&mut reply, &value)?;
                 }
                 value => {
                     if let Some(number) = value.get("n").and_then(Value::as_str) {
                         if let Ok(integer) = number.parse::<i64>() {
-                            reply.write_all(&[2])?;
+                            reply.write_all(&[wire::INTEGER])?;
                             reply.write_all(&integer.to_le_bytes())?;
                         } else {
-                            reply.write_all(&[5])?;
+                            reply.write_all(&[wire::DECIMAL])?;
                             text(&mut reply, number)?;
                         }
                     } else {
-                        reply.write_all(&[6])?;
+                        reply.write_all(&[wire::TEXT])?;
                         text(&mut reply, &value.to_string())?;
                     }
                 }

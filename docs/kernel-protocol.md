@@ -562,12 +562,16 @@ status.value = "Ready";
 
 ## Rust kernel
 
-CodingPad builds the editor snapshot in a fresh Cargo shadow project. It uses
+CodingPad builds the editor snapshot in a Cargo shadow project. It uses
 the installed stable Rust toolchain (1.85 or later for edition 2024) and a
 bundled, dependency-free `codingpad` crate. Each run uses an offline debug
-build to retain source information. Shared build caching is scoped to M6.4. Saved
-scripts run with their directory as the working directory. The script on disk
-is untouched.
+build to retain source information. Cargo shares compiled dependencies across
+Rust scripts, and small edits reuse the open script's shadow project and
+lockfile. After a Rust run, CodingPad precompiles common crates when idle.
+The Rust toolbar's **Build cache…** dialog shows the size of the compiled
+artifacts and can clear them. Script values stored with `cache()` are managed
+by Reset. Saved scripts run with their directory as the working directory,
+and the script on disk is untouched.
 
 ```rust
 use codingpad::dump;

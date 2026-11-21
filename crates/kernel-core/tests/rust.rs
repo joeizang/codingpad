@@ -784,3 +784,26 @@ async fn invalid_cargo_script_frontmatter_reports_its_original_line() {
     );
     assert!(!events.iter().any(|event| event.method == "stream"));
 }
+
+#[tokio::test]
+async fn rust_build_cache_reuses_artifacts_and_clears_without_resetting_values() {
+    let supervisor = Supervisor::default();
+    assert_eq!(supervisor.rust_build_cache_size().await.unwrap(), 0);
+    let (result, _) = run(&supervisor, r#"codingpad::cache("answer", || 42)"#).await;
+    assert!(result.ok);
+    let size = supervisor.rust_build_cache_size().await.unwrap();
+    assert!(size > 0);
+
+    let start = std::time::Instant::now();
+    let (result, events) = run(&supervisor, r#"codingpad::cache("answer", || 43)"#).await;
+    eprintln!("Edited Rust rerun took {:?}", start.elapsed());
+    assert!(result.ok);
+    assert_eq!(dumps(&events)[0]["v"], 42);
+
+    supervisor.clear_rust_build_cache().await.unwrap();
+    assert_eq!(supervisor.rust_build_cache_size().await.unwrap(), 0);
+    let (result, events) = run(&supervisor, r#"codingpad::cache("answer", || 44)"#).await;
+    assert!(result.ok);
+    assert_eq!(dumps(&events)[0]["v"], 42);
+    assert!(supervisor.rust_build_cache_size().await.unwrap() > 0);
+}

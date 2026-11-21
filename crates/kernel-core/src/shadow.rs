@@ -1,6 +1,6 @@
 //! Shadow project storage shared by language-specific project writers.
-use crate::data_context::GeneratedContext;
 use crate::typescript::{Imports, Project};
+use crate::{data_context::GeneratedContext, rust::BuildCache};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -14,8 +14,8 @@ use tokio::sync::{watch, Mutex, OnceCell};
 use crate::lsp::path_to_uri;
 
 /// Projects shared by the editor and kernel supervisor for the lifetime of a tab.
-#[derive(Default)]
 pub struct ShadowProjects {
+    pub(crate) rust_build: Arc<BuildCache>,
     typescript: Mutex<HashMap<String, Arc<TypescriptSlot>>>,
     data_dir: Option<PathBuf>,
     bun: Option<PathBuf>,
@@ -34,40 +34,24 @@ struct StagedTypescript {
     source: String,
 }
 
-impl ShadowProjects {
-    /// Each Rust run owns its staged sources and build products until it exits.
-    pub(crate) fn prepare_rust(
-        &self,
-        source: &str,
-        manifest: &str,
-    ) -> Result<ShadowProject, String> {
-        let project = ShadowProject::temporary("src/main.rs")?;
-        let root = project.root();
-        let stage = || -> std::io::Result<()> {
-            fs::create_dir(root.join("src"))?;
-            fs::create_dir_all(root.join("codingpad/src"))?;
-            fs::write(root.join("Cargo.toml"), manifest)?;
-            fs::write(
-                root.join("codingpad/Cargo.toml"),
-                crate::rust::RUNTIME_MANIFEST,
-            )?;
-            fs::write(root.join("codingpad/src/lib.rs"), crate::rust::RUNTIME)?;
-            fs::write(
-                root.join("codingpad/src/cache.rs"),
-                crate::rust::CACHE_RUNTIME,
-            )?;
-            fs::write(
-                root.join("codingpad/src/rich.rs"),
-                crate::rust::RICH_RUNTIME,
-            )?;
-            fs::write(root.join("src/main.rs"), source)
-        };
-        stage().map_err(|error| format!("Could not stage the Rust shadow project: {error}"))?;
-        Ok(project)
+impl Default for ShadowProjects {
+    fn default() -> Self {
+        Self {
+            rust_build: Arc::new(BuildCache::new(None)),
+            typescript: Mutex::default(),
+            data_dir: None,
+            bun: None,
+            typescript_sql_server: OnceCell::new(),
+            #[cfg(test)]
+            registry: None,
+        }
     }
+}
 
+impl ShadowProjects {
     pub(crate) fn with_data_dir(data_dir: PathBuf) -> Self {
         Self {
+            rust_build: Arc::new(BuildCache::new(Some(&data_dir))),
             data_dir: Some(data_dir),
             ..Self::default()
         }

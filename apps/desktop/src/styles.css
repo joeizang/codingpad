@@ -1039,6 +1039,13 @@ summary {
   border-radius: 10px;
   box-shadow: 0 24px 70px rgba(0, 0, 0, 0.45);
 }
+.rust-build-cache {
+  margin: auto;
+  color: inherit;
+}
+.rust-build-cache::backdrop {
+  background: rgba(9, 12, 16, 0.72);
+}
 .modal-heading {
   display: flex;
   align-items: center;

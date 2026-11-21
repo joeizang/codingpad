@@ -1,18 +1,22 @@
 //! Builds and runs an editor snapshot in a fresh Cargo project.
+mod build_cache;
 mod debug;
 mod dumps;
 mod manifest;
 mod panic;
 mod source;
 
+pub(crate) use build_cache::BuildCache;
 pub(crate) use dumps::Dumps;
 pub(crate) use manifest::{frontmatter, Manifest};
+pub(crate) use source::FILE as SCRIPT_FILE;
 
-use crate::{shadow::ShadowProjects, KernelEvent, RunResult};
+use crate::{shadow::ShadowProject, KernelEvent, RunResult};
 use debug::{Snapshot, ValueNode};
 use panic::Panic;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use source::Source;
 use std::{
     collections::VecDeque,
@@ -21,6 +25,7 @@ use std::{
     net::Ipv4Addr,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -93,16 +98,25 @@ fn cargo() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
+pub(super) struct RunPaths<'a> {
+    pub(super) project: &'a ShadowProject,
+    pub(super) script: Option<&'a Path>,
+    pub(super) cache: &'a Path,
+}
+
 pub(super) async fn run(
-    projects: &ShadowProjects,
+    builds: &Arc<BuildCache>,
     source: &str,
-    path: Option<&str>,
-    cache: &Path,
+    paths: RunPaths<'_>,
     eager: bool,
     stop: &mut watch::Receiver<u64>,
     emit: &mut (impl FnMut(KernelEvent) + Send),
 ) -> Result<(RunResult, Dumps), String> {
-    let script = path.map(Path::new);
+    let RunPaths {
+        project,
+        script,
+        cache,
+    } = paths;
     let name = script
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
@@ -134,27 +148,53 @@ pub(super) async fn run(
     };
     let source =
         Source::with_frontmatter(source, manifest.frontmatter.clone(), &manifest.runtime_name);
-    let project = projects.prepare_rust(&source.generated, &manifest.cargo)?;
-    let cancel = project.root().join("cancel");
+    let run_files = tempfile::tempdir_in(project.root())
+        .map_err(|error| format!("Could not prepare the Rust run: {error}"))?;
+    let cancel = run_files.path().join("cancel");
     let cargo = cargo();
+    let root = project.root();
+    let binary = format!(
+        "codingpad-{:x}",
+        Sha256::digest(root.as_os_str().as_encoded_bytes())
+    );
+    let prepare = async {
+        let lease = builds.acquire().await?;
+        build_cache::stage(
+            project,
+            &source.generated,
+            &manifest,
+            &lease.runtime()?,
+            &binary,
+        )?;
+        if manifest.needs_packages
+            && !prepare_dependencies(&cargo, root, &manifest, &mut events).await?
+        {
+            return Ok(None);
+        }
+        let executable = compile(&cargo, root, &lease.target(), &source, name, &mut events).await?;
+        // The shared target may be cleared while this script runs. A private
+        // copy also avoids trying to replace an in-use executable on Windows.
+        let Some(executable) = executable else {
+            return Ok(None);
+        };
+        let copy = run_files.path().join(executable.file_name().unwrap());
+        std::fs::copy(&executable, &copy)
+            .map_err(|error| format!("Could not stage the Rust executable: {error}"))?;
+        Ok::<_, String>(Some(copy))
+    };
     let build = tokio::select! {
         biased;
         _ = stop.changed() => {
             events.send("run_finished", json!({"ok": false}));
             return Ok((stopped(), events.dumps));
         },
-        build = async {
-            if manifest.needs_packages && !prepare_dependencies(&cargo, project.root(), &manifest, &mut events).await? {
-                return Ok(None);
-            }
-            compile(&cargo, project.root(), &source, name, &mut events).await
-        } => build?,
+        build = prepare => build?,
     };
     let ok = if let Some(executable) = build {
         let exit = execute(
             &executable,
             script,
-            project.root(),
+            run_files.path(),
             &cancel,
             cache,
             stop,
@@ -204,12 +244,16 @@ pub(super) async fn run(
     } else {
         false
     };
+    if ok {
+        builds.schedule_warmup();
+    }
     Ok((events.finish(ok), events.dumps))
 }
 
 async fn compile(
     cargo: &Path,
     root: &Path,
+    target: &Path,
     source: &Source<'_>,
     name: &str,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
@@ -218,7 +262,7 @@ async fn compile(
         status,
         stdout,
         stderr,
-    } = build_cargo(cargo, root).await?;
+    } = build_cargo(cargo, root, target).await?;
 
     let root_source = root.join(source::FILE);
     let canonical_source = std::fs::canonicalize(&root_source).ok();
@@ -317,7 +361,7 @@ async fn compile(
     }
 }
 
-async fn build_cargo(cargo: &Path, root: &Path) -> Result<CargoOutput, String> {
+async fn build_cargo(cargo: &Path, root: &Path, target: &Path) -> Result<CargoOutput, String> {
     let mut command = Command::new(cargo);
     command
         .current_dir(root)
@@ -328,7 +372,7 @@ async fn build_cargo(cargo: &Path, root: &Path) -> Result<CargoOutput, String> {
             "--quiet",
             "--target-dir",
         ])
-        .arg(root.join("target"));
+        .arg(target);
     cargo_output(command).await
 }
 
@@ -382,7 +426,8 @@ struct CargoOutput {
     stderr: Vec<u8>,
 }
 
-async fn cargo_output(command: Command) -> Result<CargoOutput, String> {
+async fn cargo_output(mut command: Command) -> Result<CargoOutput, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = spawn(command).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             MISSING.to_owned()
@@ -522,11 +567,7 @@ fn assign_job(process: &Child) -> Option<std::os::windows::io::OwnedHandle> {
 }
 
 fn spawn(mut command: Command) -> io::Result<RunningChild> {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    command.stdin(Stdio::null()).kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
     #[cfg(windows)]
@@ -583,12 +624,14 @@ async fn execute(
         .env("CODINGPAD_RUST_CANCEL", cancel)
         .env("CODINGPAD_RUST_CACHE", cache)
         .env("CODINGPAD_RUST_OUTPUT", address.to_string())
-        .env("CODINGPAD_RUST_TOKEN", secret);
+        .env("CODINGPAD_RUST_TOKEN", secret)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     #[cfg(windows)]
     let ready = {
         // Let the generated entry point wait until the job is attached before
         // it can start a subprocess.
-        let ready = root.join("start");
+        let ready = cancel.with_file_name("start");
         command.env("CODINGPAD_RUST_START", &ready);
         ready
     };

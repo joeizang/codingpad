@@ -13,7 +13,10 @@ pub(crate) async fn analyzer_command(builds: &BuildCache) -> Result<AnalyzerComm
     let help = toolchain.analyzer_help();
     let executable = match std::env::var_os("CODINGPAD_RUST_LSP") {
         Some(path) => PathBuf::from(path),
-        None => toolchain.analyzer().await.ok_or_else(|| help.clone())?,
+        None => toolchain
+            .find_analyzer()
+            .await?
+            .ok_or_else(|| help.clone())?,
     };
     let executable = std::path::absolute(executable).map_err(|error| error.to_string())?;
     if !executable.is_file() {

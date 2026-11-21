@@ -131,22 +131,28 @@ impl RustToolchain {
     }
 
     /// rustup installs a proxy even when the analyzer component is missing.
-    pub(crate) async fn analyzer(&self) -> Option<PathBuf> {
+    pub(crate) async fn find_analyzer(&self) -> Result<Option<PathBuf>, RustToolchainError> {
         let Some(root) = &self.private else {
-            return Some(self.executable(RustTool::Analyzer));
+            return Ok(Some(self.executable(RustTool::Analyzer)));
         };
         let mut command = self.command(RustTool::Rustup);
         command.current_dir(root).args(["which", "rust-analyzer"]);
         prepare_tool_command(&mut command);
-        let output = tokio::time::timeout(VERSION_TIMEOUT, command.output())
+        let output = tokio::time::timeout(COMMAND_PROBE_TIMEOUT, command.output())
             .await
-            .ok()?
-            .ok()?;
+            .map_err(|_| RustToolchainError::ProbeTimeout)?
+            .map_err(|error| {
+                format!("Could not check the private rust-analyzer installation: {error}")
+            })?;
         if !output.status.success() {
-            return None;
+            return Ok(None);
         }
-        let path = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
-        path.is_file().then_some(path)
+        let path = PathBuf::from(
+            String::from_utf8(output.stdout)
+                .map_err(|error| error.to_string())?
+                .trim(),
+        );
+        Ok(path.is_file().then_some(path))
     }
 
     pub(crate) fn still_present(&self) -> bool {
@@ -226,14 +232,14 @@ impl RustToolchain {
             return Some(false);
         }
         let (cargo, rustc) = tokio::join!(
-            probe_version(self.command(RustTool::Cargo), VERSION_TIMEOUT),
-            probe_version(self.command(RustTool::Compiler), VERSION_TIMEOUT)
+            probe_version(self.command(RustTool::Cargo), COMMAND_PROBE_TIMEOUT),
+            probe_version(self.command(RustTool::Compiler), COMMAND_PROBE_TIMEOUT)
         );
         Some(cargo? && rustc?)
     }
 }
 
-const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
+const COMMAND_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: &str =
     "The Rust toolchain took too long to respond. Wait for it to finish starting, then try again.";
 
@@ -422,7 +428,9 @@ async fn verify_linker(directory: &Path) -> Result<(), String> {
     if cfg!(target_os = "macos") {
         let mut xcode = Command::new("xcode-select");
         xcode.arg("-p");
-        run(xcode, VERSION_TIMEOUT).await.map_err(|_| message)?;
+        run(xcode, COMMAND_PROBE_TIMEOUT)
+            .await
+            .map_err(|_| message)?;
     }
     let probe = tempfile::tempdir_in(directory).map_err(|e| e.to_string())?;
     let source = probe.path().join("linker.c");
@@ -432,7 +440,7 @@ async fn verify_linker(directory: &Path) -> Result<(), String> {
         .arg(source)
         .arg("-o")
         .arg(probe.path().join("linker"));
-    run(link, VERSION_TIMEOUT)
+    run(link, COMMAND_PROBE_TIMEOUT)
         .await
         .map_err(|error| format!("{message} {error}"))
 }
@@ -494,18 +502,18 @@ mod tests {
         assert!(!abandoned.exists());
         let private = RustToolchain::private(root);
         verify_install(&private, data.path()).await.unwrap();
-        assert!(private.analyzer().await.is_some());
+        assert!(private.find_analyzer().await.ok().flatten().is_some());
         let mut remove = private.command(RustTool::Rustup);
         remove
             .current_dir(data.path())
             .args(["component", "remove", "rust-analyzer"]);
-        run(remove, VERSION_TIMEOUT).await.unwrap();
+        run(remove, COMMAND_PROBE_TIMEOUT).await.unwrap();
         assert!(
             private.executable(RustTool::Analyzer).is_file(),
             "rustup leaves the proxy installed"
         );
         assert!(
-            private.analyzer().await.is_none(),
+            matches!(private.find_analyzer().await, Ok(None)),
             "the proxy must not be mistaken for the component"
         );
         verify_install(&private, data.path()).await.unwrap();
@@ -550,10 +558,13 @@ mod tests {
         let unlaunchable = directory.path().join("cargo");
         std::fs::write(&unlaunchable, "not a Rust tool").unwrap();
         assert_eq!(
-            probe_version(Command::new(unlaunchable), VERSION_TIMEOUT).await,
+            probe_version(Command::new(unlaunchable), COMMAND_PROBE_TIMEOUT).await,
             Some(false)
         );
         assert_eq!(probe_version(slow, Duration::from_millis(10)).await, None);
-        assert_eq!(probe_version(broken, VERSION_TIMEOUT).await, Some(false));
+        assert_eq!(
+            probe_version(broken, COMMAND_PROBE_TIMEOUT).await,
+            Some(false)
+        );
     }
 }

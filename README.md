@@ -1,6 +1,6 @@
 # CodingPad
 
-CodingPad is a desktop scratchpad for **Python, C#, TypeScript, and SQL**.
+CodingPad is a desktop scratchpad for **Python, C#, TypeScript, Rust, and SQL**.
 Write a short script, run it, and inspect the output beside your code. Use it
 to try an idea, explore a database, or save a script you want to run again.
 
@@ -54,6 +54,7 @@ open an existing script.
 | Python (`.py`) | Python 3.10+ and `uv`. If `uv` is missing, choose **Install uv and run** when prompted. If Python is missing too, [install Python before rerunning](TECHNICAL_REFERENCE.md#first-launch). |
 | C# (`.cs`) | .NET 10 or later. If prompted, choose **Install .NET and run**. |
 | TypeScript (`.ts`) | Bun. If prompted, choose **Install Bun and run**. |
+| Rust (`.rs`) | Cargo and rustc. If prompted, choose **Install Rust and run**. |
 | SQL (`.sql`) | A saved connection. Choose **codingpad-sample** for the included database, or click **Manage…** in the sidebar’s **Connections** section to add SQLite, PostgreSQL, or SQL Server. |
 
 In a Python tab, try this and click **Run**:
@@ -66,8 +67,8 @@ print("Scores")
 **Results** shows the printed text and displays the final expression as a table.
 To inspect values elsewhere in a script, use `dump(value)` in Python,
 `import { dump } from "codingpad"` and `dump(value)` in TypeScript, or
-`value.Dump()` in C#. Expand a result to explore nested data, and click a line
-link in an error to jump to the corresponding code.
+`value.Dump()` in C#. In Rust, call `codingpad::dump(value)`. Expand a result to
+explore nested data, and click a line link in an error to jump to the code.
 
 Press **Ctrl+S** (**Cmd+S** on macOS) to save your work as an ordinary source
 file. The sidebar starts with your library in `Documents/CodingPad`, and you

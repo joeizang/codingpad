@@ -1,7 +1,7 @@
 //! The terminal runner behind `cpad run` (D28).
 //!
 //! The command reuses the desktop's Rust core: the same kernel supervisor,
-//! Python, C# and TypeScript kernels, SQL manager, connection store and
+//! Python, C#, TypeScript and Rust kernels, SQL manager, connection store and
 //! secret vault. It replaces the results panel with terminal output.
 //!
 //! Kernels normally defer C# properties and deep values as lazy nodes so the
@@ -59,9 +59,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// The script types `cpad run` understands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScriptLanguage {
-    Python,
-    Csharp,
-    Typescript,
+    Kernel(Language),
     Sql,
 }
 
@@ -96,21 +94,22 @@ pub fn language_for(path: &Path) -> Result<ScriptLanguage, String> {
         .and_then(|extension| extension.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    match extension.as_str() {
-        ext if ext == Language::Python.extension() => Ok(ScriptLanguage::Python),
-        ext if ext == Language::Csharp.extension() => Ok(ScriptLanguage::Csharp),
-        ext if ext == Language::Typescript.extension() => Ok(ScriptLanguage::Typescript),
-        "sql" => Ok(ScriptLanguage::Sql),
-        ext => Err(format!(
-            "Cannot run \"{}\": expected a .py, .cs, .ts or .sql script{}.",
-            path.display(),
-            if ext.is_empty() {
-                String::new()
-            } else {
-                format!(", not .{ext}")
-            }
-        )),
+    if extension == "sql" {
+        return Ok(ScriptLanguage::Sql);
     }
+    Language::from_extension(&extension)
+        .map(ScriptLanguage::Kernel)
+        .ok_or_else(|| {
+            format!(
+                "Cannot run \"{}\": expected a .py, .cs, .ts, .rs or .sql script{}.",
+                path.display(),
+                if extension.is_empty() {
+                    String::new()
+                } else {
+                    format!(", not .{extension}")
+                }
+            )
+        })
 }
 
 /// Run one script and return the process exit code, printing dumps as text.
@@ -174,6 +173,7 @@ async fn run_file_in(
     let supervisor = Arc::new(
         Supervisor::with_data_dir_and_secrets(data_directory, secrets)
             .with_connections(connections)
+            .with_session_rust_cache()
             .with_eager_dumps(),
     );
 
@@ -221,9 +221,7 @@ async fn run_file_in(
             })
     };
     let result = match language {
-        ScriptLanguage::Python => run_kernel(Language::Python).await,
-        ScriptLanguage::Csharp => run_kernel(Language::Csharp).await,
-        ScriptLanguage::Typescript => run_kernel(Language::Typescript).await,
+        ScriptLanguage::Kernel(language) => run_kernel(language).await,
         ScriptLanguage::Sql => {
             run_sql_script(&sql, &script_id, &source, &absolute, &mut recorder).await
         }
@@ -972,7 +970,7 @@ fn write_recorded(record: &Recorded) {
 
 #[cfg(test)]
 mod tests {
-    use super::{language_for, run_file_in, OutputFormat, ScriptLanguage};
+    use super::{language_for, run_file_in, Language, OutputFormat, ScriptLanguage};
     use codingpad_kernel_core::secrets::Vault;
     use std::{fs, path::Path, sync::Arc};
 
@@ -980,15 +978,19 @@ mod tests {
     fn extensions_pick_the_runner() {
         assert_eq!(
             language_for(Path::new("hello.py")),
-            Ok(ScriptLanguage::Python)
+            Ok(ScriptLanguage::Kernel(Language::Python))
         );
         assert_eq!(
             language_for(Path::new("Hello.CS")),
-            Ok(ScriptLanguage::Csharp)
+            Ok(ScriptLanguage::Kernel(Language::Csharp))
         );
         assert_eq!(
             language_for(Path::new("hello.TS")),
-            Ok(ScriptLanguage::Typescript)
+            Ok(ScriptLanguage::Kernel(Language::Typescript))
+        );
+        assert_eq!(
+            language_for(Path::new("hello.RS")),
+            Ok(ScriptLanguage::Kernel(Language::Rust))
         );
         assert_eq!(
             language_for(Path::new("query.sql")),
@@ -999,29 +1001,29 @@ mod tests {
     #[test]
     fn unknown_extensions_are_rejected_with_the_expected_ones() {
         let message = language_for(Path::new("notes.txt")).unwrap_err();
-        assert!(message.contains(".py, .cs, .ts or .sql"));
+        assert!(message.contains(".py, .cs, .ts, .rs or .sql"));
         assert!(message.contains("notes.txt"));
+    }
+
+    struct TestVault;
+
+    impl Vault for TestVault {
+        fn get(&self, name: &str) -> Result<Option<String>, String> {
+            assert_eq!(name, "test-token");
+            Ok(Some("vault-fixture".into()))
+        }
+
+        fn set(&self, _: &str, _: &str) -> Result<(), String> {
+            panic!("Running a script must not write vault entries");
+        }
+
+        fn delete(&self, _: &str) -> Result<(), String> {
+            panic!("Running a script must not delete vault entries");
+        }
     }
 
     #[tokio::test]
     async fn typescript_cli_runner_reads_a_vault_secret() {
-        struct TestVault;
-
-        impl Vault for TestVault {
-            fn get(&self, name: &str) -> Result<Option<String>, String> {
-                assert_eq!(name, "test-token");
-                Ok(Some("vault-fixture".into()))
-            }
-
-            fn set(&self, _: &str, _: &str) -> Result<(), String> {
-                panic!("Running a script must not write vault entries");
-            }
-
-            fn delete(&self, _: &str) -> Result<(), String> {
-                panic!("Running a script must not delete vault entries");
-            }
-        }
-
         let directory = tempfile::tempdir().unwrap();
         let data = directory.path().join("data");
         fs::create_dir(&data).unwrap();
@@ -1039,6 +1041,27 @@ if (secret("test-token") !== "vault-fixture") {
         .unwrap();
         assert_eq!(
             run_file_in(&script, OutputFormat::Text, data, Arc::new(TestVault),).await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn rust_cli_runner_reads_a_vault_secret() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("secret.rs");
+        fs::write(
+            &script,
+            r#"assert_eq!(codingpad::secret("test-token"), "vault-fixture");"#,
+        )
+        .unwrap();
+        assert_eq!(
+            run_file_in(
+                &script,
+                OutputFormat::Text,
+                directory.path().join("data"),
+                Arc::new(TestVault)
+            )
+            .await,
             0
         );
     }

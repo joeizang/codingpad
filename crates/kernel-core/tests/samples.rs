@@ -1,6 +1,6 @@
 //! Every built-in sample must run against the bundled sample database.
 //!
-//! The structural, SQL and TypeScript checks run in the normal suite. The full
+//! The structural, SQL, TypeScript and Rust checks run in the normal suite. The full
 //! acceptance run is ignored because the first Python/C# database sample installs
 //! SQLAlchemy or EF Core and may need network access; run it explicitly with
 //! `cargo test -p codingpad-kernel-core --test samples -- --ignored`.
@@ -30,6 +30,7 @@ fn every_sample_is_listed_with_runnable_source() {
         SampleLanguage::Python,
         SampleLanguage::Csharp,
         SampleLanguage::Typescript,
+        SampleLanguage::Rust,
         SampleLanguage::Sql,
     ] {
         let count = samples
@@ -86,19 +87,20 @@ async fn sql_samples_run_against_the_bundled_database() {
 }
 
 #[tokio::test]
-async fn typescript_samples_run_without_a_saved_path() {
+async fn typescript_and_rust_samples_run_without_a_saved_path() {
     let directory = tempfile::tempdir().unwrap();
     let (connections, _) = manager(directory.path());
     let supervisor =
         Supervisor::with_data_dir(directory.path().to_path_buf()).with_connections(connections);
-    for sample in samples::all()
-        .into_iter()
-        .filter(|sample| sample.language == SampleLanguage::Typescript)
-    {
+    for sample in samples::all() {
+        let Some(language @ (Language::Typescript | Language::Rust)) = sample.language.language()
+        else {
+            continue;
+        };
         let mut events = Vec::new();
         let result = timeout(
             Duration::from_secs(90),
-            supervisor.run_language(&sample.id, sample.source, Language::Typescript, |event| {
+            supervisor.run_language(&sample.id, sample.source, language, |event| {
                 events.push(event);
             }),
         )
@@ -106,11 +108,28 @@ async fn typescript_samples_run_without_a_saved_path() {
         .unwrap_or_else(|_| panic!("{} timed out", sample.id))
         .unwrap_or_else(|error| panic!("{} failed: {error}", sample.id));
         assert!(result.ok, "{} failed: {events:?}", sample.id);
-        assert!(
-            events.iter().any(|event| event.method == "dump"),
-            "{} produced no dump",
-            sample.id
-        );
+        let dumps: Vec<_> = events
+            .iter()
+            .filter(|event| event.method == "dump")
+            .map(|event| &event.params["node"])
+            .collect();
+        assert!(!dumps.is_empty(), "{} produced no dump", sample.id);
+        match (language, sample.name.as_str()) {
+            (Language::Rust, "tables.rs") => {
+                assert_eq!(dumps[0]["kind"], "table");
+                assert_eq!(dumps[0]["columns"][0]["name"], "title");
+                assert_eq!(dumps[0]["total"], 3);
+            }
+            (Language::Rust, "query_products.rs" | "query_orders.rs") => {
+                assert_eq!(dumps[0]["kind"], "table");
+                assert_eq!(dumps[0]["total"], 8);
+            }
+            (Language::Rust, "enums.rs") => {
+                assert_eq!(dumps.len(), 3);
+                assert!(dumps[1].to_string().contains("Invalid score: oops"));
+            }
+            _ => {}
+        }
     }
     supervisor.shutdown().await;
 }
@@ -126,10 +145,8 @@ async fn python_csharp_and_sql_samples_run_end_to_end() {
 
     // Run the samples that need no database first, so each language keeps one
     // warm kernel for the plain scripts and restarts only for the db samples.
-    for (language, expected) in [
-        (Language::Python, SampleLanguage::Python),
-        (Language::Csharp, SampleLanguage::Csharp),
-    ] {
+    for expected in [SampleLanguage::Python, SampleLanguage::Csharp] {
+        let language = expected.language().unwrap();
         let mut scripts: Vec<_> = samples
             .iter()
             .filter(|sample| sample.language == expected)

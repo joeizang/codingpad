@@ -53,38 +53,193 @@ fn python_script_prints_streams_and_dumps_as_text() {
     assert!(text.contains("\n42\n"), "{text}");
 }
 
-#[test]
-fn typescript_samples_run_from_saved_files() {
+fn run_samples(language: SampleLanguage, check: impl Fn(&str, &Path, &Path, &str)) {
     let directory = tempdir().unwrap();
     let data = directory.path().join("data");
     for sample in samples::all()
         .into_iter()
-        .filter(|sample| sample.language == SampleLanguage::Typescript)
+        .filter(|sample| sample.language == language)
     {
         let script = directory.path().join(&sample.name);
         fs::write(&script, sample.source).unwrap();
         let output = cpad(&data, &script);
-        let errors = stderr(&output);
         let text = stdout(&output);
-        assert!(output.status.success(), "{}: {text}\n{errors}", sample.id);
+        assert!(
+            output.status.success(),
+            "{}: {text}\n{}",
+            sample.id,
+            stderr(&output)
+        );
         assert!(!text.trim().is_empty(), "{} produced no output", sample.id);
-        if sample.name == "cache.ts" {
+        match script.file_stem().and_then(|stem| stem.to_str()) {
+            Some("query_products") => assert!(text.contains("Ethiopia Yirgacheffe"), "{text}"),
+            Some("query_orders") => assert!(text.contains("Ada Lovelace"), "{text}"),
+            Some("rich_output") => {
+                let output = cpad_html(&data, &script);
+                assert!(output.status.success(), "{}", stderr(&output));
+                let page = stdout(&output);
+                assert!(page.starts_with("<!doctype html>"), "{page}");
+                assert!(page.contains("<strong>All three steps completed.</strong>"));
+            }
+            _ => {}
+        }
+        check(&sample.name, &data, &script, &text);
+    }
+}
+
+#[test]
+fn typescript_samples_run_from_saved_files() {
+    run_samples(SampleLanguage::Typescript, |name, _, _, text| {
+        if name == "cache.ts" {
             assert_eq!(text.matches("Computing squares").count(), 1, "{text}");
             assert!(text.to_ascii_lowercase().contains("reused: true"), "{text}");
         }
-        if sample.name == "query_products.ts" {
-            assert!(text.contains("Ethiopia Yirgacheffe"), "{text}");
+    });
+}
+
+#[test]
+fn rust_samples_run_from_saved_files() {
+    run_samples(
+        SampleLanguage::Rust,
+        |name, data, script, text| match name {
+            "cache.rs" => {
+                assert_eq!(text.matches("Computing squares").count(), 1, "{text}");
+                let rerun = cpad(data, script);
+                assert!(rerun.status.success(), "{}", stderr(&rerun));
+                assert_eq!(stdout(&rerun), text);
+            }
+            "query_orders.rs" => {
+                let output = cpad_html(data, script);
+                assert!(output.status.success(), "{}", stderr(&output));
+                let page = stdout(&output);
+                assert!(page.contains("<table"), "{page}");
+                assert!(page.contains("Ada Lovelace"), "{page}");
+            }
+            _ => {}
+        },
+    );
+}
+
+#[test]
+fn rust_compile_errors_and_panics_exit_with_one() {
+    let directory = tempdir().unwrap();
+    let data = directory.path().join("data");
+    let script = directory.path().join("fail.rs");
+    for (source, message) in [
+        ("let _: u32 = true;", "mismatched types"),
+        (r#"panic!("rust cli panic");"#, "rust cli panic"),
+    ] {
+        fs::write(&script, source).unwrap();
+        let output = cpad(&data, &script);
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        let rendered = stdout(&output) + &stderr(&output);
+        assert!(rendered.contains(message), "{rendered}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn ctrl_c_exits_with_130_and_stops_rust_build_or_script() {
+    use std::{
+        os::unix::fs::PermissionsExt,
+        process::Stdio,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    let directory = tempdir().unwrap();
+    let data = directory.path().join("data");
+    let script = directory.path().join("pause.rs");
+    let marker = directory.path().join("process-id");
+    fs::write(
+        &script,
+        r#"
+        let path = std::env::var_os("CPAD_TEST_PROCESS_ID").unwrap();
+        std::fs::write(path, std::process::id().to_string()).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(120));
+    "#,
+    )
+    .unwrap();
+
+    let bin = directory.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    fs::write(
+        &cargo,
+        r#"#!/bin/sh
+if [ "$1" = --version ]; then
+    echo "cargo fixture"
+    exit 0
+fi
+printf '%s' "$$" > "$CPAD_TEST_PROCESS_ID"
+exec sleep 120
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+
+    for during_build in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cpad"));
+        command
+            .arg("run")
+            .arg(&script)
+            .env("CODINGPAD_DATA_DIR", &data)
+            .env("CPAD_TEST_PROCESS_ID", &marker)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        if during_build {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            command.env(
+                "PATH",
+                std::env::join_paths(
+                    std::iter::once(bin.clone()).chain(std::env::split_paths(&path)),
+                )
+                .unwrap(),
+            );
         }
-        if sample.name == "query_orders.ts" {
-            assert!(text.contains("Ada Lovelace"), "{text}");
-        }
-        if sample.name == "rich_output.ts" {
-            let output = cpad_html(&data, &script);
-            assert!(output.status.success(), "stderr: {}", stderr(&output));
-            let page = stdout(&output);
-            assert!(page.starts_with("<!doctype html>"), "{page}");
-            assert!(page.contains("<strong>All three steps completed.</strong>"));
-        }
+        let mut child = command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let pid = loop {
+            if let Ok(pid) = fs::read_to_string(&marker) {
+                if pid.parse::<u32>().is_ok() {
+                    break pid;
+                }
+            }
+            if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("Rust did not start (during_build={during_build})");
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        fs::remove_file(&marker).unwrap();
+        assert!(Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("cpad did not stop (during_build={during_build})");
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.code(), Some(130));
+        let stat = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&stat.stdout);
+        assert!(
+            stat.trim().is_empty() || stat.trim_start().starts_with('Z'),
+            "Rust process {pid} is still running: {stat}"
+        );
     }
 }
 
@@ -488,14 +643,14 @@ fn usage_errors_exit_with_two() {
 
     let output = cpad(&data, &script);
     assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
-    assert!(stderr(&output).contains(".py, .cs, .ts or .sql"));
+    assert!(stderr(&output).contains(".py, .cs, .ts, .rs or .sql"));
 
     // The type check comes before opening the file, so a missing unknown path
     // is still a usage error rather than "Could not open".
     let missing = directory.path().join("missing.txt");
     let output = cpad(&data, &missing);
     assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
-    assert!(stderr(&output).contains(".py, .cs, .ts or .sql"));
+    assert!(stderr(&output).contains(".py, .cs, .ts, .rs or .sql"));
 
     // An unknown option is a usage error too.
     let output = Command::new(env!("CARGO_BIN_EXE_cpad"))

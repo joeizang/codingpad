@@ -308,13 +308,16 @@ a file to open it, or use **Open file…** for any single file. **Save** (or
 prompts for its location the first time and can use **Save as…** afterwards.
 CodingPad settings live in the app config folder, never in your scripts.
 
-A script's optional single-line header stays at the top of the file and is shown
-in the footer. For Python it is a `#` comment; C#, Rust and TypeScript use `//`;
+The footer shows the optional single-line script header. Put the header at
+the top of the file unless it follows cargo-script frontmatter in Rust. For Python it is a `#` comment; C#, Rust and TypeScript use `//`;
 SQL uses `--`:
 
 ```python
 # codingpad: connection=northwind
 ```
+
+For Rust scripts using cargo-script frontmatter, put the header comment after
+the closing fence. A shebang, if present, comes before the frontmatter.
 
 The line is preserved byte-for-byte when reading, editing and saving. Saves go
 through a temporary file and rename, so a crash mid-save cannot truncate a

@@ -634,3 +634,153 @@ async fn cooperative_stop_keeps_the_cache_and_does_not_mask_an_independent_exit(
         assert_eq!(dumps(&events)[0]["v"], 42);
     }
 }
+
+const CARGO_SCRIPT_EXAMPLE: &str = concat!(
+    "#!/usr/bin/env -S cargo +nightly -Zscript\r\n",
+    "----cargo\r\n",
+    "# café\r\n",
+    "[package]\r\nedition = \"2021\"\r\n",
+    "[dependencies]\r\nserde_json = \"1\"\r\n",
+    "----\r\n",
+    "// codingpad: connection=demo\r\n",
+    "fn main() { println!(\"{}\", serde_json::json!(42)); }\r\n",
+);
+
+#[tokio::test]
+async fn cargo_frontmatter_resolves_crates_and_preserves_editor_positions() {
+    let supervisor = Supervisor::default();
+    let source = CARGO_SCRIPT_EXAMPLE;
+    let (result, events) = run(&supervisor, source).await;
+    assert!(result.ok, "{events:?}");
+    assert!(events
+        .iter()
+        .any(|event| event.method == "stream" && event.params["text"] == "42\n"));
+
+    let bad = source.replace("serde_json::json!(42)", "missing()");
+    let (result, events) = run(&supervisor, &bad).await;
+    assert!(!result.ok);
+    let diagnostics = &events
+        .iter()
+        .find(|event| event.method == "diagnostics")
+        .unwrap()
+        .params["diagnostics"];
+    assert_eq!(diagnostics[0]["line"], 10);
+    assert_eq!(diagnostics[0]["column"], 28);
+}
+
+#[tokio::test]
+async fn cargo_frontmatter_uses_the_bundled_runtime_under_its_declared_alias() {
+    let source = "---cargo\n[dependencies]\ncp = { package = 'codingpad', version = '0.8' }\n---\ncp::dump(42);";
+    let (result, events) = run(&Supervisor::default(), source).await;
+    assert!(result.ok, "{events:?}");
+    assert_eq!(dumps(&events)[0]["v"], 42);
+}
+
+#[test]
+#[ignore = "requires Cargo nightly; run with --ignored"]
+fn the_cargo_script_example_runs_under_native_cargo() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("example.rs");
+    for source in [
+        CARGO_SCRIPT_EXAMPLE.to_owned(),
+        CARGO_SCRIPT_EXAMPLE.replace("----cargo", "----"),
+    ] {
+        std::fs::write(&path, source).unwrap();
+        let output = std::process::Command::new("cargo")
+            .current_dir(dir.path())
+            .args([
+                "+nightly",
+                "-Zscript",
+                "run",
+                "--offline",
+                "--quiet",
+                "--manifest-path",
+            ])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+    }
+}
+
+#[tokio::test]
+async fn relative_frontmatter_dependencies_resolve_from_the_saved_script() {
+    let base = tempfile::tempdir().unwrap();
+    let dependency = base.path().join("local-crate");
+    std::fs::create_dir_all(dependency.join("src")).unwrap();
+    std::fs::write(
+        dependency.join("Cargo.toml"),
+        "[package]\nname = \"local-crate\"\nversion = \"0.1.0\"\nedition = \"2021\"",
+    )
+    .unwrap();
+    std::fs::write(
+        dependency.join("src/lib.rs"),
+        "pub fn answer() -> i32 { 42 }",
+    )
+    .unwrap();
+    let supervisor = Supervisor::default();
+    let source = "---cargo\n[dependencies]\nlocal-crate = { path = \"local-crate\" }\n---\nlocal_crate::answer()";
+    let script = base.path().join("saved.rs");
+    let mut events = Vec::new();
+    let result = supervisor
+        .run_language_at(
+            "relative",
+            source,
+            Language::Rust,
+            script.to_str(),
+            |event| events.push(event),
+        )
+        .await
+        .unwrap();
+    assert!(result.ok, "{events:?}");
+    assert_eq!(dumps(&events)[0]["v"], 42);
+
+    let source = source.replace("path = \"local-crate\"", "path = \"missing-crate\"");
+    let mut events = Vec::new();
+    let result = supervisor
+        .run_language_at(
+            "relative",
+            &source,
+            Language::Rust,
+            script.to_str(),
+            |event| events.push(event),
+        )
+        .await
+        .unwrap();
+    assert!(!result.ok);
+    let error = dumps(&events)[0];
+    assert_eq!(error["type"], "Build error");
+    assert!(error["message"].as_str().unwrap().contains("missing-crate"));
+    let diagnostic = events
+        .iter()
+        .find(|event| event.method == "diagnostics")
+        .unwrap();
+    assert_eq!(
+        diagnostic.params["diagnostics"][0]["line"], 3,
+        "{:?}",
+        diagnostic.params
+    );
+}
+
+#[tokio::test]
+async fn invalid_cargo_script_frontmatter_reports_its_original_line() {
+    let source = "#!/usr/bin/env -S cargo +nightly -Zscript\r\n---cargo\r\n[dependencies\r\n---\r\nprintln!(\"must not run\");\r\n";
+    let (result, events) = run(&Supervisor::default(), source).await;
+    assert!(!result.ok);
+    assert_eq!(dumps(&events)[0]["type"], "Cargo-script frontmatter error");
+    let diagnostic = events
+        .iter()
+        .find(|event| event.method == "diagnostics")
+        .unwrap();
+    assert_eq!(
+        diagnostic.params["diagnostics"][0]["line"], 3,
+        "{:?}",
+        diagnostic.params
+    );
+    assert!(!events.iter().any(|event| event.method == "stream"));
+}

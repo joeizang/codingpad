@@ -1,10 +1,12 @@
 //! Builds and runs an editor snapshot in a fresh Cargo project.
 mod debug;
 mod dumps;
+mod manifest;
 mod panic;
 mod source;
 
 pub(crate) use dumps::Dumps;
+pub(crate) use manifest::{frontmatter, Manifest};
 
 use crate::{shadow::ShadowProjects, KernelEvent, RunResult};
 use debug::{Snapshot, ValueNode};
@@ -29,17 +31,6 @@ use tokio::{
     time::Instant,
 };
 
-pub(super) const SCRIPT_MANIFEST: &str = r#"
-[package]
-name = "codingpad-script"
-version = "0.0.0"
-edition = "2024"
-
-[dependencies]
-codingpad = { path = "codingpad" }
-
-[workspace]
-"#;
 pub(super) const RUNTIME_MANIFEST: &str =
     include_str!("../../../runtimes/rust/codingpad/Cargo.toml");
 pub(super) const RUNTIME: &str = include_str!("../../../runtimes/rust/codingpad/src/lib.rs");
@@ -111,8 +102,6 @@ pub(super) async fn run(
     stop: &mut watch::Receiver<u64>,
     emit: &mut (impl FnMut(KernelEvent) + Send),
 ) -> Result<(RunResult, Dumps), String> {
-    let source = Source::new(source);
-    let project = projects.prepare_rust(&source.generated)?;
     let script = path.map(Path::new);
     let name = script
         .and_then(Path::file_name)
@@ -126,6 +115,26 @@ pub(super) async fn run(
         panic: None,
         main_unwound: false,
     };
+    let manifest = match Manifest::parse(source, script) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let text = error.to_string();
+            let line = error.line;
+            events.send(
+                "diagnostics",
+                json!({"diagnostics": [
+                    {"message": text, "line": line, "column": 1, "endLine": line, "endColumn": 2}
+                ]}),
+            );
+            events.error("Cargo-script frontmatter error", &text, vec![
+                json!({"file": name, "line": line, "column": 1, "function": "<manifest>", "text": "", "script": true}),
+            ]);
+            return Ok((events.finish(false), events.dumps));
+        }
+    };
+    let source =
+        Source::with_frontmatter(source, manifest.frontmatter.clone(), &manifest.runtime_name);
+    let project = projects.prepare_rust(&source.generated, &manifest.cargo)?;
     let cancel = project.root().join("cancel");
     let cargo = cargo();
     let build = tokio::select! {
@@ -134,7 +143,12 @@ pub(super) async fn run(
             events.send("run_finished", json!({"ok": false}));
             return Ok((stopped(), events.dumps));
         },
-        build = compile(&cargo, project.root(), &source, name, &mut events) => build?,
+        build = async {
+            if manifest.needs_packages && !prepare_dependencies(&cargo, project.root(), &manifest, &mut events).await? {
+                return Ok(None);
+            }
+            compile(&cargo, project.root(), &source, name, &mut events).await
+        } => build?,
     };
     let ok = if let Some(executable) = build {
         let exit = execute(
@@ -190,15 +204,7 @@ pub(super) async fn run(
     } else {
         false
     };
-    events.send("run_finished", json!({"ok": ok}));
-    Ok((
-        RunResult {
-            ok,
-            stopped: false,
-            cache_cleared: false,
-        },
-        events.dumps,
-    ))
+    Ok((events.finish(ok), events.dumps))
 }
 
 async fn compile(
@@ -214,6 +220,8 @@ async fn compile(
         stderr,
     } = build_cargo(cargo, root).await?;
 
+    let root_source = root.join(source::FILE);
+    let canonical_source = std::fs::canonicalize(&root_source).ok();
     let mut executable = None;
     let mut diagnostics = Vec::new();
     let mut had_error = false;
@@ -221,7 +229,17 @@ async fn compile(
         let Ok(message) = serde_json::from_slice::<Value>(line) else {
             continue;
         };
-        if message["reason"] == "compiler-artifact" {
+        let is_script = message["target"]["src_path"]
+            .as_str()
+            .map(Path::new)
+            .is_some_and(|path| {
+                path == root_source
+                    || canonical_source.as_ref().is_some_and(|source| {
+                        path.ends_with(source::FILE)
+                            && std::fs::canonicalize(path).is_ok_and(|path| path == *source)
+                    })
+            });
+        if message["reason"] == "compiler-artifact" && is_script {
             if let Some(path) = message["executable"].as_str() {
                 executable = Some(root.join(path));
             }
@@ -239,7 +257,9 @@ async fn compile(
                     spans
                         .iter()
                         .filter(|span| span["is_primary"] == true)
-                        .find_map(|span| diagnostic_range(span, source))
+                        .find_map(|span| {
+                            is_script.then(|| diagnostic_range(span, source)).flatten()
+                        })
                 });
                 let frames = if let Some((line, column, end_line, end_column)) = span {
                     diagnostics.push(json!({
@@ -250,7 +270,19 @@ async fn compile(
                         json!({"file": name, "line": line, "column": column, "function": "<compile>", "text": "", "script": true}),
                     ]
                 } else {
-                    Vec::new()
+                    diagnostic["spans"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|span| span["is_primary"] == true)
+                        .map(|span| {
+                            json!({
+                                "file": span["file_name"], "line": span["line_start"],
+                                "column": span["column_start"], "function": "<compile>",
+                                "text": "", "script": false
+                            })
+                        })
+                        .collect()
                 };
                 events.error("Compile error", &text, frames);
             }
@@ -274,18 +306,15 @@ async fn compile(
         if !had_error {
             events.error(
                 "Build error",
-                "Cargo could not build the Rust script.",
+                match stderr.trim() {
+                    "" => "Cargo could not build the Rust script.",
+                    text => text.strip_prefix("error: ").unwrap_or(text),
+                },
                 Vec::new(),
             );
         }
         Ok(None)
     }
-}
-
-struct CargoOutput {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
 }
 
 async fn build_cargo(cargo: &Path, root: &Path) -> Result<CargoOutput, String> {
@@ -300,6 +329,60 @@ async fn build_cargo(cargo: &Path, root: &Path) -> Result<CargoOutput, String> {
             "--target-dir",
         ])
         .arg(root.join("target"));
+    cargo_output(command).await
+}
+
+async fn prepare_dependencies(
+    cargo: &Path,
+    root: &Path,
+    manifest: &Manifest,
+    events: &mut Events<'_, impl FnMut(KernelEvent)>,
+) -> Result<bool, String> {
+    let fetch = |offline| {
+        let mut command = Command::new(cargo);
+        command.current_dir(root).args(["fetch", "--quiet"]);
+        if offline {
+            command.arg("--offline");
+        }
+        cargo_output(command)
+    };
+    let offline = fetch(true).await?;
+    if offline.status.success() {
+        return Ok(true);
+    }
+
+    let online = fetch(false).await?;
+    if !online.status.success() {
+        let offline_error = String::from_utf8_lossy(&offline.stderr);
+        let online_error = String::from_utf8_lossy(&online.stderr);
+        let mut message = "Could not resolve Rust dependencies.".to_owned();
+        let offline_error = offline_error.trim();
+        let online_error = online_error.trim();
+        if !offline_error.is_empty() {
+            message.push_str(&format!("\nCached packages:\n{offline_error}"));
+        }
+        if !online_error.is_empty() && online_error != offline_error {
+            message.push_str(&format!("\nCargo fetch:\n{online_error}"));
+        }
+        let line = manifest.dependency_error_line(offline_error);
+        events.send(
+            "diagnostics",
+            json!({"diagnostics": [
+                {"message": message, "line": line, "column": 1, "endLine": line, "endColumn": 2}
+            ]}),
+        );
+        events.error("Build error", &message, Vec::new());
+    }
+    Ok(online.status.success())
+}
+
+struct CargoOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+async fn cargo_output(command: Command) -> Result<CargoOutput, String> {
     let mut child = spawn(command).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             MISSING.to_owned()
@@ -672,6 +755,15 @@ struct Events<'a, F> {
 }
 
 impl<F: FnMut(KernelEvent)> Events<'_, F> {
+    fn finish(&mut self, ok: bool) -> RunResult {
+        self.send("run_finished", json!({"ok": ok}));
+        RunResult {
+            ok,
+            stopped: false,
+            cache_cleared: false,
+        }
+    }
+
     fn send(&mut self, method: &str, mut params: Value) {
         params["runId"] = json!(self.dumps.run_id());
         (self.emit)(KernelEvent {

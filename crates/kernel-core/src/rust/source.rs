@@ -10,8 +10,34 @@ pub(super) struct Source<'a> {
 }
 
 impl<'a> Source<'a> {
-    pub(super) fn new(original: &'a str) -> Self {
+    pub(super) fn with_frontmatter(
+        original: &'a str,
+        frontmatter: std::ops::Range<usize>,
+        runtime: &str,
+    ) -> Self {
+        if frontmatter.is_empty() {
+            return Self::new(original, runtime);
+        }
+        // Keep byte offsets and line breaks so compiler spans still map back to
+        // the editor, including offsets after non-ASCII manifest comments.
+        let mut masked = original.as_bytes().to_vec();
+        for byte in &mut masked[frontmatter] {
+            if !matches!(byte, b'\n' | b'\r') {
+                *byte = b' ';
+            }
+        }
+        let masked = String::from_utf8(masked).expect("replacing a full range preserves UTF-8");
+        let staged = Source::new(&masked, runtime);
+        Self {
+            original,
+            generated: staged.generated,
+            segments: staged.segments,
+        }
+    }
+
+    fn new(original: &'a str, runtime: &str) -> Self {
         let _spans = SpanScope;
+        let runtime = runtime.replace('-', "_");
         let prefix = source_prefix_len(original);
         let mut staged = Self {
             original,
@@ -21,9 +47,9 @@ impl<'a> Source<'a> {
         // Native Rust programs retain their entry point and crate-level items.
         if let Some(entry) = native_entry(&original[prefix..]).map(|entry| prefix + entry) {
             staged.copy(0, entry);
-            staged
-                .generated
-                .push_str(" let __codingpad_panic_guard = ::codingpad::__start(); ");
+            staged.generated.push_str(&format!(
+                " let __codingpad_panic_guard = ::{runtime}::__start(); "
+            ));
             staged.copy(entry, original.len());
             return staged;
         }
@@ -49,12 +75,14 @@ impl<'a> Source<'a> {
             })
             .unwrap_or((prefix, None));
         staged.copy(0, body);
-        staged
-            .generated
-            .push_str("\nfn main() { let __codingpad_panic_guard = ::codingpad::__start();\n");
+        staged.generated.push_str(&format!(
+            "\nfn main() {{ let __codingpad_panic_guard = ::{runtime}::__start();\n"
+        ));
         if let Some(tail) = tail {
             staged.copy(body, tail.start);
-            staged.generated.push_str("::codingpad::__finish(");
+            staged
+                .generated
+                .push_str(&format!("::{runtime}::__finish("));
             staged.copy(tail.start, tail.end);
             staged.generated.push_str(");");
             staged.copy(tail.end, original.len());
@@ -148,7 +176,7 @@ fn native_entry(source: &str) -> Option<usize> {
 }
 
 // Rust allows a BOM and a shebang only at the start of the file.
-fn source_prefix_len(source: &str) -> usize {
+pub(super) fn source_prefix_len(source: &str) -> usize {
     let rest = source.strip_prefix('\u{feff}').unwrap_or(source);
     let bom = source.len() - rest.len();
     if rest
@@ -192,19 +220,21 @@ mod tests {
     #[test]
     fn stages_attributes_and_wraps_only_the_unterminated_expression() {
         let original = "#![allow(unused)]\nlet café = \"☕\";\ncafé.len() // dump\n";
-        let staged = Source::new(original);
+        let staged = Source::new(original, "codingpad");
         assert!(staged.generated.starts_with("#![allow(unused)]\nfn main()"));
         let expr = "::codingpad::__finish(café.len()); // dump";
         assert!(staged.generated.contains(expr), "{}", staged.generated);
         let offset = staged.generated.find("café.len").unwrap();
         assert_eq!(staged.position(offset), Some((3, 1)));
-        assert!(!Source::new("42;").generated.contains("__finish"));
+        assert!(!Source::new("42;", "codingpad")
+            .generated
+            .contains("__finish"));
     }
 
     #[test]
     fn adds_panic_capture_after_an_explicit_mains_inner_attributes() {
         let source = "#!/usr/bin/env rust-script\n#![allow(unused)]\nfn main() { #![allow(unused)] println!(\"hello\"); }";
-        let staged = Source::new(source);
+        let staged = Source::new(source, "codingpad");
         assert!(staged
             .generated
             .contains("{ #![allow(unused)] let __codingpad_panic_guard = ::codingpad::__start();"));

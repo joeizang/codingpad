@@ -20,10 +20,26 @@ export type ScriptFile = {
   source: string;
 };
 
-// Mirror of the Rust parser so the footer stays accurate while the header line
-// is being edited, before anything is saved.
+// The Cargo fence must precede comments for the file to run with Cargo.
+export function cargoScriptFrontmatter(source: string) {
+  const lines = source.replace(/^\uFEFF/, "").split(/\r?\n/);
+  if (/^#!/.test(lines[0] ?? "") && !/^#!\s*\[/.test(lines[0])) lines.shift();
+  const first = lines.findIndex((line) => line.trim() !== "");
+  const fence = first < 0 ? null : lines[first].match(/^(-{3,255})(?:[ \t]*cargo)?[ \t]*$/)?.[1];
+  if (!fence) return null;
+  const end = lines.findIndex((line, index) => index > first && line.startsWith(fence) && line.trimEnd() === fence);
+  return {
+    key: lines.slice(first, end === -1 ? first + 1 : end + 1).join("\n"),
+    body: end === -1 ? null : lines.slice(end + 1).find((line) => line !== ""),
+  };
+}
+
+// The footer follows the host header rules, identifying Rust blocks by the
+// explicit cargo marker before looking for a CodingPad comment.
 export function parseHeader(source: string): ScriptHeader | null {
-  const first = source.split(/\r?\n/, 1)[0] ?? "";
+  const { key, body } = cargoScriptFrontmatter(source) ?? {};
+  const explicit = key?.split("\n", 1)[0]?.trimEnd().endsWith("cargo");
+  const first = (explicit ? body : null) ?? source.split(/\r?\n/, 1)[0] ?? "";
   const line = first.startsWith("\uFEFF") ? first.slice(1) : first;
   const trimmed = line.trimStart();
   const rest = trimmed.startsWith("//")

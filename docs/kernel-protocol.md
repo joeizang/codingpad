@@ -577,6 +577,35 @@ dump("An explicit dump");
 6 * 7
 ```
 
+Declare crates in cargo-script frontmatter after any shebang and before the
+optional `// codingpad:` script header. Use the explicit `---cargo` fence when
+a script header follows it. The script header is a Rust comment
+after the closing fence, so the same file works under Cargo.
+CodingPad fetches missing crates before building offline. Cargo reuses
+downloaded crates in its local package cache. CodingPad supplies its bundled
+runtime library for a declared codingpad dependency, including an alias.
+A bare fence accepted by Cargo can declare dependencies too. Use the explicit
+marker to associate a CodingPad script header with the block. Malformed frontmatter is
+reported at its script line. Relative path
+dependencies are resolved from the saved script's directory.
+
+```rust
+---cargo
+[package]
+edition = "2024"
+
+[dependencies]
+serde_json = "1"
+---
+
+fn main() {
+    println!("{}", serde_json::json!({ "ready": true }));
+}
+```
+
+Save this example as `example.rs` and run it with
+`cargo +nightly -Zscript example.rs` outside CodingPad.
+
 An explicit `fn main()` runs as a normal Rust program. In a top-level script,
 CodingPad automatically dumps a final expression without a semicolon if it
 returns a non-unit value. Dumped values need Rust's `Debug` implementation.

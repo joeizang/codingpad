@@ -179,9 +179,13 @@ pub enum Language {
 
 impl Language {
     pub fn from_extension(extension: &str) -> Option<Self> {
-        [Self::Python, Self::Csharp, Self::Typescript, Self::Rust]
-            .into_iter()
-            .find(|language| extension.eq_ignore_ascii_case(language.extension()))
+        match extension {
+            "py" => Some(Self::Python),
+            "cs" => Some(Self::Csharp),
+            "ts" => Some(Self::Typescript),
+            "rs" => Some(Self::Rust),
+            _ => None,
+        }
     }
 
     pub fn extension(self) -> &'static str {

@@ -267,10 +267,10 @@ cargo run --locked -p cpad -- run hello.py
 ```
 
 `cargo build --locked -p cpad` produces `target/debug/cpad` (`target/release/cpad`
-with `--release`). Python (`.py`), C# (`.cs`), TypeScript (`.ts`) and
-Rust (`.rs`) scripts use the app's kernels. TypeScript uses Bun on PATH or the private Bun installed
-by CodingPad. Rust uses your installed toolchain first and can use the private
-copy installed by CodingPad. A `.sql` script runs through its header connection.
+with `--release`). Python (`.py`), C# (`.cs`), TypeScript (`.ts`) and Rust
+(`.rs`) scripts use the app's kernels. TypeScript uses Bun on PATH or CodingPad's
+private copy. Rust uses your installed toolchain first and falls back to the
+private copy. A `.sql` script runs through its header connection.
 Dumps print as text. Short values stay on one line, tables are aligned, and C#
 properties and deep Python values are materialised in the kernel so they appear
 inline. For a table larger than its first 100-row page, the output shows the

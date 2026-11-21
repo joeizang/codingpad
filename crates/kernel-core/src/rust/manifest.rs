@@ -98,6 +98,7 @@ fn set_package_defaults(cargo: &mut Table) -> Result<(), String> {
     const PACKAGE_FIELDS: &[&str] = &[
         "workspace",
         "build",
+        "default-run",
         "links",
         "autolib",
         "autobins",
@@ -230,7 +231,17 @@ pub(crate) fn frontmatter(source: &str) -> Result<(&str, Range<usize>), Manifest
             if line.trim_end() != fence {
                 return Err(invalid("The closing fence must match the opening fence."));
             }
-            return Ok((&source[body..end], offset..end + line.len()));
+            let after_fence = end + line.len();
+            let remaining = &source[after_fence..];
+            let next = remaining.trim_start();
+            if next.starts_with("---") {
+                return Err(ManifestError::at(
+                    source,
+                    source.len() - next.len(),
+                    "Only one cargo-script frontmatter block is allowed.",
+                ));
+            }
+            return Ok((&source[body..end], offset..after_fence));
         }
         end += line.len();
     }
@@ -247,6 +258,14 @@ mod tests {
             ("---cargo\n[dependencies]\n", "Missing closing fence"),
             ("---cargo\n[dependencies\n---", "expected"),
             ("---other\n---", "optional cargo identifier"),
+            (
+                "---cargo\n---\n\n---cargo\n---",
+                "Only one cargo-script frontmatter block",
+            ),
+            (
+                concat!("---cargo\n[package]\n", r#"default-run = "demo""#, "\n---"),
+                "package.default-run is unavailable",
+            ),
             (
                 "---cargo\n[workspace]\n---",
                 "unavailable in single-file packages",

@@ -11,11 +11,12 @@ A single file of code in one language that the user writes, runs and saves in Co
 _Avoid_: Query, snippet, pad
 
 **Script header**:
-The single leading `codingpad:` comment that holds CodingPad-only settings, such as the attached connection. In a Rust script with cargo-script frontmatter, the comment follows the frontmatter.
+The single `codingpad:` comment that holds CodingPad-only settings, such as the attached connection. In a Rust script with cargo-script frontmatter, the comment follows the frontmatter.
 _Avoid_: Metadata, sidecar
 
 **Cargo-script frontmatter**:
 The embedded Cargo manifest for a single-file Rust script, including its crate declarations.
+_Avoid_: Rust Cargo frontmatter, Cargo single-file frontmatter
 
 **Library**:
 The user's main folder of saved scripts, always shown in the sidebar.

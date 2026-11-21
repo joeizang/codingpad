@@ -635,18 +635,20 @@ async fn cooperative_stop_keeps_the_cache_and_does_not_mask_an_independent_exit(
     }
 }
 
+const CARGO_SCRIPT_EXAMPLE: &str = concat!(
+    "#!/usr/bin/env -S cargo +nightly -Zscript\r\n",
+    "----cargo\r\n",
+    "# café\r\n",
+    "[package]\r\nedition = \"2021\"\r\n",
+    "[dependencies]\r\nserde_json = \"1\"\r\n",
+    "----\r\n",
+    "fn main() { println!(\"{}\", serde_json::json!(42)); }\r\n",
+);
+
 #[tokio::test]
 async fn cargo_frontmatter_resolves_crates_and_preserves_editor_positions() {
     let supervisor = Supervisor::default();
-    let source = concat!(
-        "#!/usr/bin/env -S cargo +nightly -Zscript\r\n",
-        "----cargo\r\n",
-        "# café\r\n",
-        "[package]\r\nedition = \"2021\"\r\n",
-        "[dependencies]\r\nserde_json = \"1\"\r\n",
-        "----\r\n",
-        "fn main() { println!(\"{}\", serde_json::json!(42)); }\r\n",
-    );
+    let source = CARGO_SCRIPT_EXAMPLE;
     let (result, events) = run(&supervisor, source).await;
     assert!(result.ok, "{events:?}");
     assert!(events
@@ -663,6 +665,33 @@ async fn cargo_frontmatter_resolves_crates_and_preserves_editor_positions() {
         .params["diagnostics"];
     assert_eq!(diagnostics[0]["line"], 9);
     assert_eq!(diagnostics[0]["column"], 28);
+}
+
+#[test]
+#[ignore = "requires Cargo nightly; run with --ignored"]
+fn the_cargo_script_example_runs_under_native_cargo() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("example.rs");
+    std::fs::write(&path, CARGO_SCRIPT_EXAMPLE).unwrap();
+    let output = std::process::Command::new("cargo")
+        .current_dir(dir.path())
+        .args([
+            "+nightly",
+            "-Zscript",
+            "run",
+            "--offline",
+            "--quiet",
+            "--manifest-path",
+        ])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
 }
 
 #[tokio::test]

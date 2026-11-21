@@ -597,6 +597,7 @@ fn main() {
             let sql = Arc::new(SqlManager::new(connections.clone(), secrets.clone()));
             app.manage(sql.clone());
             let supervisor = Supervisor::with_data_dir_and_secrets(data_dir.clone(), secrets)
+                .with_session_rust_cache()
                 .with_connections(connections);
             let shadow_projects = supervisor.shadow_projects();
             app.manage(supervisor);

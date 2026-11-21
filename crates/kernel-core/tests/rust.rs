@@ -379,7 +379,7 @@ async fn runs_top_level_scripts_with_a_bom_and_shebang() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_closes_a_rust_scripts_descendant_processes() {
     use tokio::io::AsyncReadExt;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{timeout, Duration, Instant};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
@@ -391,6 +391,7 @@ async fn stop_closes_a_rust_scripts_descendant_processes() {
                 let _ = std::io::Read::read(&mut socket, &mut [0]);
                 return;
             }
+            codingpad::cache("demo", || 42);
             let _child = std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("child")
                 .spawn()
@@ -412,7 +413,11 @@ async fn stop_closes_a_rust_scripts_descendant_processes() {
     socket.read_exact(&mut ready).await.unwrap();
     assert_eq!(ready, *b"1");
 
-    supervisor.stop("rust-script").await;
+    let started = Instant::now();
+    timeout(Duration::from_secs(10), supervisor.stop("rust-script"))
+        .await
+        .unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(1900));
     let result = running.await.unwrap();
     assert!(result.stopped);
     assert!(result.cache_cleared);

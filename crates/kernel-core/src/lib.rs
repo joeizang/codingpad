@@ -309,6 +309,7 @@ pub struct Supervisor {
     shadow_projects: Arc<shadow::ShadowProjects>,
     csharp: OnceCell<csharp::Installation>,
     rust_cache: OnceCell<TempDir>,
+    rust_cache_data: Option<PathBuf>,
     secrets: Option<Arc<SecretStore>>,
     connections: Option<Arc<databases::ConnectionStore>>,
     eager_dumps: bool,
@@ -365,6 +366,7 @@ impl Supervisor {
             shadow_projects: Arc::default(),
             csharp: OnceCell::new(),
             rust_cache: OnceCell::new(),
+            rust_cache_data: None,
             secrets: None,
             connections: None,
             eager_dumps: false,
@@ -383,6 +385,7 @@ impl Supervisor {
             shadow_projects: Arc::default(),
             csharp: OnceCell::new(),
             rust_cache: OnceCell::new(),
+            rust_cache_data: None,
             secrets: None,
             connections: None,
             eager_dumps: false,
@@ -415,6 +418,7 @@ impl Supervisor {
     pub fn with_data_dir(data_dir: PathBuf) -> Self {
         Self {
             data_dir: Some(data_dir.clone()),
+            rust_cache_data: Some(data_dir.join("rust-cache")),
             shadow_projects: Arc::new(shadow::ShadowProjects::with_data_dir(data_dir)),
             ..Self::default()
         }
@@ -426,6 +430,12 @@ impl Supervisor {
             secrets: Some(secrets),
             ..Self::with_data_dir(data_dir)
         }
+    }
+
+    /// Keep Rust values for this host session when script IDs are temporary.
+    pub fn with_session_rust_cache(mut self) -> Self {
+        self.rust_cache_data = None;
+        self
     }
 
     /// Use the same live connection store as the desktop connection editor.
@@ -473,17 +483,16 @@ impl Supervisor {
         typescript::BUN_NOT_FOUND.to_owned()
     }
 
-    fn configured_rust_cache_path(&self, script_id: &str) -> Option<PathBuf> {
-        let root = if let Some(data) = &self.data_dir {
-            data.join("rust-cache")
-        } else {
-            self.rust_cache.get()?.path().to_owned()
-        };
+    fn rust_cache_path_if_initialized(&self, script_id: &str) -> Option<PathBuf> {
+        let root = self
+            .rust_cache_data
+            .as_deref()
+            .or_else(|| self.rust_cache.get().map(TempDir::path))?;
         Some(root.join(rust::cache_key(script_id)))
     }
 
     async fn rust_cache_path(&self, script_id: &str) -> Result<PathBuf, String> {
-        if let Some(path) = self.configured_rust_cache_path(script_id) {
+        if let Some(path) = self.rust_cache_path_if_initialized(script_id) {
             return Ok(path);
         }
         let root = self
@@ -814,7 +823,7 @@ impl Supervisor {
 
     pub async fn reset(&self, script_id: &str) -> Result<(), String> {
         let slots = self.kernels.lock().await;
-        let cache = self.configured_rust_cache_path(script_id);
+        let cache = self.rust_cache_path_if_initialized(script_id);
         let retired = match slots.get(script_id).cloned() {
             Some(slot) => {
                 drop(slots);
@@ -842,14 +851,13 @@ impl Supervisor {
         let mut retired = None;
         if let Some(slot) = slot {
             slot.closed.send_replace(true);
-            let mut state = slot.state.lock().await;
-            *state = SlotState::default();
+            *slot.state.lock().await = SlotState::default();
             let mut slots = self.kernels.lock().await;
             if slots
                 .get(script_id)
                 .is_some_and(|current| Arc::ptr_eq(current, &slot))
             {
-                let cache = self.configured_rust_cache_path(script_id);
+                let cache = self.rust_cache_path_if_initialized(script_id);
                 retired = rust::retire_cache(cache.as_deref()).unwrap_or_default();
                 slots.remove(script_id);
             }

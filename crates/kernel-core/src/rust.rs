@@ -147,14 +147,22 @@ pub(super) async fn run(
         )
         .await?;
         let ScriptExit::Completed(status) = exit else {
-            let forced = matches!(exit, ScriptExit::Killed);
-            if forced {
-                remove_retired_cache(retire_cache(Some(cache))?).await?;
+            let mut cache_cleared = false;
+            if matches!(exit, ScriptExit::Killed) {
+                match retire_cache(Some(cache)) {
+                    Ok(retired) => {
+                        cache_cleared = retired.is_some();
+                        if let Err(error) = remove_retired_cache(retired).await {
+                            events.stream("stderr", &format!("{error}\n"));
+                        }
+                    }
+                    Err(error) => events.stream("stderr", &format!("{error}\n")),
+                }
             }
             events.send("run_finished", json!({"ok": false}));
             return Ok((
                 RunResult {
-                    cache_cleared: forced,
+                    cache_cleared,
                     ..stopped()
                 },
                 events.dumps,
@@ -199,7 +207,11 @@ async fn compile(
     name: &str,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
 ) -> Result<Option<PathBuf>, String> {
-    let (status, stdout, stderr) = build_cargo(cargo, root).await?;
+    let CargoOutput {
+        status,
+        stdout,
+        stderr,
+    } = build_cargo(cargo, root).await?;
 
     let mut executable = None;
     let mut diagnostics = Vec::new();
@@ -269,7 +281,13 @@ async fn compile(
     }
 }
 
-async fn build_cargo(cargo: &Path, root: &Path) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), String> {
+struct CargoOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+async fn build_cargo(cargo: &Path, root: &Path) -> Result<CargoOutput, String> {
     let mut command = Command::new(cargo);
     command
         .current_dir(root)
@@ -300,7 +318,11 @@ async fn build_cargo(cargo: &Path, root: &Path) -> Result<(ExitStatus, Vec<u8>, 
     .map_err(|error| format!("Could not read Cargo output: {error}"))?;
 
     child.finished = true;
-    Ok((status, stdout, stderr))
+    Ok(CargoOutput {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn diagnostic_range(span: &Value, source: &Source<'_>) -> Option<(usize, usize, usize, usize)> {
@@ -426,8 +448,11 @@ fn spawn(mut command: Command) -> io::Result<RunningChild> {
     #[cfg(windows)]
     command.creation_flags(0x08000000 | 0x00000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
     let process = command.spawn()?;
+    let pid = process
+        .id()
+        .ok_or_else(|| io::Error::other("Could not get the child process ID"))?;
     Ok(RunningChild {
-        pid: process.id().expect("a newly spawned child has a PID"),
+        pid,
         #[cfg(windows)]
         job: assign_job(&process),
         process,

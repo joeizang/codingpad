@@ -589,11 +589,11 @@ this script. The `codingpad` runtime library supports numeric types, booleans,
 strings, vectors and options, and custom types can implement `CacheValue`.
 Each script keeps up to 32 stored keys of at most 96 UTF-8 bytes, with up to
 1 MiB per entry. Oversize keys or values, encoding failures, and filesystem
-errors surface as Rust panics with the offending key. Reset removes these
+errors fail the script and include the offending key. Reset removes these
 values, and closing the script attempts the same cleanup.
-Supervisors without an application data directory keep their caches for the
-life of the supervisor. Stop makes `codingpad::is_cancelled()` return true so scripts
-can release resources and exit. After two seconds CodingPad forcibly stops
+The desktop and supervisors without an application data directory keep these
+values for the host session. Stop makes `codingpad::is_cancelled()` return
+true so scripts can release resources and exit. After two seconds CodingPad forcibly stops
 the process tree and clears the script cache.
 
 Derived `Debug` values render as structured data. Structs and data-bearing enum

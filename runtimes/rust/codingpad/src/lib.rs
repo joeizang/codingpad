@@ -1,5 +1,8 @@
 //! Rust helpers available in CodingPad and in standalone Cargo programs.
+mod cache;
 mod rich;
+
+pub use cache::{cache, is_cancelled};
 
 pub use rich::{html, image, image_bytes, live, Html, Image, Live};
 

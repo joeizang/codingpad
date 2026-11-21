@@ -563,8 +563,9 @@ status.value = "Ready";
 
 CodingPad builds the editor snapshot in a fresh Cargo shadow project. It uses
 the installed stable Rust toolchain (1.85 or later for edition 2024) and a
-bundled, dependency-free `codingpad` crate. Each run uses an offline debug
-build to retain source information. Shared build caching is scoped to M6.4. Saved
+bundled `codingpad` crate. Each run uses a debug build to retain source
+information. Cargo first uses local packages and downloads missing dependencies
+when needed. Shared build caching is scoped to M6.4. Saved
 scripts run with their directory as the working directory. The script on disk
 is untouched.
 
@@ -583,6 +584,12 @@ Compiler errors block execution and are sent as `diagnostics` and error dumps
 with ranges mapped to the original editor snapshot. Stdout and stderr use
 `stream` notifications. Dump messages travel over a separate authenticated
 loopback connection, so native output can contain arbitrary text.
+
+Use `codingpad::cache("key", || value)` to store a Serde-compatible value on
+disk for this script and reuse it across native processes. Reset removes
+these values. Stop makes `codingpad::is_cancelled()` return true so scripts
+can release resources and exit. After two seconds CodingPad forcibly stops
+the process tree and clears the script cache.
 
 Derived `Debug` values render as structured data. Structs and data-bearing enum
 variants show their fields, `None` appears as null, and collections of records

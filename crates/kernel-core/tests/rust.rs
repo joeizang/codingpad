@@ -413,7 +413,9 @@ async fn stop_closes_a_rust_scripts_descendant_processes() {
     assert_eq!(ready, *b"1");
 
     supervisor.stop("rust-script").await;
-    assert!(running.await.unwrap().stopped);
+    let result = running.await.unwrap();
+    assert!(result.stopped);
+    assert!(result.cache_cleared);
     match timeout(Duration::from_secs(5), socket.read(&mut ready))
         .await
         .unwrap()
@@ -499,4 +501,69 @@ async fn dump_preserves_mixed_variants_and_keeps_debug_markers_private() {
         .collect::<Vec<_>>();
     assert_eq!(updates.len(), 1);
     assert_eq!(updates[0].params["node"]["v"], "now updated");
+}
+
+#[tokio::test]
+async fn rust_cache_survives_fresh_processes_and_can_be_reset_before_a_run() {
+    let data = tempfile::tempdir().unwrap();
+    let source = |value| format!(r#"codingpad::cache("example", || {value})"#);
+    let supervisor = Supervisor::with_data_dir(data.path().to_owned());
+    let (result, events) = run(&supervisor, &source(41)).await;
+    assert!(result.ok);
+    assert_eq!(dumps(&events)[0]["v"], 41);
+
+    let supervisor = Supervisor::with_data_dir(data.path().to_owned());
+    let (result, events) = run(&supervisor, &source(42)).await;
+    assert!(result.ok);
+    assert_eq!(dumps(&events)[0]["v"], 41);
+    drop(supervisor);
+
+    let supervisor = Supervisor::with_data_dir(data.path().to_owned());
+    supervisor.reset("rust-script").await.unwrap();
+    let (result, events) = run(&supervisor, &source(42)).await;
+    assert!(result.ok);
+    assert_eq!(dumps(&events)[0]["v"], 42);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rust_script_can_cooperate_with_stop() {
+    use std::sync::Arc;
+    use tokio::{
+        sync::Notify,
+        time::{timeout, Duration},
+    };
+
+    let supervisor = Arc::new(Supervisor::default());
+    let ready = Arc::new(Notify::new());
+    let running = tokio::spawn({
+        let supervisor = supervisor.clone();
+        let ready = ready.clone();
+        async move {
+            supervisor
+                .run_language(
+                    "cooperative",
+                    r#"
+                println!("ready");
+                while !codingpad::is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            "#,
+                    Language::Rust,
+                    move |event| {
+                        if event.method == "stream" && event.params["text"] == "ready\n" {
+                            ready.notify_one();
+                        }
+                    },
+                )
+                .await
+                .unwrap()
+        }
+    });
+    timeout(Duration::from_secs(60), ready.notified())
+        .await
+        .unwrap();
+    supervisor.stop("cooperative").await;
+    let result = running.await.unwrap();
+    assert!(result.stopped);
+    assert!(!result.cache_cleared);
 }

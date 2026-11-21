@@ -25,6 +25,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines},
     net::{TcpListener, TcpStream},
     process::{Child, Command},
+    sync::watch,
     time::Instant,
 };
 
@@ -42,6 +43,8 @@ codingpad = { path = "codingpad" }
 pub(super) const RUNTIME_MANIFEST: &str =
     include_str!("../../../runtimes/rust/codingpad/Cargo.toml");
 pub(super) const RUNTIME: &str = include_str!("../../../runtimes/rust/codingpad/src/lib.rs");
+pub(super) const CACHE_RUNTIME: &str =
+    include_str!("../../../runtimes/rust/codingpad/src/cache.rs");
 pub(super) const RICH_RUNTIME: &str = include_str!("../../../runtimes/rust/codingpad/src/rich.rs");
 const MISSING: &str =
     "Rust was not found. Install the stable Rust toolchain (Cargo and rustc) from https://rustup.rs/ and run the script again.";
@@ -51,6 +54,14 @@ pub(super) fn stopped() -> RunResult {
         ok: false,
         stopped: true,
         cache_cleared: false,
+    }
+}
+
+pub(super) fn clear_cache(path: &Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Could not clear the Rust script cache: {error}")),
     }
 }
 
@@ -70,7 +81,9 @@ pub(super) async fn run(
     projects: &ShadowProjects,
     source: &str,
     path: Option<&str>,
+    cache: &Path,
     eager: bool,
+    stop: &mut watch::Receiver<u64>,
     emit: &mut (impl FnMut(KernelEvent) + Send),
 ) -> Result<(RunResult, Dumps), String> {
     let source = Source::new(source);
@@ -88,9 +101,32 @@ pub(super) async fn run(
         panic: None,
         main_unwound: false,
     };
-    let build = compile(&cargo(), project.root(), &source, name, &mut events).await?;
+    let cancel = project.root().join("cancel");
+    let cargo = cargo();
+    let build = tokio::select! {
+        biased;
+        _ = stop.changed() => return Ok((stopped(), events.dumps)),
+        build = compile(&cargo, project.root(), &source, name, &mut events) => build?,
+    };
     let ok = if let Some(executable) = build {
-        let status = execute(&executable, script, project.root(), &mut events).await?;
+        let (status, forced) =
+            execute(&executable, script, &cancel, cache, stop, &mut events).await?;
+        let Some(status) = status else {
+            if forced {
+                clear_cache(cache)?;
+            }
+            events.send(
+                "run_finished",
+                json!({"ok": false, "stopped": true, "cacheCleared": forced}),
+            );
+            return Ok((
+                RunResult {
+                    cache_cleared: forced,
+                    ..stopped()
+                },
+                events.dumps,
+            ));
+        };
         let panic = events.panic.take();
         if let Some(panic) = panic.as_ref() {
             if status.success() || !events.main_unwound {
@@ -130,34 +166,12 @@ async fn compile(
     name: &str,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
 ) -> Result<Option<PathBuf>, String> {
-    let mut command = Command::new(cargo);
-    command
-        .current_dir(root)
-        .args([
-            "build",
-            "--offline",
-            "--message-format=json",
-            "--quiet",
-            "--target-dir",
-        ])
-        .arg(root.join("target"));
-    let mut child = spawn(command).map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
-            MISSING.to_owned()
-        } else {
-            format!("Could not start Cargo: {error}")
-        }
-    })?;
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let mut stdout_pipe = child.0.stdout.take().unwrap();
-    let mut stderr_pipe = child.0.stderr.take().unwrap();
-    let (status, _, _) = tokio::try_join!(
-        child.0.wait(),
-        stdout_pipe.read_to_end(&mut stdout),
-        stderr_pipe.read_to_end(&mut stderr),
-    )
-    .map_err(|error| format!("Could not read Cargo output: {error}"))?;
+    let (status, stdout, stderr) = build_cargo(cargo, root, true).await?;
+    let (status, stdout, stderr) = if !status.success() && needs_network(&stderr) {
+        build_cargo(cargo, root, false).await?
+    } else {
+        (status, stdout, stderr)
+    };
 
     let mut executable = None;
     let mut diagnostics = Vec::new();
@@ -227,6 +241,45 @@ async fn compile(
     }
 }
 
+fn needs_network(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr);
+    stderr.contains("offline mode") || stderr.contains("--offline was specified")
+}
+
+async fn build_cargo(
+    cargo: &Path,
+    root: &Path,
+    offline: bool,
+) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), String> {
+    let mut command = Command::new(cargo);
+    command
+        .current_dir(root)
+        .args(["build", "--message-format=json", "--quiet", "--target-dir"])
+        .arg(root.join("target"));
+    if offline {
+        command.arg("--offline");
+    }
+    let mut child = spawn(command).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            MISSING.to_owned()
+        } else {
+            format!("Could not start Cargo: {error}")
+        }
+    })?;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut stdout_pipe = child.0.stdout.take().unwrap();
+    let mut stderr_pipe = child.0.stderr.take().unwrap();
+    let (status, _, _) = tokio::try_join!(
+        child.0.wait(),
+        stdout_pipe.read_to_end(&mut stdout),
+        stderr_pipe.read_to_end(&mut stderr),
+    )
+    .map_err(|error| format!("Could not read Cargo output: {error}"))?;
+
+    Ok((status, stdout, stderr))
+}
+
 fn diagnostic_range(span: &Value, source: &Source<'_>) -> Option<(usize, usize, usize, usize)> {
     if span["file_name"].as_str()?.replace('\\', "/") == source::FILE {
         let start = span["byte_start"].as_u64()?;
@@ -243,8 +296,8 @@ fn diagnostic_range(span: &Value, source: &Source<'_>) -> Option<(usize, usize, 
 // Kill the process tree before the child handle or shadow project drops.
 struct RunningChild(Child);
 
-impl Drop for RunningChild {
-    fn drop(&mut self) {
+impl RunningChild {
+    fn kill_tree(&mut self) {
         if self.0.id().is_none() {
             return;
         }
@@ -258,6 +311,12 @@ impl Drop for RunningChild {
             return;
         }
         crate::kill_process_tree(&mut self.0);
+    }
+}
+
+impl Drop for RunningChild {
+    fn drop(&mut self) {
+        self.kill_tree();
     }
 }
 
@@ -287,9 +346,11 @@ fn token() -> Result<([u8; 32], OsString), String> {
 async fn execute(
     executable: &Path,
     script: Option<&Path>,
-    root: &Path,
+    cancel: &Path,
+    cache: &Path,
+    stop: &mut watch::Receiver<u64>,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
-) -> Result<ExitStatus, String> {
+) -> Result<(Option<ExitStatus>, bool), String> {
     let (token, secret) = token()?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -300,15 +361,40 @@ async fn execute(
         .and_then(|path| std::path::absolute(path).ok())
         .and_then(|path| path.parent().map(Path::to_path_buf));
     command
-        .current_dir(cwd.as_deref().unwrap_or(root))
+        .current_dir(cwd.as_deref().unwrap_or_else(|| cancel.parent().unwrap()))
+        .env("CODINGPAD_RUST_CANCEL", cancel)
+        .env("CODINGPAD_RUST_CACHE", cache)
         .env("CODINGPAD_RUST_OUTPUT", address.to_string())
         .env("CODINGPAD_RUST_TOKEN", secret);
     let mut child =
         spawn(command).map_err(|error| format!("Could not start the Rust script: {error}"))?;
-    let status = read_output(&mut child.0, &listener, &token, events)
+    let outcome = {
+        let read = read_output(&mut child.0, &listener, &token, events);
+        tokio::pin!(read);
+        tokio::select! {
+            biased;
+            _ = stop.changed() => {
+                let _ = std::fs::write(cancel, []);
+                match tokio::time::timeout(Duration::from_secs(2), &mut read).await {
+                    Ok(Ok(_)) => return Ok((None, false)),
+                    _ => None,
+                }
+            }
+            status = &mut read => Some(status),
+        }
+    };
+    if let Some(status) = outcome {
+        return status
+            .map(|status| (Some(status), false))
+            .map_err(|error| format!("Could not read Rust script output: {error}"));
+    }
+    child.kill_tree();
+    child
+        .0
+        .wait()
         .await
-        .map_err(|error| format!("Could not read Rust script output: {error}"))?;
-    Ok(status)
+        .map_err(|error| format!("Could not stop the Rust script: {error}"))?;
+    Ok((None, true))
 }
 
 async fn read_output(

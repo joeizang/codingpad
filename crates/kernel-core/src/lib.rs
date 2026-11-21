@@ -308,6 +308,7 @@ pub struct Supervisor {
     kernels: Mutex<HashMap<String, SharedSlot>>,
     shadow_projects: Arc<shadow::ShadowProjects>,
     csharp: OnceCell<csharp::Installation>,
+    rust_cache: OnceCell<TempDir>,
     secrets: Option<Arc<SecretStore>>,
     connections: Option<Arc<databases::ConnectionStore>>,
     eager_dumps: bool,
@@ -363,6 +364,7 @@ impl Supervisor {
             kernels: Mutex::new(HashMap::new()),
             shadow_projects: Arc::default(),
             csharp: OnceCell::new(),
+            rust_cache: OnceCell::new(),
             secrets: None,
             connections: None,
             eager_dumps: false,
@@ -380,6 +382,7 @@ impl Supervisor {
             kernels: Mutex::new(HashMap::new()),
             shadow_projects: Arc::default(),
             csharp: OnceCell::new(),
+            rust_cache: OnceCell::new(),
             secrets: None,
             connections: None,
             eager_dumps: false,
@@ -470,6 +473,23 @@ impl Supervisor {
         typescript::BUN_NOT_FOUND.to_owned()
     }
 
+    async fn rust_cache_path(&self, script_id: &str) -> Result<PathBuf, String> {
+        use sha2::{Digest, Sha256};
+        let root = match &self.data_dir {
+            Some(data) => data.join("rust-cache"),
+            None => self
+                .rust_cache
+                .get_or_try_init(|| async {
+                    tempfile::tempdir()
+                        .map_err(|error| format!("Could not create the Rust cache: {error}"))
+                })
+                .await?
+                .path()
+                .to_owned(),
+        };
+        Ok(root.join(format!("{:x}", Sha256::digest(script_id.as_bytes()))))
+    }
+
     pub async fn run(
         &self,
         script_id: &str,
@@ -542,11 +562,11 @@ impl Supervisor {
                 return Err("Script was closed".into());
             }
             *guard = SlotState::default();
+            let cache = self.rust_cache_path(script_id).await?;
             return tokio::select! {
                 biased;
                 _ = closed.changed() => Err("Script was closed".into()),
-                _ = stop.changed() => Ok(rust::stopped()),
-                result = rust::run(&self.shadow_projects, source, path, self.eager_dumps, &mut emit) => {
+                result = rust::run(&self.shadow_projects, source, path, &cache, self.eager_dumps, &mut stop, &mut emit) => {
                     let (result, dumps) = result?;
                     guard.rust_dumps = Some(dumps);
                     Ok(result)
@@ -787,14 +807,21 @@ impl Supervisor {
     }
 
     pub async fn reset(&self, script_id: &str) -> Result<(), String> {
-        self.stop(script_id).await;
-        let slot = self.kernels.lock().await.get(script_id).cloned();
-        if let Some(slot) = slot {
-            let mut guard = slot.state.lock().await;
-            if *slot.closed.borrow() {
-                return Err("Script was closed".into());
-            }
-            *guard = SlotState::default();
+        let slot = self
+            .kernels
+            .lock()
+            .await
+            .entry(script_id.into())
+            .or_insert_with(|| Arc::new(Slot::new()))
+            .clone();
+        slot.stop.send_modify(|version| *version += 1);
+        let mut guard = slot.state.lock().await;
+        if *slot.closed.borrow() {
+            return Err("Script was closed".into());
+        }
+        *guard = SlotState::default();
+        if self.data_dir.is_some() || self.rust_cache.initialized() {
+            rust::clear_cache(&self.rust_cache_path(script_id).await?)?;
         }
         Ok(())
     }

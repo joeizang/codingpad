@@ -819,7 +819,7 @@ async fn read_output(
             line = async { runtime.as_mut().unwrap().next_line().await }, if runtime.is_some() && request.is_none() => {
                 match line {
                     Ok(Some(line)) => {
-                        match serde_json::from_str(&line)? {
+                        match RuntimeMessage::parse(&line)? {
                             RuntimeMessage::Request(event) if !stopping && exit.is_none() => {
                                 request = Some(services.request(event));
                             }
@@ -878,11 +878,24 @@ fn peer_closed(error: &io::Error) -> bool {
     )
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
 enum RuntimeMessage {
     Request(services::Request),
     Event(RuntimeEvent),
+}
+
+impl RuntimeMessage {
+    fn parse(line: &str) -> serde_json::Result<Self> {
+        #[derive(Deserialize)]
+        struct Header<'a> {
+            #[serde(borrow)]
+            kind: std::borrow::Cow<'a, str>,
+        }
+        let header: Header<'_> = serde_json::from_str(line)?;
+        match header.kind.as_ref() {
+            "query" | "execute" | "secret" => serde_json::from_str(line).map(Self::Request),
+            _ => serde_json::from_str(line).map(Self::Event),
+        }
+    }
 }
 
 #[derive(Deserialize)]

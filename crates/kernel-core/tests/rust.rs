@@ -953,7 +953,7 @@ mod database {
             assert_eq!(changed, 2);
             assert_eq!(db.query("SELECT label FROM items WHERE id = ?", &[DbParameter::Integer(2)]).unwrap().rows()[0][0], DbValue::Null);
             let rows = db.query("SELECT id AS value, label AS value, 0 AS value_2 FROM items ORDER BY id DESC", &[]).unwrap();
-            assert_eq!(rows.columns(), &["value", "value_3", "value_2"]);
+            assert_eq!(rows.columns(), &["value", "value_2", "value_2_2"]);
             assert_eq!(rows.rows()[0], [DbValue::Integer(9007199254740993), DbValue::Text("D'Angelo".into()), DbValue::Integer(0)]);
             assert_eq!(rows.rows()[1][1], DbValue::Null);
             dump(rows);
@@ -962,7 +962,7 @@ mod database {
         assert!(result.ok, "{events:?}");
         let nodes = dumps(&events);
         assert_eq!(nodes[0]["kind"], "table");
-        assert_eq!(nodes[0]["columns"][1]["name"], "value_3");
+        assert_eq!(nodes[0]["columns"][1]["name"], "value_2");
         assert_eq!(nodes[0]["rows"][0][0]["v"], "9007199254740993");
         assert_eq!(nodes[1]["kind"], "table");
         assert_eq!(nodes[1]["total"], 0);
@@ -1085,6 +1085,40 @@ mod database {
             assert_eq!(nodes[0]["kind"], "table");
             assert_eq!(nodes[0]["columns"][0]["name"], "id");
             assert_eq!(nodes[0]["rows"][0][0]["v"], 42);
+
+            if kind == DatabaseKind::Postgres {
+                let (result, events) = run(&supervisor, r#"// codingpad: connection=test
+                    use codingpad::{db, dump, DbParameter, DbValue};
+                    assert_eq!(db.execute("CREATE TEMP TABLE batch_test (id INT); INSERT INTO batch_test VALUES (1), (2)", &[]).unwrap(), 2);
+                    let rows = db.query(
+                        "SELECT 123456789012345678901234567890.123456789::numeric AS price,
+                                '-0.000123'::numeric AS small, NULL::numeric AS empty,
+                                '2026-01-02T03:04:05+00:00'::timestamptz AS stamp,
+                                '2026-01-02'::date AS day,
+                                '1 month 2 days 3 seconds'::interval AS duration,
+                                ARRAY[[1, NULL], [3, 4]]::int[] AS numbers
+                         WHERE $1::integer = 1",
+                        &[DbParameter::Integer(1)],
+                    ).unwrap();
+                    let row = &rows.rows()[0];
+                    assert_eq!(row[0], DbValue::Decimal("123456789012345678901234567890.123456789".into()));
+                    assert_eq!(row[1], DbValue::Decimal("-0.000123".into()));
+                    assert_eq!(row[2], DbValue::Null);
+                    assert_eq!(row[3], DbValue::Text("2026-01-02T03:04:05+00:00".into()));
+                    assert_eq!(row[4], DbValue::Text("2026-01-02".into()));
+                    assert_eq!(row[5], DbValue::Text("1 months 2 days 3000000 microseconds".into()));
+                    assert_eq!(row[6], DbValue::Text("[[1,null],[3,4]]".into()));
+                    dump(rows);
+                "#).await;
+                assert!(result.ok, "{events:?}");
+                let nodes = dumps(&events);
+                assert_eq!(nodes[0]["kind"], "table");
+                assert_eq!(
+                    nodes[0]["rows"][0][0]["v"],
+                    "123456789012345678901234567890.123456789"
+                );
+                assert_eq!(nodes[0]["rows"][0][2]["kind"], "null");
+            }
 
             let table = format!("cpad_rust_cancel_{}", std::process::id());
             let setup = format!(

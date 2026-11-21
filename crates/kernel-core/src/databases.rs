@@ -3,6 +3,7 @@
 //! SQL scripts run through their connection without starting a kernel. Passwords
 //! are referenced by secret name and read from the vault at connection time, so
 //! connection settings never contain them.
+mod postgres_value;
 pub mod schema;
 mod script;
 
@@ -942,7 +943,6 @@ impl SqlManager {
 impl TableData {
     fn unique_column_names(&mut self) {
         use std::collections::HashSet;
-        let original: HashSet<_> = self.column_names().map(str::to_owned).collect();
         let mut used = HashSet::new();
         for column in &mut self.columns {
             if used.insert(column.name.clone()) {
@@ -950,7 +950,7 @@ impl TableData {
             }
             let name = (2..)
                 .map(|index| format!("{}_{index}", column.name))
-                .find(|name| !original.contains(name) && !used.contains(name))
+                .find(|name| !used.contains(name))
                 .unwrap();
             used.insert(name.clone());
             column.name = name;
@@ -1532,7 +1532,7 @@ async fn postgres_query(
         }
         let mut cells = Vec::with_capacity(columns.len());
         for (index, (_, kind)) in columns.iter().enumerate() {
-            cells.push(pg_cell(&row, index, kind, values.len()));
+            cells.push(pg_cell(&row, index, kind, values.len())?);
         }
         values.push(cells);
     }
@@ -1744,35 +1744,35 @@ fn pg_cell(
     column: usize,
     kind: &tokio_postgres::types::Type,
     row_index: usize,
-) -> Value {
+) -> Result<Value, String> {
     let id = format!("sql:r{row_index}c{column}");
     if let Ok(value) = row.try_get::<_, Option<bool>>(column) {
-        return value.map_or_else(|| null_node(&id), |value| primitive_node(&id, json!(value)));
+        return Ok(value.map_or_else(|| null_node(&id), |value| primitive_node(&id, json!(value))));
     }
     if let Ok(value) = row.try_get::<_, Option<i16>>(column) {
-        return value.map_or_else(|| null_node(&id), |value| integer_node(&id, value as i64));
+        return Ok(value.map_or_else(|| null_node(&id), |value| integer_node(&id, value as i64)));
     }
     if let Ok(value) = row.try_get::<_, Option<i32>>(column) {
-        return value.map_or_else(|| null_node(&id), |value| integer_node(&id, value as i64));
+        return Ok(value.map_or_else(|| null_node(&id), |value| integer_node(&id, value as i64)));
     }
     if let Ok(value) = row.try_get::<_, Option<i64>>(column) {
-        return value.map_or_else(|| null_node(&id), |value| integer_node(&id, value));
+        return Ok(value.map_or_else(|| null_node(&id), |value| integer_node(&id, value)));
     }
     if let Ok(value) = row.try_get::<_, Option<u32>>(column) {
-        return value.map_or_else(|| null_node(&id), |value| integer_node(&id, value as i64));
+        return Ok(value.map_or_else(|| null_node(&id), |value| integer_node(&id, value as i64)));
     }
     if let Ok(value) = row.try_get::<_, Option<f32>>(column) {
-        return match value {
+        return Ok(match value {
             None => null_node(&id),
             Some(value) if !value.is_finite() => bounded_text(&id, value.to_string(), None),
             Some(value) => primitive_node(
                 &id,
                 json!(value.to_string().parse::<f64>().unwrap_or(value as f64)),
             ),
-        };
+        });
     }
     if let Ok(value) = row.try_get::<_, Option<f64>>(column) {
-        return match value {
+        return Ok(match value {
             None => null_node(&id),
             Some(value) if value.is_nan() => bounded_text(&id, "NaN".into(), None),
             Some(value) if value.is_infinite() => bounded_text(
@@ -1785,39 +1785,59 @@ fn pg_cell(
                 None,
             ),
             Some(value) => primitive_node(&id, json!(value)),
-        };
+        });
     }
     if let Ok(value) = row.try_get::<_, Option<chrono::NaiveTime>>(column) {
-        return value.map_or_else(
+        return Ok(value.map_or_else(
             || null_node(&id),
             |value| bounded_text(&id, value.to_string(), Some("time")),
-        );
+        ));
     }
     if let Ok(value) = row.try_get::<_, Option<uuid::Uuid>>(column) {
-        return value.map_or_else(
+        return Ok(value.map_or_else(
             || null_node(&id),
             |value| bounded_text(&id, value.to_string(), Some("uuid")),
-        );
+        ));
     }
     if let Ok(value) = row.try_get::<_, Option<serde_json::Value>>(column) {
-        return value.map_or_else(
+        return Ok(value.map_or_else(
             || null_node(&id),
             |value| bounded_text(&id, value.to_string(), Some(kind.name())),
-        );
+        ));
     }
     if let Ok(value) = row.try_get::<_, Option<Vec<u8>>>(column) {
-        return value.map_or_else(
+        return Ok(value.map_or_else(
             || null_node(&id),
             |value| bounded_text(&id, hex(&value), Some("bytea")),
-        );
+        ));
     }
     if let Ok(value) = row.try_get::<_, Option<String>>(column) {
-        return value.map_or_else(
+        return Ok(value.map_or_else(
             || null_node(&id),
             |value| bounded_text(&id, value, Some(kind.name())),
-        );
+        ));
     }
-    bounded_text(&id, format!("<{}>", kind.name()), None)
+    let raw = row
+        .try_get::<_, Option<postgres_value::RawValue<'_>>>(column)
+        .map_err(|error| format!("Could not read PostgreSQL column {}: {error}", column + 1))?;
+    let Some(raw) = raw else {
+        return Ok(null_node(&id));
+    };
+    let value = postgres_value::decode(kind, raw.0).map_err(|error| {
+        format!(
+            "Could not decode PostgreSQL column {} ({}): {error}",
+            column + 1,
+            kind.name()
+        )
+    })?;
+    Ok(match value {
+        Value::String(text) => bounded_text(&id, text, Some(kind.name())),
+        Value::Null => null_node(&id),
+        Value::Array(_) | Value::Object(_) => {
+            bounded_text(&id, value.to_string(), Some(kind.name()))
+        }
+        _ => primitive_node(&id, value),
+    })
 }
 
 fn pg_text_cell(

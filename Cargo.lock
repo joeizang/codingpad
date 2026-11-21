@@ -676,6 +676,7 @@ dependencies = [
  "oxc_parser",
  "oxc_span",
  "postgres-native-tls",
+ "postgres-protocol",
  "proc-macro2",
  "reqwest 0.12.28",
  "rusqlite",

@@ -295,8 +295,29 @@ async fn postgres(
     parameters: &[Parameter],
     execute: bool,
 ) -> Result<ScriptResult, String> {
-    if parameters.is_empty() && !execute {
-        return postgres_tables(client, sql).await.map(last_table);
+    if parameters.is_empty() {
+        if !execute {
+            return postgres_tables(client, sql).await.map(last_table);
+        }
+
+        use futures_util::TryStreamExt;
+        let messages = client
+            .simple_query_raw(sql)
+            .await
+            .map_err(|error| pg_error("PostgreSQL could not run the batch", error))?;
+        tokio::pin!(messages);
+        let mut affected = 0u64;
+        while let Some(message) = messages
+            .as_mut()
+            .try_next()
+            .await
+            .map_err(|error| pg_error("PostgreSQL could not read the batch results", error))?
+        {
+            if let tokio_postgres::SimpleQueryMessage::CommandComplete(count) = message {
+                affected = affected.saturating_add(count);
+            }
+        }
+        return Ok(ScriptResult::Affected(affected));
     }
     let params: Vec<&(dyn ToSql + Sync)> =
         parameters.iter().map(|parameter| parameter as _).collect();

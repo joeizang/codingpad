@@ -583,7 +583,7 @@ async fn desktop_rust_cache_reuses_values_in_one_open_tab() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_rust_script_can_cooperate_with_stop() {
+async fn cooperative_stop_keeps_the_cache_and_does_not_mask_an_independent_exit() {
     use std::sync::Arc;
     use tokio::{
         sync::Notify,
@@ -591,36 +591,46 @@ async fn a_rust_script_can_cooperate_with_stop() {
     };
 
     let supervisor = Arc::new(Supervisor::default());
-    let ready = Arc::new(Notify::new());
-    let running = tokio::spawn({
-        let supervisor = supervisor.clone();
-        let ready = ready.clone();
-        async move {
-            supervisor
-                .run_language(
-                    "cooperative",
-                    r#"
-                println!("ready");
-                while !codingpad::is_cancelled() {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-            "#,
-                    Language::Rust,
-                    move |event| {
+    // The second fixture observes the file directly so its exit represents a
+    // program completing on its own without acknowledging cancellation.
+    let independent = r#"
+        std::path::PathBuf::from(std::env::var_os("CODINGPAD_RUST_CANCEL").unwrap()).is_file()
+    "#;
+    for (condition, stopped) in [("codingpad::is_cancelled()", true), (independent, false)] {
+        let source = format!(
+            r#"
+            codingpad::cache("answer", || 42);
+            println!("ready");
+            while !({condition}) {{
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }}
+        "#
+        );
+        let ready = Arc::new(Notify::new());
+        let running = tokio::spawn({
+            let supervisor = supervisor.clone();
+            let ready = ready.clone();
+            async move {
+                supervisor
+                    .run_language("rust-script", &source, Language::Rust, move |event| {
                         if event.method == "stream" && event.params["text"] == "ready\n" {
                             ready.notify_one();
                         }
-                    },
-                )
-                .await
-                .unwrap()
-        }
-    });
-    timeout(Duration::from_secs(60), ready.notified())
-        .await
-        .unwrap();
-    supervisor.stop("cooperative").await;
-    let result = running.await.unwrap();
-    assert!(result.stopped);
-    assert!(!result.cache_cleared);
+                    })
+                    .await
+                    .unwrap()
+            }
+        });
+        timeout(Duration::from_secs(60), ready.notified())
+            .await
+            .unwrap();
+        supervisor.stop("rust-script").await;
+        let result = running.await.unwrap();
+        assert_eq!(result.stopped, stopped);
+        assert_eq!(result.ok, !stopped);
+        assert!(!result.cache_cleared);
+        let (result, events) = run(&supervisor, r#"codingpad::cache("answer", || 43)"#).await;
+        assert!(result.ok);
+        assert_eq!(dumps(&events)[0]["v"], 42);
+    }
 }

@@ -601,7 +601,7 @@ async fn read_output(
         }
     }
     child.finished = true;
-    Ok(if stopping {
+    Ok(if stopping && cancel.with_extension("observed").is_file() {
         ScriptExit::Cancelled
     } else {
         ScriptExit::Completed(exit.unwrap())

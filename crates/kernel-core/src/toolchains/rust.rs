@@ -122,12 +122,31 @@ impl RustToolchain {
         self.private.as_ref().map_or_else(
             || "rust-analyzer was not found. Install it with `rustup component add rust-analyzer rust-src` or set CODINGPAD_RUST_LSP.".into(),
             |root| format!(
-                "rust-analyzer was not found in CodingPad's private Rust toolchain. Set CARGO_HOME to \"{}\" and RUSTUP_HOME to \"{}\", then run \"{}\" component add rust-analyzer rust-src.",
+                "rust-analyzer was not found in CodingPad's private Rust toolchain. Set CARGO_HOME to \"{}\" and RUSTUP_HOME to \"{}\", then run \"{}\" component add rust-analyzer rust-src, or set CODINGPAD_RUST_LSP.",
                 root.join("cargo").display(),
                 root.join("rustup").display(),
                 self.executable(RustTool::Rustup).display(),
             ),
         )
+    }
+
+    /// rustup installs a proxy even when the analyzer component is missing.
+    pub(crate) async fn analyzer(&self) -> Option<PathBuf> {
+        let Some(root) = &self.private else {
+            return Some(self.executable(RustTool::Analyzer));
+        };
+        let mut command = self.command(RustTool::Rustup);
+        command.current_dir(root).args(["which", "rust-analyzer"]);
+        prepare_tool_command(&mut command);
+        let output = tokio::time::timeout(VERSION_TIMEOUT, command.output())
+            .await
+            .ok()?
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+        path.is_file().then_some(path)
     }
 
     pub(crate) fn still_present(&self) -> bool {
@@ -475,10 +494,21 @@ mod tests {
         assert!(!abandoned.exists());
         let private = RustToolchain::private(root);
         verify_install(&private, data.path()).await.unwrap();
-        assert_eq!(
-            probe_version(private.command(RustTool::Analyzer), VERSION_TIMEOUT).await,
-            Some(true)
+        assert!(private.analyzer().await.is_some());
+        let mut remove = private.command(RustTool::Rustup);
+        remove
+            .current_dir(data.path())
+            .args(["component", "remove", "rust-analyzer"]);
+        run(remove, VERSION_TIMEOUT).await.unwrap();
+        assert!(
+            private.executable(RustTool::Analyzer).is_file(),
+            "rustup leaves the proxy installed"
         );
+        assert!(
+            private.analyzer().await.is_none(),
+            "the proxy must not be mistaken for the component"
+        );
+        verify_install(&private, data.path()).await.unwrap();
     }
 
     #[test]

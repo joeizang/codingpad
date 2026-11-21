@@ -1,21 +1,27 @@
 use super::{build_cache, manifest, BuildCache, Manifest, Source, SCRIPT_FILE};
-use crate::{shadow::ShadowProject, toolchains::RustTool};
+use crate::shadow::ShadowProject;
 use std::{path::PathBuf, sync::Arc};
 use tokio::process::Command;
 
-pub(crate) async fn analyzer_command(builds: &BuildCache) -> Result<(Command, String), String> {
+pub(crate) struct AnalyzerCommand {
+    pub(crate) command: Command,
+    pub(crate) help: String,
+}
+
+pub(crate) async fn analyzer_command(builds: &BuildCache) -> Result<AnalyzerCommand, String> {
     let toolchain = builds.toolchain().await.unwrap_or_default();
-    let executable = std::env::var_os("CODINGPAD_RUST_LSP")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| toolchain.executable(RustTool::Analyzer));
-    let executable = std::path::absolute(executable).map_err(|error| error.to_string())?;
     let help = toolchain.analyzer_help();
+    let executable = match std::env::var_os("CODINGPAD_RUST_LSP") {
+        Some(path) => PathBuf::from(path),
+        None => toolchain.analyzer().await.ok_or_else(|| help.clone())?,
+    };
+    let executable = std::path::absolute(executable).map_err(|error| error.to_string())?;
     if !executable.is_file() {
         return Err(help);
     }
     let mut command = Command::new(executable);
     toolchain.configure(&mut command);
-    Ok((command, help))
+    Ok(AnalyzerCommand { command, help })
 }
 
 pub(crate) struct RustShadowProject {

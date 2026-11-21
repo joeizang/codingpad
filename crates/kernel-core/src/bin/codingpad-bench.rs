@@ -193,6 +193,9 @@ async fn rust_completion_latency() -> Result<Duration, String> {
         while request().await?.is_none() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        servers
+            .did_change("rust-bench", &format!("{source}\n// edited"))
+            .await?;
         request()
             .await?
             .ok_or_else(|| "Rust completion disappeared after warmup".to_owned())

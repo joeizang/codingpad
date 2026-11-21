@@ -187,14 +187,14 @@ pub fn __finish<T: Debug>(value: T) {
     }
 }
 
+const OUTPUT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn connect() -> Option<TcpStream> {
     let address = std::env::var("CODINGPAD_RUST_OUTPUT").ok()?;
     let token = std::env::var("CODINGPAD_RUST_TOKEN").ok()?;
     let mut socket = TcpStream::connect(address).ok()?;
     socket.set_nodelay(true).ok()?;
-    socket
-        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-        .ok()?;
+    socket.set_read_timeout(Some(OUTPUT_READ_TIMEOUT)).ok()?;
     socket.write_all(token.as_bytes()).ok()?;
     Some(socket)
 }
@@ -220,6 +220,9 @@ fn request_secret(name: &str) -> Result<String, String> {
         .lock()
         .map_err(|_| unavailable())?;
     let socket = output.as_mut().ok_or_else(unavailable)?;
+    // Unlocking the OS vault can require user interaction. Stop still closes
+    // the connection when it ends the run.
+    socket.set_read_timeout(None).map_err(|_| unavailable())?;
     let mut read = || -> io::Result<(bool, String)> {
         socket.write_all(encode_fields(&[("kind", "secret"), ("name", name)]).as_bytes())?;
         let mut header = [0; 5];
@@ -234,10 +237,12 @@ fn request_secret(name: &str) -> Result<String, String> {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         Ok((header[0] == 1, value))
     };
-    match read() {
-        Ok((true, value)) => Ok(value),
-        Ok((false, error)) => Err(error),
-        Err(_) => {
+    let reply = read();
+    let restored = socket.set_read_timeout(Some(OUTPUT_READ_TIMEOUT));
+    match (reply, restored) {
+        (Ok((true, value)), Ok(())) => Ok(value),
+        (Ok((false, error)), Ok(())) => Err(error),
+        _ => {
             *output = None;
             Err(unavailable())
         }

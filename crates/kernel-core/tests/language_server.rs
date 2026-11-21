@@ -559,7 +559,7 @@ async fn rust_code_intelligence_maps_shadow_edits_and_compiler_errors() {
     use serde_json::Value;
 
     let source = concat!(
-        "---cargo\n[dependencies]\nserde_json = \"1\"\n---\n",
+        "---cargo\n[dependencies]\nserde_json = \"1\"\n---\n// codingpad: connection=example\n",
         "let _emoji = \"😀\"; let _ = codingpad::du;\n",
         "let _ = codingpad::ca;\n",
         "let _ = codingpad::se;\n",
@@ -594,7 +594,7 @@ async fn rust_code_intelligence_maps_shadow_edits_and_compiler_errors() {
         ("Valu>", "Value"),
     ];
     for (index, (token, expected)) in positions.into_iter().enumerate() {
-        let line = index + 4;
+        let line = index + 5;
         let text = source.lines().nth(line).unwrap();
         let start = text.rfind(token).unwrap();
         let end = start + token.len() - 1;
@@ -617,7 +617,10 @@ async fn rust_code_intelligence_maps_shadow_edits_and_compiler_errors() {
         let start_time = Instant::now();
         let result = complete(line, column).await.unwrap();
         let elapsed = start_time.elapsed();
-        eprintln!("Warm Rust {expected} completion took {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "Warm Rust {expected} completion took {elapsed:?}"
+        );
         let item = result["items"]
             .as_array()
             .unwrap()
@@ -635,7 +638,7 @@ async fn rust_code_intelligence_maps_shadow_edits_and_compiler_errors() {
     }
 
     let edited = concat!(
-        "---cargo\n[dependencies]\nserde_json = \"1\"\n---\n",
+        "---cargo\n[dependencies]\nserde_json = \"1\"\n---\n// codingpad: connection=example\n",
         "let _: u32 = \"not a number\";\n"
     );
     servers.did_change("one", edited).await.unwrap();

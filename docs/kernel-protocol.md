@@ -1,7 +1,7 @@
 # Kernel protocol v1
 
-JSON-RPC 2.0 over UTF-8, one JSON object per line. The Rust supervisor writes
-requests to the kernel's stdin. It reads responses from stdout for Python and C#
+Python, C# and TypeScript use JSON-RPC 2.0 over UTF-8, one JSON object per line.
+The supervisor writes their requests to stdin. It reads responses from stdout for Python and C#
 and from a dedicated loopback connection for TypeScript. Each open Python, C#
 or TypeScript script keeps one warm kernel process. Rust starts a fresh process
 for each run and the supervisor retains its dump snapshots.
@@ -27,8 +27,8 @@ The supervisor allocates monotonically increasing integer request IDs per kernel
 `params.secrets` is an optional object of named secret values resolved by the
 host from the OS password vault before each run. The kernel keeps them in memory;
 Python and TypeScript expose them through `secret("name")`, C# through
-`Secret("name")`. They
-are never written to stdout/stderr or included in dumps unless a script chooses
+`Secret("name")`. Rust requests named values through its loopback connection
+described below. Secret values are never written to stdout/stderr or included in dumps unless a script chooses
 to do so.
 
 `params.secret_errors` is an optional object of vault read errors keyed by
@@ -619,12 +619,16 @@ Install the toolchain's `rust-analyzer` and `rust-src` components to enable
 completions, hover and live diagnostics. The language server sees the same
 generated source and dependencies as the Rust kernel. CodingPad translates
 its UTF-16 ranges back to the script, including edits and diagnostics after
-Cargo frontmatter. `CODINGPAD_RUST_LSP` can point to a specific rust-analyzer
-executable.
+cargo-script frontmatter. `CODINGPAD_RUST_LSP` can point to a specific
+rust-analyzer executable. The editor shadow project uses its own Cargo target
+directory so background checks do not hold the execution build cache lock.
 
-`codingpad::secret("name")` retrieves that name from the configured vault or
-session over the authenticated loopback connection. Connection passwords
-remain in the host.
+`codingpad::secret("name")` writes a UTF-8 JSON line with `kind: "secret"`
+and the requested `name` over the same authenticated loopback connection as
+dump events. The host replies with one status byte (1 for a value, 0 for an
+error), four big-endian length bytes, then that many UTF-8 bytes. The maximum
+reply body is 1 MiB. The script waits for the reply before sending another
+event on the connection. Connection passwords remain in the host.
 
 An explicit `fn main()` runs as a normal Rust program. In a top-level script,
 CodingPad automatically dumps a final expression without a semicolon if it

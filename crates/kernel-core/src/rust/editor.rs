@@ -28,19 +28,19 @@ pub(crate) fn analyzer_command() -> Result<Command, String> {
     Ok(command)
 }
 
-pub(crate) struct RustWorkspace {
+pub(crate) struct RustShadowProject {
     pub(crate) shadow: ShadowProject,
     runtime_name: String,
 }
 
-impl RustWorkspace {
+impl RustShadowProject {
     pub(crate) async fn create(
         cache: &BuildCache,
         manifest: &Manifest,
         source: &str,
     ) -> Result<Self, String> {
         let shadow = ShadowProject::temporary(SCRIPT_FILE)?;
-        let runtime = cache.runtime().await?;
+        let runtime = cache.stage_runtime().await?;
         let source =
             Source::with_frontmatter(source, manifest.frontmatter.clone(), &manifest.runtime_name);
         build_cache::stage(

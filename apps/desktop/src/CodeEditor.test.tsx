@@ -118,6 +118,27 @@ test("C# reports compiler diagnostics and starts Roslyn for the same script", as
 });
 
 
+test("Rust keeps compiler errors when rust-analyzer reports no diagnostics", async () => {
+  const uri = "file:///shadow/src/main.rs";
+  let publish: ((event: unknown) => void) | undefined;
+  invoke.mockImplementation(async (command, args) => {
+    if (command === "start_language_server") {
+      publish = (event) => args.onEvent.onmessage(event);
+      return { uri };
+    }
+  });
+  const diagnostics = vi.fn();
+  render(<CodeEditor
+    id="rust" language="rust" source="missing();" onChange={vi.fn()} onRun={vi.fn()}
+    onDiagnostics={diagnostics}
+    compileDiagnostics={[{ message: "E0425: cannot find function", line: 1, column: 1, endLine: 1, endColumn: 8 }]}
+  />);
+  mountEditor();
+  await waitFor(() => expect(publish).toBeDefined());
+  act(() => publish?.({ method: "textDocument/publishDiagnostics", params: { uri, diagnostics: [] } }));
+  expect(diagnostics).toHaveBeenLastCalledWith({ errors: 1, warnings: 0, message: undefined });
+});
+
 test("TypeScript starts the TS7 language server on the script", async () => {
   invoke.mockClear();
   invoke.mockImplementation(async (command) =>

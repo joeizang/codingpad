@@ -773,7 +773,8 @@ unavailable, the dialog offers an explicit **Store for this session only** actio
 those values disappear when CodingPad exits.
 
 Python and TypeScript scripts read a secret with `secret("name")` (also importable
-from `codingpad`), and C# scripts use `Secret("name")`:
+from `codingpad`). C# scripts use `Secret("name")`, and Rust scripts use
+`codingpad::secret("name")`.
 
 ```python
 from codingpad import secret
@@ -906,8 +907,15 @@ it with `bun add -g @typescript/native-preview`, or point `CODINGPAD_TS_LSP` at
 The shared project prefers real `@types/bun` types and falls back to a small
 checked-in declaration file when it cannot install them.
 
-Type errors appear as squiggles and a count in the editor header, but they never
-stop **Run**; Python and TypeScript execute regardless.
+Rust completions, hover and diagnostics come from **rust-analyzer**. Install
+the `rust-analyzer` and `rust-src` toolchain components with rustup.
+`CODINGPAD_RUST_LSP` can point to a different rust-analyzer executable.
+CodingPad translates diagnostics and completion edits from the editor shadow
+project back to the script.
+
+Type errors appear as squiggles and a count in the editor header. Python and
+TypeScript execute regardless of editor warnings. Rust must compile before
+it can run.
 
 ## Performance checks
 

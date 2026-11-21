@@ -186,6 +186,9 @@ export default function CodeEditor({
   const pendingChange = useRef<string | null>(null);
   const changeTimer = useRef<number | null>(null);
   const seenDiagnostics = useRef(false);
+  const rustDiagnostics = useRef<LspDiagnostic[] | null>(null);
+  const compileDiagnosticsRef = useRef(compileDiagnostics);
+  compileDiagnosticsRef.current = compileDiagnostics;
   const onDiagnosticsRef = useRef(onDiagnostics);
   const cleanup = useRef<(() => void) | null>(null);
 
@@ -227,13 +230,17 @@ export default function CodeEditor({
       : "";
 
   const applyDiagnostics = (diagnostics: LspDiagnostic[]) => {
-    onDiagnosticsRef.current?.(summarizeDiagnostics(diagnostics));
+    if (language === "rust") {
+      rustDiagnostics.current = diagnostics;
+      applyCompileDiagnostics();
+    } else {
+      onDiagnosticsRef.current?.(summarizeDiagnostics(diagnostics));
+    }
     const model = editorRef.current?.getModel();
     if (!model) {
       pendingDiagnostics.current = diagnostics;
       return;
     }
-    if (language === "rust") monaco.editor.setModelMarkers(model, "codingpad-compiler", []);
     monaco.editor.setModelMarkers(
       model,
       "codingpad-lsp",
@@ -251,13 +258,19 @@ export default function CodeEditor({
   };
 
   const applyCompileDiagnostics = () => {
-    if (language === "rust" && seenDiagnostics.current) return;
+    const live = language === "rust" ? rustDiagnostics.current : null;
+    const visible = compileDiagnosticsRef.current.filter((compiled) => !live?.some((diagnostic) =>
+      diagnostic.severity === 1 &&
+      diagnostic.range.start.line + 1 === compiled.line &&
+      diagnostic.range.start.character + 1 === compiled.column &&
+      diagnostic.message.startsWith(compiled.message.replace(/^E\d{4}: /, "")),
+    ));
     const model = editorRef.current?.getModel();
     if (model) {
       monaco.editor.setModelMarkers(
         model,
         "codingpad-compiler",
-        compileDiagnostics.map((diagnostic) => ({
+        visible.map((diagnostic) => ({
           severity: monaco.MarkerSeverity.Error,
           message: diagnostic.message,
           startLineNumber: diagnostic.line,
@@ -269,11 +282,14 @@ export default function CodeEditor({
         })),
       );
     }
-    onDiagnosticsRef.current?.({
-      errors: compileDiagnostics.length,
-      warnings: 0,
-      message: compileDiagnostics.length ? undefined : "Compile diagnostics on Run",
-    });
+    if (live || visible.length || language === "csharp") {
+      const summary = summarizeDiagnostics(live ?? []);
+      onDiagnosticsRef.current?.({
+        errors: summary.errors + visible.length,
+        warnings: summary.warnings,
+        message: live || visible.length ? undefined : "Compile diagnostics on Run",
+      });
+    }
   };
 
   useEffect(() => {
@@ -339,6 +355,7 @@ export default function CodeEditor({
     const initial = source;
     pendingChange.current = null;
     seenDiagnostics.current = false;
+    rustDiagnostics.current = null;
     pendingDiagnostics.current = null;
     lsp.current = null;
 

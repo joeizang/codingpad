@@ -9,7 +9,7 @@ mod source;
 
 pub(crate) use build_cache::BuildCache;
 pub(crate) use dumps::Dumps;
-pub(crate) use editor::{analyzer_command, RustWorkspace, MISSING_ANALYZER};
+pub(crate) use editor::{analyzer_command, RustShadowProject, MISSING_ANALYZER};
 pub(crate) use manifest::{frontmatter, Manifest};
 pub(crate) use source::Source;
 pub(crate) use source::FILE as SCRIPT_FILE;

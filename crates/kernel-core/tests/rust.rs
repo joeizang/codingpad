@@ -714,3 +714,17 @@ async fn relative_frontmatter_dependencies_resolve_from_the_saved_script() {
     assert_eq!(error["type"], "Build error");
     assert!(error["message"].as_str().unwrap().contains("missing-crate"));
 }
+
+#[tokio::test]
+async fn invalid_cargo_script_frontmatter_reports_its_original_line() {
+    let source = "#!/usr/bin/env -S cargo +nightly -Zscript\r\n---cargo\r\n[dependencies\r\n---\r\nprintln!(\"must not run\");\r\n";
+    let (result, events) = run(&Supervisor::default(), source).await;
+    assert!(!result.ok);
+    assert_eq!(dumps(&events)[0]["type"], "Cargo-script frontmatter error");
+    let diagnostic = events
+        .iter()
+        .find(|event| event.method == "diagnostics")
+        .unwrap();
+    assert_eq!(diagnostic.params["diagnostics"][0]["line"], 3);
+    assert!(!events.iter().any(|event| event.method == "stream"));
+}

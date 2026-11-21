@@ -316,6 +316,9 @@ SQL uses `--`:
 # codingpad: connection=northwind
 ```
 
+For Rust scripts using cargo-script frontmatter, put the header comment after
+the closing fence. A shebang, if present, comes before the frontmatter.
+
 The line is preserved byte-for-byte when reading, editing and saving. Saves go
 through a temporary file and rename, so a crash mid-save cannot truncate a
 script; a corrupt settings file is copied to `settings.json.bak` before it is

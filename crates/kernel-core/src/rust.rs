@@ -6,7 +6,7 @@ mod panic;
 mod source;
 
 pub(crate) use dumps::Dumps;
-pub(crate) use manifest::Manifest;
+pub(crate) use manifest::{frontmatter, Manifest};
 
 use crate::{shadow::ShadowProjects, KernelEvent, RunResult};
 use debug::{Snapshot, ValueNode};
@@ -103,9 +103,6 @@ pub(super) async fn run(
     emit: &mut (impl FnMut(KernelEvent) + Send),
 ) -> Result<(RunResult, Dumps), String> {
     let script = path.map(Path::new);
-    let manifest = Manifest::parse(source, script)?;
-    let source = Source::with_frontmatter(source, manifest.frontmatter);
-    let project = projects.prepare_rust(&source.generated, &manifest.cargo)?;
     let name = script
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
@@ -118,6 +115,25 @@ pub(super) async fn run(
         panic: None,
         main_unwound: false,
     };
+    let manifest = match Manifest::parse(source, script) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let text = error.to_string();
+            let line = error.line;
+            events.send(
+                "diagnostics",
+                json!({"diagnostics": [
+                    {"message": text, "line": line, "column": 1, "endLine": line, "endColumn": 2}
+                ]}),
+            );
+            events.error("Cargo-script frontmatter error", &text, vec![
+                json!({"file": name, "line": line, "column": 1, "function": "<manifest>", "text": "", "script": true}),
+            ]);
+            return Ok((events.finish(false), events.dumps));
+        }
+    };
+    let source = Source::with_frontmatter(source, manifest.frontmatter);
+    let project = projects.prepare_rust(&source.generated, &manifest.cargo)?;
     let cancel = project.root().join("cancel");
     let cargo = cargo();
     let build = tokio::select! {
@@ -127,7 +143,7 @@ pub(super) async fn run(
             return Ok((stopped(), events.dumps));
         },
         build = async {
-            if manifest.packages && !prepare_dependencies(&cargo, project.root(), &mut events).await? {
+            if manifest.needs_packages && !prepare_dependencies(&cargo, project.root(), &mut events).await? {
                 return Ok(None);
             }
             compile(&cargo, project.root(), &source, name, &mut events).await
@@ -187,15 +203,7 @@ pub(super) async fn run(
     } else {
         false
     };
-    events.send("run_finished", json!({"ok": ok}));
-    Ok((
-        RunResult {
-            ok,
-            stopped: false,
-            cache_cleared: false,
-        },
-        events.dumps,
-    ))
+    Ok((events.finish(ok), events.dumps))
 }
 
 async fn compile(
@@ -251,7 +259,19 @@ async fn compile(
                         json!({"file": name, "line": line, "column": column, "function": "<compile>", "text": "", "script": true}),
                     ]
                 } else {
-                    Vec::new()
+                    diagnostic["spans"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|span| span["is_primary"] == true)
+                        .map(|span| {
+                            json!({
+                                "file": span["file_name"], "line": span["line_start"],
+                                "column": span["column_start"], "function": "<compile>",
+                                "text": "", "script": false
+                            })
+                        })
+                        .collect()
                 };
                 events.error("Compile error", &text, frames);
             }
@@ -286,12 +306,6 @@ async fn compile(
     }
 }
 
-struct CargoOutput {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
 async fn build_cargo(cargo: &Path, root: &Path) -> Result<CargoOutput, String> {
     let mut command = Command::new(cargo);
     command
@@ -312,31 +326,45 @@ async fn prepare_dependencies(
     root: &Path,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
 ) -> Result<bool, String> {
-    let mut command = Command::new(cargo);
-    command
-        .current_dir(root)
-        .args(["fetch", "--quiet", "--offline"]);
-    if cargo_output(command).await?.0.success() {
+    let fetch = |offline| {
+        let mut command = Command::new(cargo);
+        command.current_dir(root).args(["fetch", "--quiet"]);
+        if offline {
+            command.arg("--offline");
+        }
+        cargo_output(command)
+    };
+    let offline = fetch(true).await?;
+    if offline.status.success() {
         return Ok(true);
     }
 
-    let mut command = Command::new(cargo);
-    command.current_dir(root).args(["fetch", "--quiet"]);
-    let (status, _, stderr) = cargo_output(command).await?;
-    if !status.success() {
-        let stderr = String::from_utf8_lossy(&stderr);
+    let online = fetch(false).await?;
+    if !online.status.success() {
         events.send("diagnostics", json!({"diagnostics": []}));
-        events.stream("stderr", &stderr);
+        let fallback = String::from_utf8_lossy(&offline.stderr);
+        let failure = String::from_utf8_lossy(&online.stderr);
+        let failure = if failure.trim().is_empty() {
+            fallback.trim()
+        } else {
+            failure.trim()
+        };
         events.error(
             "Build error",
-            &format!("Could not resolve Rust dependencies. {}", stderr.trim()),
+            &format!("Could not resolve Rust dependencies. {failure}"),
             Vec::new(),
         );
     }
-    Ok(status.success())
+    Ok(online.status.success())
 }
 
-async fn cargo_output(command: Command) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), String> {
+struct CargoOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+async fn cargo_output(command: Command) -> Result<CargoOutput, String> {
     let mut child = spawn(command).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             MISSING.to_owned()
@@ -709,6 +737,15 @@ struct Events<'a, F> {
 }
 
 impl<F: FnMut(KernelEvent)> Events<'_, F> {
+    fn finish(&mut self, ok: bool) -> RunResult {
+        self.send("run_finished", json!({"ok": ok}));
+        RunResult {
+            ok,
+            stopped: false,
+            cache_cleared: false,
+        }
+    }
+
     fn send(&mut self, method: &str, mut params: Value) {
         params["runId"] = json!(self.dumps.run_id());
         (self.emit)(KernelEvent {

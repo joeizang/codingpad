@@ -67,6 +67,10 @@ test("parses the same header forms as the Rust store", () => {
       },
     ],
     ["print(1)\n# codingpad: connection=one\n", null],
+    ["#!/usr/bin/env -S cargo +nightly -Zscript\n---cargo\n[dependencies]\n---\n// codingpad: connection=shop\nfn main() {}", {
+      line: "// codingpad: connection=shop",
+      settings: { connection: "shop" },
+    }],
     ["# a normal comment\n", null],
     ["", null],
   ];

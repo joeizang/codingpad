@@ -19,12 +19,16 @@ pub struct ScriptHeader {
     pub settings: BTreeMap<String, String>,
 }
 
-/// Parse the first line of a script as a `codingpad:` header.
+/// Read the `codingpad:` header, which follows cargo-script frontmatter when present.
 ///
 /// The header is the top line of the file, written as a Python `#` comment or
 /// a C#/Rust/TypeScript `//` comment. Settings are whitespace-separated
 /// `key=value` pairs, where a value may be quoted.
 pub fn parse_header(source: &str) -> Option<ScriptHeader> {
+    let source = match crate::rust::frontmatter(source) {
+        Ok((_, range)) if !range.is_empty() => source[range.end..].trim_start_matches(['\r', '\n']),
+        _ => source,
+    };
     let first = source.lines().next()?;
     let first = first.strip_prefix('\u{feff}').unwrap_or(first);
     let trimmed = first.trim_start();
@@ -319,6 +323,10 @@ mod tests {
                 )),
             ),
             ("print(1)\n# codingpad: connection=one\n", None),
+            (
+                "#!/usr/bin/env -S cargo +nightly -Zscript\n---cargo\n[dependencies]\n---\n// codingpad: connection=shop\nfn main() {}",
+                Some(("// codingpad: connection=shop", &[("connection", "shop")])),
+            ),
             ("# a normal comment\n", None),
             ("", None),
         ]

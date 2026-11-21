@@ -8,8 +8,9 @@ pub(crate) struct Manifest {
     pub(crate) cargo: String,
     pub(super) frontmatter: Range<usize>,
     pub(super) needs_packages: bool,
-    pub(super) declared_runtime: bool,
-    pub(super) dependency_line: usize,
+    pub(super) runtime_name: String,
+    dependency_line: usize,
+    dependency_lines: Vec<(String, usize)>,
 }
 
 #[derive(Debug)]
@@ -21,11 +22,7 @@ pub(crate) struct ManifestError {
 impl ManifestError {
     fn at(source: &str, offset: usize, message: impl Into<String>) -> Self {
         Self {
-            line: source.as_bytes()[..offset]
-                .iter()
-                .filter(|&&byte| byte == b'\n')
-                .count()
-                + 1,
+            line: line_at(source, offset),
             message: message.into(),
         }
     }
@@ -62,51 +59,123 @@ impl Manifest {
         set_package_defaults(&mut cargo).map_err(error)?;
         resolve_dependencies(&mut cargo, path).map_err(error)?;
 
-        let needs_packages = DEPENDENCY_SECTIONS
-            .iter()
-            .copied()
-            .chain(["target", "patch", "replace"])
-            .any(|key| {
-                cargo
-                    .get(key)
-                    .and_then(Value::as_table)
-                    .is_some_and(|section| !section.is_empty())
-            });
+        let needs_packages = package_sections().any(|key| {
+            cargo
+                .get(key)
+                .and_then(Value::as_table)
+                .is_some_and(|section| !section.is_empty())
+        });
         let dependencies = table_or_insert(&mut cargo, "dependencies").map_err(error)?;
-        let declared_runtime = dependencies.contains_key("codingpad");
+        let mut runtime_keys = dependencies
+            .iter()
+            .filter(|(key, value)| {
+                value.get("package").and_then(Value::as_str).unwrap_or(key) == "codingpad"
+            })
+            .map(|(key, _)| key.as_str());
+        let runtime_name = runtime_keys.next().unwrap_or("codingpad").to_owned();
+        if let Some(duplicate) = runtime_keys.next() {
+            return Err(error(ManifestIssue::new(
+                &["dependencies", duplicate],
+                "Declare the codingpad runtime library once.",
+            )));
+        }
+        if syn::parse_str::<syn::Ident>(&runtime_name.replace('-', "_")).is_err() {
+            return Err(error(ManifestIssue::new(
+                &["dependencies", &runtime_name],
+                "Use a Rust identifier for the codingpad dependency name.",
+            )));
+        }
         dependencies.insert(
-            "codingpad".to_owned(),
-            Value::Table(Table::from_iter([(
-                "path".to_owned(),
-                Value::from("codingpad"),
-            )])),
+            runtime_name.clone(),
+            runtime_dependency(&runtime_name, "codingpad"),
         );
         cargo.insert("workspace".to_owned(), Value::Table(Table::new()));
-        let first_dependency = needs_packages
+
+        let mut dependency_line = line_at(source, frontmatter.start);
+        let mut dependency_lines = Vec::new();
+        if let Some(manifest) = needs_packages
             .then(|| toml_edit::Document::parse(embedded).ok())
             .flatten()
-            .and_then(|manifest| {
-                DEPENDENCY_SECTIONS
-                    .iter()
-                    .copied()
-                    .chain(["target", "patch", "replace"])
-                    .filter_map(|section| field_offset(manifest.as_table(), &[section.to_owned()]))
-                    .min()
-            });
-        let dependency_line = ManifestError::at(
-            source,
-            first_dependency.map_or(frontmatter.start, |offset| body + offset),
-            "",
-        )
-        .line;
+        {
+            let table = manifest.as_table();
+            if let Some(first) = package_sections()
+                .filter_map(|section| field_offset(table, &[section.to_owned()]))
+                .min()
+            {
+                dependency_line = line_at(source, body + first);
+            }
+            for &section in DEPENDENCY_SECTIONS {
+                if let Some(dependencies) = cargo.get(section).and_then(Value::as_table) {
+                    for (key, spec) in dependencies {
+                        let package = spec.get("package").and_then(Value::as_str).unwrap_or(key);
+                        if let Some(offset) =
+                            field_offset(table, &[section.to_owned(), key.to_owned()])
+                        {
+                            dependency_lines
+                                .push((package.to_owned(), line_at(source, body + offset)));
+                        }
+                    }
+                }
+            }
+        }
         Ok(Self {
             cargo: cargo.to_string(),
             frontmatter,
             needs_packages,
-            declared_runtime,
+            runtime_name,
             dependency_line,
+            dependency_lines,
         })
     }
+    pub(super) fn dependency_error_line(&self, output: &str) -> usize {
+        for line in output.lines() {
+            for prefix in [
+                "error: no matching package named `",
+                "error: failed to get `",
+                "error: failed to load manifest for dependency `",
+                "error: failed to select a version for the requirement `",
+            ] {
+                if let Some(name) = line
+                    .trim_start()
+                    .strip_prefix(prefix)
+                    .and_then(|text| text.split_once('`'))
+                    .map(|(name, _)| name.split_whitespace().next().unwrap_or(name))
+                {
+                    if let Some((_, line)) = self
+                        .dependency_lines
+                        .iter()
+                        .find(|(dependency, _)| dependency == name)
+                    {
+                        return *line;
+                    }
+                }
+            }
+        }
+        self.dependency_line
+    }
+}
+
+fn line_at(source: &str, offset: usize) -> usize {
+    source.as_bytes()[..offset]
+        .iter()
+        .filter(|&&byte| byte == b'\n')
+        .count()
+        + 1
+}
+
+fn package_sections() -> impl Iterator<Item = &'static str> {
+    DEPENDENCY_SECTIONS
+        .iter()
+        .copied()
+        .chain(["target", "patch", "replace"])
+}
+
+fn runtime_dependency(name: &str, path: &str) -> Value {
+    let mut dependency = Table::from_iter([("path".to_owned(), Value::from(path))]);
+    if name != "codingpad" {
+        dependency.insert("package".to_owned(), Value::from("codingpad"));
+    }
+    Value::Table(dependency)
 }
 
 struct ManifestIssue {

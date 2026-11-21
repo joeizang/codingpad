@@ -132,10 +132,8 @@ pub(super) async fn run(
             return Ok((events.finish(false), events.dumps));
         }
     };
-    if manifest.declared_runtime {
-        events.stream("stderr", "CodingPad uses its bundled codingpad runtime library. The declared codingpad dependency is for standalone Cargo runs.\n");
-    }
-    let source = Source::with_frontmatter(source, manifest.frontmatter);
+    let source =
+        Source::with_frontmatter(source, manifest.frontmatter.clone(), &manifest.runtime_name);
     let project = projects.prepare_rust(&source.generated, &manifest.cargo)?;
     let cancel = project.root().join("cancel");
     let cargo = cargo();
@@ -146,7 +144,7 @@ pub(super) async fn run(
             return Ok((stopped(), events.dumps));
         },
         build = async {
-            if manifest.needs_packages && !prepare_dependencies(&cargo, project.root(), manifest.dependency_line, &mut events).await? {
+            if manifest.needs_packages && !prepare_dependencies(&cargo, project.root(), &manifest, &mut events).await? {
                 return Ok(None);
             }
             compile(&cargo, project.root(), &source, name, &mut events).await
@@ -223,6 +221,7 @@ async fn compile(
     } = build_cargo(cargo, root).await?;
 
     let root_source = root.join(source::FILE);
+    let canonical_source = std::fs::canonicalize(&root_source).ok();
     let mut executable = None;
     let mut diagnostics = Vec::new();
     let mut had_error = false;
@@ -230,7 +229,16 @@ async fn compile(
         let Ok(message) = serde_json::from_slice::<Value>(line) else {
             continue;
         };
-        let is_script = message["target"]["src_path"].as_str().map(Path::new) == Some(&root_source);
+        let is_script = message["target"]["src_path"]
+            .as_str()
+            .map(Path::new)
+            .is_some_and(|path| {
+                path == root_source
+                    || canonical_source.as_ref().is_some_and(|source| {
+                        path.ends_with(source::FILE)
+                            && std::fs::canonicalize(path).is_ok_and(|path| path == *source)
+                    })
+            });
         if message["reason"] == "compiler-artifact" && is_script {
             if let Some(path) = message["executable"].as_str() {
                 executable = Some(root.join(path));
@@ -327,7 +335,7 @@ async fn build_cargo(cargo: &Path, root: &Path) -> Result<CargoOutput, String> {
 async fn prepare_dependencies(
     cargo: &Path,
     root: &Path,
-    line: usize,
+    manifest: &Manifest,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
 ) -> Result<bool, String> {
     let fetch = |offline| {
@@ -348,12 +356,15 @@ async fn prepare_dependencies(
         let offline_error = String::from_utf8_lossy(&offline.stderr);
         let online_error = String::from_utf8_lossy(&online.stderr);
         let mut message = "Could not resolve Rust dependencies.".to_owned();
-        for detail in [offline_error.trim(), online_error.trim()] {
-            if !detail.is_empty() && !message.contains(detail) {
-                message.push('\n');
-                message.push_str(detail);
-            }
+        let offline_error = offline_error.trim();
+        let online_error = online_error.trim();
+        if !offline_error.is_empty() {
+            message.push_str(&format!("\nCached packages:\n{offline_error}"));
         }
+        if !online_error.is_empty() && online_error != offline_error {
+            message.push_str(&format!("\nCargo fetch:\n{online_error}"));
+        }
+        let line = manifest.dependency_error_line(offline_error);
         events.send(
             "diagnostics",
             json!({"diagnostics": [

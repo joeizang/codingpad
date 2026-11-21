@@ -642,6 +642,7 @@ const CARGO_SCRIPT_EXAMPLE: &str = concat!(
     "[package]\r\nedition = \"2021\"\r\n",
     "[dependencies]\r\nserde_json = \"1\"\r\n",
     "----\r\n",
+    "// codingpad: connection=demo\r\n",
     "fn main() { println!(\"{}\", serde_json::json!(42)); }\r\n",
 );
 
@@ -663,8 +664,16 @@ async fn cargo_frontmatter_resolves_crates_and_preserves_editor_positions() {
         .find(|event| event.method == "diagnostics")
         .unwrap()
         .params["diagnostics"];
-    assert_eq!(diagnostics[0]["line"], 9);
+    assert_eq!(diagnostics[0]["line"], 10);
     assert_eq!(diagnostics[0]["column"], 28);
+}
+
+#[tokio::test]
+async fn cargo_frontmatter_uses_the_bundled_runtime_under_its_declared_alias() {
+    let source = "---cargo\n[dependencies]\ncp = { package = 'codingpad', version = '0.8' }\n---\ncp::dump(42);";
+    let (result, events) = run(&Supervisor::default(), source).await;
+    assert!(result.ok, "{events:?}");
+    assert_eq!(dumps(&events)[0]["v"], 42);
 }
 
 #[test]
@@ -672,26 +681,31 @@ async fn cargo_frontmatter_resolves_crates_and_preserves_editor_positions() {
 fn the_cargo_script_example_runs_under_native_cargo() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("example.rs");
-    std::fs::write(&path, CARGO_SCRIPT_EXAMPLE).unwrap();
-    let output = std::process::Command::new("cargo")
-        .current_dir(dir.path())
-        .args([
-            "+nightly",
-            "-Zscript",
-            "run",
-            "--offline",
-            "--quiet",
-            "--manifest-path",
-        ])
-        .arg(path)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+    for source in [
+        CARGO_SCRIPT_EXAMPLE.to_owned(),
+        CARGO_SCRIPT_EXAMPLE.replace("----cargo", "----"),
+    ] {
+        std::fs::write(&path, source).unwrap();
+        let output = std::process::Command::new("cargo")
+            .current_dir(dir.path())
+            .args([
+                "+nightly",
+                "-Zscript",
+                "run",
+                "--offline",
+                "--quiet",
+                "--manifest-path",
+            ])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+    }
 }
 
 #[tokio::test]
@@ -746,7 +760,11 @@ async fn relative_frontmatter_dependencies_resolve_from_the_saved_script() {
         .iter()
         .find(|event| event.method == "diagnostics")
         .unwrap();
-    assert_eq!(diagnostic.params["diagnostics"][0]["line"], 2);
+    assert_eq!(
+        diagnostic.params["diagnostics"][0]["line"], 3,
+        "{:?}",
+        diagnostic.params
+    );
 }
 
 #[tokio::test]
@@ -759,6 +777,10 @@ async fn invalid_cargo_script_frontmatter_reports_its_original_line() {
         .iter()
         .find(|event| event.method == "diagnostics")
         .unwrap();
-    assert_eq!(diagnostic.params["diagnostics"][0]["line"], 3);
+    assert_eq!(
+        diagnostic.params["diagnostics"][0]["line"], 3,
+        "{:?}",
+        diagnostic.params
+    );
     assert!(!events.iter().any(|event| event.method == "stream"));
 }

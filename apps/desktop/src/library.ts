@@ -34,8 +34,8 @@ export function cargoScriptFrontmatter(source: string) {
   };
 }
 
-// Mirror of the Rust parser so the footer stays accurate while the header line
-// is being edited, before anything is saved.
+// The footer follows the host header rules, identifying Rust blocks by the
+// explicit cargo marker before looking for a CodingPad comment.
 export function parseHeader(source: string): ScriptHeader | null {
   const { key, body } = cargoScriptFrontmatter(source) ?? {};
   const explicit = key?.split("\n", 1)[0]?.trimEnd().endsWith("cargo");

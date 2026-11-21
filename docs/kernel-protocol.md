@@ -582,8 +582,10 @@ optional `// codingpad:` script header. Use the explicit `---cargo` fence when
 a script header follows it. The script header is a Rust comment
 after the closing fence, so the same file works under Cargo.
 CodingPad fetches missing crates before building offline. Cargo reuses
-downloaded crates in its local package cache. Compiled artifacts use a fresh
-target directory per run. Shared compiled artifacts are tracked in issue #71 (M6.4). Malformed frontmatter is
+downloaded crates in its local package cache. CodingPad supplies its bundled
+runtime library for a declared codingpad dependency, including an alias.
+A bare fence accepted by Cargo can declare dependencies too. Use the explicit
+marker to associate a CodingPad script header with the block. Malformed frontmatter is
 reported at its script line. Relative path
 dependencies are resolved from the saved script's directory.
 

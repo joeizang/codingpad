@@ -396,14 +396,18 @@ async fn stop_closes_a_rust_scripts_descendant_processes() {
                 .arg("child")
                 .spawn()
                 .unwrap();
-            std::thread::park();
+            while !codingpad::is_cancelled() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            println!("cancel observed");
+            loop { std::thread::park(); }
         }
     "#
     .replace("ADDRESS", &address);
     let supervisor = std::sync::Arc::new(Supervisor::default());
     let running = tokio::spawn({
         let supervisor = supervisor.clone();
-        async move { run(&supervisor, &source).await.0 }
+        async move { run(&supervisor, &source).await }
     });
     let (mut socket, _) = timeout(Duration::from_secs(30), listener.accept())
         .await
@@ -414,11 +418,14 @@ async fn stop_closes_a_rust_scripts_descendant_processes() {
     assert_eq!(ready, *b"1");
 
     let started = Instant::now();
-    timeout(Duration::from_secs(10), supervisor.stop("rust-script"))
+    timeout(Duration::from_secs(4), supervisor.stop("rust-script"))
         .await
         .unwrap();
     assert!(started.elapsed() >= Duration::from_millis(1900));
-    let result = running.await.unwrap();
+    let (result, events) = running.await.unwrap();
+    assert!(events
+        .iter()
+        .any(|event| { event.method == "stream" && event.params["text"] == "cancel observed\n" }));
     assert!(result.stopped);
     assert!(result.cache_cleared);
     match timeout(Duration::from_secs(5), socket.read(&mut ready))
@@ -533,6 +540,34 @@ async fn rust_cache_survives_fresh_processes_and_can_be_reset_before_a_run() {
     let (result, events) = run(&supervisor, &source(43)).await;
     assert!(result.ok);
     assert_eq!(dumps(&events)[0]["v"], 43);
+}
+
+#[tokio::test]
+async fn desktop_rust_cache_reuses_values_in_one_open_tab() {
+    let data = tempfile::tempdir().unwrap();
+    let path = data.path().join("saved.rs");
+    let supervisor = Supervisor::with_data_dir(data.path().to_owned()).with_session_rust_cache();
+    let run_tab = |id, initial, expected| {
+        let supervisor = &supervisor;
+        let path = &path;
+        async move {
+            let source = format!(r#"codingpad::cache("answer", || {initial})"#);
+            let mut events = Vec::new();
+            let result = supervisor
+                .run_language_at(id, &source, Language::Rust, path.to_str(), |event| {
+                    events.push(event)
+                })
+                .await
+                .unwrap();
+            assert!(result.ok, "{events:?}");
+            assert_eq!(dumps(&events)[0]["v"], expected);
+        }
+    };
+    run_tab("file-first-tab", 41, 41).await;
+    run_tab("file-first-tab", 42, 41).await;
+    supervisor.close("file-first-tab").await;
+    run_tab("file-reopened-tab", 42, 42).await;
+    assert!(!data.path().join("rust-cache").exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

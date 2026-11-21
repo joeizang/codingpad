@@ -19,6 +19,11 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 ///
 /// Entries are limited to 1 MiB and keys to 96 UTF-8 bytes. The cache keeps
 /// the latest 32 stored keys per script.
+///
+/// # Panics
+///
+/// Panics if the key or encoded value exceeds these limits, if the value
+/// fails to encode, or if the cache directory cannot be read or written.
 pub fn cache<T: CacheValue>(key: &str, factory: impl FnOnce() -> T) -> T {
     let Some(root) = std::env::var_os("CODINGPAD_RUST_CACHE") else {
         return factory();

@@ -117,7 +117,11 @@ pub fn __start() -> PanicGuard {
     #[cfg(windows)]
     if let Some(ready) = std::env::var_os("CODINGPAD_RUST_START") {
         let ready = std::path::PathBuf::from(ready);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !ready.is_file() {
+            if std::time::Instant::now() >= deadline {
+                std::process::exit(1);
+            }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }

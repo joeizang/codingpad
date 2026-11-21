@@ -59,6 +59,7 @@ pub(super) fn stopped() -> RunResult {
 
 pub(super) fn cache_key(script_id: &str) -> String {
     use sha2::{Digest, Sha256};
+    // Script IDs may contain paths or use characters unavailable in file names.
     format!("{:x}", Sha256::digest(script_id.as_bytes()))
 }
 
@@ -80,7 +81,7 @@ pub(super) fn retire_cache(path: Option<&Path>) -> Result<Option<tempfile::TempD
 
 pub(super) async fn remove_retired_cache(retired: Option<tempfile::TempDir>) -> Result<(), String> {
     if let Some(retired) = retired {
-        tokio::task::spawn_blocking(move || retired.close())
+        tokio::task::spawn_blocking(move || std::fs::remove_dir_all(retired.path()))
             .await
             .map_err(|error| format!("Could not clear the Rust script cache: {error}"))?
             .map_err(|error| format!("Could not clear the Rust script cache: {error}"))?;
@@ -135,7 +136,7 @@ pub(super) async fn run(
         build = compile(&cargo, project.root(), &source, name, &mut events) => build?,
     };
     let ok = if let Some(executable) = build {
-        let (status, forced) = execute(
+        let exit = execute(
             &executable,
             script,
             project.root(),
@@ -145,7 +146,8 @@ pub(super) async fn run(
             &mut events,
         )
         .await?;
-        let Some(status) = status else {
+        let ScriptExit::Completed(status) = exit else {
+            let forced = matches!(exit, ScriptExit::Killed);
             if forced {
                 remove_retired_cache(retire_cache(Some(cache))?).await?;
             }
@@ -318,7 +320,6 @@ fn diagnostic_range(span: &Value, source: &Source<'_>) -> Option<(usize, usize, 
 struct RunningChild {
     process: Child,
     finished: bool,
-    #[cfg(unix)]
     pid: u32,
     #[cfg(windows)]
     job: Option<std::os::windows::io::OwnedHandle>,
@@ -336,11 +337,22 @@ impl RunningChild {
             }
         }
         #[cfg(windows)]
-        if let Some(job) = &self.job {
-            use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::System::JobObjects::TerminateJobObject;
-            if unsafe { TerminateJobObject(job.as_raw_handle(), 1) } == 0 {
-                return Err(io::Error::last_os_error());
+        {
+            if let Some(job) = &self.job {
+                use std::os::windows::io::AsRawHandle;
+                use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+                if unsafe { TerminateJobObject(job.as_raw_handle(), 1) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            } else if self.process.id().is_some() {
+                let kill = || terminate_windows_tree(self.pid);
+                if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+                    handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+                }) {
+                    tokio::task::block_in_place(kill)?;
+                } else {
+                    kill()?;
+                }
             }
         }
         self.finished = true;
@@ -357,26 +369,50 @@ impl Drop for RunningChild {
 }
 
 #[cfg(windows)]
-fn assign_job(process: &mut Child) -> io::Result<Option<std::os::windows::io::OwnedHandle>> {
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+fn terminate_windows_tree(pid: u32) -> io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    let status = std::process::Command::new("taskkill")
+        .creation_flags(0x08000000)
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("taskkill exited with {status}")))
+    }
+}
 
+#[cfg(windows)]
+fn assign_job(process: &Child) -> Option<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    let child = process.raw_handle()?;
     let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
     if handle.is_null() {
-        return Err(io::Error::last_os_error());
+        return None;
     }
     let job = unsafe { OwnedHandle::from_raw_handle(handle) };
-    if let Some(child) = process.raw_handle() {
-        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), child) } == 0 {
-            let error = io::Error::last_os_error();
-            if process.try_wait()?.is_none() {
-                return Err(error);
-            }
-            return Ok(None);
-        }
-        return Ok(Some(job));
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let configured = unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectExtendedLimitInformation,
+            std::ptr::from_ref(&limits).cast(),
+            std::mem::size_of_val(&limits) as u32,
+        )
+    };
+    if configured == 0 || unsafe { AssignProcessToJobObject(job.as_raw_handle(), child) } == 0 {
+        return None;
     }
-    Ok(None)
+    Some(job)
 }
 
 fn spawn(mut command: Command) -> io::Result<RunningChild> {
@@ -390,17 +426,10 @@ fn spawn(mut command: Command) -> io::Result<RunningChild> {
     #[cfg(windows)]
     command.creation_flags(0x08000000 | 0x00000200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
     let process = command.spawn()?;
-    #[cfg(windows)]
-    let (process, job) = {
-        let mut process = process;
-        let job = assign_job(&mut process)?;
-        (process, job)
-    };
     Ok(RunningChild {
-        #[cfg(unix)]
         pid: process.id().expect("a newly spawned child has a PID"),
         #[cfg(windows)]
-        job,
+        job: assign_job(&process),
         process,
         finished: false,
     })
@@ -416,6 +445,12 @@ fn token() -> Result<([u8; 32], OsString), String> {
     Ok((token, text.into()))
 }
 
+enum ScriptExit {
+    Completed(ExitStatus),
+    Cancelled,
+    Killed,
+}
+
 async fn execute(
     executable: &Path,
     script: Option<&Path>,
@@ -424,7 +459,7 @@ async fn execute(
     cache: &Path,
     stop: &mut watch::Receiver<u64>,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
-) -> Result<(Option<ExitStatus>, bool), String> {
+) -> Result<ScriptExit, String> {
     let (token, secret) = token()?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -465,7 +500,7 @@ async fn read_output(
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
     stop: &mut watch::Receiver<u64>,
     cancel: &Path,
-) -> io::Result<(Option<ExitStatus>, bool)> {
+) -> io::Result<ScriptExit> {
     let mut stdout = BufReader::new(child.process.stdout.take().unwrap());
     let mut stderr = BufReader::new(child.process.stderr.take().unwrap());
     let mut runtime: Option<Lines<BufReader<TcpStream>>> = None;
@@ -498,7 +533,7 @@ async fn read_output(
             _ = tokio::time::sleep_until(deadline), if exit.is_none() && stopping => {
                 child.kill_tree()?;
                 child.process.wait().await?;
-                return Ok((None, true));
+                return Ok(ScriptExit::Killed);
             }
             _ = tokio::time::sleep_until(deadline), if exit.is_some() => break,
             socket = &mut connect, if !connected => {
@@ -538,12 +573,20 @@ async fn read_output(
         if let Some(status) = exit {
             if !stdout_open && !stderr_open && runtime.is_none() {
                 child.finished = true;
-                return Ok(((!stopping).then_some(status), false));
+                return Ok(if stopping {
+                    ScriptExit::Cancelled
+                } else {
+                    ScriptExit::Completed(status)
+                });
             }
         }
     }
     child.finished = true;
-    Ok((exit.filter(|_| !stopping), false))
+    Ok(if stopping {
+        ScriptExit::Cancelled
+    } else {
+        ScriptExit::Completed(exit.unwrap())
+    })
 }
 
 fn peer_closed(error: &io::Error) -> bool {

@@ -523,6 +523,11 @@ async fn rust_cache_survives_fresh_processes_and_can_be_reset_before_a_run() {
     let (result, events) = run(&supervisor, &source(42)).await;
     assert!(result.ok);
     assert_eq!(dumps(&events)[0]["v"], 42);
+
+    supervisor.close("rust-script").await;
+    let (result, events) = run(&supervisor, &source(43)).await;
+    assert!(result.ok);
+    assert_eq!(dumps(&events)[0]["v"], 43);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

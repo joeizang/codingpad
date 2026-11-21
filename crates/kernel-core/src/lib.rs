@@ -473,7 +473,7 @@ impl Supervisor {
         typescript::BUN_NOT_FOUND.to_owned()
     }
 
-    fn existing_rust_cache_path(&self, script_id: &str) -> Option<PathBuf> {
+    fn configured_rust_cache_path(&self, script_id: &str) -> Option<PathBuf> {
         let root = if let Some(data) = &self.data_dir {
             data.join("rust-cache")
         } else {
@@ -483,7 +483,7 @@ impl Supervisor {
     }
 
     async fn rust_cache_path(&self, script_id: &str) -> Result<PathBuf, String> {
-        if let Some(path) = self.existing_rust_cache_path(script_id) {
+        if let Some(path) = self.configured_rust_cache_path(script_id) {
             return Ok(path);
         }
         let root = self
@@ -814,7 +814,7 @@ impl Supervisor {
 
     pub async fn reset(&self, script_id: &str) -> Result<(), String> {
         let slots = self.kernels.lock().await;
-        let cache = self.existing_rust_cache_path(script_id);
+        let cache = self.configured_rust_cache_path(script_id);
         let retired = match slots.get(script_id).cloned() {
             Some(slot) => {
                 drop(slots);
@@ -829,18 +829,34 @@ impl Supervisor {
             None => {
                 // Exclude registration of a new run until its old cache has
                 // been moved out of the way, without creating an idle slot.
-                rust::retire_cache(cache.as_deref())?
+                let retired = rust::retire_cache(cache.as_deref())?;
+                drop(slots);
+                retired
             }
         };
         rust::remove_retired_cache(retired).await
     }
 
     pub async fn close(&self, script_id: &str) {
-        if let Some(slot) = self.kernels.lock().await.remove(script_id) {
+        let slot = self.kernels.lock().await.get(script_id).cloned();
+        let mut retired = None;
+        if let Some(slot) = slot {
             slot.closed.send_replace(true);
-            *slot.state.lock().await = SlotState::default();
+            let mut state = slot.state.lock().await;
+            *state = SlotState::default();
+            let mut slots = self.kernels.lock().await;
+            if slots
+                .get(script_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &slot))
+            {
+                let cache = self.configured_rust_cache_path(script_id);
+                retired = rust::retire_cache(cache.as_deref()).unwrap_or_default();
+                slots.remove(script_id);
+            }
         }
         self.shadow_projects.close(script_id).await;
+        // Cache maintenance should never prevent closing a script.
+        let _ = rust::remove_retired_cache(retired).await;
     }
 
     pub async fn expand(

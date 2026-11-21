@@ -584,11 +584,13 @@ with ranges mapped to the original editor snapshot. Stdout and stderr use
 `stream` notifications. Dump messages travel over a separate authenticated
 loopback connection, so native output can contain arbitrary text.
 
-Use `codingpad::cache("key", || value)` to reuse a value across native
-processes for this script. The runtime supports numeric types, booleans,
+Use `codingpad::cache("key", || value)` to reuse a value across runs of
+this script. The `codingpad` runtime library supports numeric types, booleans,
 strings, vectors and options, and custom types can implement `CacheValue`.
 Each script keeps up to 32 stored keys of at most 96 UTF-8 bytes, with up to
-1 MiB per entry. Reset removes these values, as does closing a desktop tab.
+1 MiB per entry. Oversize keys or values, encoding failures, and filesystem
+errors surface as Rust panics with the offending key. Reset removes these
+values, and closing the script attempts the same cleanup.
 Supervisors without an application data directory keep their caches for the
 life of the supervisor. Stop makes `codingpad::is_cancelled()` return true so scripts
 can release resources and exit. After two seconds CodingPad forcibly stops

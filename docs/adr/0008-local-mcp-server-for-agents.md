@@ -130,7 +130,7 @@ Agents can list and read scripts in the **library** and in the user's **pinned f
 
 ## Consequences
 
-- A new milestone, **MCP server (0.3)**, sits between M5 (TypeScript) and M6 (Rust). Rust becomes available to agents automatically when M6 lands. D33 and D34 are amended to include it.
+- A new milestone, **MCP server**, is added to the roadmap. D74 later placed it after M6 (Rust) as 0.4, so Rust is available to agents from the start. D33 and D34 are amended to include it.
 - D15 is amended: the MCP server is in scope before 1.0; an MCP client arrives with the in-app AI.
 - The kernel protocol gains a `db_query` request, from the kernel to the supervisor, and each language's `db` client gains an agent mode that uses it. GUI runs keep their direct connections.
 - The supervisor gains a SQL parser for guarded queries, a privilege checker for agent credentials, and a script-keyed kernel cache for MCP.

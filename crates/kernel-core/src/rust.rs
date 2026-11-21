@@ -46,6 +46,7 @@ pub(super) const RUNTIME: &str = include_str!("../../../runtimes/rust/codingpad/
 pub(super) const CACHE_RUNTIME: &str =
     include_str!("../../../runtimes/rust/codingpad/src/cache.rs");
 pub(super) const RICH_RUNTIME: &str = include_str!("../../../runtimes/rust/codingpad/src/rich.rs");
+const STOP_GRACE: Duration = Duration::from_secs(2);
 const MISSING: &str =
     "Rust was not found. Install the stable Rust toolchain (Cargo and rustc) from https://rustup.rs/ and run the script again.";
 
@@ -553,7 +554,7 @@ async fn read_output(
             _ = stop.changed(), if exit.is_none() && !stopping => {
                 std::fs::write(cancel, [])?;
                 stopping = true;
-                deadline = Instant::now() + Duration::from_secs(2);
+                deadline = Instant::now() + STOP_GRACE;
             }
             _ = tokio::time::sleep_until(deadline), if exit.is_none() && stopping => {
                 child.kill_tree()?;
@@ -595,15 +596,8 @@ async fn read_output(
                 }
             }
         }
-        if let Some(status) = exit {
-            if !stdout_open && !stderr_open && runtime.is_none() {
-                child.finished = true;
-                return Ok(if stopping {
-                    ScriptExit::Cancelled
-                } else {
-                    ScriptExit::Completed(status)
-                });
-            }
+        if exit.is_some() && !stdout_open && !stderr_open && runtime.is_none() {
+            break;
         }
     }
     child.finished = true;

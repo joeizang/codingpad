@@ -404,7 +404,10 @@ async fn stop_closes_a_rust_scripts_descendant_processes() {
         }
     "#
     .replace("ADDRESS", &address);
-    let supervisor = std::sync::Arc::new(Supervisor::default());
+    let data = tempfile::tempdir().unwrap();
+    let supervisor = std::sync::Arc::new(
+        Supervisor::with_data_dir(data.path().to_owned()).with_session_rust_cache(),
+    );
     let running = tokio::spawn({
         let supervisor = supervisor.clone();
         async move { run(&supervisor, &source).await }
@@ -421,7 +424,11 @@ async fn stop_closes_a_rust_scripts_descendant_processes() {
     timeout(Duration::from_secs(4), supervisor.stop("rust-script"))
         .await
         .unwrap();
-    assert!(started.elapsed() >= Duration::from_millis(1900));
+    let elapsed = started.elapsed();
+    assert!(
+        (Duration::from_millis(1900)..Duration::from_secs(3)).contains(&elapsed),
+        "Stop took {elapsed:?}"
+    );
     let (result, events) = running.await.unwrap();
     assert!(events
         .iter()
@@ -436,6 +443,9 @@ async fn stop_closes_a_rust_scripts_descendant_processes() {
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
         result => panic!("expected the descendant's socket to close, got {result:?}"),
     }
+    let (result, events) = run(&supervisor, r#"codingpad::cache("demo", || 43)"#).await;
+    assert!(result.ok);
+    assert_eq!(dumps(&events)[0]["v"], 43);
 }
 
 #[tokio::test]
@@ -565,6 +575,8 @@ async fn desktop_rust_cache_reuses_values_in_one_open_tab() {
     };
     run_tab("file-first-tab", 41, 41).await;
     run_tab("file-first-tab", 42, 41).await;
+    supervisor.reset("file-first-tab").await.unwrap();
+    run_tab("file-first-tab", 43, 43).await;
     supervisor.close("file-first-tab").await;
     run_tab("file-reopened-tab", 42, 42).await;
     assert!(!data.path().join("rust-cache").exists());

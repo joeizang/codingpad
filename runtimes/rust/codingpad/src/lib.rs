@@ -2,7 +2,7 @@
 mod cache;
 mod rich;
 
-pub use cache::{cache, is_cancelled, CacheValue};
+pub use cache::{cache, CacheValue};
 
 pub use rich::{html, image, image_bytes, live, Html, Image, Live};
 
@@ -11,6 +11,13 @@ use std::fmt::{self, Debug};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::{Mutex, OnceLock};
+
+/// Whether CodingPad has asked this run to stop. Long-running scripts can
+/// poll this during their work and return to release resources before exiting.
+pub fn is_cancelled() -> bool {
+    std::env::var_os("CODINGPAD_RUST_CANCEL")
+        .is_some_and(|path| std::path::PathBuf::from(path).is_file())
+}
 
 /// Display a Rust value in Results, or pretty-print it in a terminal.
 pub fn dump<T: Debug>(value: T) {

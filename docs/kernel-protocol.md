@@ -589,18 +589,20 @@ Use `codingpad::cache("key", || value)` to reuse a value across runs of
 this script. The `codingpad` runtime library supports numeric types, booleans,
 strings, vectors and options, and custom types can implement `CacheValue`.
 Each script keeps up to 32 stored keys of at most 96 UTF-8 bytes, with up to
-1 MiB per entry. Oversize keys fail the script with the key size limit.
+1 MiB per entry. The limits bound storage even when scripts generate new keys
+on each run. Oversize keys fail the script and report the actual size and limit.
 Oversize values, encoding failures, and filesystem errors include the key.
 Reset removes these values, and closing the script attempts the same cleanup.
 
 Desktop cache entries belong to the open tab and survive reruns in that tab.
 Reopening a saved script or restarting CodingPad starts with an empty cache.
 Hosts configured with a data directory can keep entries across host launches
-when they reuse the same script ID.
+when they reuse the same script ID. For example, `cpad run` uses the script
+path and keeps its entries on disk when that path is no longer used.
 
 Stop makes `codingpad::is_cancelled()` return true so scripts can release
 resources and exit. After two seconds, CodingPad forcibly stops the process
-tree and clears any script cache it finds.
+tree and clears the cache for that script when it exists.
 
 Derived `Debug` values render as structured data. Structs and data-bearing enum
 variants show their fields, `None` appears as null, and collections of records

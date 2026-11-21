@@ -8,6 +8,7 @@ use std::{
     },
 };
 
+const MAX_VECTOR_ELEMENTS: usize = 1024 * 1024;
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_ENTRIES: usize = 32;
 const MAX_KEY_BYTES: usize = 96;
@@ -30,7 +31,8 @@ pub fn cache<T: CacheValue>(key: &str, factory: impl FnOnce() -> T) -> T {
     };
     assert!(
         key.len() <= MAX_KEY_BYTES,
-        "cache() keys must fit in 96 UTF-8 bytes"
+        "cache() key is {} UTF-8 bytes, exceeding the {MAX_KEY_BYTES}-byte limit",
+        key.len()
     );
     let entry = PathBuf::from(root).join(format!(
         "{}.cache",
@@ -55,12 +57,6 @@ pub fn cache<T: CacheValue>(key: &str, factory: impl FnOnce() -> T) -> T {
     store_entry(&entry, &value)
         .unwrap_or_else(|error| panic!("cache() could not store {key:?}: {error}"));
     value
-}
-
-/// Whether CodingPad has asked this run to stop. Long-running scripts can
-/// poll this during their work and return to release resources before exiting.
-pub fn is_cancelled() -> bool {
-    std::env::var_os("CODINGPAD_RUST_CANCEL").is_some_and(|path| PathBuf::from(path).is_file())
 }
 
 /// A value that can be written to and read from CodingPad's disk cache.
@@ -123,14 +119,17 @@ impl CacheValue for String {
 
 impl<T: CacheValue> CacheValue for Vec<T> {
     fn encode(&self, output: &mut dyn Write) -> io::Result<()> {
+        if self.len() > MAX_VECTOR_ELEMENTS {
+            return Err(too_many_elements());
+        }
         encode_length(self.len(), output)?;
         self.iter().try_for_each(|value| value.encode(output))
     }
 
     fn decode(input: &mut &[u8]) -> io::Result<Self> {
         let len = u32::decode(input)? as usize;
-        if len > MAX_BYTES {
-            return Err(too_large());
+        if len > MAX_VECTOR_ELEMENTS {
+            return Err(too_many_elements());
         }
         (0..len).map(|_| T::decode(input)).collect()
     }
@@ -239,6 +238,13 @@ fn store_entry(entry: &Path, value: &impl CacheValue) -> io::Result<()> {
 fn too_large() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "a cache value must fit in 1 MiB",
+        format!("a cache value must fit in {MAX_BYTES} bytes"),
+    )
+}
+
+fn too_many_elements() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("a cached vector must fit in {MAX_VECTOR_ELEMENTS} elements"),
     )
 }

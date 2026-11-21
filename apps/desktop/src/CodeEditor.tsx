@@ -6,6 +6,7 @@ import "monaco-editor/languages/definitions/python/register.js";
 import "monaco-editor/languages/definitions/csharp/register.js";
 import "monaco-editor/languages/definitions/sql/register.js";
 import "monaco-editor/languages/definitions/typescript/register.js";
+import "monaco-editor/languages/definitions/rust/register.js";
 import { scriptLanguageDetails } from "./scriptLanguages";
 import { createSqlCompletions } from "./sqlCompletions";
 import { EDITOR_OPTIONS } from "./editorOptions";
@@ -275,7 +276,7 @@ export default function CodeEditor({
   };
 
   useEffect(() => {
-    if (language === "csharp") applyCompileDiagnostics();
+    if (language === "csharp" || language === "rust") applyCompileDiagnostics();
   }, [language, compileDiagnostics]);
 
   useEffect(() => {
@@ -479,12 +480,12 @@ export default function CodeEditor({
           });
           cleanup.current = () => completion.dispose();
         }
+        if (language === "csharp" || language === "rust") applyCompileDiagnostics();
         if (!supportsCodeIntelligence(language)) {
           onMount?.(editor);
           reportReady();
           return;
         }
-        if (language === "csharp") applyCompileDiagnostics();
         if (pendingDiagnostics.current) {
           const model = editor.getModel();
           if (model) {

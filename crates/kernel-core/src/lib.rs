@@ -10,6 +10,7 @@ pub mod installer;
 pub mod lsp;
 mod packages;
 mod roslyn;
+mod rust;
 pub mod samples;
 pub mod secrets;
 pub mod shadow;
@@ -113,10 +114,51 @@ use std::{
 };
 use tempfile::TempDir;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, Lines},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, Lines},
+    net::{TcpListener, TcpStream},
     process::{Child, ChildStdin, Command},
     sync::{watch, Mutex, OnceCell},
 };
+
+fn kill_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // The child was started in its own process group, so this also stops
+        // its descendants.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("taskkill")
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.start_kill();
+}
+
+async fn accept_kernel(listener: &TcpListener, token: &[u8; 32]) -> std::io::Result<TcpStream> {
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        let mut received = [0u8; 32];
+        if matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                stream.read_exact(&mut received),
+            )
+            .await,
+            Ok(Ok(_))
+        ) && &received == token
+        {
+            return Ok(stream);
+        }
+    }
+}
 
 // Write bytes explicitly: Windows piped stdout may use an ANSI code page.
 const PYTHON_EXECUTABLE_PROBE: &str =
@@ -132,6 +174,7 @@ pub enum Language {
     Python,
     Csharp,
     Typescript,
+    Rust,
 }
 
 impl Language {
@@ -140,6 +183,7 @@ impl Language {
             Self::Python => "py",
             Self::Csharp => "cs",
             Self::Typescript => "ts",
+            Self::Rust => "rs",
         }
     }
 }
@@ -199,7 +243,7 @@ pub async fn attached_data_context(
     source: &str,
     language: Language,
 ) -> (Option<DataContextRun>, Option<String>) {
-    if language == Language::Typescript {
+    if matches!(language, Language::Typescript | Language::Rust) {
         return (None, None);
     }
     let Some(name) = attached_connection(source) else {
@@ -211,7 +255,7 @@ pub async fn attached_data_context(
             let source = match language {
                 Language::Python => generated.python,
                 Language::Csharp => generated.csharp,
-                Language::Typescript => return (None, None),
+                Language::Typescript | Language::Rust => return (None, None),
             };
             (
                 Some(DataContextRun {
@@ -481,6 +525,24 @@ impl Supervisor {
             .clone();
         let mut closed = slot.closed.subscribe();
         let mut stop = slot.stop.subscribe();
+        if language == Language::Rust {
+            let mut guard = tokio::select! {
+                biased;
+                _ = closed.changed() => return Err("Script was closed".into()),
+                _ = stop.changed() => return Ok(rust::stopped()),
+                guard = slot.kernel.lock() => guard,
+            };
+            if *closed.borrow() {
+                return Err("Script was closed".into());
+            }
+            *guard = None;
+            return tokio::select! {
+                biased;
+                _ = closed.changed() => Err("Script was closed".into()),
+                _ = stop.changed() => Ok(rust::stopped()),
+                result = rust::run(&self.shadow_projects, source, path, &mut emit) => result,
+            };
+        }
         // Vault prompts block. Resolve values off the async thread and let Stop
         // or Close cancel the wait before the kernel slot lock is taken.
         let secrets = match &self.secrets {
@@ -682,6 +744,7 @@ impl Supervisor {
                                 }
                             }
                         }
+                        Language::Rust => unreachable!("Rust runs in a fresh process"),
                     }
                 } => result,
                 _ = closed.changed() => return Err("Script was closed".into()),
@@ -922,6 +985,7 @@ impl Kernel {
             Language::Csharp => format!("Could not start C# kernel: {error}"),
             Language::Typescript => typescript::bun_not_found(&error)
                 .unwrap_or_else(|| format!("Could not start the Bun kernel: {error}")),
+            Language::Rust => format!("Could not start Rust: {error}"),
         })
     }
 

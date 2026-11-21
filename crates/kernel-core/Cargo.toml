@@ -35,6 +35,8 @@ oxc_ast = "0.110"
 oxc_ast_visit = "0.110"
 oxc_parser = { version = "0.110", default-features = false }
 oxc_span = "0.110"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn = { version = "2", features = ["full"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

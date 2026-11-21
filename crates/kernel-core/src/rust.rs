@@ -178,10 +178,7 @@ pub(super) async fn run(
         let Some(executable) = executable else {
             return Ok(None);
         };
-        let copy = run_files.path().join(executable.file_name().unwrap());
-        std::fs::copy(&executable, &copy)
-            .map_err(|error| format!("Could not stage the Rust executable: {error}"))?;
-        Ok::<_, String>(Some(copy))
+        stage_executable(&executable, run_files.path()).map(Some)
     };
     let build = tokio::select! {
         biased;
@@ -249,6 +246,26 @@ pub(super) async fn run(
         builds.schedule_warmup();
     }
     Ok((events.finish(ok), events.dumps))
+}
+
+fn stage_executable(executable: &Path, destination: &Path) -> Result<PathBuf, String> {
+    let name = executable
+        .file_name()
+        .ok_or("Cargo returned an invalid executable path")?;
+    let copy = destination.join(name);
+    std::fs::copy(executable, &copy)
+        .map_err(|error| format!("Could not stage the Rust executable: {error}"))?;
+    #[cfg(windows)]
+    {
+        // MSVC stores source locations in a companion PDB. Keep it beside the
+        // private executable so Windows can symbolize the panic stack.
+        match std::fs::copy(executable.with_extension("pdb"), copy.with_extension("pdb")) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Could not stage Rust debug symbols: {error}")),
+        }
+    }
+    Ok(copy)
 }
 
 async fn compile(
@@ -373,7 +390,8 @@ async fn build_cargo(cargo: &Path, root: &Path, target: &Path) -> Result<CargoOu
             "--quiet",
             "--target-dir",
         ])
-        .arg(target);
+        .arg(target)
+        .env("CARGO_BUILD_BUILD_DIR", target);
     cargo_output(command).await
 }
 

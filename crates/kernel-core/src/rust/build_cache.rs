@@ -156,6 +156,18 @@ impl BuildCache {
                     &runtime,
                     "codingpad-warmup",
                 )?;
+                let mut fetch = Command::new(cargo());
+                fetch
+                    .current_dir(project.root())
+                    .args(["fetch", "--offline", "--quiet"]);
+                if !run_in_background(fetch).await? {
+                    let mut fetch = Command::new(cargo());
+                    fetch.current_dir(project.root()).args(["fetch", "--quiet"]);
+                    if !run_in_background(fetch).await? {
+                        all_compiled = false;
+                        continue;
+                    }
+                }
                 let mut command = Command::new(cargo());
                 command
                     .current_dir(project.root())
@@ -168,12 +180,8 @@ impl BuildCache {
                         "--target-dir",
                     ])
                     .arg(lease.target())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null());
-                let mut child = spawn(&mut command).map_err(cache_error)?;
-                let status = child.process.wait().await.map_err(cache_error)?;
-                child.finished = true;
-                all_compiled &= status.success();
+                    .env("CARGO_BUILD_BUILD_DIR", lease.target());
+                all_compiled &= run_in_background(command).await?;
             }
             Ok(all_compiled)
         })
@@ -202,6 +210,14 @@ impl BuildCache {
         }
         Ok(runtime)
     }
+}
+
+async fn run_in_background(mut command: Command) -> Result<bool, String> {
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = spawn(&mut command).map_err(cache_error)?;
+    let status = child.process.wait().await.map_err(cache_error)?;
+    child.finished = true;
+    Ok(status.success())
 }
 
 pub(super) struct BuildLease {
@@ -245,7 +261,10 @@ fn write_if_changed(path: &Path, content: &str) -> io::Result<()> {
         return Ok(());
     }
     use io::Write;
-    let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing output directory"))?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
     file.write_all(content.as_bytes())?;
     file.persist(path)?;
     Ok(())

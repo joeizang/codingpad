@@ -107,7 +107,7 @@ async fn runs_top_level_scripts_with_a_bom_and_shebang() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_closes_a_rust_scripts_descendant_processes() {
     use tokio::io::AsyncReadExt;
     use tokio::time::{timeout, Duration};

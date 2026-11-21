@@ -11,8 +11,11 @@ check:
     uv run --offline --no-project --no-config --no-python-downloads python -m unittest discover -s tests/python -v
     uv run --offline --no-project --no-config --no-python-downloads python -m unittest discover -s tests/dotnet -v
     cargo fmt --all -- --check
+    cargo fmt --manifest-path runtimes/rust/codingpad/Cargo.toml -- --check
     cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo clippy --manifest-path runtimes/rust/codingpad/Cargo.toml --all-targets --locked -- -D warnings
     cargo test --workspace --locked
+    cargo test --manifest-path runtimes/rust/codingpad/Cargo.toml --locked
     npm --prefix apps/desktop run tauri -- build --debug --no-bundle
 
 run:

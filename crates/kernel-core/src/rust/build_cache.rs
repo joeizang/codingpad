@@ -1,7 +1,7 @@
 use super::{manifest::Manifest, spawn, CACHE_RUNTIME, RICH_RUNTIME, RUNTIME, RUNTIME_MANIFEST};
 use crate::{
     shadow::ShadowProject,
-    toolchains::{RustTool, RustToolchain},
+    toolchains::{RustTool, RustToolchain, RustToolchainError},
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -23,6 +23,7 @@ use tokio::{
 };
 
 const TARGET_DIR: &str = "rust-build";
+const PRIVATE_TOOLCHAIN_RECHECK: Duration = Duration::from_secs(30);
 const CLEAR_WAIT: Duration = Duration::from_secs(1);
 const POPULAR_CRATES: &[(&str, &str)] = &[
     ("serde", "1"),
@@ -58,13 +59,13 @@ impl BuildCache {
         }
     }
 
-    pub(super) async fn toolchain(&self) -> Result<RustToolchain, String> {
+    pub(super) async fn toolchain(&self) -> Result<RustToolchain, RustToolchainError> {
         let mut cached = self.toolchain.lock().await;
         if let Some((toolchain, resolved)) = &*cached {
             // Recheck a private selection periodically so new user installs
             // can take precedence. Missing files always trigger a recheck.
             if toolchain.still_present()
-                && (!toolchain.is_private() || resolved.elapsed() < Duration::from_secs(30))
+                && (!toolchain.is_private() || resolved.elapsed() < PRIVATE_TOOLCHAIN_RECHECK)
             {
                 return Ok(toolchain.clone());
             }

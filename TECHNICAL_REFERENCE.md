@@ -910,7 +910,8 @@ checked-in declaration file when it cannot install them.
 CodingPad uses your installed Cargo and rustc first. If they are missing,
 **Install Rust and run** in Results installs stable Rust under the app data
 folder (`toolchains/rust/stable`). CodingPad verifies the pinned rustup 1.29.3
-bootstrap and tests compilation before publishing the installation. Retrying removes abandoned staging files. The private install
+bootstrap and tests compilation before publishing the installation. Retrying
+removes abandoned staging files. The private install
 leaves your shell profile, PATH and existing toolchain alone. Windows x64 uses
 the Rust GNU distribution, which includes the linker. Windows ARM64 uses an
 existing toolchain. On Linux and macOS, CodingPad checks for working C

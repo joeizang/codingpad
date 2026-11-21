@@ -9,14 +9,14 @@ mod source;
 
 pub(crate) use build_cache::BuildCache;
 pub(crate) use dumps::Dumps;
-pub(crate) use editor::{analyzer_command, RustShadowProject, MISSING_ANALYZER};
+pub(crate) use editor::{analyzer_command, RustShadowProject};
 pub(crate) use manifest::{frontmatter, Manifest};
 pub(crate) use source::Source;
 pub(crate) use source::FILE as SCRIPT_FILE;
 
 use crate::{
     shadow::ShadowProject,
-    toolchains::{RustTool, RustToolchain, MISSING_RUST},
+    toolchains::{RustTool, RustToolchain, RustToolchainError},
     KernelEvent, RunResult,
 };
 use debug::{Snapshot, ValueNode};
@@ -179,7 +179,7 @@ pub(super) async fn run(
         {
             // Run from Cargo's output path so Windows can use its original
             // debug-symbol layout. The lease protects the executable until exit.
-            Ok::<_, String>(Some(StagedExecutable {
+            Ok::<_, RustToolchainError>(Some(StagedExecutable {
                 path: executable,
                 _lease: lease,
             }))
@@ -187,7 +187,7 @@ pub(super) async fn run(
         #[cfg(not(windows))]
         {
             let copy = stage_executable(&executable, run_files.path())?;
-            Ok::<_, String>(Some(StagedExecutable { path: copy }))
+            Ok::<_, RustToolchainError>(Some(StagedExecutable { path: copy }))
         }
     };
     let build = tokio::select! {
@@ -198,10 +198,7 @@ pub(super) async fn run(
         },
         build = prepare => build,
     };
-    if build
-        .as_ref()
-        .is_err_and(|error| error.starts_with(MISSING_RUST))
-    {
+    if matches!(build, Err(RustToolchainError::Missing(_))) {
         builds.invalidate_toolchain().await;
     }
     let build = build?;
@@ -283,7 +280,7 @@ async fn compile(
     source: &Source,
     name: &str,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<PathBuf>, RustToolchainError> {
     let CargoOutput {
         status,
         stdout,
@@ -360,9 +357,9 @@ async fn compile(
     }
     events.send("diagnostics", json!({"diagnostics": diagnostics}));
     if status.success() {
-        executable
-            .map(Some)
-            .ok_or_else(|| "Cargo did not produce a runnable Rust executable.".into())
+        executable.map(Some).ok_or_else(|| {
+            RustToolchainError::Other("Cargo did not produce a runnable Rust executable.".into())
+        })
     } else {
         let stderr = String::from_utf8_lossy(&stderr);
         if !stderr.is_empty() {
@@ -386,7 +383,7 @@ async fn build_cargo(
     toolchain: &RustToolchain,
     root: &Path,
     target: &Path,
-) -> Result<CargoOutput, String> {
+) -> Result<CargoOutput, RustToolchainError> {
     let mut command = toolchain.command(RustTool::Cargo);
     command
         .current_dir(root)
@@ -400,7 +397,7 @@ async fn prepare_dependencies(
     root: &Path,
     manifest: &Manifest,
     events: &mut Events<'_, impl FnMut(KernelEvent)>,
-) -> Result<bool, String> {
+) -> Result<bool, RustToolchainError> {
     let fetch = |offline| {
         let mut command = toolchain.command(RustTool::Cargo);
         command.current_dir(root).args(["fetch", "--quiet"]);
@@ -445,13 +442,13 @@ struct CargoOutput {
     stderr: Vec<u8>,
 }
 
-async fn cargo_output(mut command: Command) -> Result<CargoOutput, String> {
+async fn cargo_output(mut command: Command) -> Result<CargoOutput, RustToolchainError> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = spawn(&mut command).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
-            MISSING_RUST.to_owned()
+            RustToolchainError::Missing(None)
         } else {
-            format!("Could not start Cargo: {error}")
+            format!("Could not start Cargo: {error}").into()
         }
     })?;
     let mut stdout = Vec::new();
@@ -473,7 +470,7 @@ async fn cargo_output(mut command: Command) -> Result<CargoOutput, String> {
                 line.starts_with("error: could not execute process ") && line.contains("rustc")
             })
         {
-            return Err(format!("{MISSING_RUST}\n{}", message.trim()));
+            return Err(RustToolchainError::Missing(Some(message.trim().to_owned())));
         }
     }
     Ok(CargoOutput {

@@ -507,7 +507,8 @@ impl LanguageServers {
             return Ok(started);
         }
 
-        let command = rust::analyzer_command(&self.shadow_projects.rust_build).await?;
+        let (command, analyzer_help) =
+            rust::analyzer_command(&self.shadow_projects.rust_build).await?;
         let workspace =
             RustShadowProject::create(&self.shadow_projects.rust_build, &manifest, source).await?;
         let server = LspServer::start(
@@ -516,7 +517,7 @@ impl LanguageServers {
             "rust",
             "rust-analyzer",
             restart_key,
-            rust::MISSING_ANALYZER.to_owned(),
+            analyzer_help,
             events,
         )
         .await?;

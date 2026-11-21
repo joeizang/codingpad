@@ -3,21 +3,19 @@ use crate::{shadow::ShadowProject, toolchains::RustTool};
 use std::{path::PathBuf, sync::Arc};
 use tokio::process::Command;
 
-pub(crate) const MISSING_ANALYZER: &str =
-    "rust-analyzer was not found. Install it with `rustup component add rust-analyzer rust-src` or set CODINGPAD_RUST_LSP.";
-
-pub(crate) async fn analyzer_command(builds: &BuildCache) -> Result<Command, String> {
+pub(crate) async fn analyzer_command(builds: &BuildCache) -> Result<(Command, String), String> {
     let toolchain = builds.toolchain().await.unwrap_or_default();
     let executable = std::env::var_os("CODINGPAD_RUST_LSP")
         .map(PathBuf::from)
         .unwrap_or_else(|| toolchain.executable(RustTool::Analyzer));
     let executable = std::path::absolute(executable).map_err(|error| error.to_string())?;
+    let help = toolchain.analyzer_help();
     if !executable.is_file() {
-        return Err(MISSING_ANALYZER.into());
+        return Err(help);
     }
     let mut command = Command::new(executable);
     toolchain.configure(&mut command);
-    Ok(command)
+    Ok((command, help))
 }
 
 pub(crate) struct RustShadowProject {

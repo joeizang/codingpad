@@ -1,6 +1,6 @@
 //! Toolchain release manifests and app-private installation lifecycle.
 mod rust;
-pub(crate) use rust::{RustTool, RustToolchain, MISSING as MISSING_RUST};
+pub(crate) use rust::{RustTool, RustToolchain, RustToolchainError};
 
 use crate::{
     find_uv,
@@ -648,7 +648,10 @@ async fn bun_version(path: &Path, deadline: Duration) -> Option<bool> {
     if !path.is_file() {
         return Some(false);
     }
-    let mut command = tokio::process::Command::new(path);
+    probe_version(tokio::process::Command::new(path), deadline).await
+}
+
+async fn probe_version(mut command: tokio::process::Command, deadline: Duration) -> Option<bool> {
     command.arg("--version");
     prepare_tool_command(&mut command);
     match tokio::time::timeout(deadline, command.output()).await {

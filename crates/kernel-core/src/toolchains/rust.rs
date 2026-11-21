@@ -1,6 +1,6 @@
 use super::{
-    installer, prepare_install, prepare_tool_command, promote_directory, Artifact, Toolchains,
-    MAX_TOOL_BYTES,
+    installer, prepare_install, prepare_tool_command, probe_version, promote_directory, Artifact,
+    Toolchains, MAX_TOOL_BYTES,
 };
 use std::{
     path::{Path, PathBuf},
@@ -43,7 +43,30 @@ const RUSTUP_RELEASES: &[(&str, &str)] = &[
     ),
 ];
 
-pub(crate) const MISSING: &str = "Rust was not found. Install Rust from Results in CodingPad, or install a stable toolchain from https://rustup.rs/ and try again.";
+const MISSING: &str = "Rust was not found. Install Rust from Results in CodingPad, or install a stable toolchain from https://rustup.rs/ and try again.";
+
+pub(crate) enum RustToolchainError {
+    Missing(Option<String>),
+    ProbeTimeout,
+    Other(String),
+}
+
+impl From<String> for RustToolchainError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl From<RustToolchainError> for String {
+    fn from(error: RustToolchainError) -> Self {
+        match error {
+            RustToolchainError::Missing(Some(detail)) => format!("{MISSING}\n{detail}"),
+            RustToolchainError::Missing(None) => MISSING.into(),
+            RustToolchainError::ProbeTimeout => PROBE_TIMEOUT.into(),
+            RustToolchainError::Other(error) => error,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum RustTool {
@@ -95,11 +118,23 @@ impl RustToolchain {
         self.private.is_some()
     }
 
+    pub(crate) fn analyzer_help(&self) -> String {
+        self.private.as_ref().map_or_else(
+            || "rust-analyzer was not found. Install it with `rustup component add rust-analyzer rust-src` or set CODINGPAD_RUST_LSP.".into(),
+            |root| format!(
+                "rust-analyzer was not found in CodingPad's private Rust toolchain. Set CARGO_HOME to \"{}\" and RUSTUP_HOME to \"{}\", then run \"{}\" component add rust-analyzer rust-src.",
+                root.join("cargo").display(),
+                root.join("rustup").display(),
+                self.executable(RustTool::Rustup).display(),
+            ),
+        )
+    }
+
     pub(crate) fn still_present(&self) -> bool {
         self.cargo.is_file() && self.compiler.is_file()
     }
 
-    pub(crate) async fn resolve(data: Option<&Path>) -> Result<Self, String> {
+    pub(crate) async fn resolve(data: Option<&Path>) -> Result<Self, RustToolchainError> {
         let user = Self::default();
         let user_ready = user.is_available().await;
         if user_ready == Some(true) {
@@ -110,21 +145,21 @@ impl RustToolchain {
                 Self::private(std::path::absolute(private_dir(data)).map_err(|e| e.to_string())?);
             match private.is_available().await {
                 Some(true) => return Ok(private),
-                None => return Err(PROBE_TIMEOUT.into()),
+                None => return Err(RustToolchainError::ProbeTimeout),
                 Some(false) => {}
             }
         }
         if user_ready.is_none() {
-            return Err(PROBE_TIMEOUT.into());
+            return Err(RustToolchainError::ProbeTimeout);
         }
-        Err(MISSING.into())
+        Err(RustToolchainError::Missing(None))
     }
 
     pub(crate) fn executable(&self, tool: RustTool) -> PathBuf {
         match tool {
             RustTool::Cargo => self.cargo.clone(),
             RustTool::Compiler => self.compiler.clone(),
-            _ => self.private.as_ref().map_or_else(
+            RustTool::Analyzer | RustTool::Rustup => self.private.as_ref().map_or_else(
                 || find_user_tool(tool),
                 |root| root.join("cargo/bin").join(tool.filename()),
             ),
@@ -172,8 +207,8 @@ impl RustToolchain {
             return Some(false);
         }
         let (cargo, rustc) = tokio::join!(
-            version(self.command(RustTool::Cargo), VERSION_TIMEOUT),
-            version(self.command(RustTool::Compiler), VERSION_TIMEOUT)
+            probe_version(self.command(RustTool::Cargo), VERSION_TIMEOUT),
+            probe_version(self.command(RustTool::Compiler), VERSION_TIMEOUT)
         );
         Some(cargo? && rustc?)
     }
@@ -182,16 +217,6 @@ impl RustToolchain {
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: &str =
     "The Rust toolchain took too long to respond. Wait for it to finish starting, then try again.";
-
-async fn version(mut command: Command, timeout: Duration) -> Option<bool> {
-    command.arg("--version");
-    prepare_tool_command(&mut command);
-    match tokio::time::timeout(timeout, command.output()).await {
-        Ok(Ok(output)) => Some(output.status.success()),
-        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
-        _ => None,
-    }
-}
 
 fn find_user_tool(tool: RustTool) -> PathBuf {
     let name = tool.filename();
@@ -219,11 +244,13 @@ fn executable_name(name: &str) -> String {
     format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
-fn release(
-    os: &str,
-    arch: &str,
-    musl: bool,
-) -> Result<(&'static str, &'static str, &'static str), String> {
+struct RustupRelease {
+    bootstrap: &'static str,
+    host: &'static str,
+    sha256: &'static str,
+}
+
+fn release(os: &str, arch: &str, musl: bool) -> Result<RustupRelease, String> {
     let unsupported = || {
         format!("Private Rust installation is unavailable on {os}/{arch}. Install a Rust toolchain from https://rustup.rs/ and try again.")
     };
@@ -246,7 +273,11 @@ fn release(
     } else {
         triple
     };
-    Ok((triple, host, sha256))
+    Ok(RustupRelease {
+        bootstrap: triple,
+        host,
+        sha256,
+    })
 }
 
 impl Toolchains {
@@ -254,8 +285,10 @@ impl Toolchains {
         let _guard = self.install.lock().await;
         match RustToolchain::resolve(Some(&self.data_dir)).await {
             Ok(_) => Ok(()),
-            Err(error) if error == MISSING => install_private_rust(&self.data_dir, progress).await,
-            Err(error) => Err(error),
+            Err(RustToolchainError::Missing(_)) => {
+                install_private_rust(&self.data_dir, progress).await
+            }
+            Err(error) => Err(error.into()),
         }
     }
 }
@@ -264,7 +297,7 @@ async fn install_private_rust(
     data_dir: &Path,
     mut progress: impl FnMut(&str) + Send,
 ) -> Result<(), String> {
-    let (triple, host, sha256) = release(
+    let release = release(
         std::env::consts::OS,
         std::env::consts::ARCH,
         cfg!(target_env = "musl"),
@@ -278,25 +311,26 @@ async fn install_private_rust(
         None => return Err(PROBE_TIMEOUT.into()),
         Some(false) => {}
     }
-    if destination.exists() {
-        std::fs::remove_dir_all(&destination)
-            .map_err(|e| format!("Could not remove the unusable private Rust toolchain: {e}"))?;
-    }
-
     let stage = tempfile::Builder::new()
         .prefix(".codingpad-install-rust-")
         .tempdir_in(root)
         .map_err(|e| format!("Could not create the Rust staging directory: {e}"))?;
     progress("Checking the system linker…");
     verify_linker(stage.path()).await?;
+    if destination.exists() {
+        std::fs::remove_dir_all(&destination)
+            .map_err(|e| format!("Could not remove the unusable private Rust toolchain: {e}"))?;
+    }
+
     let name = executable_name("rustup-init");
     progress("Downloading and verifying rustup…");
     let bootstrap = installer::download_verified(
         &Artifact {
             url: &format!(
-                "https://static.rust-lang.org/rustup/archive/{RUSTUP_VERSION}/{triple}/{name}"
+                "https://static.rust-lang.org/rustup/archive/{RUSTUP_VERSION}/{}/{name}",
+                release.bootstrap
             ),
-            sha256,
+            sha256: release.sha256,
             max_bytes: MAX_TOOL_BYTES,
         },
         stage.path(),
@@ -327,7 +361,7 @@ async fn install_private_rust(
             "--yes",
             "--no-modify-path",
             "--default-host",
-            host,
+            release.host,
             "--default-toolchain",
             "stable",
             "--profile",
@@ -442,7 +476,7 @@ mod tests {
         let private = RustToolchain::private(root);
         verify_install(&private, data.path()).await.unwrap();
         assert_eq!(
-            version(private.command(RustTool::Analyzer), VERSION_TIMEOUT).await,
+            probe_version(private.command(RustTool::Analyzer), VERSION_TIMEOUT).await,
             Some(true)
         );
     }
@@ -458,7 +492,11 @@ mod tests {
             ("macos", "aarch64", false),
             ("windows", "x86_64", false),
         ] {
-            let (bootstrap, host, digest) = release(os, arch, musl).unwrap();
+            let RustupRelease {
+                bootstrap,
+                host,
+                sha256: digest,
+            } = release(os, arch, musl).unwrap();
             assert!(bootstrap.starts_with(arch));
             assert_eq!(digest.len(), 64);
             assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
@@ -478,7 +516,14 @@ mod tests {
         slow.args(["-c", "exec sleep 1"]);
         let mut broken = Command::new("sh");
         broken.args(["-c", "exit 1"]);
-        assert_eq!(version(slow, Duration::from_millis(10)).await, None);
-        assert_eq!(version(broken, VERSION_TIMEOUT).await, Some(false));
+        let directory = tempfile::tempdir().unwrap();
+        let unlaunchable = directory.path().join("cargo");
+        std::fs::write(&unlaunchable, "not a Rust tool").unwrap();
+        assert_eq!(
+            probe_version(Command::new(unlaunchable), VERSION_TIMEOUT).await,
+            Some(false)
+        );
+        assert_eq!(probe_version(slow, Duration::from_millis(10)).await, None);
+        assert_eq!(probe_version(broken, VERSION_TIMEOUT).await, Some(false));
     }
 }

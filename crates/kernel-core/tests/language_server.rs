@@ -601,7 +601,15 @@ async fn rust_code_intelligence_maps_shadow_edits_and_compiler_errors() {
         let column = text[..end].encode_utf16().count();
         timeout(Duration::from_secs(90), async {
             loop {
-                let result = complete(line, column).await.expect("Rust completion");
+                let result = match complete(line, column).await {
+                    Ok(result) => result,
+                    Err(error)
+                        if error.contains("did not answer textDocument/completion in time") =>
+                    {
+                        continue;
+                    }
+                    Err(error) => panic!("Rust completion: {error}"),
+                };
                 if result["items"]
                     .as_array()
                     .is_some_and(|items| items.iter().any(|item| matches_item(item, expected)))
@@ -678,5 +686,43 @@ async fn rust_code_intelligence_maps_shadow_edits_and_compiler_errors() {
         range("start")["character"].as_u64().unwrap() + 1,
         compiled["column"].as_u64().unwrap()
     );
+    assert_eq!(
+        range("end")["line"].as_u64().unwrap() + 1,
+        compiled["endLine"].as_u64().unwrap()
+    );
+    assert_eq!(
+        range("end")["character"].as_u64().unwrap() + 1,
+        compiled["endColumn"].as_u64().unwrap()
+    );
+
+    let clean = edited.replace(
+        "let _: u32 = \"not a number\";",
+        "codingpad::dump(serde_json::Value::Null);",
+    );
+    servers.did_change("one", &clean).await.unwrap();
+    timeout(Duration::from_secs(90), async {
+        loop {
+            let event = receiver.recv().await.expect("rust-analyzer diagnostics");
+            if event.params["diagnostics"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("rust-analyzer did not clear diagnostics for the clean script");
+    let reused = servers
+        .start_rust("one", &clean, None, "rust-test", |_| {})
+        .await
+        .expect("reuse rust-analyzer with the same Cargo manifest");
+    assert_eq!(reused.uri, started.uri);
+    let changed = clean.replace("serde_json = \"1\"", "serde_json = \"1.0\"");
+    let restarted = servers
+        .start_rust("one", &changed, None, "rust-test", |_| {})
+        .await
+        .expect("restart rust-analyzer after Cargo manifest changes");
+    assert_ne!(restarted.uri, started.uri);
     servers.close("one").await;
 }

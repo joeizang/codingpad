@@ -773,8 +773,9 @@ unavailable, the dialog offers an explicit **Store for this session only** actio
 those values disappear when CodingPad exits.
 
 Python and TypeScript scripts read a secret with `secret("name")` (also importable
-from `codingpad`). C# scripts use `Secret("name")`, and Rust scripts use
-`codingpad::secret("name")`.
+from `codingpad`). C# scripts use `Secret("name")`. Rust code intelligence
+can resolve `codingpad::secret("name")`. Vault access for Rust is scheduled for
+the Rust database and secrets milestone.
 
 ```python
 from codingpad import secret
@@ -792,11 +793,10 @@ var password = Secret("database-password");
 
 Names starting with `connection:` are reserved for database connection
 passwords. A missing secret raises an actionable error. Secret values are not written to
-logs, script files or connection settings. Each run reads only the secrets its
-source names. Imports and dynamic uses fall back to every non-connection secret,
-because imported modules may call `secret()`. Scripts that neither import anything
-nor reference `secret` do not wait on the vault. Changing a secret takes
-effect on the next run of each script.
+logs, script files or connection settings. For Python, TypeScript and C#, the
+host resolves secrets named in the source before running the script. Imports
+and dynamic calls can require the host to read every non-connection secret.
+Changing a secret takes effect on the next run of each script.
 
 ## Repository layout
 
@@ -946,6 +946,9 @@ and is timed from the start of the run, so it includes compilation.
 The TypeScript completion metric needs the TypeScript 7 native server and Bun;
 install `@typescript/native-preview` or set `CODINGPAD_TS_LSP`. It is skipped
 when the server is not found.
+The Rust completion metric needs rust-analyzer and rust-src. It times helper and
+crate-type completions after an edit and reports the slower result. It is
+skipped when rust-analyzer is unavailable.
 C# runs use no NuGet packages, so the measurements exclude package downloads.
 Rust reruns use the shared target directory. A successful Rust run schedules
 idle precompilation of selected common crates already available to Cargo.

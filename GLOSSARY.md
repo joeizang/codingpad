@@ -41,7 +41,9 @@ The small per-language package named `codingpad` that scripts import for `dump()
 _Avoid_: Helper library, SDK, runtime
 
 **Shadow project**:
-A hidden project CodingPad keeps behind a script so that a language's tools can build it and understand it. The user never edits it.
+A hidden project CodingPad keeps behind a script so that a language's tools can build it and understand it. The user never edits it. Rust stages an execution shadow project for Run and a
+separate editor shadow project for rust-analyzer. Both use the same Cargo
+manifest and source transformation.
 _Avoid_: Hidden project, workspace
 
 ### Problems

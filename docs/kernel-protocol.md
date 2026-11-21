@@ -4,7 +4,8 @@ Python, C# and TypeScript use JSON-RPC 2.0 over UTF-8, one JSON object per line.
 The supervisor writes their requests to stdin. It reads responses from stdout for Python and C#
 and from a dedicated loopback connection for TypeScript. Each open Python, C#
 or TypeScript script keeps one warm kernel process. Rust starts a fresh process
-for each run and the supervisor retains its dump snapshots.
+for each run, sends runtime events over an authenticated loopback connection
+and retains dump snapshots in the supervisor.
 The kernel and its runtime are embedded in the Rust build and extracted to a
 private temporary directory for the process lifetime; installed apps do not need
 the source checkout or a registry package. Python starts with `-I -u -X utf8` and adds only
@@ -27,12 +28,11 @@ The supervisor allocates monotonically increasing integer request IDs per kernel
 `params.secrets` is an optional object of named secret values resolved by the
 host from the OS password vault before each run. The kernel keeps them in memory;
 Python and TypeScript expose them through `secret("name")`, C# through
-`Secret("name")`. Rust requests named values through its loopback connection
-described below. Secret values are never written to stdout/stderr or included in dumps unless a script chooses
-to do so.
+`Secret("name")`. Secret values are never written to stdout/stderr or included
+in dumps unless a script chooses to do so.
 
 `params.secret_errors` is an optional object of vault read errors keyed by
-secret name. Kernels surface the stored error when the script requests that name.
+secret name for Python, C# and TypeScript.
 `params.connection` is null or an object with `settings` (the saved connection)
 and `password` (a resolved vault password or null). Reserved connection
 passwords are excluded from `params.secrets`.
@@ -620,15 +620,13 @@ completions, hover and live diagnostics. The language server sees the same
 generated source and dependencies as the Rust kernel. CodingPad translates
 its UTF-16 ranges back to the script, including edits and diagnostics after
 cargo-script frontmatter. `CODINGPAD_RUST_LSP` can point to a specific
-rust-analyzer executable. The editor shadow project uses its own Cargo target
-directory so background checks do not hold the execution build cache lock.
+rust-analyzer executable. CodingPad reuses the editor shadow project while its
+Cargo manifest stays the same. It uses its own Cargo target directory so
+background checks cannot block Run on Cargo's target-directory lock. Cargo's
+registry cache is shared, so the project can reuse previously downloaded crates.
 
-`codingpad::secret("name")` writes a UTF-8 JSON line with `kind: "secret"`
-and the requested `name` over the same authenticated loopback connection as
-dump events. The host replies with one status byte (1 for a value, 0 for an
-error), four big-endian length bytes, then that many UTF-8 bytes. The maximum
-reply body is 1 MiB. The script waits for the reply before sending another
-event on the connection. Connection passwords remain in the host.
+`codingpad::secret("name")` is available for Rust completion and type checking.
+The Rust database and secrets milestone adds vault access.
 
 An explicit `fn main()` runs as a normal Rust program. In a top-level script,
 CodingPad automatically dumps a final expression without a semicolon if it

@@ -40,6 +40,9 @@ use crate::{
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+// rust-analyzer can block briefly while Cargo and the standard library load.
+const RUST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const RUST_CHECK_DEBOUNCE: Duration = Duration::from_millis(400);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
 const DIAGNOSTICS_METHOD: &str = "textDocument/publishDiagnostics";
 
@@ -237,14 +240,7 @@ impl LanguageServers {
         let dependencies = inline_dependencies(source);
         let events: EventSink = Arc::new(emit);
 
-        let start = {
-            let mut starts = self.starts.lock().await;
-            starts
-                .entry(script_id.to_owned())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        let _start = start.lock().await;
+        let _start = self.lock_start(script_id).await;
         if self.closed.lock().await.contains(script_id) {
             return Err("The script was closed".into());
         }
@@ -368,28 +364,13 @@ impl LanguageServers {
         );
         let events: EventSink = Arc::new(emit);
 
-        let start = {
-            let mut starts = self.starts.lock().await;
-            starts
-                .entry(script_id.to_owned())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        let _start = start.lock().await;
+        let _start = self.lock_start(script_id).await;
         self.check_session(script_id, session).await?;
-        let existing = self.servers.lock().await.get(script_id).cloned();
-        if let Some(existing) = existing {
-            if existing.restart_key == restart_key && existing.alive() {
-                existing.set_events(events.clone());
-                if existing.did_change(source).await.is_ok() {
-                    self.check_session(script_id, session).await?;
-                    return Ok(LspStartResult {
-                        uri: existing.document_uri.clone(),
-                    });
-                }
-            }
-            self.servers.lock().await.remove(script_id);
-            existing.stop().await;
+        if let Some(started) = self
+            .reuse_server(script_id, source, session, "csharp", &restart_key, &events)
+            .await?
+        {
+            return Ok(started);
         }
 
         let project_key = format!("{script_id}\n{restart_key}");
@@ -470,28 +451,20 @@ impl LanguageServers {
         let restart_key = project.shadow.document_uri().to_owned();
         let events: EventSink = Arc::new(emit);
 
-        let start = {
-            let mut starts = self.starts.lock().await;
-            starts
-                .entry(script_id.to_owned())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        let _start = start.lock().await;
+        let _start = self.lock_start(script_id).await;
         self.check_session(script_id, session).await?;
-        let existing = self.servers.lock().await.get(script_id).cloned();
-        if let Some(existing) = existing {
-            if existing.restart_key == restart_key && existing.alive() {
-                existing.set_events(events.clone());
-                if existing.did_change(source).await.is_ok() {
-                    self.check_session(script_id, session).await?;
-                    return Ok(LspStartResult {
-                        uri: existing.document_uri.clone(),
-                    });
-                }
-            }
-            self.servers.lock().await.remove(script_id);
-            existing.stop().await;
+        if let Some(started) = self
+            .reuse_server(
+                script_id,
+                source,
+                session,
+                "typescript",
+                &restart_key,
+                &events,
+            )
+            .await?
+        {
+            return Ok(started);
         }
 
         let mut command = server.command();
@@ -523,33 +496,15 @@ impl LanguageServers {
             return Err("A script id is required".into());
         }
         let manifest = rust::Manifest::parse(source, path).map_err(|error| error.to_string())?;
-        let restart_key = manifest.editor_key();
+        let restart_key = manifest.editor_restart_key();
         let events: EventSink = Arc::new(emit);
-        let start = {
-            let mut starts = self.starts.lock().await;
-            starts
-                .entry(script_id.to_owned())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        let _start = start.lock().await;
+        let _start = self.lock_start(script_id).await;
         self.check_session(script_id, session).await?;
-        let existing = self.servers.lock().await.get(script_id).cloned();
-        if let Some(existing) = existing {
-            if existing.language_id == "rust"
-                && existing.restart_key == restart_key
-                && existing.alive()
-            {
-                existing.set_events(events.clone());
-                if existing.did_change(source).await.is_ok() {
-                    self.check_session(script_id, session).await?;
-                    return Ok(LspStartResult {
-                        uri: existing.document_uri.clone(),
-                    });
-                }
-            }
-            self.servers.lock().await.remove(script_id);
-            existing.stop().await;
+        if let Some(started) = self
+            .reuse_server(script_id, source, session, "rust", &restart_key, &events)
+            .await?
+        {
+            return Ok(started);
         }
 
         let command = rust::analyzer_command()?;
@@ -567,6 +522,48 @@ impl LanguageServers {
         .await?;
         self.register_started(script_id, source, session, server)
             .await
+    }
+
+    async fn lock_start(&self, script_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let start = self
+            .starts
+            .lock()
+            .await
+            .entry(script_id.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        start.lock_owned().await
+    }
+
+    async fn reuse_server(
+        &self,
+        script_id: &str,
+        source: &str,
+        session: &str,
+        language: &str,
+        restart_key: &str,
+        events: &EventSink,
+    ) -> Result<Option<LspStartResult>, String> {
+        let existing = self.servers.lock().await.get(script_id).cloned();
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        if existing.language_id == language
+            && existing.restart_key == restart_key
+            && existing.alive()
+        {
+            existing.set_events(events.clone());
+            if existing.did_change(source).await.is_ok() {
+                self.check_session(script_id, session).await?;
+                return Ok(Some(LspStartResult {
+                    uri: existing.document_uri.clone(),
+                }));
+            }
+        }
+        if self.remove_if_same(script_id, &existing).await {
+            existing.stop().await;
+        }
+        Ok(None)
     }
 
     async fn register_started(
@@ -743,9 +740,14 @@ struct LspServer {
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     diagnostics_notify: Arc<Notify>,
     diagnostics_last: Arc<StdMutex<Option<Value>>>,
-    rust_source: Arc<StdMutex<Option<Arc<Source>>>>,
-    rust_check_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    _workspace: Workspace,
+    rust_editor: Option<Arc<RustEditor>>,
+    workspace: Workspace,
+}
+
+#[derive(Default)]
+struct RustEditor {
+    source: StdMutex<Option<Arc<Source>>>,
+    check_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 enum Workspace {
@@ -877,9 +879,8 @@ impl LspServer {
             stderr_tail: stderr_tail.clone(),
             diagnostics_notify: Arc::new(Notify::new()),
             diagnostics_last: Arc::new(StdMutex::new(None)),
-            _workspace: workspace,
-            rust_source: Arc::default(),
-            rust_check_task: Mutex::default(),
+            rust_editor: matches!(workspace, Workspace::Rust(_)).then(Arc::default),
+            workspace,
         });
 
         let response_config = ResponseConfig {
@@ -889,7 +890,7 @@ impl LspServer {
             extra_paths: server.extra_paths.clone(),
             server_name,
             version,
-            rust_source: server.rust_source.clone(),
+            rust_editor: server.rust_editor.clone(),
         };
         tokio::spawn(read_loop(
             BufReader::new(stdout),
@@ -922,7 +923,7 @@ impl LspServer {
                                 }
                                 // Keep the shadow project's liveness marker fresh
                                 // so another script's sweep cannot remove it.
-                                poll._workspace.touch();
+                                poll.workspace.touch();
                                 continue;
                             }
                         }
@@ -930,7 +931,7 @@ impl LspServer {
                     if !poll.alive() {
                         return;
                     }
-                    poll._workspace.touch();
+                    poll.workspace.touch();
                     let Some((version, diagnostics)) = poll.document_diagnostics().await else {
                         continue;
                     };
@@ -1015,7 +1016,7 @@ impl LspServer {
                 }
             }
         });
-        if self.language_id == "rust" {
+        if self.rust_editor.is_some() {
             params["capabilities"]["general"] = json!({ "positionEncodings": ["utf-16"] });
             params["initializationOptions"] = rust_analyzer_settings();
         }
@@ -1025,12 +1026,13 @@ impl LspServer {
     }
 
     fn stage_rust(&self, source: &str) -> Result<Option<Arc<Source>>, String> {
-        let Workspace::Rust(workspace) = &self._workspace else {
+        let (Workspace::Rust(workspace), Some(editor)) = (&self.workspace, &self.rust_editor)
+        else {
             return Ok(None);
         };
         let source = workspace.stage(source)?;
-        *self
-            .rust_source
+        *editor
+            .source
             .lock()
             .map_err(|_| "Rust source mapping unavailable")? = Some(source.clone());
         Ok(Some(source))
@@ -1053,10 +1055,12 @@ impl LspServer {
                 }
             }
         }));
-        if notice.is_ok() {
-            self.diagnostics_notify.notify_one();
+        notice?;
+        self.diagnostics_notify.notify_one();
+        if let Some(editor) = &self.rust_editor {
+            self.schedule_rust_check(editor).await;
         }
-        notice
+        Ok(())
     }
 
     async fn did_change(&self, source: &str) -> Result<(), String> {
@@ -1064,37 +1068,37 @@ impl LspServer {
         let mapped = self.stage_rust(source)?;
         let source = mapped.as_ref().map_or(source, |doc| &doc.generated);
         *version += 1;
-        let notice = self.write(json!({
+        self.write(json!({
             "jsonrpc": "2.0",
             "method": "textDocument/didChange",
             "params": {
                 "textDocument": { "uri": &self.document_uri, "version": *version },
                 "contentChanges": [{ "text": source }]
             }
-        }));
-        if notice.is_ok() {
-            self.diagnostics_notify.notify_one();
-        }
-        notice?;
-        if mapped.is_some() {
-            let mut task = self.rust_check_task.lock().await;
-            if let Some(previous) = task.take() {
-                previous.abort();
-            }
-            let writer = self.writer.clone();
-            let uri = self.document_uri.clone();
-            *task = Some(tokio::spawn(async move {
-                // Keep completion synchronized on every edit and let Cargo
-                // check wait until the editor is idle.
-                tokio::time::sleep(Duration::from_millis(400)).await;
-                let _ = writer.send(json!({
-                    "jsonrpc": "2.0",
-                    "method": "textDocument/didSave",
-                    "params": { "textDocument": { "uri": uri } }
-                }));
-            }));
+        }))?;
+        self.diagnostics_notify.notify_one();
+        if let Some(editor) = &self.rust_editor {
+            self.schedule_rust_check(editor).await;
         }
         Ok(())
+    }
+
+    async fn schedule_rust_check(&self, editor: &RustEditor) {
+        let mut task = editor.check_task.lock().await;
+        if let Some(previous) = task.take() {
+            previous.abort();
+        }
+        let writer = self.writer.clone();
+        let uri = self.document_uri.clone();
+        *task = Some(tokio::spawn(async move {
+            // Completions see edits immediately. Defer Cargo check until idle.
+            tokio::time::sleep(RUST_CHECK_DEBOUNCE).await;
+            let _ = writer.send(json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didSave",
+                "params": { "textDocument": { "uri": uri } }
+            }));
+        }));
     }
 
     /// Roslyn publishes document diagnostics on request rather than on edit.
@@ -1136,16 +1140,16 @@ impl LspServer {
     }
 
     async fn request(&self, method: &str, mut params: Value) -> Result<Value, String> {
-        if self.language_id != "rust" {
+        let Some(editor) = &self.rust_editor else {
             return self
                 .request_with_timeout(method, params, REQUEST_TIMEOUT)
                 .await;
-        }
+        };
 
         let (version, source) = {
             let version = *self.version.lock().await;
-            let source = self
-                .rust_source
+            let source = editor
+                .source
                 .lock()
                 .map_err(|_| "Rust source mapping unavailable")?
                 .clone()
@@ -1159,7 +1163,7 @@ impl LspServer {
             *position = mapped;
         }
         let mut response = self
-            .request_with_timeout(method, params, REQUEST_TIMEOUT)
+            .request_with_timeout(method, params, RUST_REQUEST_TIMEOUT)
             .await?;
         if *self.version.lock().await != version {
             return Ok(Value::Null);
@@ -1244,8 +1248,10 @@ impl LspServer {
     }
 
     async fn stop(&self) {
-        if let Some(task) = self.rust_check_task.lock().await.take() {
-            task.abort();
+        if let Some(editor) = &self.rust_editor {
+            if let Some(task) = editor.check_task.lock().await.take() {
+                task.abort();
+            }
         }
         let _ = self
             .request_with_timeout("shutdown", Value::Null, Duration::from_millis(500))
@@ -1345,7 +1351,7 @@ struct ResponseConfig {
     extra_paths: Vec<String>,
     server_name: &'static str,
     version: Arc<Mutex<i64>>,
-    rust_source: Arc<StdMutex<Option<Arc<Source>>>>,
+    rust_editor: Option<Arc<RustEditor>>,
 }
 
 async fn read_loop(
@@ -1380,9 +1386,9 @@ async fn read_loop(
                     let current = config.version.lock().await;
                     if diagnostics_are_current(params, &config.document_uri, *current) {
                         let source = config
-                            .rust_source
-                            .lock()
-                            .ok()
+                            .rust_editor
+                            .as_ref()
+                            .and_then(|editor| editor.source.lock().ok())
                             .and_then(|source| source.clone());
                         drop(current);
                         let sink = events.lock().ok().map(|events| (*events).clone());
@@ -1689,7 +1695,7 @@ print("hi")
             extra_paths: vec!["/tmp/runtime".into()],
             server_name: "Python",
             version: Arc::new(Mutex::new(0)),
-            rust_source: Arc::default(),
+            rust_editor: None,
         };
         let result = configuration_result(
             &json!({"params": {"items": [{"section": "python"}, {"section": "python.analysis"}, {"section": "typescript"}, {"section": "other"}]}}),

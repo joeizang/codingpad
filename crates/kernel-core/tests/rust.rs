@@ -867,29 +867,3 @@ async fn separate_rust_scripts_reuse_artifacts_and_warmup_compiles_cached_crates
     .await
     .expect("background warmup did not compile the locally available serde_json");
 }
-
-#[tokio::test]
-async fn rust_secret_requests_resolve_session_values_without_exposing_connection_passwords() {
-    use codingpad_kernel_core::secrets::SecretStore;
-    use std::sync::Arc;
-
-    let data = tempfile::tempdir().unwrap();
-    let store = Arc::new(SecretStore::new(data.path()));
-    store.set_session("demo", "line one\n🦀").unwrap();
-    store.set_session("connection:private", "reserved").unwrap();
-    let supervisor = Supervisor::with_data_dir_and_secrets(data.path().to_owned(), store);
-    let (result, events) = run(
-        &supervisor,
-        r#"codingpad::secret("demo") == "line one\n🦀""#,
-    )
-    .await;
-    assert!(result.ok, "{events:?}");
-    assert_eq!(dumps(&events)[0]["v"], true);
-    let (result, events) = run(&supervisor, r#"codingpad::secret(" connection:private ")"#).await;
-    assert!(!result.ok);
-    assert!(dumps(&events)[0]["message"]
-        .as_str()
-        .unwrap()
-        .contains("was not found"));
-    assert!(!format!("{events:?}").contains("reserved"));
-}

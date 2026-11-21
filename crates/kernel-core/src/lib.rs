@@ -596,7 +596,6 @@ impl Supervisor {
                 project,
                 script: path.map(Path::new),
                 values: &cache,
-                secrets: self.secrets.clone(),
             };
             return tokio::select! {
                 biased;

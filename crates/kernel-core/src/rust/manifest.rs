@@ -150,7 +150,8 @@ impl Manifest {
         self.dependency_line
     }
 
-    pub(crate) fn editor_key(&self) -> String {
+    // A changed Cargo table requires rust-analyzer to reload the project.
+    pub(crate) fn editor_restart_key(&self) -> String {
         self.cargo.to_string()
     }
 

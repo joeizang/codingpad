@@ -1,4 +1,5 @@
-# Build and test every component (.NET 10 SDK required). CI runs these same recipes (D63).
+# Build and test every component (.NET 10 SDK and Rust components rust-analyzer and rust-src required).
+# CI runs these same recipes (D63).
 set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
 
 default:
@@ -15,6 +16,7 @@ check:
     cargo clippy --workspace --all-targets --locked -- -D warnings
     cargo clippy --manifest-path runtimes/rust/codingpad/Cargo.toml --all-targets --locked -- -D warnings
     cargo test --workspace --locked
+    cargo test -p codingpad-kernel-core --test language_server rust_code_intelligence_maps_shadow_edits_and_compiler_errors --locked -- --ignored
     cargo test --manifest-path runtimes/rust/codingpad/Cargo.toml --locked
     npm --prefix apps/desktop run tauri -- build --debug --no-bundle
 

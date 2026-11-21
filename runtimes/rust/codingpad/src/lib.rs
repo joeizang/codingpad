@@ -187,69 +187,26 @@ pub fn __finish<T: Debug>(value: T) {
     }
 }
 
-const OUTPUT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// The named-secret API is available for Rust type checking. Vault access is
+/// pending the Rust database and secrets milestone.
+pub fn secret(_name: &str) -> String {
+    panic!("Named secrets are not available to Rust scripts yet.")
+}
 
 fn connect() -> Option<TcpStream> {
     let address = std::env::var("CODINGPAD_RUST_OUTPUT").ok()?;
     let token = std::env::var("CODINGPAD_RUST_TOKEN").ok()?;
     let mut socket = TcpStream::connect(address).ok()?;
     socket.set_nodelay(true).ok()?;
-    socket.set_read_timeout(Some(OUTPUT_READ_TIMEOUT)).ok()?;
+    socket
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok()?;
     socket.write_all(token.as_bytes()).ok()?;
     Some(socket)
 }
 
-/// Return a named value from CodingPad's password vault or session.
-pub fn secret(name: &str) -> String {
-    assert!(!name.trim().is_empty(), "A secret name cannot be empty");
-    if !in_app() {
-        panic!("Secret {name:?} was not found. Add it in Secrets… or set it for this session.");
-    }
-    match request_secret(name) {
-        Ok(value) => value,
-        Err(message) => panic!("{message}"),
-    }
-}
-
-static OUTPUT: OnceLock<Mutex<Option<TcpStream>>> = OnceLock::new();
-
-fn request_secret(name: &str) -> Result<String, String> {
-    let unavailable = || "Could not read from the CodingPad password vault".to_owned();
-    let mut output = OUTPUT
-        .get_or_init(|| Mutex::new(connect()))
-        .lock()
-        .map_err(|_| unavailable())?;
-    let socket = output.as_mut().ok_or_else(unavailable)?;
-    // Unlocking the OS vault can require user interaction. Stop still closes
-    // the connection when it ends the run.
-    socket.set_read_timeout(None).map_err(|_| unavailable())?;
-    let mut read = || -> io::Result<(bool, String)> {
-        socket.write_all(encode_fields(&[("kind", "secret"), ("name", name)]).as_bytes())?;
-        let mut header = [0; 5];
-        socket.read_exact(&mut header)?;
-        let length = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
-        if length > 1024 * 1024 {
-            return Err(io::ErrorKind::InvalidData.into());
-        }
-        let mut bytes = vec![0; length];
-        socket.read_exact(&mut bytes)?;
-        let value = String::from_utf8(bytes)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        Ok((header[0] == 1, value))
-    };
-    let reply = read();
-    let restored = socket.set_read_timeout(Some(OUTPUT_READ_TIMEOUT));
-    match (reply, restored) {
-        (Ok((true, value)), Ok(())) => Ok(value),
-        (Ok((false, error)), Ok(())) => Err(error),
-        _ => {
-            *output = None;
-            Err(unavailable())
-        }
-    }
-}
-
 fn send(fields: &[(&str, &str)]) -> bool {
+    static OUTPUT: OnceLock<Mutex<Option<TcpStream>>> = OnceLock::new();
     let Ok(mut output) = OUTPUT.get_or_init(|| Mutex::new(connect())).lock() else {
         return false;
     };
@@ -258,10 +215,6 @@ fn send(fields: &[(&str, &str)]) -> bool {
     }
     let _ = io::stdout().flush();
     let _ = io::stderr().flush();
-    send_frame(&mut output, &encode_fields(fields))
-}
-
-fn encode_fields(fields: &[(&str, &str)]) -> String {
     let mut line = String::from("{");
     for (index, (key, value)) in fields.iter().enumerate() {
         if index > 0 {
@@ -272,7 +225,7 @@ fn encode_fields(fields: &[(&str, &str)]) -> String {
         quoted(&mut line, value);
     }
     line.push_str("}\n");
-    line
+    send_frame(&mut output, &line)
 }
 
 fn send_frame(output: &mut Option<TcpStream>, line: &str) -> bool {

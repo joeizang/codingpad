@@ -1,13 +1,14 @@
+use serde_json::{json, Value};
 use syn::{parse::ParseStream, spanned::Spanned, Attribute, Expr, Item, Stmt};
 use unicode_width::UnicodeWidthChar;
 
 pub(crate) const FILE: &str = "src/main.rs";
 
 pub(crate) struct Source {
-    pub(super) original: String,
+    original: String,
     pub(crate) generated: String,
-    pub(super) segments: Vec<(usize, usize, usize)>,
-    pub(super) frontmatter: std::ops::Range<usize>,
+    segments: Vec<(usize, usize, usize)>,
+    frontmatter: std::ops::Range<usize>,
 }
 
 impl Source {
@@ -85,7 +86,9 @@ impl Source {
                 .push_str(&format!("::{runtime}::__finish("));
             staged.copy(tail.start, tail.end);
             staged.generated.push_str(");");
-            staged.copy(tail.end, original.len());
+            if tail.end < original.len() {
+                staged.copy(tail.end, original.len());
+            }
         } else {
             staged.copy(body, original.len());
         }
@@ -213,6 +216,176 @@ fn plain(expression: &Expr) -> bool {
     }))
 }
 
+impl Source {
+    pub(crate) fn editor_to_shadow(&self, value: &Value) -> Option<Value> {
+        let offset = position_offset(&self.original, value)?;
+        if self.frontmatter.contains(&offset) {
+            return None;
+        }
+        let generated = self
+            .segments
+            .iter()
+            .rev()
+            .find_map(|&(start, end, original)| {
+                let delta = offset.checked_sub(original)?;
+                (delta <= end - start).then_some(start + delta)
+            })?;
+        byte_position(&self.generated, generated)
+    }
+
+    fn shadow_to_editor(&self, value: &Value, insertion: bool) -> Option<Value> {
+        let offset = position_offset(&self.generated, value)?;
+        let mut original = self.original_offset(offset)?;
+        if self.frontmatter.contains(&original) {
+            if !insertion {
+                return None;
+            }
+            original = self.frontmatter.end;
+        }
+        byte_position(&self.original, original)
+    }
+
+    fn map_range(&self, range: &mut Value, insertion: bool) -> bool {
+        let insertion = insertion && range["start"] == range["end"];
+        let Some(start) = self.shadow_to_editor(&range["start"], insertion) else {
+            return false;
+        };
+        let Some(end) = self.shadow_to_editor(&range["end"], insertion) else {
+            return false;
+        };
+        *range = json!({ "start": start, "end": end });
+        true
+    }
+
+    pub(crate) fn map_diagnostics(&self, params: &mut Value, uri: &str) {
+        let Some(diagnostics) = params["diagnostics"].as_array_mut() else {
+            return;
+        };
+        diagnostics.retain_mut(|diagnostic| {
+            if !self.map_range(&mut diagnostic["range"], false) {
+                // Real compiler errors can point at generated wrapper code.
+                // Give them a script location; omit analyzer-only wrapper diagnostics.
+                if diagnostic["source"] != "rustc" || diagnostic["severity"] != 1 {
+                    return false;
+                }
+                let Some(position) = byte_position(&self.original, self.frontmatter.end) else {
+                    return false;
+                };
+                diagnostic["range"] = json!({ "start": position, "end": position });
+            }
+            if let Some(related) = diagnostic["relatedInformation"].as_array_mut() {
+                related.retain_mut(|info| {
+                    let location = &mut info["location"];
+                    location["uri"] != uri || self.map_range(&mut location["range"], false)
+                });
+            }
+            true
+        });
+    }
+
+    pub(crate) fn map_response(&self, method: &str, response: &mut Value) {
+        match method {
+            "textDocument/completion" => {
+                let mut default_edit = response
+                    .get_mut("itemDefaults")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|defaults| defaults.remove("editRange"));
+                let valid_default = default_edit.as_mut().is_none_or(|range| {
+                    if range.get("insert").is_some() {
+                        self.map_range(&mut range["insert"], false)
+                            && self.map_range(&mut range["replace"], false)
+                    } else {
+                        self.map_range(range, false)
+                    }
+                });
+                let items = if response.is_array() {
+                    response.as_array_mut()
+                } else {
+                    response.get_mut("items").and_then(Value::as_array_mut)
+                };
+                if let Some(items) = items {
+                    items.retain_mut(|item| {
+                        let valid = match item.get_mut("textEdit") {
+                            Some(edit) if edit.get("range").is_some() => {
+                                self.map_range(&mut edit["range"], false)
+                            }
+                            Some(edit) => {
+                                self.map_range(&mut edit["insert"], false)
+                                    && self.map_range(&mut edit["replace"], false)
+                            }
+                            None if !valid_default => false,
+                            None => {
+                                if let Some(range) = &default_edit {
+                                    let text = item["textEditText"]
+                                        .as_str()
+                                        .or_else(|| item["insertText"].as_str())
+                                        .unwrap_or_else(|| {
+                                            item["label"].as_str().unwrap_or_default()
+                                        });
+                                    item["textEdit"] = if range.get("insert").is_some() {
+                                        json!({
+                                            "newText": text,
+                                            "insert": range["insert"],
+                                            "replace": range["replace"]
+                                        })
+                                    } else {
+                                        json!({ "newText": text, "range": range })
+                                    };
+                                }
+                                true
+                            }
+                        };
+                        self.map_additional_edits(item);
+                        valid
+                    });
+                }
+            }
+            "completionItem/resolve" => self.map_additional_edits(response),
+            "textDocument/hover" => {
+                if let Some(range) = response.get_mut("range") {
+                    if !self.map_range(range, false) {
+                        response.as_object_mut().unwrap().remove("range");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn map_additional_edits(&self, item: &mut Value) {
+        if let Some(edits) = item
+            .get_mut("additionalTextEdits")
+            .and_then(Value::as_array_mut)
+        {
+            edits.retain_mut(|edit| self.map_range(&mut edit["range"], true));
+        }
+    }
+}
+
+fn position_offset(text: &str, position: &Value) -> Option<usize> {
+    let line = usize::try_from(position["line"].as_u64()?).ok()?;
+    let character = usize::try_from(position["character"].as_u64()?).ok()?;
+    let mut lines = text.split('\n');
+    let offset: usize = lines.by_ref().take(line).map(|line| line.len() + 1).sum();
+    let line = lines.next()?.trim_end_matches('\r');
+    let mut utf16 = 0;
+    for (index, ch) in line.char_indices() {
+        if utf16 == character {
+            return Some(offset + index);
+        }
+        utf16 += ch.len_utf16();
+    }
+    (utf16 == character).then_some(offset + line.len())
+}
+
+fn byte_position(text: &str, offset: usize) -> Option<Value> {
+    let prefix = text.get(..offset)?;
+    Some(json!({
+        "line": prefix.bytes().filter(|&byte| byte == b'\n').count(),
+        "character": prefix.rsplit('\n').next()?.encode_utf16().count(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +402,50 @@ mod tests {
         assert!(!Source::with_frontmatter("42;", 0..0, "codingpad")
             .generated
             .contains("__finish"));
+    }
+
+    #[test]
+    fn completion_at_eof_stays_inside_the_automatic_dump() {
+        let original = "codingpad::du";
+        let source = Source::with_frontmatter(original, 0..0, "codingpad");
+        let mapped = source
+            .editor_to_shadow(&serde_json::json!({"line": 0, "character": original.len()}))
+            .unwrap();
+        let line = source
+            .generated
+            .lines()
+            .nth(mapped["line"].as_u64().unwrap() as usize)
+            .unwrap();
+        assert_eq!(
+            &line[mapped["character"].as_u64().unwrap() as usize..],
+            ");"
+        );
+    }
+
+    #[test]
+    fn completion_list_defaults_become_script_text_edits() {
+        let source = Source::with_frontmatter("let _ = codingpad::du;", 0..0, "codingpad");
+        let start = source
+            .editor_to_shadow(&json!({ "line": 0, "character": 19 }))
+            .unwrap();
+        let end = source
+            .editor_to_shadow(&json!({ "line": 0, "character": 21 }))
+            .unwrap();
+        let mut response = json!({
+            "itemDefaults": { "editRange": { "start": start, "end": end } },
+            "items": [{ "label": "dump(…)", "textEditText": "dump" }],
+        });
+        source.map_response("textDocument/completion", &mut response);
+        assert_eq!(
+            response["items"][0]["textEdit"],
+            json!({
+                "newText": "dump",
+                "range": {
+                    "start": { "line": 0, "character": 19 },
+                    "end": { "line": 0, "character": 21 },
+                }
+            })
+        );
     }
 
     #[test]

@@ -145,6 +145,23 @@ function toCompletionItem(
   };
 }
 
+function matchesRustCompilerError(live: LspDiagnostic, compiled: CompileDiagnostic): boolean {
+  if (live.severity !== 1) return false;
+  const code = /^(E\d{4}): /.exec(compiled.message)?.[1];
+  if (code ? live.code !== code : live.message.split("\n", 1)[0] !== compiled.message) {
+    return false;
+  }
+  const { start, end } = live.range;
+  const startLine = start.line + 1;
+  const endLine = end.line + 1;
+  return (
+    (startLine < compiled.endLine ||
+      (startLine === compiled.endLine && start.character + 1 <= compiled.endColumn)) &&
+    (endLine > compiled.line ||
+      (endLine === compiled.line && end.character + 1 >= compiled.column))
+  );
+}
+
 const directiveKey = (source: string, language: string) => {
   if (language === "rust") return cargoScriptFrontmatter(source)?.key ?? "";
   if (language === "csharp") return csharpDirectiveKey(source);
@@ -186,6 +203,7 @@ export default function CodeEditor({
   const pendingChange = useRef<string | null>(null);
   const changeTimer = useRef<number | null>(null);
   const seenDiagnostics = useRef(false);
+  const hadCompilerDiagnostics = useRef(false);
   const rustDiagnostics = useRef<LspDiagnostic[] | null>(null);
   const compileDiagnosticsRef = useRef(compileDiagnostics);
   compileDiagnosticsRef.current = compileDiagnostics;
@@ -259,12 +277,12 @@ export default function CodeEditor({
 
   const applyCompileDiagnostics = () => {
     const live = language === "rust" ? rustDiagnostics.current : null;
-    const visible = compileDiagnosticsRef.current.filter((compiled) => !live?.some((diagnostic) =>
-      diagnostic.severity === 1 &&
-      diagnostic.range.start.line + 1 === compiled.line &&
-      diagnostic.range.start.character + 1 === compiled.column &&
-      diagnostic.message.startsWith(compiled.message.replace(/^E\d{4}: /, "")),
-    ));
+    const compiled = compileDiagnosticsRef.current;
+    const visible = compiled.filter((error) =>
+      !live?.some((diagnostic) => matchesRustCompilerError(diagnostic, error)),
+    );
+    const clearedCompilerDiagnostics = hadCompilerDiagnostics.current && !compiled.length;
+    hadCompilerDiagnostics.current = compiled.length > 0;
     const model = editorRef.current?.getModel();
     if (model) {
       monaco.editor.setModelMarkers(
@@ -282,12 +300,12 @@ export default function CodeEditor({
         })),
       );
     }
-    if (live || visible.length || language === "csharp") {
+    if (live || visible.length || clearedCompilerDiagnostics || language === "csharp") {
       const summary = summarizeDiagnostics(live ?? []);
       onDiagnosticsRef.current?.({
         errors: summary.errors + visible.length,
         warnings: summary.warnings,
-        message: live || visible.length ? undefined : "Compile diagnostics on Run",
+        message: language === "csharp" && !visible.length ? "Compile diagnostics on Run" : undefined,
       });
     }
   };

@@ -148,7 +148,7 @@ impl BuildCache {
             .arg(lease.target())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = spawn(command).map_err(cache_error)?;
+        let mut child = spawn(&mut command).map_err(cache_error)?;
         if let Ok(Ok(_)) =
             tokio::time::timeout(Duration::from_secs(120), child.process.wait()).await
         {

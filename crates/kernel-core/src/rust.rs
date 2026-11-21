@@ -428,7 +428,7 @@ struct CargoOutput {
 
 async fn cargo_output(mut command: Command) -> Result<CargoOutput, String> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = spawn(command).map_err(|error| {
+    let mut child = spawn(&mut command).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             MISSING.to_owned()
         } else {
@@ -566,7 +566,7 @@ fn assign_job(process: &Child) -> Option<std::os::windows::io::OwnedHandle> {
     Some(job)
 }
 
-fn spawn(mut command: Command) -> io::Result<RunningChild> {
+fn spawn(command: &mut Command) -> io::Result<RunningChild> {
     command.stdin(Stdio::null()).kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
@@ -635,14 +635,30 @@ async fn execute(
         command.env("CODINGPAD_RUST_START", &ready);
         ready
     };
-    let mut child =
-        spawn(command).map_err(|error| format!("Could not start the Rust script: {error}"))?;
+    let mut child = spawn_script(&mut command)
+        .await
+        .map_err(|error| format!("Could not start the Rust script: {error}"))?;
     #[cfg(windows)]
     std::fs::write(ready, [])
         .map_err(|error| format!("Could not start the Rust script: {error}"))?;
     read_output(&mut child, &listener, &token, events, stop, cancel)
         .await
         .map_err(|error| format!("Could not run the Rust script: {error}"))
+}
+
+async fn spawn_script(command: &mut Command) -> io::Result<RunningChild> {
+    #[cfg(unix)]
+    for _ in 0..5 {
+        match spawn(command) {
+            // A concurrent fork can briefly inherit the open file description
+            // from the executable copy before closing it on exec.
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            result => return result,
+        }
+    }
+    spawn(command)
 }
 
 async fn read_output(

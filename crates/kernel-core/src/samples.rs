@@ -4,7 +4,7 @@
 //! opening or saving them. Opening a sample creates an unsaved copy in a tab;
 //! the original embedded source is never written back. The database is copied
 //! into the app data folder on first use and exposed as a built-in connection,
-//! so SQL, Python, C# and TypeScript samples can query it without any setup.
+//! so SQL, Python, C#, TypeScript and Rust samples can query it without any setup.
 //!
 //! The built-in connection is resolved by [`crate::databases::ConnectionStore`]
 //! and is never written to `connections.json`. That keeps `cpad` from rewriting
@@ -48,6 +48,7 @@ pub enum SampleLanguage {
     Python,
     Csharp,
     Typescript,
+    Rust,
     Sql,
 }
 
@@ -57,6 +58,7 @@ impl SampleLanguage {
             Self::Python => Language::Python.extension(),
             Self::Csharp => Language::Csharp.extension(),
             Self::Typescript => Language::Typescript.extension(),
+            Self::Rust => Language::Rust.extension(),
             Self::Sql => "sql",
         }
     }
@@ -148,6 +150,16 @@ pub fn all() -> Vec<Sample> {
             "Join the sample database",
             Typescript
         ),
+        sample!("rust/hello.rs", "Hello, world!", Rust),
+        sample!("rust/objects.rs", "Structs and nested values", Rust),
+        sample!("rust/tables.rs", "Tables from Rust structs", Rust),
+        sample!("rust/iterators.rs", "Filter and aggregate", Rust),
+        sample!("rust/enums.rs", "Enums and results", Rust),
+        sample!("rust/text.rs", "Count words", Rust),
+        sample!("rust/cache.rs", "Cache a result", Rust),
+        sample!("rust/rich_output.rs", "Live values and HTML", Rust),
+        sample!("rust/query_products.rs", "Query the sample database", Rust),
+        sample!("rust/query_orders.rs", "Join the sample database", Rust),
         sample!("sql/hello.sql", "Hello from SQL", Sql),
         sample!("sql/tables.sql", "Explore the database", Sql),
         sample!("sql/customers.sql", "Customers", Sql),

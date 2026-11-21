@@ -1,7 +1,7 @@
 //! The terminal runner behind `cpad run` (D28).
 //!
 //! The command reuses the desktop's Rust core: the same kernel supervisor,
-//! Python, C# and TypeScript kernels, SQL manager, connection store and
+//! Python, C#, TypeScript and Rust kernels, SQL manager, connection store and
 //! secret vault. It replaces the results panel with terminal output.
 //!
 //! Kernels normally defer C# properties and deep values as lazy nodes so the
@@ -62,6 +62,7 @@ pub enum ScriptLanguage {
     Python,
     Csharp,
     Typescript,
+    Rust,
     Sql,
 }
 
@@ -100,9 +101,10 @@ pub fn language_for(path: &Path) -> Result<ScriptLanguage, String> {
         ext if ext == Language::Python.extension() => Ok(ScriptLanguage::Python),
         ext if ext == Language::Csharp.extension() => Ok(ScriptLanguage::Csharp),
         ext if ext == Language::Typescript.extension() => Ok(ScriptLanguage::Typescript),
+        ext if ext == Language::Rust.extension() => Ok(ScriptLanguage::Rust),
         "sql" => Ok(ScriptLanguage::Sql),
         ext => Err(format!(
-            "Cannot run \"{}\": expected a .py, .cs, .ts or .sql script{}.",
+            "Cannot run \"{}\": expected a .py, .cs, .ts, .rs or .sql script{}.",
             path.display(),
             if ext.is_empty() {
                 String::new()
@@ -224,6 +226,7 @@ async fn run_file_in(
         ScriptLanguage::Python => run_kernel(Language::Python).await,
         ScriptLanguage::Csharp => run_kernel(Language::Csharp).await,
         ScriptLanguage::Typescript => run_kernel(Language::Typescript).await,
+        ScriptLanguage::Rust => run_kernel(Language::Rust).await,
         ScriptLanguage::Sql => {
             run_sql_script(&sql, &script_id, &source, &absolute, &mut recorder).await
         }
@@ -991,6 +994,10 @@ mod tests {
             Ok(ScriptLanguage::Typescript)
         );
         assert_eq!(
+            language_for(Path::new("hello.RS")),
+            Ok(ScriptLanguage::Rust)
+        );
+        assert_eq!(
             language_for(Path::new("query.sql")),
             Ok(ScriptLanguage::Sql)
         );
@@ -999,29 +1006,29 @@ mod tests {
     #[test]
     fn unknown_extensions_are_rejected_with_the_expected_ones() {
         let message = language_for(Path::new("notes.txt")).unwrap_err();
-        assert!(message.contains(".py, .cs, .ts or .sql"));
+        assert!(message.contains(".py, .cs, .ts, .rs or .sql"));
         assert!(message.contains("notes.txt"));
+    }
+
+    struct TestVault;
+
+    impl Vault for TestVault {
+        fn get(&self, name: &str) -> Result<Option<String>, String> {
+            assert_eq!(name, "test-token");
+            Ok(Some("vault-fixture".into()))
+        }
+
+        fn set(&self, _: &str, _: &str) -> Result<(), String> {
+            panic!("Running a script must not write vault entries");
+        }
+
+        fn delete(&self, _: &str) -> Result<(), String> {
+            panic!("Running a script must not delete vault entries");
+        }
     }
 
     #[tokio::test]
     async fn typescript_cli_runner_reads_a_vault_secret() {
-        struct TestVault;
-
-        impl Vault for TestVault {
-            fn get(&self, name: &str) -> Result<Option<String>, String> {
-                assert_eq!(name, "test-token");
-                Ok(Some("vault-fixture".into()))
-            }
-
-            fn set(&self, _: &str, _: &str) -> Result<(), String> {
-                panic!("Running a script must not write vault entries");
-            }
-
-            fn delete(&self, _: &str) -> Result<(), String> {
-                panic!("Running a script must not delete vault entries");
-            }
-        }
-
         let directory = tempfile::tempdir().unwrap();
         let data = directory.path().join("data");
         fs::create_dir(&data).unwrap();
@@ -1039,6 +1046,27 @@ if (secret("test-token") !== "vault-fixture") {
         .unwrap();
         assert_eq!(
             run_file_in(&script, OutputFormat::Text, data, Arc::new(TestVault),).await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn rust_cli_runner_reads_a_vault_secret() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("secret.rs");
+        fs::write(
+            &script,
+            r#"assert_eq!(codingpad::secret("test-token"), "vault-fixture");"#,
+        )
+        .unwrap();
+        assert_eq!(
+            run_file_in(
+                &script,
+                OutputFormat::Text,
+                directory.path().join("data"),
+                Arc::new(TestVault)
+            )
+            .await,
             0
         );
     }

@@ -4,7 +4,7 @@ const USAGE: &str = "\
 Usage: cpad run [--html] <script>
 
 Run a CodingPad script from the terminal and print its dumps as text.
-Supports Python (.py), C# (.cs), TypeScript (.ts) and SQL (.sql) scripts.
+Supports Python (.py), C# (.cs), TypeScript (.ts), Rust (.rs) and SQL (.sql) scripts.
 A \"codingpad: connection=<name>\" header comment attaches a saved connection
 to the script.
 

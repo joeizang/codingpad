@@ -89,6 +89,44 @@ fn typescript_samples_run_from_saved_files() {
 }
 
 #[test]
+fn rust_samples_run_from_saved_files() {
+    let directory = tempdir().unwrap();
+    let data = directory.path().join("data");
+    for sample in samples::all()
+        .into_iter()
+        .filter(|sample| sample.language == SampleLanguage::Rust)
+    {
+        let script = directory.path().join(&sample.name);
+        fs::write(&script, sample.source).unwrap();
+        let output = cpad(&data, &script);
+        let errors = stderr(&output);
+        let text = stdout(&output);
+        assert!(output.status.success(), "{}: {text}\n{errors}", sample.id);
+        assert!(!text.trim().is_empty(), "{} produced no output", sample.id);
+        match sample.name.as_str() {
+            "cache.rs" => {
+                assert!(text.contains("Computing squares"), "{text}");
+                let rerun = cpad(&data, &script);
+                assert!(rerun.status.success(), "{}", stderr(&rerun));
+                assert!(!stdout(&rerun).contains("Computing squares"));
+                assert!(stdout(&rerun).contains("64"));
+            }
+            "query_products.rs" => assert!(text.contains("Ethiopia Yirgacheffe"), "{text}"),
+            "query_orders.rs" => {
+                assert!(text.contains("Ada Lovelace"), "{text}");
+                let output = cpad_html(&data, &script);
+                assert!(output.status.success(), "{}", stderr(&output));
+                let page = stdout(&output);
+                assert!(page.starts_with("<!doctype html>"), "{page}");
+                assert!(page.contains("<table"), "{page}");
+                assert!(page.contains("Ada Lovelace"), "{page}");
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
 fn typescript_queries_a_user_saved_connection() {
     let directory = tempdir().unwrap();
     let data = directory.path().join("data");
@@ -488,14 +526,14 @@ fn usage_errors_exit_with_two() {
 
     let output = cpad(&data, &script);
     assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
-    assert!(stderr(&output).contains(".py, .cs, .ts or .sql"));
+    assert!(stderr(&output).contains(".py, .cs, .ts, .rs or .sql"));
 
     // The type check comes before opening the file, so a missing unknown path
     // is still a usage error rather than "Could not open".
     let missing = directory.path().join("missing.txt");
     let output = cpad(&data, &missing);
     assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
-    assert!(stderr(&output).contains(".py, .cs, .ts or .sql"));
+    assert!(stderr(&output).contains(".py, .cs, .ts, .rs or .sql"));
 
     // An unknown option is a usage error too.
     let output = Command::new(env!("CARGO_BIN_EXE_cpad"))
